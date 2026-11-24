@@ -340,14 +340,15 @@ fn migrate(root: &Path, name: &str, old: &Path) -> Option<PathBuf> {
     let done = current_named(&dir, name).ok()?.is_some(); // a crash after the commit
     if !done {
         let display = std::fs::read_to_string(old.join(".display")).unwrap_or_default();
-        let mut blobs: Vec<(String, Vec<u8>)> = std::fs::read_dir(old)
-            .ok()?
-            .flatten()
-            .filter_map(|e| {
-                let blob = decode(e.file_name().to_str()?)?;
-                Some((blob, std::fs::read(e.path()).ok()?))
-            })
-            .collect();
+        let mut blobs: Vec<(String, Vec<u8>)> = Vec::new();
+        for entry in std::fs::read_dir(old).ok()? {
+            let entry = entry.ok()?;
+            let Some(blob) = entry.file_name().to_str().and_then(decode) else {
+                continue;
+            };
+            let data = std::fs::read(entry.path()).ok()?;
+            blobs.push((blob, data));
+        }
         blobs.sort();
         let sources: Vec<_> = blobs
             .iter()
@@ -1254,6 +1255,44 @@ mod tests {
         );
         let v = current_named(&c.dir, "Player").unwrap().unwrap();
         assert_eq!((v.dir.file_name(), v.display.as_str()), (Some("v1".as_ref()), "Chapter 1"));
+    }
+
+    #[test]
+    fn migration_aborts_without_deleting_old_when_a_blob_cannot_be_read() {
+        let saves = tempfile::tempdir().unwrap();
+        let root = saves.path().join(format!("{:016X}", xuser::XUID)).join("scid");
+        let old = root.join("Player");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("Save%20Game%20Data"), b"data").unwrap();
+        // A directory entry whose name decodes as a valid blob name causes
+        // `std::fs::read` to fail (`IsADirectory` / `PermissionDenied`);
+        // migration must abort without committing a partial container or
+        // deleting `old`.
+        let unreadable = old.join("Save%20Game%20Header");
+        std::fs::create_dir_all(&unreadable).unwrap();
+        std::fs::write(old.join(".display"), b"Chapter 1").unwrap();
+
+        let p = Provider::open(saves.path(), Some("scid")).unwrap();
+        assert!(old.exists(), "old container must remain intact when a blob read fails");
+        let c = p.container("Player");
+        assert!(
+            current_named(&c.dir, "Player").unwrap().is_none(),
+            "partial migration must not be committed"
+        );
+
+        // Once the entry is a readable blob file, migration succeeds cleanly.
+        std::fs::remove_dir_all(&unreadable).unwrap();
+        std::fs::write(&unreadable, b"header").unwrap();
+        let p = Provider::open(saves.path(), Some("scid")).unwrap();
+        assert!(!old.exists());
+        let blobs = read(&p.container("Player"), None).unwrap();
+        assert_eq!(
+            blobs,
+            [
+                ("Save Game Data".into(), b"data".to_vec()),
+                ("Save Game Header".into(), b"header".to_vec())
+            ]
+        );
     }
 
     /// An empty configuration id names none. As a folder name it would be
