@@ -255,7 +255,7 @@ fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
         return None;
     }
     Some(AllocationInfo {
-        size: bytes.checked_next_multiple_of(KIB_64)?,
+        size: bytes.checked_next_multiple_of(alignment)?,
         alignment,
     })
 }
@@ -916,7 +916,7 @@ fn place<'a>(
 ) -> AllocationInfo {
     let mut total = AllocationInfo {
         size: 0,
-        alignment: KIB_64,
+        alignment: 0,
     };
     for (i, desc) in descs.enumerate() {
         let Some(one) = footprint(desc) else {
@@ -946,6 +946,9 @@ fn place<'a>(
         );
         total.size = offset + one.size;
         total.alignment = total.alignment.max(one.alignment);
+    }
+    if total.alignment == 0 {
+        total.alignment = KIB_64;
     }
     total
 }
@@ -3653,6 +3656,66 @@ mod tests {
         );
         allocation_info(&mut info, std::ptr::null(), 0, 1, &texture(1, 1, 999, 1));
         assert_eq!(info.size, u64::MAX);
+
+        // Standalone 4 KiB console textures must preserve their 4 KiB alignment
+        // through `allocation_info` / `allocation_info2`, rather than clamping up
+        // to 64 KiB; empty queries still default to 64 KiB.
+        let bc7_desc = texture(512, 512, 98, 10);
+        allocation_info(&mut info, std::ptr::null(), 0, 1, &bc7_desc);
+        assert_eq!(
+            info,
+            AllocationInfo {
+                size: 0x56000,
+                alignment: 0x1000,
+            }
+        );
+        let mut each = std::array::from_fn::<_, 2, _>(|_| AllocationInfo1 {
+            offset: 0,
+            alignment: 0,
+            size: 0,
+        });
+        let two_bc7 = [
+            ResourceDesc1 {
+                desc: bc7_desc,
+                mip_region: [0; 3],
+            },
+            ResourceDesc1 {
+                desc: bc7_desc,
+                mip_region: [0; 3],
+            },
+        ];
+        allocation_info2(
+            &mut info,
+            std::ptr::null(),
+            0,
+            2,
+            two_bc7.as_ptr(),
+            each.as_mut_ptr(),
+        );
+        assert_eq!(
+            info,
+            AllocationInfo {
+                size: 2 * 0x56000,
+                alignment: 0x1000,
+            }
+        );
+        assert_eq!(each[0].alignment, 0x1000);
+        assert_eq!(each[1].offset, 0x56000);
+
+        // Fallback path (`footprint` without `texture_layout`) rounds `size`
+        // up to `alignment`, not unconditionally to 64 KiB.
+        let aligned_buf = ResourceDesc {
+            alignment: MIB_4,
+            ..buffer(100)
+        };
+        allocation_info(&mut info, std::ptr::null(), 0, 1, &aligned_buf);
+        assert_eq!(
+            info,
+            AllocationInfo {
+                size: MIB_4,
+                alignment: MIB_4,
+            }
+        );
     }
 
     #[test]
