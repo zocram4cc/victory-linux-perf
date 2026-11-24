@@ -113,6 +113,9 @@ pub(crate) enum Cast {
 
 /// Compare predicates: floats 0-15, integers 32-41.
 pub(crate) mod pred {
+    // FALSE and TRUE are not emitted: WARP removes its device on them (and
+    // DXC folds them away), so constant compares lower as constants.
+    #[allow(dead_code)]
     pub const FALSE: u8 = 0;
     pub const OEQ: u8 = 1;
     pub const OGT: u8 = 2;
@@ -131,6 +134,7 @@ pub(crate) mod pred {
     pub const ULT: u8 = 12;
     pub const ULE: u8 = 13;
     pub const UNE: u8 = 14;
+    #[allow(dead_code)]
     pub const TRUE: u8 = 15;
     pub const EQ: u8 = 32;
     pub const NE: u8 = 33;
