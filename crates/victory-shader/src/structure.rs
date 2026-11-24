@@ -139,6 +139,9 @@ const MAX_NODES: usize = 1 << 21;
 const MAX_MEET: usize = 1 << 16;
 /// Conditions [`Meets`] keeps; past that, they are searched anew.
 const MAX_MEETS: usize = 1 << 18;
+/// Cap the `ite` memo table so complex shaders cannot trigger multi-tens-of-MB
+/// HashMap resizes (e.g. 35 MB at 2^21 buckets) under concurrent compilation.
+const MAX_MEMO: usize = 1 << 18;
 
 /// What [`Bools::meet`] found out about one [`Bools`], for its later calls:
 /// the conditions no lane satisfies, and the case splits it took to find
@@ -233,6 +236,9 @@ impl Bools {
     }
 
     fn ite(&mut self, f: Bool, g: Bool, h: Bool) -> Bool {
+        if self.overflow {
+            return Bool::FALSE;
+        }
         if f == Bool::TRUE || g == h {
             return g;
         }
@@ -251,7 +257,12 @@ impl Bools {
         let lo = self.ite(f0, g0, h0);
         let hi = self.ite(f1, g1, h1);
         let r = self.mk(v, lo, hi);
-        self.memo.insert((f, g, h), r);
+        if !self.overflow {
+            if self.memo.len() >= MAX_MEMO {
+                self.memo.clear();
+            }
+            self.memo.insert((f, g, h), r);
+        }
         r
     }
 
@@ -379,6 +390,9 @@ impl Bools {
     /// `b` with every atom born at reverse-postorder index `from` or later
     /// existentially quantified: what still holds once those are redefined.
     fn forget(&mut self, b: Bool, from: usize, memo: &mut Map<Bool, Bool>) -> Bool {
+        if self.overflow {
+            return Bool::FALSE;
+        }
         let (v, lo, hi) = self.nodes[b.0 as usize];
         if v == TERMINAL {
             return b;
@@ -1679,6 +1693,29 @@ mod tests {
             "{none} {some} {gave_up}"
         );
         assert!(seen.none.len() > 100);
+    }
+
+    #[test]
+    fn the_ite_memo_stays_within_its_cap() {
+        // The parity of n variables, made one variable at a time: each step
+        // memoises about twice as many triples as the function has variables.
+        let mut b = Bools::new();
+        let mut parity = Bool::FALSE;
+        for i in 0..800 {
+            let x = b.atom(Atom::Constant(i), 0);
+            parity = b.xor(parity, x);
+            assert!(b.memo.len() <= MAX_MEMO, "{} memoised at variable {i}", b.memo.len());
+        }
+    }
+
+    #[test]
+    fn a_table_past_its_node_limit_answers_false_without_more_work() {
+        let mut b = Bools::new();
+        let x = b.atom(Atom::Constant(0), 0);
+        let y = b.atom(Atom::Constant(1), 0);
+        b.overflow = true;
+        assert_eq!(b.ite(x, y, Bool::TRUE), Bool::FALSE);
+        assert!(b.memo.is_empty());
     }
 
     #[test]
