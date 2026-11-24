@@ -54,6 +54,11 @@ type Out = *mut *mut c_void;
 static FACTORY_OBJECT: Object = Object::new("dstorage factory", &FACTORY_VTABLE);
 
 pub extern "system" fn DStorageGetFactory(iid: *const Guid, out: Out) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    // SAFETY: checked non-null; the title passes room for a pointer.
+    unsafe { out.write(std::ptr::null_mut()) };
     // SAFETY: the title passes a GUID (null tolerated).
     match unsafe { iid.as_ref() } {
         Some(&iid) if iid == FACTORY => {
@@ -1778,6 +1783,27 @@ mod tests {
         let mut factory = std::ptr::null_mut();
         assert_eq!(DStorageGetFactory(&FACTORY, &mut factory), S_OK);
         factory
+    }
+
+    #[test]
+    fn a_refused_factory_interface_clears_the_out_pointer() {
+        // `_COM_Outptr_`: *ppv is null on failure, not the caller's stale value.
+        let unknown = Guid::new(0, 0, 0, [0; 8]);
+        let mut out = 0x1234 as *mut c_void;
+        assert_eq!(DStorageGetFactory(&unknown, &mut out), E_NOINTERFACE);
+        assert!(out.is_null());
+
+        let mut out = 0x1234 as *mut c_void;
+        assert_eq!(
+            DStorageGetFactory(std::ptr::null(), &mut out),
+            E_NOINTERFACE
+        );
+        assert!(out.is_null());
+
+        assert_eq!(
+            DStorageGetFactory(&FACTORY, std::ptr::null_mut()),
+            E_INVALIDARG
+        );
     }
 
     fn open(path: &std::path::Path) -> *mut c_void {
