@@ -146,17 +146,39 @@ fn map_dll(
     seen: &mut HashSet<String>,
     loaded: &mut Vec<(String, LoadedImage)>,
 ) -> Result<()> {
-    let name = name.to_ascii_lowercase();
-    let path = dirs.0.join(&name);
-    if !seen.insert(name.clone()) || !wanted(&name) || !path.is_file() {
+    let key = name.to_ascii_lowercase();
+    if !seen.insert(key.clone()) || !wanted(&key) {
         return Ok(());
     }
+    let Some(path) = file_in(dirs.0, name) else {
+        return Ok(());
+    };
     let original = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
     let prepared = prepare(&original).with_context(|| format!("preparing {}", path.display()))?;
     let image = load(&prepared, dirs.1).with_context(|| format!("loading {}", path.display()))?;
     map_imports(&image.info, dirs, wanted, seen, loaded)?;
-    loaded.push((name, image));
+    loaded.push((key, image));
     Ok(())
+}
+
+/// The file `name` in `dir`, its case ignored as the Windows loader ignores
+/// it. A folder can be case-sensitive (WSL makes the folders it creates
+/// so), where joining the name finds only that exact spelling.
+fn file_in(dir: &Path, name: &str) -> Option<PathBuf> {
+    let exact = dir.join(name);
+    if exact.is_file() {
+        return Some(exact);
+    }
+    std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .find(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.eq_ignore_ascii_case(name))
+        })
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
 }
 
 /// Resolves through `inner`, then through the exports of the title's DLLs.
