@@ -25,6 +25,8 @@
 mod console_insn;
 mod crash;
 #[cfg(windows)]
+mod hooks;
+#[cfg(windows)]
 pub mod descriptor_sites;
 pub mod frame_rate;
 mod movies;
