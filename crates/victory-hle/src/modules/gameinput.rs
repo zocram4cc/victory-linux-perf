@@ -1060,14 +1060,16 @@ extern "system" fn key_state(this: *const Reading, count: u32, out: *mut KeyStat
     n as u32
 }
 extern "system" fn gamepad_state(this: *const Reading, out: *mut PadState) -> bool {
-    match &reading(this).value {
-        Value::Pad(state) if !out.is_null() => {
-            // SAFETY: checked non-null.
-            unsafe { out.write(*state) };
-            true
-        }
-        _ => false,
+    if out.is_null() {
+        return false;
     }
+    let (state, is_gamepad) = match &reading(this).value {
+        Value::Pad(state) => (*state, true),
+        Value::Keys(_) => (PadState::default(), false),
+    };
+    // SAFETY: the title passes writable storage for the state.
+    unsafe { out.write(state) };
+    is_gamepad
 }
 /// Kinds our devices do not have: no count, no state.
 extern "system" fn nothing(_: *const c_void) -> usize {
@@ -1558,8 +1560,9 @@ mod tests {
         release(r);
 
         let r = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        let mut state = pad(r);
         assert_eq!(
-            pad(r),
+            state,
             PadState {
                 buttons: A,
                 left_y: 1.0,
@@ -1571,6 +1574,11 @@ mod tests {
         release(r);
         // A keyboard reading is no gamepad reading.
         assert_eq!(current(hub, GAMEPAD_KIND, KEYBOARD), Err(READING_NOT_FOUND));
+        let r = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
+        let get = slot::<extern "system" fn(*const Reading, *mut PadState) -> bool, _>(r, 0xb0);
+        assert!(!get(r, &mut state));
+        assert_eq!(state, PadState::default());
+        release(r);
     }
 
     #[test]
