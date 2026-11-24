@@ -1281,7 +1281,16 @@ fn pooled(n: usize) -> Vec<u8> {
         .map(|(i, _)| i);
     let mut v = match fit {
         Some(i) => pool.swap_remove(i),
-        None => Vec::with_capacity(n),
+        None if pool.is_empty() => Vec::with_capacity(n),
+        None => {
+            let mut snapshot = Vec::new();
+            if snapshot.try_reserve_exact(n).is_err() {
+                // Release unused snapshot memory before a final attempt.
+                pool.clear();
+                snapshot.reserve_exact(n);
+            }
+            snapshot
+        }
     };
     v.clear();
     v
