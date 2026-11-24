@@ -333,7 +333,7 @@ fn operands(inst: &Instruction, name: &str, fields: &Fields) -> String {
                 0..=7 => format!("mrt{target}"),
                 8 => "mrtz".into(),
                 9 => "null".into(),
-                12..=15 => format!("pos{}", target - 12),
+                12..=16 => format!("pos{}", target - 12),
                 20 => "prim".into(),
                 32..=63 => format!("param{}", target - 32),
                 _ => format!("<target {target}>"),
@@ -905,6 +905,15 @@ mod tests {
                 "buffer_load_dword v1, s[4:7], s0 offen lds",
                 "v_mov_b32 v1, v2 src0_sel:WORD_1",
             ]
+        );
+    }
+
+    #[test]
+    fn export_target_16_is_pos4() {
+        // llvm-mc -mcpu=gfx1010: exp pos4 v4, v3, v2, v1
+        assert_eq!(
+            one(&[0xF800_010F, 0x0102_0304], true),
+            "exp pos4, v4, v3, v2, v1"
         );
     }
 
