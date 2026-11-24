@@ -801,11 +801,14 @@ extern "system" fn read_blobs(
     size: usize,
     out: *mut u8,
 ) -> HRESULT {
+    if count.is_null() {
+        return E_INVALIDARG;
+    }
     let Some(c) = get(container) else {
         return E_INVALIDARG;
     };
-    // SAFETY: the title passes its count.
-    let wanted = unsafe { count.as_ref() }.copied().unwrap_or(0);
+    // SAFETY: the title supplies the required count, checked above for null.
+    let wanted = unsafe { count.read() };
     let blobs = match read(c, names(blob_names, wanted)) {
         Ok(blobs) => blobs,
         Err(hr) => return hr,
@@ -841,6 +844,9 @@ extern "system" fn read_result(
     out: *mut u8,
     count: *mut u32,
 ) -> HRESULT {
+    if count.is_null() {
+        return E_INVALIDARG;
+    }
     let mut used = 0;
     let hr = xasync::XAsyncGetResult(block, (&raw const READ).cast(), size, out.cast(), &mut used);
     // The documented error for a small buffer; the result stays for a
@@ -1339,6 +1345,17 @@ mod tests {
         let mut buffer = vec![0u64; size.div_ceil(8)];
         let mut count = 0;
         assert_eq!(
+            read_result(
+                this,
+                &mut b,
+                size,
+                buffer.as_mut_ptr().cast(),
+                std::ptr::null_mut()
+            ),
+            E_INVALIDARG
+        );
+        assert!(buffer.iter().all(|&word| word == 0));
+        assert_eq!(
             read_result(this, &mut b, 8, buffer.as_mut_ptr().cast(), &mut count),
             BUFFER_TOO_SMALL
         );
@@ -1376,6 +1393,19 @@ mod tests {
                 *mut u8,
             ) -> HRESULT,
         >(&OBJECT, 0xa0);
+        buffer.fill(0);
+        assert_eq!(
+            read_now(
+                this,
+                container,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                size,
+                buffer.as_mut_ptr().cast()
+            ),
+            E_INVALIDARG
+        );
+        assert!(buffer.iter().all(|&word| word == 0));
         assert_eq!(
             read_now(
                 this,
