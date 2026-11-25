@@ -56,10 +56,12 @@ pub fn run(
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
-    match victory_game::identify(&hash) {
-        Some(build) => println!("build          {} ({hash})", build.label),
-        None => println!("build          unknown ({hash})"),
-    }
+    let label = match victory_game::identify(&hash) {
+        Some(build) => format!("{} ({hash})", build.label),
+        None => format!("unknown ({hash})"),
+    };
+    println!("build          {label}");
+    victory_hle::modules::d3d12x::use_frametime_dump(cfg.cache_dir.join("frametime.csv"), label);
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
