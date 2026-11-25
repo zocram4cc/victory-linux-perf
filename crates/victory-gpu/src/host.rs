@@ -150,6 +150,15 @@ fn sweep() {
     crate::resource::let_go_idle();
 }
 
+/// `VICTORY_PAD_KB` (diagnostics of the README's "Known blocker"): every
+/// host buffer made here gets that many KiB more at its end, so a shader
+/// reading past a buffer's end reads our padding instead of faulting on
+/// unmapped address space.
+pub(crate) fn pad_buffer(size: u64) -> u64 {
+    static PAD: OnceLock<u64> = OnceLock::new();
+    size + *PAD.get_or_init(|| std::env::var("VICTORY_PAD_KB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 10)
+}
+
 /// Kinds of commands for [`HostList::serial`].
 pub(crate) const SERIAL_DISPATCH: u8 = 1;
 pub(crate) const SERIAL_DRAW: u8 = 2;
@@ -300,6 +309,7 @@ pub(crate) fn log_removal_context() {
         return;
     }
     tracing::error!("when the host device went: {}", removal_context());
+    crate::shadow::dump_copies();
 }
 
 /// Time spent in submissions since the last frame-rate line, in
@@ -4404,7 +4414,7 @@ impl HostList {
                 let readback = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
                 let desc = D3D12_RESOURCE_DESC {
                     Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-                    Width: u64::from(STAMPS) * 8,
+                    Width: pad_buffer(u64::from(STAMPS) * 8),
                     Height: 1,
                     DepthOrArraySize: 1,
                     MipLevels: 1,
@@ -5622,7 +5632,7 @@ impl Host {
         };
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: size.max(1),
+            Width: pad_buffer(size.max(1)),
             Height: 1,
             DepthOrArraySize: 1,
             MipLevels: 1,
@@ -5663,7 +5673,7 @@ impl Host {
         };
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: size.max(1),
+            Width: pad_buffer(size.max(1)),
             Height: 1,
             DepthOrArraySize: 1,
             MipLevels: 1,
@@ -6313,7 +6323,7 @@ impl Host {
         };
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: size.max(1),
+            Width: pad_buffer(size.max(1)),
             Height: 1,
             DepthOrArraySize: 1,
             MipLevels: 1,
@@ -6363,7 +6373,7 @@ impl Host {
         };
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: size.max(1),
+            Width: pad_buffer(size.max(1)),
             Height: 1,
             DepthOrArraySize: 1,
             MipLevels: 1,

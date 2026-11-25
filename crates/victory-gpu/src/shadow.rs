@@ -3297,3 +3297,45 @@ pub(crate) fn near(va: u64) -> String {
     }
     text
 }
+
+/// `VICTORY_ALLOC_DUMP=<file>` (diagnostics of the README's "Known
+/// blocker"): when the host device is lost, every live host copy of a
+/// title buffer and every window of title memory is written there, one per
+/// line: GPU address, bytes, title address, kind. The fault address RADV
+/// prints can then be placed against them.
+pub(crate) fn dump_copies() {
+    let Some(path) = std::env::var_os("VICTORY_ALLOC_DUMP") else {
+        return;
+    };
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let line = |out: &mut String, s: &Shadow, kind: &str| {
+        let _ = writeln!(
+            out,
+            "{:#x} {:#x} {:#x} {}{}",
+            s.gpu,
+            s.len,
+            s.start,
+            kind,
+            if s.card.is_some() { " card" } else if s.place.is_some() { " inplace" } else { "" }
+        );
+    };
+    // `try_lock`: the thread that lost the device may hold them.
+    if let Ok(buffers) = BUFFERS.try_lock() {
+        for entry in buffers.values() {
+            if let Some(s) = &entry.shadow {
+                line(&mut out, s, "buffer");
+            }
+        }
+    } else {
+        out.push_str("# buffers locked\n");
+    }
+    if let Ok(loose) = LOOSE.try_lock() {
+        for s in loose.values() {
+            line(&mut out, s, "window");
+        }
+    } else {
+        out.push_str("# windows locked\n");
+    }
+    let _ = std::fs::write(path, out);
+}

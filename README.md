@@ -310,7 +310,9 @@ Left, since only the CPU waiting for an idle GPU helps:
 - work vkd3d keeps in flight past our wait;
 - **an out-of-range raw read (leading):** several fault addresses sit exactly on 1-2 MB boundaries, which is what a shader reading past the end of an allocation into unmapped space looks like. Raw addresses (root descriptors, title memory by address) have no bounds checks.
 
-**Next step:** an allocation journal (`VICTORY_ALLOC_LOG=1`) that matches the fault address against buffers alive and recently freed. Details and every run are in [docs/journal.md](docs/journal.md) (entries of 25 Nov).
+**Status (25 Nov):**
+- `VICTORY_ALLOC_DUMP` placed a fault about 740 MB away from every live buffer copy and window. With the TCP (texture unit) client, it points to a **texture view reading beyond its image** (more mips or slices than the host copy has).
+- **Next step:** check every texture view against its host texture and count the mismatches. Details and every run are in [docs/journal.md](docs/journal.md) (entries of 25 Nov).
 
 **Why it matters:** it blocks fast writes, frames in flight (phase 3) and the open-world scene for measurements. Fixing it comes before any further speed work.
 

@@ -4,6 +4,14 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-25
 
+**Device loss: the fault is not in a buffer copy; likely a texture read out of range**
+- `VICTORY_PAD_KB=256` (256 KiB more at the end of every host buffer made in `host.rs`): still lost 2 of 2. The faults were at `0x8003bb7f0000` and `0x800410e00000`.
+- **`VICTORY_ALLOC_DUMP=<file>`** writes, on device loss, every live host copy of a title buffer and every window: GPU address, bytes, title address, kind.
+  - vkd3d's addresses are sign-extended (`0xffff8001…`); RADV prints the low 48 bits. Compare `addr & (2^48 − 1)`.
+- One run: fault at `0x80035fac4000`. The 4,070 live copies (3,402 buffers, 658 windows, 10 card copies) span `0x800112200000`-`0x800332200000`. **The fault is ~740 MB above the highest, in no copy of ours.**
+- The faulting client is TCP (texture unit), so it is most likely a **texture read**: images live elsewhere in the GPU's address space. Retired textures were kept alive in the leak runs, so not a freed texture.
+- **Leading hypothesis:** a shader resource view that describes more mips or array slices than the host texture has (textures streamed in part, mips picked from the first one present). On the console those reads land in title memory; here they run past the image's allocation. Next: check every texture view made against its host texture and count the mismatches.
+
 **Device loss: two more hypotheses ruled out (saved game, release build)**
 
 | Switch | Lost | Furthest draws a frame |
