@@ -1655,13 +1655,19 @@ impl State {
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
         HEAP_PASS_PARTS[1].fetch_add(slots.len() as u64, Ordering::Relaxed);
         for (n, &index) in slots.iter().enumerate() {
-            ranges.remove(&index);
             let Some(handle) = heap.handle(index) else {
+                ranges.remove(&index);
                 continue;
             };
-            let Some(view) = host.mirror(index, handle, true) else {
+            let Some((view, resolved)) = host.mirror_heap_buffer(index, handle) else {
+                ranges.remove(&index);
                 continue;
             };
+            // Whether making the view just resolved the copy the slot reads
+            // (`buffer_copy`): the slot then shows that copy, as it was put
+            // in `kept` with it.
+            #[cfg(feature = "diagnostics")]
+            let made = resolved.is_some();
             // Every 64 views while the device lives (a cheap query).
             if alive
                 && n % 64 == 63
@@ -1678,20 +1684,42 @@ impl State {
                 crate::host::log_removal_context();
             }
             // The copy the slot shows (`buffer_copy`), not the one the
-            // view's range alone would find.
-            let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
-                continue;
+            // view's range alone would find: the one making the view just
+            // resolved, when it did, and only otherwise looked up again.
+            let (shadow, address, len) = match resolved {
+                Some(copy) => copy,
+                None => match crate::descriptor::host::buffer_copy(&view) {
+                    Some(copy) => copy,
+                    None => {
+                        ranges.remove(&index);
+                        continue;
+                    }
+                },
             };
             #[cfg(feature = "diagnostics")]
-            if host.shows(index, &shadow.buffer) == Some(false) {
+            if !made && host.shows(index, &shadow.buffer) == Some(false) {
                 HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
             }
-            ranges.insert(index, (shadow, address, address + len));
+            // The entry is mostly the one the last look left (the pass
+            // takes every buffer slot every 16 frames and the writes since
+            // between): written in place, not taken out and put back.
+            if let Some(entry) = ranges.get_mut(&index) {
+                if !(std::sync::Arc::ptr_eq(&entry.0, &shadow)
+                    && entry.1 == address
+                    && entry.2 == address + len)
+                {
+                    *entry = (shadow, address, address + len);
+                }
+            } else {
+                ranges.insert(index, (shadow, address, address + len));
+            }
         }
         let views = ranges.len() as u32;
-        // Per host copy, the span its picked views cover.
+        // Per host copy, the span its picked views cover: one entry per copy
+        // (some 4,600 against 29,000 slots), so it is sized for the slots it
+        // is filled from rather than left to grow from nothing every frame.
         let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
-            std::collections::HashMap::new();
+            std::collections::HashMap::with_capacity(ranges.len().min(8192));
         for (shadow, from, to) in ranges.values() {
             let key = std::sync::Arc::as_ptr(shadow) as usize;
             let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
