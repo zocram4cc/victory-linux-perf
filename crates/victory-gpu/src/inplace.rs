@@ -1903,8 +1903,11 @@ pub(crate) mod tests {
 
             // (d) the page pool's shape: a section with a view of our own
             // kept mapped and opened by its address, and the title writing
-            // and reading through another view of the same pages (aliases on
-            // the RX 6900 XT under Proton with the stock libdrm).
+            // and reading through another view of the same pages. The views
+            // are memfd-backed under Wine: the stock libdrm imports them with
+            // ANONONLY and the kernel refuses (vkd3d-proton then copies,
+            // stale); with LIBDRM_AMDGPU_USERPTR_SHARED=1 and the patched
+            // libdrm_amdgpu it aliases both ways on the RX 6900 XT.
             let invalid = windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
             let section = mem::CreateFileMappingW(invalid, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_COMMIT, 0, K64 as u32, std::ptr::null());
             assert!(!section.is_null(), "CreateFileMapping");
