@@ -99,6 +99,13 @@ struct Card {
     /// ([`card_dirty`]), kept until a fetch sent after it has been merged.
     /// Locked inside `dirty`'s lock.
     sent: Mutex<Vec<(usize, usize, u64)>>,
+    /// Whether the copy is in [`CARD_QUEUE`]: set when `dirty` takes its
+    /// first range, cleared when [`card_dirty`] takes them. Written under
+    /// `dirty`'s lock.
+    queued: std::sync::atomic::AtomicBool,
+    /// With [`card_queue`]: the copy's own weak reference, set when it is
+    /// noted ([`note_carded`]); what [`CARD_QUEUE`] holds.
+    me: std::sync::OnceLock<std::sync::Weak<Shadow>>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
 }
@@ -232,21 +239,61 @@ pub(crate) fn card_room_kept() -> u64 {
 /// The copies in the card's memory.
 static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
 
+/// Notes a new copy in the card's memory in [`CARDED`]; with `queue`, the
+/// copy also gets the weak reference [`CARD_QUEUE`] holds for it. The
+/// entries of copies that are gone are dropped when they may be half of
+/// them (the walk drops them at each take; with the queue, nothing else does).
+fn note_carded(shadow: &Arc<Shadow>, queue: bool) {
+    static SWEPT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    if queue && let Some(card) = shadow.card.as_ref() {
+        let _ = card.me.set(Arc::downgrade(shadow));
+    }
+    let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+    carded.push(Arc::downgrade(shadow));
+    if carded.len() >= 2 * SWEPT.load(Ordering::Relaxed) + 64 {
+        carded.retain(|weak| weak.strong_count() > 0);
+        SWEPT.store(carded.len(), Ordering::Relaxed);
+    }
+}
+
 /// Since the last frame line: bytes copied to card sides and the ranges
 /// they were; pieces compared on the card, pieces fetched and their
 /// bytes; the waits for the card the fetches added and their microseconds.
 pub(crate) static CARD_STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
+/// Since the last frame line: copies [`card_dirty`] visited and its calls
+/// (one per submission).
+static CARD_WALK: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// With [`card_queue`]: the copies in the card's memory whose CPU side
+/// changed since [`card_dirty`] last took their ranges, each once (its
+/// [`Card::queued`] mark). A submission takes these instead of walking
+/// every copy in [`CARDED`].
+static CARD_QUEUE: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
+
+/// Whether [`card_dirty`] takes the copies whose CPU side changed from
+/// [`CARD_QUEUE`] instead of walking every copy in the card's memory at
+/// each submission (`VICTORY_CARD_QUEUE=1`; off by default). The ranges
+/// that go to the card are the same; with the queue the copies come in the
+/// order of their first change, not the order they were made.
+fn card_queue() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_QUEUE").is_some_and(|v| v == "1"))
+}
+
 /// [`CARD_STATS`], taken; then the copies in the card's memory, their
-/// bytes and their "before" twins' bytes.
-pub(crate) fn card_stats() -> [u64; 10] {
-    let mut out = [0u64; 10];
+/// bytes and their "before" twins' bytes; then the copies [`card_dirty`]
+/// visited and the calls it ran in ([`CARD_WALK`]).
+pub(crate) fn card_stats() -> [u64; 12] {
+    let mut out = [0u64; 12];
     for (i, stat) in CARD_STATS.iter().enumerate() {
         out[i] = stat.swap(0, Ordering::Relaxed);
     }
     out[7] = CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|w| w.strong_count() > 0).count() as u64;
     out[8] = CARD_BYTES[0].load(Ordering::Relaxed) + WINDOW_CARD_BYTES.load(Ordering::Relaxed);
     out[9] = CARD_BYTES[1].load(Ordering::Relaxed);
+    out[10] = CARD_WALK[0].swap(0, Ordering::Relaxed);
+    out[11] = CARD_WALK[1].swap(0, Ordering::Relaxed);
     out
 }
 
@@ -376,7 +423,8 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
 /// The copies in the card's memory whose CPU side changed since they were
 /// last asked: each with the changed offsets, in order and joined where
 /// they touch. The ranges are taken: the caller copies them to the card's
-/// side (`Host::card_before`).
+/// side (`Host::card_before`). With [`card_queue`] only the copies in
+/// [`CARD_QUEUE`] are looked at; otherwise every copy in [`CARDED`] is.
 ///
 /// With [`relay`], `sent_as` is the number of the send that takes them
 /// (`crate::host`'s order of the queue): each range is noted with it, in
@@ -385,33 +433,64 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
 /// ([`Shadow::card_merge_relay`]). Notes of sends that every fetch still to
 /// be merged came after are dropped.
 pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
-    let mut out = Vec::new();
-    let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+    card_dirty_visiting(sent_as, card_queue(), |_| {})
+}
+
+/// [`card_dirty`], with `visit` told the address of each copy it looks at;
+/// the calls and the copies looked at are counted in [`CARD_WALK`].
+fn card_dirty_visiting(sent_as: u64, queue: bool, mut visit: impl FnMut(usize)) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
-    carded.retain(|weak| {
-        let Some(shadow) = weak.upgrade() else {
-            return false;
-        };
-        let ranges = shadow
-            .card
-            .as_ref()
-            .map(|c| {
-                let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
-                let ranges = std::mem::take(&mut *dirty);
-                if relay() {
-                    let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
-                    sent.retain(|s| s.2 > fetched);
-                    sent.extend(ranges.iter().map(|&(a, b)| (a, b, sent_as)));
-                }
-                ranges
-            })
-            .unwrap_or_default();
-        if !ranges.is_empty() {
-            out.push((shadow, joined(ranges)));
+    let mut out = Vec::new();
+    let mut walked = 0u64;
+    if queue {
+        let taken = std::mem::take(&mut *CARD_QUEUE.lock().unwrap_or_else(|e| e.into_inner()));
+        for weak in taken {
+            visit(weak.as_ptr() as usize);
+            walked += 1;
+            let Some(shadow) = weak.upgrade() else {
+                continue;
+            };
+            let ranges = take_changed(&shadow, sent_as, fetched);
+            if !ranges.is_empty() {
+                out.push((shadow, joined(ranges)));
+            }
         }
-        true
-    });
+    } else {
+        let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+        carded.retain(|weak| {
+            visit(weak.as_ptr() as usize);
+            walked += 1;
+            let Some(shadow) = weak.upgrade() else {
+                return false;
+            };
+            let ranges = take_changed(&shadow, sent_as, fetched);
+            if !ranges.is_empty() {
+                out.push((shadow, joined(ranges)));
+            }
+            true
+        });
+    }
+    CARD_WALK[0].fetch_add(walked, Ordering::Relaxed);
+    CARD_WALK[1].fetch_add(1, Ordering::Relaxed);
     out
+}
+
+/// The changed ranges of a copy in the card's memory, taken for the send
+/// numbered `sent_as` (see [`card_dirty`]). Under the copy's `dirty` lock,
+/// which also clears its queue mark: a change after this take queues it again.
+fn take_changed(shadow: &Shadow, sent_as: u64, fetched: u64) -> Vec<(usize, usize)> {
+    let Some(c) = shadow.card.as_ref() else {
+        return Vec::new();
+    };
+    let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
+    c.queued.store(false, Ordering::Release);
+    let ranges = std::mem::take(&mut *dirty);
+    if relay() {
+        let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
+        sent.retain(|s| s.2 > fetched);
+        sent.extend(ranges.iter().map(|&(a, b)| (a, b, sent_as)));
+    }
+    ranges
 }
 
 /// Ranges in order, those that overlap or touch as one.
@@ -3350,6 +3429,12 @@ impl Shadow {
             Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
             _ => dirty.push((from, to)),
         }
+        // With the queue (`me` is set by `note_carded`): queued once, until the next take.
+        if let Some(me) = card.me.get()
+            && !card.queued.swap(true, Ordering::AcqRel)
+        {
+            CARD_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).push(me.clone());
+        }
     }
 
     /// Of a copy in the card's memory: the CPU's side (PC memory), the
@@ -3747,6 +3832,8 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     before: Mutex::default(),
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
+                    queued: std::sync::atomic::AtomicBool::new(false),
+                    me: std::sync::OnceLock::new(),
                     size,
                 };
                 (on_card, Some(card))
@@ -3772,7 +3859,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         shadow.card = card;
         let shadow = Arc::new(shadow);
         if shadow.card.is_some() {
-            CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+            note_carded(&shadow, card_queue());
         }
         entry.shadow = Some(shadow);
     }
@@ -3975,6 +4062,8 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
+                queued: std::sync::atomic::AtomicBool::new(false),
+                me: std::sync::OnceLock::new(),
                 size: len,
             };
             (on_card, Some(card))
@@ -3993,7 +4082,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     shadow.card = card;
     let shadow = Arc::new(shadow);
     if shadow.card.is_some() {
-        CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+        note_carded(&shadow, card_queue());
     }
     note(&shadow);
     map.insert((start, len), shadow.clone());
@@ -4185,7 +4274,7 @@ mod window_tests {
 #[cfg(test)]
 mod card_merge_tests {
     use super::{Card, Shadow};
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
     use windows::Win32::Graphics::Direct3D12::*;
     use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
@@ -4254,6 +4343,8 @@ mod card_merge_tests {
                 before: Mutex::new(None),
                 dirty: Mutex::default(),
                 sent: Mutex::new(vec![(title_byte, title_byte + 1, 7)]),
+                queued: std::sync::atomic::AtomicBool::new(false),
+                me: std::sync::OnceLock::new(),
                 // 0: no card bytes counted (`Drop` takes them off again).
                 size: 0,
             });
@@ -4276,6 +4367,66 @@ mod card_merge_tests {
         // older card byte is taken for a shader's write.
         let before = land(7);
         assert_eq!(before[title_byte], content[title_byte]);
+    }
+
+    /// A copy in the card's memory that `note_carded` has noted, with
+    /// `side` as its CPU side (as `lookup` makes one).
+    fn carded_copy(buffer: &ID3D12Resource, staging: &ID3D12Resource, side: &mut [u8], start: u64, queue: bool) -> Arc<Shadow> {
+        let mut shadow = Shadow::new(buffer.clone(), side.as_mut_ptr(), 0, start, side.len() as u64);
+        shadow.card = Some(Card {
+            staging: staging.clone(),
+            before: Mutex::new(None),
+            dirty: Mutex::default(),
+            sent: Mutex::default(),
+            queued: std::sync::atomic::AtomicBool::new(false),
+            me: std::sync::OnceLock::new(),
+            // 0: no card bytes counted (`Drop` takes them off again).
+            size: 0,
+        });
+        let shadow = Arc::new(shadow);
+        super::note_carded(&shadow, queue);
+        shadow
+    }
+
+    /// The card's walk over its copies (`card_dirty`) visits a copy only
+    /// when its CPU side changed since the last take: the changed copy is
+    /// visited and its ranges come out; the unchanged copy is not visited.
+    #[test]
+    fn card_dirty_visits_only_the_copies_that_changed() {
+        let buffer = warp_buffer().expect("a software adapter for the copies' buffers");
+        let staging = warp_buffer().expect("a software adapter for the copies' buffers");
+        const LEN: usize = 64 << 10;
+        let (mut side_a, mut side_b) = (vec![0u8; LEN], vec![0u8; LEN]);
+        let a = carded_copy(&buffer, &staging, &mut side_a, 0x1_0000, true);
+        let b = carded_copy(&buffer, &staging, &mut side_b, 0x2_0000, true);
+        let (a_at, b_at) = (Arc::as_ptr(&a) as usize, Arc::as_ptr(&b) as usize);
+        // Nothing changed since the copies were made: the first take is empty.
+        super::card_dirty_visiting(0, true, |_| {});
+        a.card_changed(0, 16);
+        let mut visited = Vec::new();
+        let taken = super::card_dirty_visiting(1, true, |at| visited.push(at));
+        assert!(!visited.contains(&b_at), "the copy whose CPU side did not change was visited");
+        assert!(visited.contains(&a_at), "the copy whose CPU side changed was not visited");
+        assert_eq!(taken.len(), 1);
+        assert!(Arc::ptr_eq(&taken[0].0, &a));
+        assert_eq!(taken[0].1, vec![(0, 16)]);
+        // A change after the take is handed out by the next take, and only that copy is visited.
+        b.card_changed(5, 9);
+        let mut visited = Vec::new();
+        let taken = super::card_dirty_visiting(2, true, |at| visited.push(at));
+        assert_eq!(visited, vec![b_at], "only the copy that changed since the last take is visited");
+        assert_eq!(taken.len(), 1);
+        assert!(Arc::ptr_eq(&taken[0].0, &b));
+        assert_eq!(taken[0].1, vec![(5, 9)]);
+        // Off (the default): the copy is not queued, and the walk takes its ranges.
+        let mut side_c = vec![0u8; LEN];
+        let c = carded_copy(&buffer, &staging, &mut side_c, 0x3_0000, false);
+        c.card_changed(2, 4);
+        assert!(c.card.as_ref().is_some_and(|card| !card.queued.load(std::sync::atomic::Ordering::Acquire)), "a copy noted without the queue was queued");
+        let taken = super::card_dirty_visiting(3, false, |_| {});
+        assert_eq!(taken.len(), 1);
+        assert!(Arc::ptr_eq(&taken[0].0, &c));
+        assert_eq!(taken[0].1, vec![(2, 4)]);
     }
 }
 
