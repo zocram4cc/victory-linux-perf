@@ -2,6 +2,15 @@
 
 What was tried, what came out of it, and what was decided. Newest first. The Spanish journal before 25 Nov 2026 is in [history/es/diario.md](history/es/diario.md).
 
+## 2026-11-26
+
+**S.6 confirmed: textures in pre-mapped heaps remove the device loss at its root, with no wait, and faster**
+- The first pool run (2 GiB, grown only when full) still lost 5 of 5: the pool filled, 16-60 textures a frame fell back to committed memory. A fault report placed the culprit in a 16 MB vkd3d block, not a pool heap.
+- Fixed: the pool grows ahead of need (a new heap when ready free space falls under 1 GiB) and counts every texture it does not take. With 8 GiB to start: 0 committed, 0 not taken.
+- **Jason save, no slot wait (`VICTORY_SLOT_WAIT=0`):** without the pool **8 of 8 lost** (`bench/trials-20261126-000514-control-nowait` and earlier); **with the pool 5 of 5 held** (`bench/trials-…-pool2-nowait`), at **406-453 ms a frame** (2.21-2.50 fps) against 469-489 ms with the wait and committed textures. Two of the five windows are valid (444, 453 ms); the others saw the scene change.
+- **The cause is settled:** fresh memory mappings of textures made while work that can read them is in flight. The slot wait hides it by serialising; the pool removes it, which is what frames in flight (3.1) need.
+- **Open before it becomes the default:** 32,000 textures live, 12.4 GB "in use", none ever given back. Small textures take a whole 64 KiB block each (95 % are under 1 MiB, many far smaller); D3D12's 4 KiB small-resource alignment would cut this. And why none is given back (held by descriptor slots that keep their last view, or a wrong count) has to be measured.
+
 ## 2026-11-25
 
 **S.6 step 1 measured: the open world makes hundreds of host textures a frame, all over title memory; the pool built**

@@ -71,8 +71,12 @@ static POOL: Mutex<Option<Pool>> = Mutex::new(None);
 
 /// Since the last frame line: textures placed, textures that fell back to
 /// committed memory (no ready room), blocks given back, heaps made; then,
-/// as levels, bytes in use and bytes in all heaps.
-pub(crate) static STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+/// as levels, bytes in use and bytes in all heaps; then textures the pool
+/// does not take (no size from the driver, or larger than [`LARGEST`]).
+pub(crate) static STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+/// Ready free space under which the next heap is made ahead of need.
+const HEADROOM: u64 = 1 << 30;
 
 fn pool() -> std::sync::MutexGuard<'static, Option<Pool>> {
     POOL.lock().unwrap_or_else(|e| e.into_inner())
@@ -152,6 +156,22 @@ pub(crate) unsafe fn place(
     // SAFETY: the caller's description.
     let info = unsafe { device.GetResourceAllocationInfo(0, std::slice::from_ref(&*desc)) };
     if info.SizeInBytes == u64::MAX || info.SizeInBytes == 0 || info.SizeInBytes > LARGEST {
+        STATS[6].fetch_add(1, Relaxed);
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        // SAFETY: the caller's description.
+        let d = unsafe { *desc };
+        ONCE.call_once(|| {
+            tracing::info!(
+                bytes = info.SizeInBytes,
+                width = d.Width,
+                height = d.Height,
+                depth = d.DepthOrArraySize,
+                levels = d.MipLevels,
+                format = d.Format.0,
+                flags = d.Flags.0,
+                "texture pool: a texture it does not take (the first)"
+            );
+        });
         return None;
     }
     let align = info.Alignment.max(ALIGN);
@@ -215,6 +235,25 @@ pub(crate) unsafe fn place(
     });
     STATS[0].fetch_add(1, Relaxed);
     STATS[4].fetch_add(bytes, Relaxed);
+    // Grow ahead of need: the next heap is made while there is room, so it
+    // is ready (mapped, a submission past it) before the room runs out.
+    let ready_free: u64 = pool
+        .heaps
+        .iter()
+        .filter(|h| finished > h.ready_after)
+        .map(|h| h.free.values().sum::<u64>())
+        .sum();
+    if ready_free < HEADROOM
+        && !pool.growing
+        && let Some(heap) = make_heap(device)
+    {
+        pool.heaps.push(PoolHeap {
+            heap,
+            free: BTreeMap::from([(0, HEAP_BYTES)]),
+            ready_after: started,
+        });
+        pool.growing = true;
+    }
     Some(resource)
 }
 
@@ -274,12 +313,14 @@ pub(crate) fn pool_line(frames: f64) {
         return;
     }
     let [placed, fell_back, freed, heaps] = [0, 1, 2, 3].map(|i| STATS[i].swap(0, Relaxed));
+    let refused = STATS[6].swap(0, Relaxed);
     let (used, all) = (STATS[4].load(Relaxed), STATS[5].load(Relaxed));
     let live = pool().as_ref().map_or(0, |p| p.live.len());
     tracing::info!(
-        "texture pool per frame: {:.1} placed, {:.1} committed for want of ready room, {:.1} given back; {heaps} heaps made; {live} live, {} of {} MB in use",
+        "texture pool per frame: {:.1} placed, {:.1} committed for want of ready room, {:.1} not taken, {:.1} given back; {heaps} heaps made; {live} live, {} of {} MB in use",
         placed as f64 / frames,
         fell_back as f64 / frames,
+        refused as f64 / frames,
         freed as f64 / frames,
         used >> 20,
         all >> 20
