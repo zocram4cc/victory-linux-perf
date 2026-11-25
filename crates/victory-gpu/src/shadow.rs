@@ -77,6 +77,9 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// With [`crate::stamp`] on: the pages checked in this submission, by the
+    /// sequence number they were checked under.
+    stamp: crate::stamp::Stamp,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -2348,6 +2351,7 @@ impl Shadow {
             card: None,
             window: false,
             place: None,
+            stamp: crate::stamp::Stamp::default(),
         }
     }
 
@@ -3054,6 +3058,41 @@ impl Shadow {
         if from >= to {
             return 0;
         }
+        if !crate::stamp::on() {
+            return self.free_parts(from, to, |a, e| self.update_free(a, e));
+        }
+        // Checked already in this submission (`crate::stamp`): each part on
+        // its own. The sequence is read before the checks, so a title write
+        // during them is not marked as seen.
+        let seq = crate::stamp::now();
+        self.free_parts(from, to, |a, e| {
+            let copied = self
+                .stamp
+                .refresh(seq, (a, e), (start, end), || self.update_free(a, e));
+            match copied {
+                Some(bytes) => bytes,
+                None => {
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        use crate::copystat::{C, add};
+                        add(C::StampSkips, 1);
+                        add(C::StampSkipBytes, (e - a) as u64);
+                    }
+                    0
+                }
+            }
+        })
+    }
+
+    /// Calls `part` on each piece of `[from, to)` (inside the buffer) that no
+    /// range shaders may be writing, and on none of those ranges; returns the
+    /// sum of what it returns.
+    fn free_parts(
+        &self,
+        from: usize,
+        to: usize,
+        mut part: impl FnMut(usize, usize) -> usize,
+    ) -> usize {
         let mut busy: Vec<(usize, usize)> = self
             .pending
             .lock()
@@ -3062,24 +3101,24 @@ impl Shadow {
             .copied()
             .filter(|&(a, e)| a < to && e > from)
             .collect();
-        if !busy.is_empty() {
-            // Around ranges shaders are writing: the gaps, each as below
-            // (in the world most submissions have such ranges; copying the
-            // gaps whole cost ~1 s per frame).
-            busy.sort_unstable();
-            let (mut at, mut bytes) = (from, 0);
-            for (a, e) in busy {
-                if a > at {
-                    bytes += self.update_free(at, a);
-                }
-                at = at.max(e);
-            }
-            if at < to {
-                bytes += self.update_free(at, to);
-            }
-            return bytes;
+        if busy.is_empty() {
+            return part(from, to);
         }
-        self.update_free(from, to)
+        // Around ranges shaders are writing: the gaps, each on its own (in the
+        // world most submissions have such ranges; copying the gaps whole cost
+        // ~1 s per frame).
+        busy.sort_unstable();
+        let (mut at, mut bytes) = (from, 0);
+        for (a, e) in busy {
+            if a > at {
+                bytes += part(at, a);
+            }
+            at = at.max(e);
+        }
+        if at < to {
+            bytes += part(at, to);
+        }
+        bytes
     }
 
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no

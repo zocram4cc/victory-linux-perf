@@ -4288,6 +4288,8 @@ fn read_backs(list: &HostList) {
         crate::texback::land(back);
     }
     for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
+        // The title's bytes may change below (`crate::stamp`).
+        let _changed = crate::stamp::Changed;
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer of ours, written by the list that has
         // run; the title's destination holds every row (checked when the
@@ -6258,6 +6260,9 @@ impl Host {
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
+        // Title memory may have changed since the last submission: what the
+        // copies checked is checked again (`crate::stamp`).
+        crate::stamp::advance();
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let lock = (started - called).as_micros() as u64;
@@ -8289,6 +8294,8 @@ impl Batch {
 /// cost about 2 ms per copy in the title's big pools (it walks the page
 /// tables to the region's end), which made copies run at 100-200 MB/s.
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
+    // The title's bytes change by the end of this copy, however it ends (`crate::stamp`).
+    let _changed = title_dst.then_some(crate::stamp::Changed);
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
         1 => {
@@ -8700,6 +8707,8 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     if len == 0 {
         return;
     }
+    // The title's bytes change below, whichever way the copy ends (`crate::stamp`).
+    let _changed = crate::stamp::Changed;
     // Title memory is view memory with holes: copy the committed runs at
     // memory speed and give the holes to the kernel, one piece at a time.
     let mut at = dst as usize;
