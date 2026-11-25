@@ -64,6 +64,27 @@ pub(crate) fn on() -> bool {
 /// (and went to the kernel instead).
 pub(crate) static STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
+/// `STATUS_GUARD_PAGE_VIOLATION`.
+#[cfg(all(windows, target_arch = "x86_64"))]
+const STATUS_GUARD_PAGE_VIOLATION: i32 = 0x8000_0001_u32 as i32;
+
+/// Puts `PAGE_GUARD` back on the page holding `at`, which a read of ours
+/// just took it from.
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn restore_guard(at: usize) {
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, PAGE_GUARD, VirtualProtect, VirtualQuery};
+    // SAFETY: queries and protects one page that is committed (it faulted
+    // as a guard page), keeping its protection otherwise.
+    unsafe {
+        let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+        if VirtualQuery(at as *const _, &mut info, size_of_val(&info)) == 0 {
+            return;
+        }
+        let mut old = 0;
+        VirtualProtect((at & !0xfff) as *const _, 0x1000, info.Protect | PAGE_GUARD, &mut old);
+    }
+}
+
 #[cfg(all(windows, target_arch = "x86_64"))]
 fn install() {
     use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
@@ -75,9 +96,17 @@ fn install() {
         unsafe {
             let record = &*(*info).ExceptionRecord;
             let context = &mut *(*info).ContextRecord;
-            if record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
-                || context.Rip as usize != &raw const victory_fast_copy_at as usize
-            {
+            if context.Rip as usize != &raw const victory_fast_copy_at as usize {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+            let code = record.ExceptionCode;
+            if code == STATUS_GUARD_PAGE_VIOLATION && record.NumberParameters >= 2 {
+                // A guard page (a thread's stack end, or the title's own):
+                // the fault took its guard away. It is put back, so the
+                // owner sees its guard page as before, and the copy goes
+                // through the kernel, which reads around it.
+                restore_guard(record.ExceptionInformation[1]);
+            } else if code != EXCEPTION_ACCESS_VIOLATION as NTSTATUS {
                 return EXCEPTION_CONTINUE_SEARCH;
             }
             context.Rip = &raw const victory_fast_copy_fail as u64;
@@ -137,6 +166,25 @@ mod tests {
             assert!(!super::copy(out.as_mut_ptr(), base.add(0x1000), 16));
             assert!(super::copy(out.as_mut_ptr(), base.add(8), 16));
             assert_eq!(out[0], 8);
+            VirtualFree(base.cast(), 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn a_guard_page_fails_the_copy_and_keeps_its_guard() {
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, PAGE_GUARD, VirtualQuery};
+        // SAFETY: two committed pages of our own, the second a guard page.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 0x2000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE).cast::<u8>();
+            assert!(!base.is_null());
+            assert!(!VirtualAlloc(base.add(0x1000).cast(), 0x1000, MEM_COMMIT, PAGE_READWRITE | PAGE_GUARD).is_null());
+            let mut out = vec![0u8; 0x2000];
+            assert!(!super::copy(out.as_mut_ptr(), base, 0x2000));
+            let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            VirtualQuery(base.add(0x1000).cast(), &mut info, size_of_val(&info));
+            assert_ne!(info.Protect & PAGE_GUARD, 0, "the guard was put back");
+            // Twice: the guard still fails the copy.
+            assert!(!super::copy(out.as_mut_ptr(), base.add(0x1000), 16));
             VirtualFree(base.cast(), 0, MEM_RELEASE);
         }
     }

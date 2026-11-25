@@ -18,6 +18,7 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
   - Symbolising PE code: victory.exe was at `0x6ffffd670000` in that run; `llvm-symbolizer --obj=victory.exe` takes `0x140000000 + (address − base)`. Find the base by scoring candidate bases on plausible names.
 - **`crate::fastcopy`:** title memory is read with `rep movsb` in a small assembly routine. A read of a missing page faults, and our vectored handler (first in the chain, ahead of the crash reporter) moves the thread to the routine's failure exit; `read()` then falls back to `ReadProcessMemory` as before. This is the kernels' technique for copying from user memory. `VICTORY_F1_FAST_READ=0` turns it off. A unit test (mapped page, reserved page, reuse after a fault) passes under wine.
 - New CSV columns: `fast_reads`, `fast_mb`, `fast_faults`.
+- **First run in the world: crash** `0x80000001` (`STATUS_GUARD_PAGE_VIOLATION`) at `victory_fast_copy_at`, reading `0x11000`. Some title range holds a guard page. That raises its own one-shot exception, not an access violation, and the fault clears the guard. **Fix:** the handler also takes guard-page faults at our instruction, puts `PAGE_GUARD` back on the page, and fails the copy to the kernel path. A second unit test covers it, and both pass under wine.
 - **Next:** measure scene A. Then find who reads the clock so often.
 
 **Phase 1.8 started: fast reads of title memory**
