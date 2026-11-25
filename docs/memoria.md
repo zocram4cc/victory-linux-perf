@@ -122,6 +122,18 @@ La misma escena, con 5.037 draws por frame frente a 4.971:
   - escena A esperando 2 minutos sin mover la cámara, y después girarla: si aparece con el tiempo, H2; si solo al acercarse, H1;
   - cruzar el momento en que aparece con los draws descartados y los hashes de pipeline del log.
 
+**Actualización tras 11 ejecuciones (25-nov):**
+
+- **Es todo o nada por partida:** cuando se ven, se ven las caras de todos (Lucía y los demás). La prueba de esperar 150 s y luego girar la cámara no mostró ninguna. Así que no es la cámara ni el tiempo dentro de la partida.
+- **El juego no manda dibujarlas.** En las 3 partidas con caras se usan **182 shaders** (66 de malla, 100 de píxel, 8 de vértice y 5 de cómputo; lista en `docs/datos/shaders-caras.txt`) que no aparecen en ninguna de las 8 sin caras.
+  - Ninguno falla al traducirse.
+  - Los draws descartados son los mismos (~340).
+  - Lo que falta no lo descarta VIctory: **el juego no emite esos draws**.
+- **DirectStorage no falla** en ninguna partida (0 *request failed*).
+- En las partidas con caras, los shaders empiezan a usarse 57-135 s después de arrancar, más o menos al llegar al juego.
+- **Hipótesis H3:** el juego decide al cargar el mundo si usa los modelos detallados de las cabezas, según qué hay cargado en ese momento. Influyen el streaming de los modelos, el momento en que se salta la cinemática y lo lentos que van nuestros frames durante la carga. Si no llegaron a tiempo, se queda con un modelo de cabeza que solo pinta ojos y boca.
+- **Prueba siguiente:** ver la primera cinemática entera, sin saltarla, dos veces. Si salen caras las dos veces, el salto temprano es el disparador (carrera de streaming durante el salto).
+
 ## 8. El título y sus hilos (`VICTORY_MEDIR=1`)
 
 - 42 hilos. **El que menos espera pasa un 82 % del tiempo esperando.** Casi todo es `WaitForSingleObject` en `title+0x2215eca` (*workers* de trabajos, de 2 a 280 veces por segundo).

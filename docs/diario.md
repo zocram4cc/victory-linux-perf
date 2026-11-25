@@ -4,6 +4,11 @@ Qué se probó, qué salió y qué se decidió. Lo más nuevo va arriba.
 
 ## 2026-11-25
 
+- **Caras, de nuevo.**
+  - Esperar 150 s y girar: no se ven. Es todo o nada por partida.
+  - En las partidas con caras el juego usa 182 shaders que no usa en ninguna sin caras (`docs/datos/shaders-caras.txt`). **El juego no emite los draws de las cabezas**; no es que VIctory los descarte.
+  - DirectStorage no falla.
+  - Hipótesis H3: depende de qué hay cargado al entrar al mundo (salto de la cinemática, streaming). Siguiente prueba: no saltar la cinemática.
 - **Caras.**
   - `PROBE+MEDIR` ×2 con la cámara quieta: no se ven.
   - **Base B sin switches, caminando: se ven perfectas** (captura del usuario: cara completa, piel, luz).
