@@ -4,6 +4,11 @@ Qué se probó, qué salió y qué se decidió. Lo más nuevo va arriba.
 
 ## 2026-11-25
 
+- **Segunda tanda de techos.**
+  - **Sin copias:** 5,9 fps y 170 ms por frame, con los mismos draws. El techo es ×2, y lo que queda es una cadena en serie.
+  - **`plain`:** se cierra al leer una página sin respaldo. Los buffers tienen huecos.
+  - **Caras:** con `MEDIR` solo o `PROBE` solo no se ven, así que la vez que se vieron con los dos no es reproducible por ahora (¿carrera?).
+- **`docs/memoria.md`:** todos los datos de memoria (volúmenes, censo por tipo, sonda, coste en sitio, techo, huecos, caras, hilos) y 6 reglas de diseño. El 72 % de los bytes que leen los shaders está en el *pool*.
 - **Techos (fase 0.5).** Detalle en `docs/baseline.md`.
   - `COPY_MODE` no hacía nada en la build normal; ya está arreglado.
   - `INPLACE=1` deja ver las caras, pero duplica el tiempo de GPU (lee por PCIe).

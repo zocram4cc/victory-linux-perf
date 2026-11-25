@@ -75,7 +75,7 @@ Todo esto ocurre **en serie**: el título, después la preparación, la GPU y la
 
 ## 3. Cómo funciona hoy el envío a la GPU
 
-Este es el mapa del código que la ruta va a cambiar. Las rutas son relativas a `crates/`.
+Este es el mapa del código que la ruta va a cambiar. Las rutas son relativas a `crates/`. Los datos medidos sobre la memoria (volúmenes, censo, sonda, techos) están en [docs/memoria.md](docs/memoria.md).
 
 | Pieza | Dónde | Qué hace hoy |
 |---|---|---|
@@ -173,6 +173,8 @@ Ninguno es imprescindible: el lanzador ya pone `d3dcompiler_47`.
 - La variación entre ejecuciones es menor del 10 % en `ms_per_frame`.
 - 10 minutos en el mundo sin perder el dispositivo.
 - La tabla de techos está escrita, y con ella se confirma o se corrige el orden de las fases 1 y 2.
+
+> **Techo medido (25-nov, `docs/memoria.md` §5):** sin copias, el frame baja de 354 a 170 ms (×2, ~6 fps), pero sigue siendo una cadena en serie. Las fases 1 y 2 dan como mucho ×2 por sí solas, y para pasar de ahí hace falta la fase 3. Si la fase 1 se estanca, la 3.1-3.2 (frames en vuelo) se puede adelantar y hacer antes que la 2.
 
 ### Fase 1: abaratar las copias que hay hoy
 

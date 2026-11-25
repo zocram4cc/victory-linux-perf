@@ -41,6 +41,10 @@ Los datos completos están en `bench/` (local).
 | `INPLACE=1` | **1,6** | **638** | **396 ms** | 84 / 401 | **se ven las caras** (de espaldas bien; de frente negras); sin parpadeos. El usuario se movió un poco |
 | `INPLACE=2` | — | — | — | — | **pierde el dispositivo** al llegar al mundo (0x887A0005) |
 | `INPLACE_PROBE=1 MEDIR=1` | 2,7 | 369 | 159 | 67 / 230 | **caras de Lucía y de los demás bien**, texturas bien, un objeto algo negro |
+| `COPY_MODE=none` (repetida, ya válida) | **5,9** | **170** | 72 | 22 / 68 | pantalla negra (lo esperado); los mismos draws que la base (5.037) |
+| `COPY_MODE=plain` (repetida) | — | — | — | — | se cierra antes de la cinemática: lee una página *reserved, never committed* |
+| `MEDIR=1` solo | 2,8 | 358 | 160 | 62 / 216 | caras invisibles |
+| `INPLACE_PROBE=1` solo | 2,7 | 366 | 161 | 63 / 216 | caras invisibles |
 
 ### Lo que dice la sonda (vkd3d-proton + RADV en este PC)
 
@@ -64,6 +68,9 @@ Los datos completos están en `bench/` (local).
 - Encaja con lo medido el 24-nov: la CPU del título está ociosa y el frame lo marca la cadena de VIctory.
 
 ### Conclusiones
+
+El desarrollo de todo esto está en [memoria.md](memoria.md).
+
 
 1. **Las caras no faltan por los shaders.** Con los datos leídos en sitio se ven, así que lo más probable es que las copias del host lleguen **viejas o incompletas**. Es un problema de coherencia de las copias, y también de corrección, no solo de velocidad.
 2. **La memoria del sistema en sitio no sirve para lo que la GPU lee mucho**: duplica el tiempo de GPU. La fase 2 tiene que llevar esos datos a VRAM (ReBAR o copia solo de lo que cambia), y dejar en sitio solo lo que se lee poco o lo que lee la CPU.
