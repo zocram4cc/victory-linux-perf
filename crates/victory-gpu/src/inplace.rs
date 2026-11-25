@@ -168,6 +168,46 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     }
 }
 
+/// Where a window of view memory lies in the card view's heaps: the heap
+/// (`lo..hi`, section offsets), the buffer in it (`at` and `bytes`) and the
+/// window's bias in the buffer (see [`card_span`]).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct CardSpan {
+    pub(crate) lo: u64,
+    pub(crate) hi: u64,
+    pub(crate) at: u64,
+    pub(crate) bytes: u64,
+    pub(crate) bias: u64,
+}
+
+/// The heap and the buffer of a window of `len` bytes at section offset
+/// `offset`. Stub: red first.
+pub(crate) fn card_span(_offset: u64, _len: u64, _section_bytes: u64, _chunk: u64) -> Option<CardSpan> {
+    None
+}
+
+/// Where a window is placed, by what the views say. Stub: red first.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Route {
+    /// No view holds it: private memory, placed as before.
+    Private,
+    /// One run of a section from `offset` on: the card view.
+    Card { section: usize, offset: u64 },
+    /// Anything else: a copy.
+    Turned,
+}
+
+/// Stub: red first.
+pub(crate) fn route(_cover: Cover, _view: bool) -> Route {
+    Route::Turned
+}
+
+/// [`place_for`] on `device`, with `view` saying whether view memory may be
+/// placed. Stub: red first.
+pub(crate) fn place_on(_device: &ID3D12Device, _start: u64, _len: u64, _window: bool, _view: bool) -> Option<Placed> {
+    None
+}
+
 /// What [`place_for`] gave is gone.
 pub(crate) fn gone(window: bool, bytes: u64) {
     let at = if window { 0 } else { 2 };
@@ -189,16 +229,10 @@ pub fn title_memory_freeing(at: usize, len: usize) {
     STATS[7].fetch_add(gone, Ordering::Relaxed);
 }
 
-/// The line of what is in place, every ten seconds while [`level`] is on.
-fn say() {
-    static LAST: AtomicU64 = AtomicU64::new(0);
-    let now = crate::host::now_ms();
-    let last = LAST.load(Ordering::Relaxed);
-    if now < last + 10_000 || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
-        return;
-    }
+/// The line of what is in place, as [`say`] logs it.
+fn line() -> String {
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
-    tracing::info!(
+    format!(
         "title memory in place: {} windows {} MB, {} title buffers {} MB (no copy, no refresh, no copy-back); turned down: {} view memory or not private memory committed whole, \
          {} refused by the host, {} over VICTORY_INPLACE_MB; {} let go because their memory changed",
         s[0],
@@ -209,7 +243,18 @@ fn say() {
         s[5],
         s[6],
         s[7]
-    );
+    )
+}
+
+/// Every ten seconds while [`level`] is on, the line of what is in place.
+fn say() {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = crate::host::now_ms();
+    let last = LAST.load(Ordering::Relaxed);
+    if now < last + 10_000 || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return;
+    }
+    tracing::info!("{}", line());
 }
 
 /// What a heap is opened on.
@@ -1259,7 +1304,7 @@ pub(crate) fn tick() {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Views as the runtime tells them: a range inside one view, or over
@@ -1447,7 +1492,7 @@ mod tests {
 
     /// The first adapter that is not the software one, its name, and a
     /// device on it: the card, under Proton.
-    fn hardware() -> Option<(ID3D12Device, String)> {
+    pub(crate) fn hardware() -> Option<(ID3D12Device, String)> {
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
         use windows::Win32::Graphics::Dxgi::*;
         // SAFETY: plain DXGI queries and device creation; each adapter is
@@ -1557,6 +1602,120 @@ mod tests {
             // rejected (-EFAULT) and the device lost. (d) is the way.
         }
         assert!(stale.is_empty(), "NOT ALIASED (stale) in {stale:?}: the GPU and the title hold other bytes there");
+        Ok(())
+    }
+
+    /// `len` bytes of the pattern [`fill`] writes with `seed`.
+    fn bytes_of(len: usize, seed: u8) -> Vec<u8> {
+        (0..len).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed)).collect()
+    }
+
+    /// Heaps cut on four pages here: a window's heap, its buffer in it and
+    /// the window's bias in the buffer, wherever the window lies.
+    #[test]
+    fn card_span_says_which_heap_and_buffer_a_window_needs() {
+        let page = K64 as u64;
+        let chunk = 4 * page;
+        let section = 4 * chunk;
+        let span = |lo, hi, at, bytes, bias| Some(CardSpan { lo, hi, at, bytes, bias });
+        // Inside one heap, off the page line: a buffer over its three pages.
+        assert_eq!(card_span(0x1230, 2 * page + 5, section, chunk), span(0, chunk, 0, 3 * page, 0x1230));
+        // Across a heap line: the heap is the two chunks the pages lie in.
+        assert_eq!(card_span(chunk - 0x1000, 0x3000, section, chunk), span(0, 2 * chunk, chunk - page, 2 * page, 0xf000));
+        // In the second chunk: its heap starts there, the buffer at the page's place in it.
+        assert_eq!(card_span(chunk + 3 * page + 7, 10, section, chunk), span(chunk, 2 * chunk, 3 * page, page, 7));
+        // The last heap ends at the section's end.
+        assert_eq!(card_span(section - 100, 50, section, chunk), span(3 * chunk, section, 3 * page, page, page - 100));
+        // A section that is no whole number of chunks: its last heap is cut short.
+        assert_eq!(card_span(4 * page, page, 5 * page, chunk), span(chunk, 5 * page, 0, page, 0));
+        // Not inside the section, or nothing.
+        assert_eq!(card_span(section - 10, 20, section, chunk), None);
+        assert_eq!(card_span(0, 0, section, chunk), None);
+    }
+
+    /// A window is placed over private memory as before, over one run of a
+    /// section only when the level allows view memory, and never over
+    /// scattered or partly held views.
+    #[test]
+    fn route_places_one_run_of_a_section_on_the_card_view_when_asked() {
+        let run = Cover::Run(9, 16 * K64 as u64);
+        assert_eq!(route(Cover::None, false), Route::Private);
+        assert_eq!(route(Cover::None, true), Route::Private);
+        assert_eq!(route(run, true), Route::Card { section: 9, offset: 16 * K64 as u64 });
+        assert_eq!(route(run, false), Route::Turned);
+        assert_eq!(route(Cover::Scattered, true), Route::Turned);
+        assert_eq!(route(Cover::Holes, true), Route::Turned);
+    }
+
+    /// View memory in place (`VICTORY_INPLACE=3`), as xmem maps it: two
+    /// title views of one section's pages, the second remapped at its own
+    /// address to other pages under the first window's placed buffer. Both
+    /// directions through the card view, before and after the remap; the
+    /// windows start off the page line, so the bias counts.
+    #[test]
+    #[ignore = "hardware: the RX 6900 XT, under Proton"]
+    fn card_view_windows_alias_both_ways_across_a_remap() -> windows::core::Result<()> {
+        let Some((device, name)) = hardware() else { panic!("no hardware adapter") };
+        eprintln!("inplace view: adapter \"{name}\"");
+        assert!(name.contains("6900"), "not the RX 6900 XT: \"{name}\"");
+        let mut rig = Rig::new(&device)?;
+        const SIZE: usize = 8 * K64;
+        const WINDOW: usize = 2 * K64 + 5;
+        const AT: usize = 0x1230;
+        // SAFETY (the whole body): the section and the views are the test's
+        // own; every address used lies inside them, and the windows die
+        // before the views are unmapped.
+        unsafe {
+            let invalid = windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+            let section = mem::CreateFileMappingW(invalid, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_COMMIT, 0, SIZE as u32, std::ptr::null());
+            assert!(!section.is_null(), "CreateFileMapping");
+            title_memory_section(section as usize, SIZE as u64, true);
+            // Pages 0..4 at `a` and at `b`, as xmem maps physical pages.
+            let view_a = mem::MapViewOfFile(section, mem::FILE_MAP_WRITE, 0, 0, 4 * K64);
+            let view_b = mem::MapViewOfFile(section, mem::FILE_MAP_WRITE, 0, 0, 4 * K64);
+            assert!(!view_a.Value.is_null() && !view_b.Value.is_null(), "MapViewOfFile");
+            let (a, b) = (view_a.Value.cast::<u8>(), view_b.Value.cast::<u8>());
+            title_memory_view(a as usize, 4 * K64, section as usize, 0);
+            title_memory_view(b as usize, 4 * K64, section as usize, 0);
+            let (wa, wb) = (a.add(AT), b.add(AT));
+            let pa = place_on(&device, wa as u64, WINDOW as u64, true, true).expect("the window over a is not placed in place");
+            let pb = place_on(&device, wb as u64, WINDOW as u64, true, true).expect("the window over b is not placed in place");
+            assert_eq!(pa.bias, AT as u64, "the window's bias in its buffer");
+            // Before the remap: the title writes and the GPU reads through
+            // both windows; the GPU writes and the title reads at both.
+            fill(wa, WINDOW, 0x21);
+            assert!(rig.fetch(&pa.buffer, pa.bias, WINDOW)? == bytes_of(WINDOW, 0x21), "a: the GPU reads the title's bytes");
+            assert!(rig.fetch(&pb.buffer, pb.bias, WINDOW)? == bytes_of(WINDOW, 0x21), "b: the GPU reads the same pages through the other view");
+            rig.store(&pa.buffer, pa.bias, &bytes_of(WINDOW, 0x42))?;
+            assert!(same(wa, &bytes_of(WINDOW, 0x42)) && same(wb, &bytes_of(WINDOW, 0x42)), "the GPU's write shows in both views");
+            // The remap: the window over `b` is let go (its buffer is not
+            // used again), and `b` shows pages 4..8 at the same address.
+            drop(pb);
+            crate::watch::title_memory_remapped(b as usize, 4 * K64);
+            mem::UnmapViewOfFile(view_b);
+            let view_b = mem::MapViewOfFileEx(section, mem::FILE_MAP_WRITE, 0, (4 * K64) as u32, 4 * K64, b.cast());
+            assert_eq!(view_b.Value.cast::<u8>(), b, "the view comes back at its address");
+            crate::watch::title_memory_remapped(b as usize, 4 * K64);
+            title_memory_view(b as usize, 4 * K64, section as usize, 4 * K64 as u64);
+            // After the remap: the title writes pages 4..8 and the GPU reads
+            // them through a window placed anew; the GPU's write shows at
+            // `b`, and pages 0..4 keep what the GPU wrote there before.
+            let pb = place_on(&device, wb as u64, WINDOW as u64, true, true).expect("the remapped window is not placed in place");
+            fill(wb, WINDOW, 0x63);
+            assert!(rig.fetch(&pb.buffer, pb.bias, WINDOW)? == bytes_of(WINDOW, 0x63), "b: the GPU reads the remapped pages");
+            rig.store(&pb.buffer, pb.bias, &bytes_of(WINDOW, 0x84))?;
+            assert!(same(wb, &bytes_of(WINDOW, 0x84)), "b: the GPU's write shows at the remapped window");
+            assert!(same(wa, &bytes_of(WINDOW, 0x42)), "a: pages 0..4 keep what the GPU wrote before the remap");
+            // The window over `a` still aliases after the remap.
+            fill(wa, WINDOW, 0xa5);
+            assert!(rig.fetch(&pa.buffer, pa.bias, WINDOW)? == bytes_of(WINDOW, 0xa5), "a: the GPU reads its window after the remap");
+            eprintln!("inplace view: {}", line());
+            drop((pa, pb));
+            crate::watch::title_memory_remapped(b as usize, 4 * K64);
+            mem::UnmapViewOfFile(view_b);
+            mem::UnmapViewOfFile(view_a);
+            windows_sys::Win32::Foundation::CloseHandle(section);
+        }
         Ok(())
     }
 }

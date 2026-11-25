@@ -4428,3 +4428,52 @@ mod mask_runs_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod placed_tests {
+    use super::*;
+    use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE, SEC_COMMIT, UnmapViewOfFile};
+
+    /// Two placed windows, over the pages of one view and of another: when
+    /// the runtime remaps the second view's range, its window goes out of
+    /// the tables with that range, and the window over the first stays.
+    #[test]
+    #[ignore = "hardware: the RX 6900 XT, under Proton"]
+    fn a_remapped_view_window_is_let_go_and_its_neighbour_is_not() {
+        let Some((device, _)) = crate::inplace::tests::hardware() else { panic!("no hardware adapter") };
+        const K64: usize = 64 << 10;
+        // SAFETY: the section and the views are the test's own; the windows
+        // are let go before the views are unmapped.
+        unsafe {
+            let invalid = windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+            let section = CreateFileMappingW(invalid, std::ptr::null(), PAGE_READWRITE | SEC_COMMIT, 0, 8 * K64 as u32, std::ptr::null());
+            assert!(!section.is_null(), "CreateFileMapping");
+            crate::inplace::title_memory_section(section as usize, 8 * K64 as u64, true);
+            let first = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 4 * K64);
+            let second = MapViewOfFile(section, FILE_MAP_WRITE, 0, 4 * K64 as u32, 4 * K64);
+            assert!(!first.Value.is_null() && !second.Value.is_null(), "MapViewOfFile");
+            let (a, b) = (first.Value as u64, second.Value as u64);
+            crate::inplace::title_memory_view(a as usize, 4 * K64, section as usize, 0);
+            crate::inplace::title_memory_view(b as usize, 4 * K64, section as usize, 4 * K64 as u64);
+            let wa = crate::inplace::place_on(&device, a, 2 * K64 as u64, true, true).expect("the window over the first view is not placed in place");
+            let wb = crate::inplace::place_on(&device, b, 2 * K64 as u64, true, true).expect("the window over the second view is not placed in place");
+            let (ka, kb) = ((a, 2 * K64 as u64), (b, 2 * K64 as u64));
+            {
+                let mut loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+                loose.insert(ka, Arc::new(Shadow::placed(wa, ka.0, ka.1, true)));
+                loose.insert(kb, Arc::new(Shadow::placed(wb, kb.0, kb.1, true)));
+            }
+            // The runtime remaps the second view's range.
+            crate::watch::title_memory_remapped(b as usize, 4 * K64);
+            {
+                let mut loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+                assert!(!loose.contains_key(&kb), "the window over the remapped range is let go");
+                assert!(loose.contains_key(&ka), "the window over the other view stays");
+                loose.remove(&ka);
+            }
+            UnmapViewOfFile(second);
+            UnmapViewOfFile(first);
+            windows_sys::Win32::Foundation::CloseHandle(section);
+        }
+    }
+}
