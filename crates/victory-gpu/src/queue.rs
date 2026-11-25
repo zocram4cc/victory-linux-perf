@@ -1610,6 +1610,71 @@ pub(crate) struct PageBatch {
 /// Bytes per mapped page.
 const PAGE: u64 = 64 << 10;
 
+fn copy_page_ranges(
+    mut ranges: &[PageRange],
+    mut at: u64,
+    pool: u64,
+    pool_pages: u32,
+    batch: bool,
+    mut map: impl FnMut(u64, u64, u64) -> bool,
+) -> bool {
+    let linear_end = |r: &PageRange| {
+        if r.count == 0 || (r.kind != 0 && !(r.kind == 1 && r.count == 1)) {
+            return None;
+        }
+        r.start.checked_add(r.count).filter(|&end| end <= pool_pages)
+    };
+    let mut ok = true;
+    while let Some((first, tail)) = ranges.split_first() {
+        let mut parts = 1;
+        let mut pages = first.count;
+        if batch && let Some(mut end) = linear_end(first) {
+            for next in tail {
+                if next.start != end {
+                    break;
+                }
+                let Some(next_end) = linear_end(next) else {
+                    break;
+                };
+                end = next_end;
+                parts += 1;
+            }
+            pages = end - first.start;
+        }
+        let len = u64::from(pages) * PAGE;
+        let (group, rest) = ranges.split_at(parts);
+        let combined = parts > 1
+            && pool.checked_add(u64::from(first.start) * PAGE).is_some_and(|source| {
+                source != 0
+                    && at.checked_add(len).zip(source.checked_add(len)).is_some_and(
+                        |(to_end, from_end)| to_end <= source || from_end <= at,
+                    )
+                    && map(at, source, len)
+            });
+        if !combined {
+            // A failed combined call may have mapped only part of the
+            // range. Apply each original request, even after a failure.
+            let mut address = at;
+            for r in group {
+                let bytes = u64::from(r.count) * PAGE;
+                let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
+                let source = pool + u64::from(r.start) * PAGE;
+                ok &= match r.kind {
+                    0 if inside(r.count) => map(address, source, bytes),
+                    1 if inside(1) => (0..u64::from(r.count)).all(|k| map(address + k * PAGE, source, PAGE)),
+                    2 => map(address, 0, bytes),
+                    3 => true,
+                    _ => false,
+                };
+                address += bytes;
+            }
+        }
+        at += len;
+        ranges = rest;
+    }
+    ok
+}
+
 /// `CopyPageMappingsBatchX(count, batches, pool, pool pages, flags)`: maps
 /// pages of a pool (memory the title mapped physical pages into) at the
 /// batches' addresses. The title streams textures into pool pages
@@ -1635,26 +1700,14 @@ extern "system" fn copy_page_mappings(
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
     });
     let mut ok = true;
+    let batch = crate::resource::batch_page_mappings();
     for b in batches.into_iter().flatten() {
         if b.ranges.is_null() {
             continue;
         }
         // SAFETY: each batch holds `count` ranges.
         let ranges = unsafe { std::slice::from_raw_parts(b.ranges, b.count as usize) };
-        let mut at = b.destination;
-        for r in ranges {
-            let len = u64::from(r.count) * PAGE;
-            let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
-            let source = pool + u64::from(r.start) * PAGE;
-            ok &= match r.kind {
-                0 if inside(r.count) => map(at, source, len),
-                1 if inside(1) => (0..u64::from(r.count)).all(|k| map(at + k * PAGE, source, PAGE)),
-                2 => map(at, 0, len),
-                3 => true,
-                _ => false,
-            };
-            at += len;
-        }
+        ok &= copy_page_ranges(ranges, b.destination, pool, pool_pages, batch, map);
     }
     if !ok {
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -1719,6 +1772,37 @@ static NEWER_FUNCTIONS: Table<36> = Table(queue_table(true));
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn page_mapping_runs_keep_repeat_ranges_and_fall_back_in_order() {
+        let ranges = [
+            PageRange { kind: 1, start: 3, count: 1 },
+            PageRange { kind: 0, start: 4, count: 2 },
+            PageRange { kind: 1, start: 6, count: 2 },
+        ];
+        let pool = 32 * PAGE;
+        let collect = |at, batch, reject_combined: bool| {
+            let mut calls = Vec::new();
+            assert!(copy_page_ranges(&ranges, at, pool, 10, batch, |to, from, len| {
+                calls.push((to - at, from - pool, len));
+                !reject_combined || len <= 2 * PAGE
+            }));
+            calls
+        };
+        let single = [
+            (0, 3 * PAGE, PAGE),
+            (PAGE, 4 * PAGE, 2 * PAGE),
+            (3 * PAGE, 6 * PAGE, PAGE),
+            (4 * PAGE, 6 * PAGE, PAGE),
+        ];
+        let combined = (0, 3 * PAGE, 3 * PAGE);
+        assert_eq!(collect(PAGE, false, false), single);
+        assert_eq!(collect(PAGE, true, false), [combined, single[2], single[3]]);
+        let mut retry = vec![combined];
+        retry.extend(single);
+        assert_eq!(collect(PAGE, true, true), retry);
+        assert_eq!(collect(pool + 4 * PAGE, true, false), single);
+    }
 
     #[cfg(windows)]
     #[test]
