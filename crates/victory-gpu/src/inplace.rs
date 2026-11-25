@@ -298,6 +298,25 @@ fn views_mut() -> std::sync::RwLockWriteGuard<'static, Views> {
     VIEWS.write().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The addresses inside `(start, end)` where a title view begins or ends,
+/// in order: a change of protection cannot cross from one view to the next
+/// (`crate::watch` cuts its runs of blocks there).
+pub(crate) fn view_edges(start: usize, end: usize) -> Vec<usize> {
+    let v = views();
+    let mut edges = Vec::new();
+    let before = v.views.range(..=start).next_back();
+    for (&base, &(bytes, _, _)) in before.into_iter().chain(v.views.range(start.saturating_add(1)..end)) {
+        for edge in [base, base.saturating_add(bytes)] {
+            if start < edge && edge < end {
+                edges.push(edge);
+            }
+        }
+    }
+    edges.sort_unstable();
+    edges.dedup();
+    edges
+}
+
 /// The runtime made a section of `bytes` for physical pages; `committed`
 /// if with `SEC_COMMIT` (only such a section can be opened as a heap).
 pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
