@@ -150,9 +150,29 @@ fn sweep() {
     crate::resource::let_go_idle();
 }
 
+/// Kinds of commands for [`HostList::serial`].
+pub(crate) const SERIAL_DISPATCH: u8 = 1;
+pub(crate) const SERIAL_DRAW: u8 = 2;
+pub(crate) const SERIAL_INDIRECT: u8 = 4;
+
+/// `VICTORY_LEAK_RETIRED=1`: host objects let go are never dropped (see
+/// [`retire`]).
+pub(crate) fn leaking() -> bool {
+    static LEAK: OnceLock<bool> = OnceLock::new();
+    *LEAK.get_or_init(|| std::env::var_os("VICTORY_LEAK_RETIRED").is_some_and(|v| v == "1"))
+}
+
 /// Drops `object` once every submission running now has finished: at once
 /// if none is.
 pub(crate) fn retire<T: 'static>(object: T) {
+    // `VICTORY_LEAK_RETIRED=1` (diagnostics of the device loss in the
+    // README's "Known blocker"): nothing retired is ever dropped. If the
+    // loss goes away, a host object is freed while the GPU still uses it.
+    if leaking() {
+        RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
+        std::mem::forget(object);
+        return;
+    }
     let started = STARTED.load(Ordering::Acquire);
     if started <= FINISHED.load(Ordering::Acquire) {
         RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
@@ -4814,6 +4834,42 @@ impl HostList {
             fail(format_args!("a host state prelude did not record ({e})"));
         }
         list.cast().ok()
+    }
+
+    /// `VICTORY_SERIAL_OPS` (diagnostics of the device loss in the README's
+    /// "Known blocker"): a global UAV barrier before every command of the
+    /// kinds named (`dispatch`, `draw`, `indirect`, `all`, comma-separated),
+    /// so each waits for every earlier shader write. If the loss goes away,
+    /// a barrier is missing between commands of those kinds.
+    pub(crate) fn serial(&self, kind: u8) {
+        static KINDS: OnceLock<u8> = OnceLock::new();
+        let kinds = *KINDS.get_or_init(|| {
+            std::env::var("VICTORY_SERIAL_OPS").map_or(0, |v| {
+                v.split(',').fold(0u8, |k, w| {
+                    k | match w.trim() {
+                        "dispatch" => SERIAL_DISPATCH,
+                        "draw" => SERIAL_DRAW,
+                        "indirect" => SERIAL_INDIRECT,
+                        "all" => SERIAL_DISPATCH | SERIAL_DRAW | SERIAL_INDIRECT,
+                        _ => 0,
+                    }
+                })
+            })
+        });
+        if kinds & kind == 0 {
+            return;
+        }
+        let barrier = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                    pResource: std::mem::ManuallyDrop::new(None),
+                }),
+            },
+        };
+        // SAFETY: an open list; a global barrier names no resource.
+        unsafe { self.list.ResourceBarrier(&[barrier]) };
     }
 
     /// Notes what the command about to be recorded does, as a marker

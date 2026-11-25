@@ -296,8 +296,16 @@ Today the chain is: console shader → DXIL → dxil-spirv → SPIR-V → RADV, 
 - Not a broken command: serialising the same commands avoids it.
 
 **Open hypotheses**
-- A missing GPU barrier, for example indirect arguments or descriptors written by one pass and read by the next.
-- A host resource freed or reused while the GPU still reads it.
+
+Ruled out:
+- the texture sweep;
+- objects freed through `retire()` (`VICTORY_LEAK_RETIRED=1`: still 3 of 3);
+- barriers between commands (`VICTORY_SERIAL_OPS=all`: still 2 of 2).
+
+Left, since only the CPU waiting for an idle GPU helps:
+- DirectStorage's worker threads writing destinations while the GPU runs;
+- work vkd3d keeps in flight past our wait;
+- an out-of-range read on data that is not complete yet.
 
 **Next step:** an allocation journal (`VICTORY_ALLOC_LOG=1`) that matches the fault address against buffers alive and recently freed. Details and every run are in [docs/journal.md](docs/journal.md) (entries of 25 Nov).
 

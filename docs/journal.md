@@ -4,6 +4,20 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-25
 
+**Device loss: two more hypotheses ruled out (saved game, release build)**
+
+| Switch | Lost | Furthest draws a frame |
+|---|---|---|
+| `VICTORY_LEAK_RETIRED=1`: nothing passed to `retire()` is dropped, nor texture staging (×3) | **3 of 3** | 12,246-14,399 |
+| `VICTORY_SERIAL_OPS=all`: a global UAV barrier before every draw, dispatch and indirect command (×2) | **2 of 2** | 7,375-13,498 |
+
+- Not a host object freed through `retire()` (shadows, texture copies, slot views, staging).
+- Not a missing barrier between commands on the GPU.
+- What did avoid it: **the CPU waiting for the GPU to go idle after each submission** (`RADV_DEBUG=hang`, `breadcrumbs_sync`), and the diag build with the runtime's DRED. So something the CPU side touches while the GPU still works. Candidates:
+  - DirectStorage's worker threads (`victory:disk`) writing destinations during loading;
+  - work vkd3d keeps in flight past our wait;
+  - a GPU read out of range on data not complete yet.
+
 **The saved game's device loss: what keeps it alive (all runs load the save, `royale-save`)**
 
 | Build and switches | Device lost | Notes |

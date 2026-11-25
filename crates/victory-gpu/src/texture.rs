@@ -444,6 +444,9 @@ pub(crate) fn let_go_idle() {
         let keep = Arc::strong_count(s) > 1
             || !crate::host::long_ago(s.used.load(Relaxed), IDLE_MS, IDLE_FRAMES);
         if !keep {
+            if crate::host::leaking() {
+                std::mem::forget(Arc::clone(s));
+            }
             LET_GO[0].fetch_add(1, Relaxed);
             LET_GO[1].fetch_add(s.bytes, Relaxed);
             went += 1;
