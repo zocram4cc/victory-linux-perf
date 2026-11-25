@@ -4,6 +4,20 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-25
 
+**Phase 1.8 measured: fast reads work, −10 % frame time**
+
+| Scene A | baseline | 1.7 (own write-back) | 1.8 (fast reads) |
+|---|---|---|---|
+| ms per frame | 354 | 348 | **317** (3.2 fps) |
+| prepare | 124 | 129 | **102** |
+| copies | 63 ms | 66 | **49** |
+| GPU | 159 | 143 | 142 |
+| copy-back | 67 ms | 71 | 69 |
+
+- **17,190 reads of title memory per frame** (288 MB), each one a system call before. 20 per frame meet a missing or guard page and take the kernel path.
+- No crash after the guard-page fix.
+- **Copy-back did not move.** It writes with `NtWriteVirtualMemory` (`host.rs::write_mapped`), the same per-call cost in the other direction. **Next: fast writes**, the same technique.
+
 **Phase 1.8: profile of the submitting thread, and fast reads (branch `p1.8-fast-reads`)**
 - **Profile** (`bench.sh --perf`, scene A, 30 s). The submitting thread is busy about half the time (~170 ms per frame):
 

@@ -158,6 +158,14 @@ This still has to be measured with royale in the world; that log is not printed 
 - With `VICTORY_F1_OWN`, ~100 MB a frame of the 216 MB uploaded turned out to be pages we had written back ourselves. 95 % of them were identical to the copy.
 - Skipping them halves the bytes, but **not the time**: 63-66 ms either way. The copy time is the kernel reads of title memory (`copy_mapped`, `read_into`), not the bytes moved.
 
+## 9c. Reads of title memory per frame (phase 1.8, 25 Nov 2026)
+
+- Scene A makes **17,190 reads of title memory per frame (288 MB)**.
+- Through `ReadProcessMemory` under Wine, each one cost a syscall plus `virtual_check_buffer_for_write` walking the destination.
+- With a plain `rep movsb` and fault recovery (`crate::fastcopy`), prepare fell from 124 to 102 ms and the frame from 354 to 317 ms.
+- Only ~20 reads per frame meet a missing or guard page.
+- Guard pages exist in title ranges, for example at `0x11000`. A direct read must put the guard back.
+
 ## 10. Design rules drawn from the data
 
 1. **The cost is in deciding what to copy and in reading title memory through the kernel, not in moving bytes** (confirmed in §9b). Every phase 1 improvement is measured in hash passes and write-watch queries, not only in MB.
