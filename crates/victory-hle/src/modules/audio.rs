@@ -19,7 +19,7 @@
 use std::alloc::Layout;
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
-use std::sync::{Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard};
 use std::time::Instant;
 
 use super::xasync::E_INVALIDARG;
@@ -38,10 +38,51 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 // The APU heap.
 
+struct Allocation {
+    ptr: *mut u8,
+    layout: Layout,
+}
+
+// SAFETY: `Allocation` owns a heap allocation freed when the last `Arc` drops.
+unsafe impl Send for Allocation {}
+unsafe impl Sync for Allocation {}
+
+impl Drop for Allocation {
+    fn drop(&mut self) {
+        // SAFETY: allocated by `heap_alloc` with this layout.
+        unsafe { std::alloc::dealloc(self.ptr, self.layout) };
+    }
+}
+
+/// A live slice of an APU heap block that retains the backing [`Allocation`]
+/// until dropped, preventing `ApuFree` from deallocating memory under active
+/// XMA decoding or command notifications.
+struct HeapSlice {
+    _alloc: Arc<Allocation>,
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl std::ops::Deref for HeapSlice {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        // SAFETY: `ptr..ptr+len` lies inside `_alloc`, kept alive until drop.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+impl std::ops::DerefMut for HeapSlice {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as above; the title and audio hardware share the block.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
 struct Block {
     size: usize,
     apu: u32,
-    layout: Layout,
+    alloc: Arc<Allocation>,
 }
 
 struct Heap {
@@ -111,8 +152,8 @@ fn heap_alloc(size: usize, align: usize) -> Option<(*mut u8, u32)> {
         heap.give_back(apu, apu + layout.size() as u32);
         return None;
     }
-    heap.blocks
-        .insert(ptr as usize, Block { size, apu, layout });
+    let alloc = Arc::new(Allocation { ptr, layout });
+    heap.blocks.insert(ptr as usize, Block { size, apu, alloc });
     heap.by_apu.insert(apu, ptr as usize);
     // The big ones are named in the log: they are the title's audio memory
     // given out of our allocator, which the memory line counts as ours.
@@ -128,10 +169,9 @@ fn heap_free(ptr: *mut u8) {
         return;
     };
     heap.by_apu.remove(&block.apu);
-    heap.give_back(block.apu, block.apu + block.layout.size() as u32);
+    heap.give_back(block.apu, block.apu + block.alloc.layout.size() as u32);
     drop(heap);
-    // SAFETY: allocated by `heap_alloc` with this layout.
-    unsafe { std::alloc::dealloc(ptr, block.layout) };
+    drop(block);
 }
 
 /// Sizes the heap once, before anything is allocated from it. The console
@@ -179,15 +219,20 @@ fn heap_unmap(apu: u32) -> Option<*mut u8> {
 }
 
 /// `len` bytes of title memory at a device address, if one heap block holds
-/// them all.
-fn heap_bytes<'a>(apu: u32, len: usize) -> Option<&'a mut [u8]> {
+/// them all. Retains the block's backing allocation until dropped.
+fn heap_bytes(apu: u32, len: usize) -> Option<HeapSlice> {
     let heap = lock(&HEAP);
     let (&start, &host) = heap.by_apu.range(..=apu).next_back()?;
+    let block = &heap.blocks[&host];
     let offset = (apu - start) as usize;
-    (offset + len <= heap.blocks[&host].size)
-        // SAFETY: inside a live heap block, which the title and the audio
-        // hardware share like on the console.
-        .then(|| unsafe { std::slice::from_raw_parts_mut((host + offset) as *mut u8, len) })
+    offset
+        .checked_add(len)
+        .is_some_and(|end| end <= block.size)
+        .then(|| HeapSlice {
+            _alloc: Arc::clone(&block.alloc),
+            ptr: (host + offset) as *mut u8,
+            len,
+        })
 }
 
 pub extern "system" fn ApuAlloc(
@@ -538,7 +583,7 @@ fn pump(context: Context, voice: &mut Voice) {
         // the first write, which would otherwise land past the ring's end.
         let write = context.field(0, 27, 5) % size;
         let address = context.get(7) as usize + write as usize * BLOCK_BYTES;
-        let Some(out) = heap_bytes(address as u32, BLOCK_BYTES) else {
+        let Some(mut out) = heap_bytes(address as u32, BLOCK_BYTES) else {
             return;
         };
         for pair in out.as_chunks_mut::<2>().0 {
@@ -614,9 +659,9 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
     };
     let mut at = context.field(2, 0, 26) as usize;
     if at < 32 {
-        at = 32 + xma::packet(data, 0).map_or(0, |p| p.first_frame_bit as usize);
+        at = 32 + xma::packet(&data, 0).map_or(0, |p| p.first_frame_bit as usize);
     }
-    let Some(frame) = xma::read_frame(data, at) else {
+    let Some(frame) = xma::read_frame(&data, at) else {
         // This input is used up.
         context.set_field(0, 20 + current, 1, 0);
         return true;
@@ -692,7 +737,10 @@ fn dump_input(index: u32, context: Context) {
     );
     let _ = std::fs::create_dir_all(&dir);
     let _ = std::fs::write(dir.join(format!("{n:02}-{index}.ctx")), words);
-    let _ = std::fs::write(dir.join(format!("{n:02}-{index}.xma")), input.unwrap_or_default());
+    let _ = std::fs::write(
+        dir.join(format!("{n:02}-{index}.xma")),
+        input.as_deref().unwrap_or(&[]),
+    );
 }
 
 /// Starts the decoding thread on the first enabled voice, and has it fill
@@ -896,10 +944,10 @@ extern "system" fn submit(
         state.post(COMMAND_COMPLETED, &done);
     }
     if notification != 0
-        && let Some(word) = heap_unmap(notification)
+        && let Some(word) = heap_bytes(notification, 4)
     {
-        // SAFETY: a u32 in a heap block, which the title reads as volatile.
-        unsafe { word.cast::<u32>().write_volatile(1) };
+        // SAFETY: 4-byte slice in a retained heap block, written volatile for the title.
+        unsafe { word.ptr.cast::<u32>().write_volatile(1) };
     }
     S_OK
 }
@@ -1439,5 +1487,26 @@ mod tests {
         assert_eq!((m.message_count)(acp), 1, "disconnected");
         (m.release)(acp);
         assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
+    }
+
+    #[test]
+    fn heap_bytes_retains_allocation_across_apu_free() {
+        let (mut ptr, mut apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut ptr, &mut apu, 4096, 256, 1), S_OK);
+
+        let mut slice = heap_bytes(apu, 4096).expect("live APU block");
+        assert_eq!(Arc::strong_count(&slice._alloc), 2);
+
+        // Freeing the block unmaps its APU range immediately, but defers
+        // deallocation while the decoder's `HeapSlice` still holds a reference.
+        ApuFree(ptr);
+        assert!(ApuMapApuAddress(apu).is_null());
+        assert_eq!(Arc::strong_count(&slice._alloc), 1);
+
+        slice.fill(0x5A);
+        assert!(slice.iter().all(|&b| b == 0x5A));
+        // Overflow check: `offset + len` wrapping must not pass bounds checks.
+        assert!(heap_bytes(apu, usize::MAX).is_none());
+        drop(slice);
     }
 }
