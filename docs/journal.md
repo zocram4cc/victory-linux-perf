@@ -4,6 +4,16 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-25
 
+**Our base is behind: fxceless moved a long way today**
+- `RADV_DEBUG=allbos`: still lost 2 of 2, so not memory missing from a submission.
+- Release with the skip fixed and `VICTORY_DRED_DEVICE=both`: 1 of 2 lost; the other loaded with the 3D picture blown out to white (HUD right; screenshot). That looks like auto-exposure fed a wrong value. Forced held submissions do not correlate with the losses.
+- **fxceless/main has 15 commits past our base (joshuu `003beef`, which is fxceless + myokex + joshuu).** It now carries the myokex view guard and joshuu's DirectStorage fix itself. Among them:
+  - `a26859f` *"The first room renders right: byte-copied descriptor records are mirrored"* (descriptor records the title copies as bytes were not mirrored: wrong data in slots);
+  - `f85101b` a submit thread of the layer's own (`VICTORY_ASYNC_SUBMIT`) and a copy queue for fetches (`VICTORY_QUEUE2`), i.e. our phase 3;
+  - `465b94f` / `3973179` **9.6-10.3 fps in the first rooms** on an RTX 4070.
+- Upstream VIctory has 402 commits past our base: barriers, memory-value waits, texture work.
+- **Consequence:** phases 1-3 duplicate work the forks are doing faster, on a base a day old. The descriptor fix may be exactly our wrong reads. Proposed: rebase onto fxceless/main, carry over the Linux-specific pieces (fast reads under Wine, the skip fix, `VICTORY_KEYS` in release, bench tooling), then test both scenes on Linux.
+
 **Roadmap reordered: phase S (stability foundation) before phases 2-3**
 - The user's point: the prologue is a closed space, and the game has to work anywhere. Every speed-up ran into the same correctness bug, and phase 2 rewrites the paths where it lives.
 - Phase 1 stays (small, measured, harmless), except fast writes, which stay off.
