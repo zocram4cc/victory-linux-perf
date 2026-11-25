@@ -4,6 +4,15 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-25
 
+**Unattended runs, and a reproducible device loss**
+- **`bench.sh --auto` works:** it presses A at the start screen (`VICTORY_KEYS`, now in release builds), the intro plays through, the world is reached at ~105 s, and it measures with nobody at the keyboard. Current defaults: **327 ms per frame** (auto-keys run, ~5,080 draws, stable). Holding A does not skip the intro.
+- **The user's saved game (Jason, in the world)**, installed in a separate launcher profile `royale-save` (own data folder, same build):
+  - **loses the device while loading, 3 of 3** (GPUVM fault ~45 s in, then the title's own crash handler), with no fast writes and no texture freeing in the trail;
+  - vkd3d's `breadcrumbs` gave no report in this GE build;
+  - with `RADV_DEBUG=hang` (a wait after every submission) it **ran 108 s without a fault**, until something outside sent SIGTERM (another session was using the launcher at the same time).
+  - The waits remove the loss, so this points to a race in timing again, not a broken command. It is a reliable test case for the lifetime work, in a heavier scene than the prologue.
+- **Caution:** two sessions launching the game at once kill each other's wineserver. Coordinate before measuring.
+
 **Freeing vs fast writes: three more runs**
 
 | Run | Lost device | Picture (user) | ms |
