@@ -12,6 +12,8 @@ VIctory with a Linux focus. The goal is an architecture that runs an Xbox Series
 4. [The roadmap](#4-the-roadmap)
 5. [Working on this repository](#5-working-on-this-repository)
 6. [Task board](#6-task-board)
+
+Also: [Known blocker: timing-dependent device loss](#known-blocker-timing-dependent-device-loss).
 7. [Risks and open decisions](#7-risks-and-open-decisions)
 8. [Building and running](#8-building-and-running)
 9. [Branches and remotes](#9-branches-and-remotes)
@@ -265,6 +267,41 @@ Today the chain is: console shader → DXIL → dxil-spirv → SPIR-V → RADV, 
 | **Texture sweep frees copies the GPU still reads** | confirmed (0 losses of 3 with the sweep off, 2 of 3 with it on) | find the unheld reference (vkd3d breadcrumbs); blocks fast writes and phase 3 |
 | **Texture copies go stale?** | unproven: `VICTORY_TEXTURE_SWEEP=0` also turned off the slot repair pass, the likelier cause of the missing pieces | retest with `VICTORY_TEXTURE_FREE=0` (freeing off, repair on) |
 | Exit gate of every phase | | 30 minutes in the world without a device loss or crash |
+
+## Known blocker: timing-dependent device loss
+
+> **Read this before any speed-up work.** Every change that makes a frame faster has run into it.
+
+**Symptom**
+- The GPU faults: `radv: GPUVM fault detected at address 0x8003…`. The kernel shows `[gfxhub] page fault`, client TCP (a shader memory read).
+- The device is lost (`0x887A0005`), usually while a world loads or as the first cutscene starts.
+
+**When it happens**
+
+| Case | Rate |
+|---|---|
+| Loading the user's saved game (Jason; launcher profile `royale-save`), release build | **4 of 4** — the reproducer |
+| Prologue with fast writes (`VICTORY_F1_FAST_WRITE=1`) | 2-3 of 4 |
+| Prologue with the forks' late-wait switches (`VICTORY_LATE_WAIT`, `VICTORY_RELAY`) | 3 of 4 (24 Nov) |
+| Prologue with today's defaults | 0 of ~30 |
+
+**What keeps it away**
+- Diagnostics build with `VICTORY_D3D12_DRED=1`: 0 of 4, and the picture is right.
+- `VKD3D_CONFIG=…,breadcrumbs_sync`, or `RADV_DEBUG=hang`, which serialise the GPU (0.2 fps).
+- In the release build, `VICTORY_DRED_DEVICE=both` lives only 1 time in 2, and that run's picture was almost white.
+
+**What it is not**
+- Not the texture sweep alone: with every sweep off (`VICTORY_SWEEP=0`), the save still loses the device.
+- Not a release-only code path: every `cfg(not(feature = "diagnostics"))` block was read, and all are equivalent.
+- Not a broken command: serialising the same commands avoids it.
+
+**Open hypotheses**
+- A missing GPU barrier, for example indirect arguments or descriptors written by one pass and read by the next.
+- A host resource freed or reused while the GPU still reads it.
+
+**Next step:** an allocation journal (`VICTORY_ALLOC_LOG=1`) that matches the fault address against buffers alive and recently freed. Details and every run are in [docs/journal.md](docs/journal.md) (entries of 25 Nov).
+
+**Why it matters:** it blocks fast writes, frames in flight (phase 3) and the open-world scene for measurements. Fixing it comes before any further speed work.
 
 ## 5. Working on this repository
 
