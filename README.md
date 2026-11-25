@@ -394,7 +394,8 @@ In roadmap order. Piece letters refer to [the target](#the-target-pieces-that-fi
 | Task | Piece | Owner | Branch | Status |
 |---|---|---|---|---|
 | S.1 Wrong reads / device loss, Jason as reproducer | D | maintainer | `s5-heap-sync` | **found**: slot writes during a submission; `VICTORY_SLOT_WAIT=1` holds 5 of 5 |
-| S.6 Host textures in pre-mapped heaps ([design](docs/design/s6-premapped-textures.md)); the proper form of the wait, needed for 3.1 | M, D, Q | maintainer | | **next** |
+| S.6 Host textures in pre-mapped heaps ([design](docs/design/s6-premapped-textures.md)); the proper form of the wait, needed for 3.1 | M, D, Q | maintainer | `s5-heap-sync` | **done**: `pool.rs`, on by default; no wait needed (5 of 5 against 8 of 8 lost), ~6 % faster |
+| S.8 Bound texture memory: 35,000 live textures, 12-14 GB after minutes in the world; an exact rule for letting go | T, L | maintainer | | next |
 | S.7 Prologue null fault (SQC, address 0): 1 of 6 prologue runs with the wait | L | maintainer | | watched |
 | S.5 Evaluate fxceless `a26859f` (descriptor mirroring) | D | maintainer | `s5-heap-sync` | **done**: ported (`VICTORY_HEAP_SYNC=1`, off); not the cause; the title copies ~225,000 records a frame as bytes |
 | S.4 Open-world baseline (Jason, `bench.sh --auto -p royale-save`) | G | maintainer | | unblocked: 2.1 fps, 477 ms a frame, ~13,000 draws (first figures) |

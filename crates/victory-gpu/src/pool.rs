@@ -18,8 +18,8 @@
 //!   only the pool still holds goes through `retire()`, and its block is
 //!   free again once the submissions running then have finished.
 //!
-//! `VICTORY_TEXTURE_POOL=1` turns it on; `VICTORY_TEXTURE_POOL_MB` sets the
-//! initial size (default 2,048).
+//! On by default (`VICTORY_TEXTURE_POOL=0` turns it off);
+//! `VICTORY_TEXTURE_POOL_MB` sets the initial size (default 4,096).
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -30,18 +30,19 @@ use windows::core::Interface;
 
 /// Bytes of one pool heap.
 const HEAP_BYTES: u64 = 256 << 20;
-/// The default placement alignment.
-const ALIGN: u64 = 64 << 10;
 /// Textures larger than this stay committed.
 const LARGEST: u64 = 64 << 20;
 
+/// On by default since 26 Nov 2026: with no slot wait, the open world held
+/// 5 of 5 with it and lost 8 of 8 without, at a shorter frame (406-453 ms
+/// against 469-489 with the wait). `VICTORY_TEXTURE_POOL=0`: off.
 pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_POOL").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_POOL").is_none_or(|v| v != "0"))
 }
 
 fn initial_mb() -> u64 {
-    std::env::var("VICTORY_TEXTURE_POOL_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2048)
+    std::env::var("VICTORY_TEXTURE_POOL_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4096)
 }
 
 struct PoolHeap {
@@ -72,8 +73,13 @@ static POOL: Mutex<Option<Pool>> = Mutex::new(None);
 /// Since the last frame line: textures placed, textures that fell back to
 /// committed memory (no ready room), blocks given back, heaps made; then,
 /// as levels, bytes in use and bytes in all heaps; then textures the pool
-/// does not take (no size from the driver, or larger than [`LARGEST`]).
-pub(crate) static STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+/// does not take (no size from the driver, or larger than [`LARGEST`]);
+/// then textures placed at the 4 KiB small-resource alignment.
+pub(crate) static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+/// Of the live textures at the last [`collect`]: how many have 0, 1, 2 and
+/// 3 or more references besides the pool's, and the microseconds it took.
+pub(crate) static REFS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
 /// Ready free space under which the next heap is made ahead of need.
 const HEADROOM: u64 = 1 << 30;
@@ -153,8 +159,20 @@ pub(crate) unsafe fn place(
     if !on() {
         return None;
     }
+    // Small textures may take 4 KiB alignment (D3D12's small-resource
+    // placement) instead of 64 KiB: most the title makes are small.
     // SAFETY: the caller's description.
-    let info = unsafe { device.GetResourceAllocationInfo(0, std::slice::from_ref(&*desc)) };
+    let mut small = unsafe { *desc };
+    small.Alignment = 4096;
+    // SAFETY: a description of ours.
+    let small_info = unsafe { device.GetResourceAllocationInfo(0, std::slice::from_ref(&small)) };
+    let (desc, info) = if small_info.Alignment == 4096 && small_info.SizeInBytes != u64::MAX {
+        STATS[7].fetch_add(1, Relaxed);
+        (&raw const small, small_info)
+    } else {
+        // SAFETY: the caller's description.
+        (desc, unsafe { device.GetResourceAllocationInfo(0, std::slice::from_ref(&*desc)) })
+    };
     if info.SizeInBytes == u64::MAX || info.SizeInBytes == 0 || info.SizeInBytes > LARGEST {
         STATS[6].fetch_add(1, Relaxed);
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -174,8 +192,8 @@ pub(crate) unsafe fn place(
         });
         return None;
     }
-    let align = info.Alignment.max(ALIGN);
-    let bytes = info.SizeInBytes.div_ceil(ALIGN) * ALIGN;
+    let align = info.Alignment.max(4096);
+    let bytes = info.SizeInBytes.div_ceil(align) * align;
     let (finished, started) = crate::host::submissions();
     let mut guard = pool();
     let pool = guard.get_or_insert_with(|| {
@@ -294,10 +312,28 @@ pub(crate) fn collect() {
     if !on() {
         return;
     }
+    // A pass over every live texture costs ~1 ms at 35,000 of them: at
+    // most every 250 ms, not at every submission.
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = crate::host::now_ms();
+    if now < LAST.load(Relaxed) + 250 {
+        return;
+    }
+    LAST.store(now, Relaxed);
     let dead: Vec<Freed> = {
         let mut guard = pool();
         let Some(pool) = guard.as_mut() else { return };
-        let (dead, live): (Vec<Live>, Vec<Live>) = std::mem::take(&mut pool.live).into_iter().partition(|l| others(&l.resource) == 0);
+        let started = std::time::Instant::now();
+        let mut refs = [0u64; 4];
+        let (dead, live): (Vec<Live>, Vec<Live>) = std::mem::take(&mut pool.live).into_iter().partition(|l| {
+            let n = others(&l.resource);
+            refs[(n as usize).min(3)] += 1;
+            n == 0
+        });
+        for (i, n) in refs.into_iter().enumerate() {
+            REFS[i].store(n, Relaxed);
+        }
+        REFS[4].store(started.elapsed().as_micros() as u64, Relaxed);
         pool.live = live;
         dead.into_iter().map(|l| Freed(Some(l.resource), l.heap, l.offset, l.bytes)).collect()
     };
@@ -314,6 +350,8 @@ pub(crate) fn pool_line(frames: f64) {
     }
     let [placed, fell_back, freed, heaps] = [0, 1, 2, 3].map(|i| STATS[i].swap(0, Relaxed));
     let refused = STATS[6].swap(0, Relaxed);
+    let small = STATS[7].swap(0, Relaxed);
+    let refs = REFS.each_ref().map(|a| a.load(Relaxed));
     let (used, all) = (STATS[4].load(Relaxed), STATS[5].load(Relaxed));
     let live = pool().as_ref().map_or(0, |p| p.live.len());
     tracing::info!(
@@ -324,6 +362,11 @@ pub(crate) fn pool_line(frames: f64) {
         freed as f64 / frames,
         used >> 20,
         all >> 20
+    );
+    tracing::info!(
+        "texture pool: {:.1} a frame at 4 KiB alignment; live textures by references besides the pool's: {} none, {} one, {} two, {} more; the last collect took {} us",
+        small as f64 / frames,
+        refs[0], refs[1], refs[2], refs[3], refs[4]
     );
 }
 

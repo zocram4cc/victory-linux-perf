@@ -4,6 +4,13 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**The texture pool on by default; what holds 35,000 textures**
+- 4 KiB small-resource alignment: 98 % of pool textures take it, yet use barely falls (12.3 GB for 34,700 textures, ~360 KB each on average). The bytes are real.
+- **Live textures by references besides the pool's** (`texture pool:` frame line): none with 0, ~12,000-13,000 with 1 (their title texture), ~22,000 with 2 (also a descriptor slot, which keeps its last view alive by design), ~930 with more. Nothing is given back because the title never lets these textures go, not because the count is wrong. The committed path holds the same set.
+- **New task (T/L): bound texture memory.** The live set grows as the world streams in (12-14 GB after a few minutes); a texture held only by its title texture and unread for a long time is the candidate, which is what the sweep does today by time. It needs an exact rule (rule 7), measured over a long run.
+- `collect` took ~1 ms per call over 35,000 textures, at every submission; now at most every 250 ms.
+- **Pool on by default** (`VICTORY_TEXTURE_POOL=0` turns it off; 4 GiB to start). The slot wait stays on as a safety net; it costs nothing measurable today, and goes once frames in flight need it gone.
+
 **S.6 confirmed: textures in pre-mapped heaps remove the device loss at its root, with no wait, and faster**
 - The first pool run (2 GiB, grown only when full) still lost 5 of 5: the pool filled, 16-60 textures a frame fell back to committed memory. A fault report placed the culprit in a 16 MB vkd3d block, not a pool heap.
 - Fixed: the pool grows ahead of need (a new heap when ready free space falls under 1 GiB) and counts every texture it does not take. With 8 GiB to start: 0 committed, 0 not taken.
