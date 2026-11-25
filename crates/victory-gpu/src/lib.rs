@@ -35,6 +35,7 @@ pub mod fence;
 pub mod frame;
 #[cfg(windows)]
 pub mod framelog;
+pub mod frametime;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
