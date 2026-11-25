@@ -691,6 +691,59 @@ fn max_and_min_order_negative_zero_below_positive_zero() {
     }
 }
 
+/// The ISA defines `v_med3_f32` over `v_min_f32`/`v_max_f32`, which order -0
+/// below +0 (the same order as [`max_and_min_order_negative_zero_below_positive_zero`]),
+/// so of three zeros the median is the sign two of them share. DXIL's plain
+/// FMin/FMax chain gives either zero.
+#[test]
+fn med3_orders_negative_zero_below_positive_zero() {
+    let (pz, nz) = (0_u32, 0x8000_0000_u32);
+    let f = f32::to_bits;
+    let cases: &[([u32; 4], u32)] = &[
+        ([nz, pz, nz, 0], nz),      // -0, +0, -0
+        ([pz, nz, pz, 0], pz),      // +0, -0, +0
+        ([nz, pz, pz, 0], pz),      // -0, +0, +0
+        ([pz, nz, nz, 0], nz),      // +0, -0, -0
+        ([nz, nz, nz, 0], nz),      // -0, -0, -0
+        ([pz, pz, pz, 0], pz),      // +0, +0, +0
+        ([nz, pz, f(1.0), 0], pz),  // -0 < +0 < 1
+        ([nz, f(-1.0), pz, 0], nz), // -1 < -0 < +0
+        ([pz, f(1.0), nz, 0], pz),  // -0 < +0 < 1
+    ];
+    let shader = build_valu_cs(&vop3(0x157, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+    run_cases(&shader, &inputs, |backend, i, inp, got| {
+        let want = cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_med3_f32({:#010x}, {:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1], inp[2],
+        );
+    });
+
+    // The same in halves: -0 is 0x8000, +0 is 0x0000 (VOP3 opcode 0x357).
+    let (hpz, hnz) = (0x0000_u32, 0x8000_u32);
+    let (h1, hn1) = (0x3C00_u32, 0xBC00_u32); // 1.0, -1.0
+    let cases16: &[([u32; 4], u32)] = &[
+        ([hnz, hpz, hnz, 0], hnz),
+        ([hpz, hnz, hpz, 0], hpz),
+        ([hnz, hpz, hpz, 0], hpz),
+        ([hpz, hnz, hnz, 0], hnz),
+        ([hnz, hpz, h1, 0], hpz),
+        ([hnz, hn1, hpz, 0], hnz),
+        ([hpz, h1, hnz, 0], hpz),
+    ];
+    let shader = build_valu_cs(&vop3(0x357, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let inputs: Vec<[u32; 4]> = cases16.iter().map(|c| c.0).collect();
+    run_cases(&shader, &inputs, |backend, i, inp, got| {
+        let want = cases16[i].1 as u16;
+        assert_eq!(
+            got as u16, want,
+            "{backend}: v_med3_f16({:#06x}, {:#06x}, {:#06x}) = {got:#06x}, want {want:#06x}",
+            inp[0], inp[1], inp[2],
+        );
+    });
+}
 /// The f16 forms go through the same `max_min` helper, after widening to f32.
 #[test]
 fn f16_max_and_min_order_negative_zero_below_positive_zero() {
