@@ -4,6 +4,7 @@ Qué se probó, qué salió y qué se decidió. Lo más nuevo va arriba.
 
 ## 2026-11-25
 
+- **Línea base de la escena A (`docs/baseline.md`).** 2,8 fps y 356 ms por frame, con menos del 1 % de variación entre tres ejecuciones. Las copias suman unos 130 ms por frame (215 MB de subida y 79 MB de vuelta), y la GPU está ocupada el 45 %.
 - **`warm --no-pipelines` con royale:** 25.700 traducidos y 58 rechazados (joshuu rechazaba 106) en 101 s. Termina sin colgarse.
 - **Imagen de royale (base joshuu), según el usuario.**
   - **Bien:** se ve muy completo. Aparecen las paredes de la habitación y cosas que en otros forks no salían, y muchas texturas se ven bien.
