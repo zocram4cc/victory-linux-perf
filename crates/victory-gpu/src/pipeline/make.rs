@@ -423,6 +423,7 @@ fn workers() -> bool {
             let screens_only = i >= workers;
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
+                .stack_size(victory_shader::emit::PIPELINE_STACK)
                 .spawn(move || {
                     // Below the title's own threads (loading, recording),
                     // and the streaming one, which is below normal itself
