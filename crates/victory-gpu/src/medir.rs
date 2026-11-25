@@ -34,3 +34,15 @@ pub fn add_remap(k: usize, n: u64) {
 pub(crate) fn take_remap() -> [u64; 5] {
     [0, 1, 2, 3, 4].map(|i| REMAP[i].swap(0, Relaxed))
 }
+
+/// `VICTORY_COPY_MODE`, for timing only (fase 0.5): 0 guarded copies (as
+/// always), 1 plain copies without the mapped-page guard (`plain`), 2 none
+/// at all (`none`: the picture is wrong). In any build.
+pub(crate) fn copy_mode() -> u8 {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_COPY_MODE").as_deref() {
+        Ok("plain") => 1,
+        Ok("none") => 2,
+        _ => 0,
+    })
+}

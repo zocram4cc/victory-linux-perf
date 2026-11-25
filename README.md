@@ -193,6 +193,7 @@ Cada tarea:
 | 1.4 | **Staging persistente** | `host.rs`: `upload`, `scratch`, `take_chunk` | Ring buffers de subida reutilizados, alineados a 64 KiB, sin crear y destruir recursos por frame. Medir primero si las asignaciones aparecen en `perf`. |
 | 1.5 | **Menos vistas en los alias** | `xmem.rs`: `map_alias` y `map` | Agrupar páginas contiguas en una sola vista cuando origen y destino son contiguos. En el censo del 24-nov la media era 1,0 páginas por llamada, así que primero hay que ver si joshuu lo cambió (`948e9d3`, `476a020`). Si no hay contigüidad, se descarta. |
 | 1.6 | **Texturas solo cuando cambian** | `texture.rs` | Comprobar con el *write watch* antes del *detile*, y no volver a detilar mips que no cambiaron. |
+| 1.7 | **Copias que llegan viejas (caras invisibles)** | `watch.rs`, `shadow.rs`, `texture.rs` | Con `INPLACE=1` las caras se ven, y con `PROBE+MEDIR` también (una sospecha de carrera, 25-nov). Pasos: (a) repetir `MEDIR=1` solo y `INPLACE_PROBE=1` solo para ver cuál cambia la imagen; (b) localizar qué draw dibuja la cabeza y qué rango de memoria lee; (c) comprobar si su copia en el host se actualiza tras la última escritura del título (diario de `watch`, alias de vistas). Es también un problema de corrección. |
 
 **Salida:**
 - En la escena A: preparación de menos de 40 ms y copia de vuelta de menos de 20 ms.
@@ -207,6 +208,14 @@ Cada tarea:
 **Estimación:** 5-10 días.
 
 #### 2.1 Qué permite la plataforma
+
+**Ya medido el 25-nov con la sonda** (ver `docs/baseline.md`):
+
+- La memoria privada en sitio funciona en vkd3d-proton con RADV: lectura, escritura, coherencia y *write watch*.
+- El *pool* de páginas por secciones no funciona: `SEC_RESERVE` se rechaza, y con `SEC_COMMIT` la GPU no ve las vistas.
+- Leer en sitio por PCIe (~27 GB/s) duplica el tiempo de GPU de la escena A.
+
+Lo que falta medir es lo siguiente.
 
 Hay que medirlo primero, con la prueba de la fase 0.5:
 
@@ -227,6 +236,8 @@ Con el censo de la fase 1.1:
 | Texturas con *tiling* de consola | VRAM, con *detile* | solo cuando cambian |
 
 #### 2.3 Rediseñar el *pool* de páginas de `xmem`
+
+> **Confirmado por la sonda:** las secciones no sirven. El *pool* para la GPU tiene que salir de memoria privada (o de VRAM), y el mapeo de páginas de la consola debe hacerse con *tiles* en la GPU.
 
 Es el trabajo más grande de esta fase.
 

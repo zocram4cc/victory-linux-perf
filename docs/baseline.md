@@ -31,6 +31,40 @@
 
 Los datos completos están en `bench/` (local).
 
-## Experimentos de techo (fase 0.5)
+## Experimentos de techo (fase 0.5), 25-nov-2026
 
-Pendientes.
+| Ejecución | fps | ms por frame | GPU | copias | Imagen (según el usuario) |
+|---|---|---|---|---|---|
+| base | 2,8 | 354 | 159 ms | 63 ms / 216 MB | cabezas invisibles, texturas que parpadean |
+| `COPY_MODE=none` | 2,8 | 359 | 160 | 64 / 220 | **no válida**: el switch solo funcionaba en la build de diagnóstico (arreglado en `medir::copy_mode`, hay que repetirla) |
+| `COPY_MODE=plain` | 2,8 | 360 | 160 | 64 / 223 | **no válida**, por lo mismo |
+| `INPLACE=1` | **1,6** | **638** | **396 ms** | 84 / 401 | **se ven las caras** (de espaldas bien; de frente negras); sin parpadeos. El usuario se movió un poco |
+| `INPLACE=2` | — | — | — | — | **pierde el dispositivo** al llegar al mundo (0x887A0005) |
+| `INPLACE_PROBE=1 MEDIR=1` | 2,7 | 369 | 159 | 67 / 230 | **caras de Lucía y de los demás bien**, texturas bien, un objeto algo negro |
+
+### Lo que dice la sonda (vkd3d-proton + RADV en este PC)
+
+- **`OpenExistingHeapFromAddress` y `…1` sobre memoria privada: funcionan.**
+  - La GPU lee lo que escribe la CPU sin ninguna llamada de por medio.
+  - La CPU lee lo que escribe la GPU, por copia y por UAV.
+  - El *write watch* sigue funcionando.
+  - El título puede seguir protegiendo y liberando sus páginas.
+  - Abrir 64 MB cuesta 8 ms.
+- **`OpenExistingHeapFromFileMapping`:**
+  - Rechaza las secciones `SEC_RESERVE`, que es como está hoy el *pool* de páginas.
+  - Acepta las `SEC_COMMIT`, pero **la GPU no ve los bytes de las vistas**, ni al leer ni al escribir.
+  - Conclusión: el *pool* actual no se puede abrir en sitio por secciones. Hay que rehacerlo.
+- **Ancho de banda:** la tarjeta copia 64 MB de memoria del sistema en 2,4 ms (~27 GB/s, PCIe).
+- **Coste real de `INPLACE=1`:** pone 340-360 MB de "ventanas" en sitio, y el tiempo de GPU pasa de 159 a 396 ms, porque los shaders leen por PCIe en lugar de VRAM.
+
+### Esperas del título (`VICTORY_MEDIR=1`)
+
+- 42 hilos. **Incluso el que menos espera pasa un 82 % del tiempo esperando**, casi todo en `title+0x2215eca` (los *workers* de trabajos).
+- Ninguna espera es sobre un fence de la GPU.
+- Encaja con lo medido el 24-nov: la CPU del título está ociosa y el frame lo marca la cadena de VIctory.
+
+### Conclusiones
+
+1. **Las caras no faltan por los shaders.** Con los datos leídos en sitio se ven, así que lo más probable es que las copias del host lleguen **viejas o incompletas**. Es un problema de coherencia de las copias, y también de corrección, no solo de velocidad.
+2. **La memoria del sistema en sitio no sirve para lo que la GPU lee mucho**: duplica el tiempo de GPU. La fase 2 tiene que llevar esos datos a VRAM (ReBAR o copia solo de lo que cambia), y dejar en sitio solo lo que se lee poco o lo que lee la CPU.
+3. **Que las caras se vean con `PROBE+MEDIR`, que no colocan nada en sitio, apunta a una carrera de tiempos.** `waitstat` cambia un poco el ritmo de las esperas. Hay que separar `MEDIR=1` y `INPLACE_PROBE=1` y repetir.
