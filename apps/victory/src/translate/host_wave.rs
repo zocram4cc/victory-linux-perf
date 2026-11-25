@@ -22,13 +22,19 @@ pub(crate) fn select(
 
 /// Both translate modes start their workers here. Set the explicit width
 /// before the worker can open the host, fingerprint a shader, or translate.
+/// The workers make host pipelines, and vkd3d-proton converts DXIL on the
+/// calling thread, recursively: they get the pipeline stack
+/// (`victory_shader::emit::PIPELINE_STACK`).
 pub(crate) fn spawn<'scope>(
     scope: &'scope std::thread::Scope<'scope, '_>,
     wave: Option<u32>,
     work: impl FnOnce() + Send + 'scope,
 ) {
-    scope.spawn(move || {
-        victory_shader::emit::set_thread_max_wave(wave);
-        work();
-    });
+    std::thread::Builder::new()
+        .stack_size(victory_shader::emit::PIPELINE_STACK)
+        .spawn_scoped(scope, move || {
+            victory_shader::emit::set_thread_max_wave(wave);
+            work();
+        })
+        .expect("a translation worker");
 }
