@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # bench.sh: repeatable measurements of a scene, from Linux, through the
-# victory-proton launcher (fase 0.3 of the README).
+# victory-proton launcher (phase 0.3 of the README).
 #
 #   scripts/bench.sh run [-l LABEL] [-s SECONDS] [-p PROFILE] [--keep] [VAR=VALUE ...]
 #       Launches the game with VICTORY_FRAMETIME_DUMP=1 (and VAR=VALUE...),
@@ -79,14 +79,14 @@ c = cols
 def g(k, f="mean"): return c.get(k, {}).get(f)
 line = lambda name, k, unit="": print(f"  {name:<22} {g(k):10.1f}{unit}   p95 {g(k,'p95'):8.1f}") if g(k) is not None else None
 print(f"{d}: {len(rows)} rows")
-for name, k, u in [("fps", "fps", ""), ("ms por frame", "ms_per_frame", " ms"), ("peor frame", "frame_ms_max", " ms"),
-                   ("preparar (CPU)", "cpu_prepare_ms", " ms"), ("GPU", "gpu_ms", " ms"), ("GPU ocupada", "gpu_pct", " %"),
-                   ("copias", "copies_ms", " ms"), ("copias MB", "copies_mb", " MB"), ("texturas", "textures_ms", " ms"),
-                   ("copia de vuelta", "copyback_ms", " ms"), ("copia de vuelta MB", "copyback_mb", " MB"),
-                   ("pasadas de hash", "card_passes", ""), ("CPU del proceso", "cpu_pct", " %")]:
+for name, k, u in [("fps", "fps", ""), ("ms per frame", "ms_per_frame", " ms"), ("worst frame", "frame_ms_max", " ms"),
+                   ("prepare (CPU)", "cpu_prepare_ms", " ms"), ("GPU", "gpu_ms", " ms"), ("GPU busy", "gpu_pct", " %"),
+                   ("copies", "copies_ms", " ms"), ("copies MB", "copies_mb", " MB"), ("textures", "textures_ms", " ms"),
+                   ("copy-back", "copyback_ms", " ms"), ("copy-back MB", "copyback_mb", " MB"),
+                   ("hash passes", "card_passes", ""), ("process CPU", "cpu_pct", " %")]:
     line(name, k, u)
 for k in ("game_cores", "wineserver_cores"):
-    if k in out: print(f"  {k:<22} {out[k]:10.2f} núcleos")
+    if k in out: print(f"  {k:<22} {out[k]:10.2f} cores")
 PY
 }
 
@@ -101,7 +101,7 @@ S = [json.load(open(os.path.join(d, "summary.json"))) for d in dirs]
 keys = ["fps", "ms_per_frame", "frame_ms_max", "cpu_prepare_ms", "gpu_ms", "gpu_pct", "copies_ms", "copies_mb",
         "textures_ms", "copyback_ms", "copyback_mb", "card_passes", "cpu_pct"]
 names = [os.path.basename(os.path.normpath(d)) for d in dirs]
-print("| medida | " + " | ".join(names) + " |")
+print("| measure | " + " | ".join(names) + " |")
 print("|---" * (len(dirs) + 1) + "|")
 for k in keys + ["game_cores", "wineserver_cores"]:
     vals = [(s["columns"].get(k, {}).get("mean") if k in s.get("columns", {}) else s.get(k)) for s in S]

@@ -1,5 +1,5 @@
 //! Measuring counters that cost nothing unless asked for (`VICTORY_MEDIR=1`,
-//! fase 0.4 of the README). Other crates add to them; the frametime dump
+//! phase 0.4 of the README). Other crates add to them; the frametime dump
 //! (`VICTORY_FRAMETIME_DUMP`) takes them per summary interval, so
 //! `scripts/bench.sh` sees them beside the frame's other buckets.
 
@@ -35,7 +35,7 @@ pub(crate) fn take_remap() -> [u64; 5] {
     [0, 1, 2, 3, 4].map(|i| REMAP[i].swap(0, Relaxed))
 }
 
-/// `VICTORY_COPY_MODE`, for timing only (fase 0.5): 0 guarded copies (as
+/// `VICTORY_COPY_MODE`, for timing only (phase 0.5): 0 guarded copies (as
 /// always), 1 plain copies without the mapped-page guard (`plain`), 2 none
 /// at all (`none`: the picture is wrong). In any build.
 pub(crate) fn copy_mode() -> u8 {

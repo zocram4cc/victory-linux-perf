@@ -1,85 +1,58 @@
-# Línea base
+# Baseline
 
-## Escena A (estática), commit `176cc10`, 25-nov-2026
+## Scene A (static), commit `176cc10`, 25 Nov 2026
 
-- **Equipo:** RX 7900 XT con RADV (Mesa 26.3.1), Ryzen 9 9900X, GE-Proton11-14, wineserver con árbol de vistas.
-- **Variables:** las del perfil `royale` (`VICTORY_SKIP_PIPELINES=fc5e66f8f873d3bb VICTORY_NO_WATCHDOG=1`, `VKD3D_CONFIG=descriptor_heap`).
-- **Caché:** traducciones calientes (`warm --no-pipelines`).
-- **Medida:** tres ejecuciones de 60 s (56 filas cada una). La variación de `ms_per_frame` es menor del 1 %.
+- **Machine:** RX 7900 XT with RADV (Mesa 26.3.1), Ryzen 9 9900X, GE-Proton11-14, wineserver with the view tree.
+- **Switches:** those of the `royale` profile: `VICTORY_SKIP_PIPELINES=fc5e66f8f873d3bb`, `VICTORY_NO_WATCHDOG=1`, `VKD3D_CONFIG=descriptor_heap`.
+- **Cache:** translations warm (`warm --no-pipelines`).
+- **Runs:** three of 60 s, 56 rows each. `ms_per_frame` varies by less than 1 %.
 
-| Medida | A1 | A1b | A3 | **Media** |
+| Measure | A1 | A1b | A3 | **Mean** |
 |---|---|---|---|---|
-| fps | 2,8 | 2,8 | 2,8 | **2,8** |
-| ms por frame | 354,3 | 355,3 | 358,3 | **356** |
-| peor frame | 363,0 | 363,5 | 365,8 | **364** |
-| preparar (CPU) | 123,9 | 123,0 | 124,8 | **124** |
-| · copias | 63,4 ms / 215,7 MB | 60,8 / 214,3 | 62,1 / 215,0 | **62 ms / 215 MB** |
-| · texturas | 4,0 | 3,9 | 3,8 | **4** |
-| GPU | 158,6 | 159,0 | 159,4 | **159** |
-| GPU ocupada | 45,1 % | 45,2 % | 44,9 % | **45 %** |
-| copia de vuelta | 67,2 ms / 78,3 MB | 68,8 / 77,9 | 69,5 / 80,6 | **68 ms / 79 MB** |
-| pasadas de hash | 558 | 559 | 558 | **558** |
-| CPU del juego | 1,4 núcleos | 1,4 | 1,3 | **1,4** |
-| CPU de wineserver | (sin medir) | 0,06 | 0,06 | **0,06** |
-| draws sin pipeline | ~340 | | | **~340** (constante: no es la caché) |
+| fps | 2.8 | 2.8 | 2.8 | **2.8** |
+| ms per frame | 354.3 | 355.3 | 358.3 | **356** |
+| worst frame | 363.0 | 363.5 | 365.8 | **364** |
+| prepare (CPU) | 123.9 | 123.0 | 124.8 | **124** |
+| · copies | 63.4 ms / 215.7 MB | 60.8 / 214.3 | 62.1 / 215.0 | **62 ms / 215 MB** |
+| · textures | 4.0 | 3.9 | 3.8 | **4** |
+| GPU | 158.6 | 159.0 | 159.4 | **159** |
+| GPU busy | 45.1 % | 45.2 % | 44.9 % | **45 %** |
+| copy-back | 67.2 ms / 78.3 MB | 68.8 / 77.9 | 69.5 / 80.6 | **68 ms / 79 MB** |
+| hash passes | 558 | 559 | 558 | **558** |
+| game CPU | 1.4 cores | 1.4 | 1.3 | **1.4** |
+| wineserver CPU | (not measured) | 0.06 | 0.06 | **0.06** |
+| draws without a host pipeline | ~340 | | | **~340** (constant: not the cache) |
 
-**Lectura:**
-- Las copias de subida y de vuelta suman unos **130 ms** de los 356 de cada frame (37 %).
-- En la "GPU" (159 ms) la tarjeta solo está ocupada el 45 %, así que lo demás es espera.
-- La CPU del juego no está saturada: 1,4 núcleos.
-- El wineserver parcheado ya no pesa: 0,06 núcleos.
+**What this means:**
+- Copies up and back take about **130 ms** of the 356 ms frame (37 %).
+- During the 159 ms "GPU" phase the card is busy only 45 % of the time; the rest is waiting.
+- The game's CPU is not saturated (1.4 cores).
+- The patched wineserver no longer matters (0.06 cores).
 
-Los datos completos están en `bench/` (local).
+The raw results are in `bench/`, which stays local.
 
-## Escena B (caminando 30 s), commit `b6660c1`, una ejecución
+## Scene B (walking 30 s), commit `b6660c1`, one run
 
-| fps | ms por frame | preparar | GPU | copias | copia de vuelta |
+| fps | ms per frame | prepare | GPU | copies | copy-back |
 |---|---|---|---|---|---|
-| 2,6 | 386 | 144 | 167 | 69 ms / 229 MB | 70 ms / 86 MB |
+| 2.6 | 386 | 144 | 167 | 69 ms / 229 MB | 70 ms / 86 MB |
 
-Moverse cuesta un 9 % más que la escena estática, por más copias. **Se ven las caras** (ver `memoria.md` §7). Faltan dos ejecuciones más para que cuente como línea base.
+Moving costs 9 % more than the static scene, because more is copied. Two more runs are needed before this counts as a baseline.
 
-## Experimentos de techo (fase 0.5), 25-nov-2026
+## Ceiling experiments (phase 0.5), 25 Nov 2026
 
-| Ejecución | fps | ms por frame | GPU | copias | Imagen (según el usuario) |
+| Run | fps | ms per frame | GPU | copies | Picture |
 |---|---|---|---|---|---|
-| base | 2,8 | 354 | 159 ms | 63 ms / 216 MB | cabezas invisibles, texturas que parpadean |
-| `COPY_MODE=none` | 2,8 | 359 | 160 | 64 / 220 | **no válida**: el switch solo funcionaba en la build de diagnóstico (arreglado en `medir::copy_mode`, hay que repetirla) |
-| `COPY_MODE=plain` | 2,8 | 360 | 160 | 64 / 223 | **no válida**, por lo mismo |
-| `INPLACE=1` | **1,6** | **638** | **396 ms** | 84 / 401 | **se ven las caras** (de espaldas bien; de frente negras); sin parpadeos. El usuario se movió un poco |
-| `INPLACE=2` | — | — | — | — | **pierde el dispositivo** al llegar al mundo (0x887A0005) |
-| `INPLACE_PROBE=1 MEDIR=1` | 2,7 | 369 | 159 | 67 / 230 | **caras de Lucía y de los demás bien**, texturas bien, un objeto algo negro |
-| `COPY_MODE=none` (repetida, ya válida) | **5,9** | **170** | 72 | 22 / 68 | pantalla negra (lo esperado); los mismos draws que la base (5.037) |
-| `COPY_MODE=plain` (repetida) | — | — | — | — | se cierra antes de la cinemática: lee una página *reserved, never committed* |
-| `MEDIR=1` solo | 2,8 | 358 | 160 | 62 / 216 | caras invisibles |
-| `INPLACE_PROBE=1` solo | 2,7 | 366 | 161 | 63 / 216 | caras invisibles |
+| baseline | 2.8 | 354 | 159 ms | 63 ms / 216 MB | no heads |
+| `COPY_MODE=none` | **5.9** | **170** | 72 | 22 / 68 | black (expected); same draws as the baseline (5,037) |
+| `COPY_MODE=plain` | — | — | — | — | crashes before the cutscene: reads a *reserved, never committed* page |
+| `INPLACE=1` (3 runs) | 1.6-2.0 | 503-638 | 285-396 | 84 / 401 | heads in 1 of 3 |
+| `INPLACE=2` | — | — | — | — | **device lost** on reaching the world (0x887A0005) |
+| `INPLACE_PROBE=1` + `MEDIR=1` (3 runs) | 2.7-2.8 | 361-369 | 159-160 | 63-67 / 215-230 | heads in 1 of 3 |
+| `MEDIR=1` | 2.8 | 358 | 160 | 62 / 216 | no heads |
+| `INPLACE_PROBE=1` | 2.7 | 366 | 161 | 63 / 216 | no heads |
+| no `fc5e66f8` skip (2 runs) | 2.8 | 353-356 | 159 | — | no heads, no GPU fault |
 
-### Lo que dice la sonda (vkd3d-proton + RADV en este PC)
+The first `COPY_MODE=none` and `plain` runs were invalid: the switch only worked in the diagnostics build. It is now `medir::copy_mode`, available in any build, and the runs above are the repeated ones.
 
-- **`OpenExistingHeapFromAddress` y `…1` sobre memoria privada: funcionan.**
-  - La GPU lee lo que escribe la CPU sin ninguna llamada de por medio.
-  - La CPU lee lo que escribe la GPU, por copia y por UAV.
-  - El *write watch* sigue funcionando.
-  - El título puede seguir protegiendo y liberando sus páginas.
-  - Abrir 64 MB cuesta 8 ms.
-- **`OpenExistingHeapFromFileMapping`:**
-  - Rechaza las secciones `SEC_RESERVE`, que es como está hoy el *pool* de páginas.
-  - Acepta las `SEC_COMMIT`, pero **la GPU no ve los bytes de las vistas**, ni al leer ni al escribir.
-  - Conclusión: el *pool* actual no se puede abrir en sitio por secciones. Hay que rehacerlo.
-- **Ancho de banda:** la tarjeta copia 64 MB de memoria del sistema en 2,4 ms (~27 GB/s, PCIe).
-- **Coste real de `INPLACE=1`:** pone 340-360 MB de "ventanas" en sitio, y el tiempo de GPU pasa de 159 a 396 ms, porque los shaders leen por PCIe en lugar de VRAM.
-
-### Esperas del título (`VICTORY_MEDIR=1`)
-
-- 42 hilos. **Incluso el que menos espera pasa un 82 % del tiempo esperando**, casi todo en `title+0x2215eca` (los *workers* de trabajos).
-- Ninguna espera es sobre un fence de la GPU.
-- Encaja con lo medido el 24-nov: la CPU del título está ociosa y el frame lo marca la cadena de VIctory.
-
-### Conclusiones
-
-El desarrollo de todo esto está en [memoria.md](memoria.md).
-
-
-1. **Las caras no faltan por los shaders.** Con los datos leídos en sitio se ven, así que lo más probable es que las copias del host lleguen **viejas o incompletas**. Es un problema de coherencia de las copias, y también de corrección, no solo de velocidad.
-2. **La memoria del sistema en sitio no sirve para lo que la GPU lee mucho**: duplica el tiempo de GPU. La fase 2 tiene que llevar esos datos a VRAM (ReBAR o copia solo de lo que cambia), y dejar en sitio solo lo que se lee poco o lo que lee la CPU.
-3. **Que las caras se vean con `PROBE+MEDIR`, que no colocan nada en sitio, apunta a una carrera de tiempos.** `waitstat` cambia un poco el ritmo de las esperas. Hay que separar `MEDIR=1` y `INPLACE_PROBE=1` y repetir.
+The analysis is in [memory.md](memory.md).

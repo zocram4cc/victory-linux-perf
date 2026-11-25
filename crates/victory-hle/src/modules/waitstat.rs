@@ -1,5 +1,5 @@
 //! The title's waits, timed by thread and by the title address that called
-//! them, logged every 5 s (`VICTORY_MEDIR=1`, fase 0.4 of the README). A
+//! them, logged every 5 s (`VICTORY_MEDIR=1`, phase 0.4 of the README). A
 //! wait on an event the title gave `SetEventOnCompletion` is tagged
 //! `[fence]`: time the title spends waiting for the GPU.
 #![allow(non_snake_case)]

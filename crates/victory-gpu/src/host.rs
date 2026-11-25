@@ -5317,7 +5317,7 @@ impl Batch {
 /// tables to the region's end), which made copies run at 100-200 MB/s.
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
     // `VICTORY_COPY_MODE` (timing only) works in any build: the ceiling
-    // experiments of fase 0.5 run on the release build they compare with.
+    // experiments of phase 0.5 run on the release build they compare with.
     match crate::medir::copy_mode() {
         1 => {
             // SAFETY: timing only: the caller vouches for the source.
