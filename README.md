@@ -319,7 +319,7 @@ The correctness items that block speed work moved to **phase S** (above). What i
 
 ## Known blocker: timing-dependent device loss
 
-> **Cause found (25 Nov, late).** Host descriptor slots were written into the shader-visible heap while a submission ran on the GPU. `VICTORY_SLOT_WAIT=1` makes those writes wait: the open-world save holds **5 of 5** with the right picture, and fast writes hold too (3 of 3). Details below, under *Resolution*; the history is kept because it shows what was ruled out.
+> **Cause found (25 Nov, late).** Host descriptor slots were written into the shader-visible heap while a submission ran on the GPU. `VICTORY_SLOT_WAIT` (now on by default) makes those writes wait: the open-world save holds **5 of 5** with the right picture, and fast writes hold too (3 of 3). Details below, under *Resolution*; the history is kept because it shows what was ruled out.
 
 **Symptom**
 - The GPU faults: `radv: GPUVM fault detected at address 0x8003…`. The kernel shows `[gfxhub] page fault`, client TCP (a shader memory read).
@@ -394,8 +394,8 @@ In roadmap order. Piece letters refer to [the target](#the-target-pieces-that-fi
 | Task | Piece | Owner | Branch | Status |
 |---|---|---|---|---|
 | S.1 Wrong reads / device loss, Jason as reproducer | D | maintainer | `s5-heap-sync` | **found**: slot writes during a submission; `VICTORY_SLOT_WAIT=1` holds 5 of 5 |
-| S.6 Stage host slot writes at submission boundaries (the proper form of the wait; needed for 3.1) | D, Q | maintainer | | next |
-| S.7 Prologue null fault (SQC, address 0) seen once with the wait | L | maintainer | | measuring |
+| S.6 Host textures in pre-mapped heaps ([design](docs/design/s6-premapped-textures.md)); the proper form of the wait, needed for 3.1 | M, D, Q | maintainer | | **next** |
+| S.7 Prologue null fault (SQC, address 0): 1 of 6 prologue runs with the wait | L | maintainer | | watched |
 | S.5 Evaluate fxceless `a26859f` (descriptor mirroring) | D | maintainer | `s5-heap-sync` | **done**: ported (`VICTORY_HEAP_SYNC=1`, off); not the cause; the title copies ~225,000 records a frame as bytes |
 | S.4 Open-world baseline (Jason, `bench.sh --auto -p royale-save`) | G | maintainer | | unblocked: 2.1 fps, 477 ms a frame, ~13,000 draws (first figures) |
 | S.2 Exact lifetimes for host copies | L | *open* | | after S.1 |

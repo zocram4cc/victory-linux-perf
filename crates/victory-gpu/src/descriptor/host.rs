@@ -2264,7 +2264,7 @@ fn twin_uav(
 }
 
 /// Host slots written while a submission ran, writes that waited for it
-/// (`VICTORY_SLOT_WAIT=1`), and waits that gave up after 2 s; since the
+/// (`VICTORY_SLOT_WAIT`, on by default), and waits that gave up after 2 s; since the
 /// last frame line (`slot_line`).
 pub(crate) static SLOT_WRITES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
@@ -2273,8 +2273,8 @@ pub(crate) static SLOT_WRITES: [std::sync::atomic::AtomicU64; 4] = [const { std:
 /// after it was submitted, whose page-table update only the next
 /// submission waits for (device-loss hunt: the faults land at offset 0 of
 /// textures made ~2 s before the loss is reported, and the address is
-/// mapped). `VICTORY_SLOT_WAIT=1`: the write waits until no submission
-/// runs (at most 2 s). Always counted.
+/// mapped). The write waits until no submission runs (at most 2 s);
+/// `VICTORY_SLOT_WAIT=0` turns that off. Always counted.
 fn slot_wait() {
     use std::sync::atomic::Ordering::Relaxed;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -2283,7 +2283,10 @@ fn slot_wait() {
         return;
     }
     SLOT_WRITES[1].fetch_add(1, Relaxed);
-    if !*ON.get_or_init(|| std::env::var_os("VICTORY_SLOT_WAIT").is_some_and(|v| v == "1")) {
+    // On by default since 25 Nov 2026: open world 5 of 5 held (4 of 6
+    // lost without), prologue 3 of 3 (1 of 3 lost without), no measured
+    // cost. `VICTORY_SLOT_WAIT=0`: off.
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_SLOT_WAIT").is_none_or(|v| v != "0")) {
         return;
     }
     SLOT_WRITES[2].fetch_add(1, Relaxed);
@@ -2304,7 +2307,7 @@ pub(crate) fn slot_line(frames: f64) {
         return;
     }
     tracing::info!(
-        "host slots written per frame: {:.0}, {:.1} while a submission ran; {:.1} waited for it (VICTORY_SLOT_WAIT=1), {gave_up} gave up after 2 s",
+        "host slots written per frame: {:.0}, {:.1} while a submission ran; {:.1} waited for it (VICTORY_SLOT_WAIT, on), {gave_up} gave up after 2 s",
         all as f64 / frames,
         during as f64 / frames,
         waited as f64 / frames,

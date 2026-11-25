@@ -4,6 +4,13 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-25
 
+**`VICTORY_SLOT_WAIT` on by default; the prologue had the bug too; S.6 designed**
+- **Open world:** 5 of 5 held with the wait (`bench/trials-20261125-232200-slot-wait5` makes the fifth). Fast writes with the wait: 3 of 3 held (they lost the device before), but no gain in the open world (2.03-2.15 fps against 2.10), so they stay off.
+- **Prologue, 3 runs each:** without the wait 1 of 3 lost, with a TCP fault on a texture (the S.1 kind); with the wait 0 of 3. Frame 358-364 ms with the wait against 359-372 without: no measured cost. Both sets of windows are marked `invalid` because the intro cutscene pulls the draws down during the window, so this is a rough comparison.
+- **On by default** from here (`VICTORY_SLOT_WAIT=0` turns it off), per the rule that a switch becomes the default when it wins.
+- **New, rare (S.7):** one prologue run with the wait lost the device on a different fault: **SQC (scalar data) reading address 0**, right after the sweep let ~5,000 texture copies go. 1 of 6 prologue runs with the wait. Not the S.1 mechanism (a null pointer, not a fresh texture). Watched; next step when it repeats is `VKD3D_CONFIG=fault` on it.
+- **S.6 designed** ([design/s6-premapped-textures.md](design/s6-premapped-textures.md)): the wait does not survive frames in flight, and staging writes at submission boundaries is not enough either. The race is between a fresh memory mapping and GPU work sent before it. Host textures placed in heaps mapped ahead of time remove it in any submission model, and are the first piece of memory the layer owns (piece M).
+
 **S.1 found: host descriptor slots written while the GPU runs (`VICTORY_SLOT_WAIT=1` holds the open world, 4 of 4)**
 - **`VICTORY_LEAK_ALL=1`** (new: every resource and host descriptor heap the layer makes is held forever, `crate::host::pin` at all 18 creation sites): still **4 of 4 lost**. No title heap with a host heap was released in any run. So the invalid memory is not a use-after-free of anything we make (`bench/trials-20261125-225445-leak-all`).
 - **VRAM is not short:** sampled every 0.5 s through a losing run, at most 8,252 of 20,464 MiB of VRAM and 4,344 MiB of GTT.
