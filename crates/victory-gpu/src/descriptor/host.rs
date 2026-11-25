@@ -4307,6 +4307,25 @@ mod tests {
         assert_ne!(crate::descriptor::view_and_key(handle).unwrap().1, key);
     }
 
+    /// What the buffer pass mirrors is not handed back to it as changed: a
+    /// buffer slot made with `record_change` false leaves `buffer_changes`
+    /// empty, so the pass does not look at it again on the next frame; a
+    /// slot written by the title (`record_change` true) is listed.
+    #[test]
+    fn buffer_slots_the_buffer_pass_made_are_not_changed_again() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        // A structured buffer view: 10 elements of 16 bytes.
+        let mut desc = [0u32; 16];
+        (desc[1], desc[6], desc[7]) = (1, 10, 16);
+        let view = View::Placed(false, [1, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0], desc);
+        assert!(heap.note_buffer_checked(3, Some(&view), true, None, false, None).is_ok());
+        assert!(heap.buffer_changes().is_empty());
+        assert!(heap.note_buffer_checked(4, Some(&view), false, None, true, None).is_ok());
+        assert_eq!(heap.buffer_changes(), [4]);
+    }
+
     /// `VICTORY_STALE_TEXTURES=0`: nothing is ever stale, and a view that
     /// overlaps others is left out of the spans, as before.
     #[test]
