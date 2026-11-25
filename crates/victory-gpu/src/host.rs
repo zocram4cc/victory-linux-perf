@@ -3177,7 +3177,11 @@ impl Host {
                         let Some((_, Some(before), size)) = r.shadow.card_sides() else {
                             continue;
                         };
-                        let constants = [r.span.first, r.span.skew, size as u32, r.span.pieces, r.at * 4, if flown { 2 } else { 1 }];
+                        // `2` also stores the hashes: with the copy-back on its own thread, and
+                        // with `VICTORY_F1_CARD_MERGE` (merged pieces are not all sent up again:
+                        // `Shadow::card_merge`).
+                        let mode = if flown || crate::shadow::f1_card_merge() { 2 } else { 1 };
+                        let constants = [r.span.first, r.span.skew, size as u32, r.span.pieces, r.at * 4, mode];
                         list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
@@ -5775,6 +5779,7 @@ impl Meter {
         // buckets above and the worst/mean frame measured at each present.
         let (frame_ms_max, frame_ms_avg, _timed) = crate::frametime::take_interval();
         let remap = crate::medir::take_remap();
+        let own = [0, 1].map(|i| crate::shadow::OWN_STATS[i].swap(0, Ordering::Relaxed));
         crate::frametime::record(&crate::frametime::Row {
             frame: crate::queue::frame_count(),
             frames,
@@ -5817,6 +5822,8 @@ impl Meter {
                 + remap[crate::medir::BOOKS_US] as f64 / frames / 1e3,
             maps: remap[crate::medir::MAPS] as f64 / frames,
             unmaps: remap[crate::medir::UNMAPS] as f64 / frames,
+            own_skip_mb: own[0] as f64 / frames / 1e6,
+            own_copy_mb: own[1] as f64 / frames / 1e6,
         });
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();

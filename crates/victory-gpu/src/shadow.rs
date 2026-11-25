@@ -71,6 +71,9 @@ pub(crate) struct Shadow {
     card: Option<Card>,
     /// A window of title memory outside buffers, not a title buffer's copy.
     window: bool,
+    /// With [`f1_own`]: title pages (64 KiB page numbers) this copy wrote
+    /// into title memory since it last refreshed them.
+    own: Mutex<std::collections::BTreeSet<usize>>,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
     /// heap opened on the title memory itself, so shaders read and write
     /// the title's own bytes and nothing is copied either way. The heap,
@@ -134,6 +137,32 @@ struct Card {
 /// ranges declared as written. A write outside them is seen by later
 /// shaders, as before, and goes back to the title the next time a declared
 /// range holds its piece (before: never).
+/// `VICTORY_F1_CARD_MERGE=1` (phase 1): after a copy in the card's memory
+/// is merged into title memory, only the bytes where the merge kept the
+/// title's bytes go back up to the card (the card already holds what its
+/// shaders wrote), and the compare after the lists stores the hashes it
+/// makes, so the pieces that did not go back up are not found differing
+/// again. Off by default until measured.
+pub(crate) fn f1_card_merge() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_F1_CARD_MERGE").is_some_and(|v| v == "1"))
+}
+
+/// `VICTORY_F1_OWN=1` (phase 1): pages a copy wrote into title memory
+/// itself (what shaders wrote, put back) are reported as written by the
+/// next write-watch asking or guard, like a write of the title's. The
+/// next refresh compares such a page with title memory instead of copying
+/// it again, and leaves it (and the card side) alone when nothing else
+/// changed it. Off by default until measured.
+fn f1_own() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_F1_OWN").is_some_and(|v| v == "1"))
+}
+
+/// With [`f1_own`]: bytes of refreshes found already current by the
+/// compare (not copied), and bytes compared that had changed (copied).
+pub(crate) static OWN_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 pub(crate) fn cards() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_BUFFERS").is_none_or(|v| v != "0"))
@@ -1720,6 +1749,7 @@ impl Shadow {
             card: None,
             window: false,
             place: None,
+            own: Mutex::default(),
         }
     }
 
@@ -1951,6 +1981,7 @@ impl Shadow {
                 if differs != 0 {
                     crate::watch::writing(start + at, n);
                     crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                    self.note_own(start + at, n);
                     written += n;
                 }
             }
@@ -2040,6 +2071,7 @@ impl Shadow {
         }
         crate::watch::writing(start + at, n);
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        self.note_own(start + at, n);
         n
     }
 
@@ -2447,10 +2479,75 @@ impl Shadow {
         bytes
     }
 
+    /// With [`f1_own`]: title memory `[at, at + n)` was written by this
+    /// copy (a write-back): its pages are compared at the next refresh.
+    fn note_own(&self, at: usize, n: usize) {
+        if !f1_own() || n == 0 {
+            return;
+        }
+        self.own.lock().unwrap_or_else(|e| e.into_inner()).extend(at / PAGE..(at + n).div_ceil(PAGE));
+    }
+
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
+    /// With [`f1_own`], pages this copy wrote back itself are compared
+    /// first, and only copied if title memory differs from the copy there.
+    /// Returns the bytes copied.
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
+        if f1_own() && from < to {
+            let pages: Vec<usize> = {
+                let mut own = self.own.lock().unwrap_or_else(|e| e.into_inner());
+                let pages: Vec<usize> = own.range(from / PAGE..to.div_ceil(PAGE)).copied().collect();
+                for page in &pages {
+                    own.remove(page);
+                }
+                pages
+            };
+            if !pages.is_empty() {
+                return self.copy_comparing(from, to, &pages);
+            }
+        }
+        self.copy_plain(from, to)
+    }
+
+    /// [`Shadow::copy`] of `[from, to)` (inside the buffer) where `pages`
+    /// (in order) were written back by this copy: those are read and
+    /// compared with the copy, and left alone where equal (the copy, and
+    /// its card side, already hold them); the rest is copied.
+    fn copy_comparing(&self, from: usize, to: usize, pages: &[usize]) -> usize {
+        let start = self.start as usize;
+        let mut title = vec![0u8; PAGE];
+        let (mut at, mut bytes) = (from, 0);
+        for &page in pages {
+            let (lo, hi) = ((page * PAGE).max(from), ((page + 1) * PAGE).min(to));
+            if lo >= hi {
+                continue;
+            }
+            if at < lo {
+                bytes += self.copy_plain(at, lo);
+            }
+            let title = &mut title[..hi - lo];
+            // SAFETY: inside the mapping; this range is refreshed, not
+            // being written by shaders.
+            let held = unsafe { std::slice::from_raw_parts(self.data.add(lo - start), hi - lo) };
+            if crate::host::read_into(lo as *const u8, title) && title == held {
+                OWN_STATS[0].fetch_add((hi - lo) as u64, Ordering::Relaxed);
+            } else {
+                OWN_STATS[1].fetch_add((hi - lo) as u64, Ordering::Relaxed);
+                bytes += self.copy_plain(lo, hi);
+            }
+            at = hi;
+        }
+        if at < to {
+            bytes += self.copy_plain(at, to);
+        }
+        bytes
+    }
+
+    /// Copies title memory `[from, to)` (inside the buffer) into the copy.
+    fn copy_plain(&self, from: usize, to: usize) -> usize {
+        let start = self.start as usize;
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
@@ -2568,12 +2665,25 @@ impl Shadow {
             if differs != 0 {
                 crate::watch::writing(start + at, n);
                 crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                self.note_own(start + at, n);
                 written = n;
+            }
+            if f1_card_merge() {
+                // The card's side holds what its shaders wrote, and the
+                // compare stored its hash: only where the merge kept the
+                // title's bytes does it need them sent up.
+                for (r, m) in changed_runs(title, gpu) {
+                    self.card_changed(at + r, at + r + m);
+                }
+                return written;
             }
         } else {
             // Title memory is not mapped there: the copy keeps what the
             // card wrote, as before.
             old.copy_from_slice(gpu);
+            if f1_card_merge() {
+                return written;
+            }
         }
         // The card's side and its "before" take the result.
         self.card_changed(at, at + n);
@@ -2643,6 +2753,7 @@ impl Shadow {
         }
         crate::watch::writing(start + at, n);
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        self.note_own(start + at, n);
         n
     }
 }

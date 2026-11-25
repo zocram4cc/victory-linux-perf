@@ -279,6 +279,7 @@ Today the chain is: console shader → DXIL → dxil-spirv → SPIR-V → RADV, 
 | Task | Owner | Branch | Status |
 |---|---|---|---|
 | 1.1 Memory census | maintainer | `p1.1-census` | in progress |
+| 1.2/1.3 Stop re-copying our own write-back (`VICTORY_F1_OWN`, `VICTORY_F1_CARD_MERGE`) | maintainer | `p1.1-census` | built, to measure |
 | 1.2 Cheaper write tracking | maintainer | | after 1.1 |
 | 1.3 Copy back only what the CPU reads | maintainer | | after 1.1 |
 | 0.B Baseline on a second machine (7800X3D, RX 7900 XTX, 32 GB) | collaborator (suggested) | | first task: learn the flow, second data point |
