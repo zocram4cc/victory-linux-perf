@@ -25,9 +25,20 @@ die() { printf '\e[1;31mbench:\e[0m %s\n' "$*" >&2; exit 1; }
 say() { printf '\e[1;36mbench:\e[0m %s\n' "$*" >&2; }
 
 game_pid() { pgrep -f '^Z:.*release.victory\.exe run' | head -n1; }
-server_pid() { pgrep -f 'wineserver|viewtree' | while read -r p; do
-    [[ $(cat "/proc/$p/comm" 2>/dev/null) == *wineserver* || $(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null) == *viewtree* ]] && { echo "$p"; break; }
-done; }
+# The wineserver the game uses: the process whose executable is a
+# wineserver (Proton's, or the patched *-viewtree build).
+server_pid() {
+    local p exe
+    for p in $(pgrep -f 'wineserver|viewtree'); do
+        exe=$(readlink "/proc/$p/exe" 2>/dev/null) || continue
+        [[ $exe == */wineserver || $exe == *-viewtree ]] && { echo "$p"; return; }
+    done
+}
+# VICTORY_*/VKD3D_*/RADV_* the game runs with, from its own environment.
+game_env() {
+    [[ -r /proc/$1/environ ]] || return 0
+    tr '\0' '\n' <"/proc/$1/environ" | grep -E '^(VICTORY_|VKD3D_|RADV_|WINEFSYNC|DXVK_)' || true
+}
 # utime + stime of a process, in clock ticks.
 ticks() { [[ -n ${1:-} && -r /proc/$1/stat ]] || { echo 0; return; }; awk '{print $14 + $15}' "/proc/$1/stat"; }
 
@@ -125,6 +136,7 @@ measure() {
     say "measuring ${secs} s..."
     sleep "$secs"
     local g1 s1 t1; g1=$(ticks "$pid"); s1=$(ticks "$srv"); t1=$(date +%s.%N)
+    game_env "$pid" >"$OUT_ROOT/.env"
     game_pid >/dev/null || die "the game closed during the window"
     mkdir -p "$dir"
     { grep '^#' "$csv" || true; head -n "$(grep -n '^t_ms' "$csv" | head -n1 | cut -d: -f1)" "$csv" | tail -n1; tail -n +"$((csv0 + 1))" "$csv"; } >"$dir/frametime.csv"
@@ -135,7 +147,7 @@ json.dump({
   "label": "$label", "profile": "$profile", "seconds_measured": $t1 - $t0,
   "commit": "$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null)",
   "dirty": $( [[ -n $(git -C "$ROOT" status --porcelain 2>/dev/null) ]] && echo True || echo False ),
-  "switches": {k: v for k, v in os.environ.items() if k.startswith(("VICTORY_", "VKD3D_", "VP_", "RADV_"))},
+  "switches": dict(l.rstrip("\\n").split("=", 1) for l in open("$OUT_ROOT/.env") if "=" in l),
   "game_ticks": $g1 - $g0, "wineserver_ticks": $s1 - $s0,
   "log": "$log",
 }, open(sys.argv[1], "w"), indent=1)
