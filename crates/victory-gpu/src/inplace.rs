@@ -257,6 +257,7 @@ pub(crate) fn place(device: &ID3D12Device, heap: &ID3D12Heap, offset: u64, size:
     let flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     // SAFETY: plain creation in a live heap.
     unsafe { device.CreatePlacedResource(heap, offset, &buffer_desc(size, flags), D3D12_RESOURCE_STATE_COMMON, None, &mut placed)? };
+    crate::host::pin(&placed);
     placed.ok_or_else(windows::core::Error::empty)
 }
 
@@ -524,6 +525,7 @@ impl Rig {
             self.device
                 .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer_desc(size, D3D12_RESOURCE_FLAG_NONE), state, None, &mut buffer)?
         };
+        crate::host::pin(&buffer);
         buffer.ok_or_else(windows::core::Error::empty)
     }
 
@@ -593,6 +595,7 @@ impl Rig {
         unsafe {
             self.device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer_desc(bytes, D3D12_RESOURCE_FLAG_NONE), D3D12_RESOURCE_STATE_COMMON, None, &mut to)?
         };
+        crate::host::pin(&to);
         let to = to.ok_or_else(windows::core::Error::empty)?;
         let mut best = f64::MAX;
         for _ in 0..3 {

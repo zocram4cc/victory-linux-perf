@@ -486,6 +486,7 @@ fn twin_texture(
             &mut texture,
         )
     };
+    crate::host::pin(&texture);
     if let Err(e) = made {
         tracing::warn!(error = %e, desc = ?d, "no colour twin for a depth texture");
     }
@@ -549,6 +550,7 @@ fn twin_texture(
                 &mut texture,
             )
         };
+        crate::host::pin(&texture);
         if let Err(e) = made {
             tracing::warn!(error = %e, desc = ?d, "no twin for a depth plane");
         }
@@ -1704,6 +1706,7 @@ fn host_texture(
             &mut texture,
         )
     };
+    crate::host::pin(&texture);
     if let Err(e) = made {
         tracing::warn!(error = %e, desc = ?d, "no host texture");
     }
@@ -3169,6 +3172,7 @@ mod tests {
                         &mut made,
                     )
                     .unwrap();
+                    crate::host::pin(&made);
             }
             made.unwrap()
         };
@@ -3206,6 +3210,7 @@ mod tests {
                         &mut made,
                     )
                     .unwrap();
+                    crate::host::pin(&made);
             }
             made.unwrap()
         };

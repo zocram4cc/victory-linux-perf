@@ -730,6 +730,8 @@ impl HostHeap {
                 return None;
             }
         };
+        // `VICTORY_LEAK_ALL=1`: the heap is never freed (device-loss hunt).
+        crate::host::pin(&Some(heap.clone()));
         // SAFETY: a live heap.
         let (cpu, step) = unsafe {
             (
@@ -2261,9 +2263,58 @@ fn twin_uav(
     Some(desc)
 }
 
+/// Host slots written while a submission ran, writes that waited for it
+/// (`VICTORY_SLOT_WAIT=1`), and waits that gave up after 2 s; since the
+/// last frame line (`slot_line`).
+pub(crate) static SLOT_WRITES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// A host slot is written into a shader-visible heap that work already on
+/// the GPU may read. If that work reads the slot, it sees a resource made
+/// after it was submitted, whose page-table update only the next
+/// submission waits for (device-loss hunt: the faults land at offset 0 of
+/// textures made ~2 s before the loss is reported, and the address is
+/// mapped). `VICTORY_SLOT_WAIT=1`: the write waits until no submission
+/// runs (at most 2 s). Always counted.
+fn slot_wait() {
+    use std::sync::atomic::Ordering::Relaxed;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    SLOT_WRITES[0].fetch_add(1, Relaxed);
+    if crate::host::running() == 0 {
+        return;
+    }
+    SLOT_WRITES[1].fetch_add(1, Relaxed);
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_SLOT_WAIT").is_some_and(|v| v == "1")) {
+        return;
+    }
+    SLOT_WRITES[2].fetch_add(1, Relaxed);
+    let started = std::time::Instant::now();
+    while crate::host::running() > 0 {
+        if started.elapsed() > std::time::Duration::from_secs(2) {
+            SLOT_WRITES[3].fetch_add(1, Relaxed);
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_micros(100));
+    }
+}
+
+/// With the frame line: what [`slot_wait`] saw per frame.
+pub(crate) fn slot_line(frames: f64) {
+    let [all, during, waited, gave_up] = [0, 1, 2, 3].map(|i| SLOT_WRITES[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    if all == 0 {
+        return;
+    }
+    tracing::info!(
+        "host slots written per frame: {:.0}, {:.1} while a submission ran; {:.1} waited for it (VICTORY_SLOT_WAIT=1), {gave_up} gave up after 2 s",
+        all as f64 / frames,
+        during as f64 / frames,
+        waited as f64 / frames,
+    );
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
+    slot_wait();
     let host = host()?;
     let device = &host.device;
     match view {
@@ -2531,6 +2582,7 @@ fn magenta() -> Option<&'static ID3D12Resource> {
                         &mut texture,
                     )
                     .ok()?;
+                    crate::host::pin(&texture);
                 let texture = texture?;
                 texture.Map(0, None, None).ok()?;
                 let texel = [255u8, 0, 255, 255];

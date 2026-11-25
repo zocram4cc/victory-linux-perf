@@ -287,6 +287,7 @@ fn read_back_of(
                 &mut buffer,
             )
             .ok()?;
+            crate::host::pin(&buffer);
         let buffer = buffer?;
         let to = D3D12_TEXTURE_COPY_LOCATION {
             pResource: std::mem::transmute_copy(&buffer),
@@ -753,6 +754,7 @@ pub(crate) fn probe(
                 &mut buffer,
             )
             .ok()?;
+            crate::host::pin(&buffer);
         let buffer = buffer?;
         for i in 0..GRID * GRID {
             let (x, y) = (

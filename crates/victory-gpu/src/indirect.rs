@@ -577,6 +577,7 @@ void main() {
                         &mut buffer,
                     )
                     .unwrap();
+                    crate::host::pin(&buffer);
                 let buffer = buffer.unwrap();
                 buffer.Map(0, None, Some(&mut data)).unwrap();
                 let gpu = buffer.GetGPUVirtualAddress();
@@ -617,6 +618,7 @@ void main() {
                         &mut buffer,
                     )
                     .unwrap();
+                    crate::host::pin(&buffer);
             }
             buffer.unwrap()
         }

@@ -285,6 +285,19 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
 #[cfg(windows)]
 impl Drop for Heap {
     fn drop(&mut self) {
+        // The host heap behind it goes with it, at once: its descriptor heap
+        // and the resources its slots hold, with no fence waited for
+        // (device-loss hunt, README "Known blocker").
+        #[cfg(windows)]
+        if let Some(Some(host)) = self.host.get() {
+            tracing::info!(
+                target: "victory_gpu::heap",
+                count = host.count(),
+                start = format_args!("{:#x}", self.start),
+                running = crate::host::running(),
+                "a title heap with a host heap is released"
+            );
+        }
         let at = std::ptr::from_ref::<Heap>(self) as usize;
         let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);

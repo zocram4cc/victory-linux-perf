@@ -4,6 +4,27 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-25
 
+**S.1 found: host descriptor slots written while the GPU runs (`VICTORY_SLOT_WAIT=1` holds the open world, 4 of 4)**
+- **`VICTORY_LEAK_ALL=1`** (new: every resource and host descriptor heap the layer makes is held forever, `crate::host::pin` at all 18 creation sites): still **4 of 4 lost**. No title heap with a host heap was released in any run. So the invalid memory is not a use-after-free of anything we make (`bench/trials-20261125-225445-leak-all`).
+- **VRAM is not short:** sampled every 0.5 s through a losing run, at most 8,252 of 20,464 MiB of VRAM and 4,344 MiB of GTT.
+- **`VKD3D_CONFIG=fault` names the faulting resource** (vkd3d's address-binding tracker with `VK_EXT_device_fault`). In both reports:
+  - the address is **inside a texture made about 2 s before** the loss was reported (512×512 BC1 with 8 levels at offset 0; 512×512×32 layers with 10 levels at offset 0x1e2000);
+  - vkd3d: *"Fault address is currently mapped. This should not normally page fault."*
+  - vkd3d reports a loss about 2 s after it happens, so **the GPU faults right after the texture is made**.
+- **Mechanism:** host slots are made lazily (`descriptor/host.rs` `make()`), from the title's threads, into the shader-visible heap, **while a submission may be running**. Counted: **15,600-58,300 slots a frame written while a submission ran** in the open world. If the running work reads such a slot, it sees a resource made after it was submitted, whose page-table update only the *next* submission waits for. That fits every known fact: timing-dependent, hidden by anything that serialises the GPU, the open world (texture streaming) far more than the prologue, and a mapped address that faults.
+- **`VICTORY_SLOT_WAIT=1`** (new): `make()` waits until no submission runs (at most 2 s). **Jason save: 4 of 4 reached and held the world** (13,000-13,500 draws a frame, 2.05-2.13 fps, valid windows, the picture right: house, light, water), against 1 of 2 with the counter only and 10 of 12 lost earlier tonight. Only 82-97 writes a frame had to wait; none gave up (`bench/trials-20261125-231520-slot-wait`).
+- **Architectural reading (piece D, guarantee "a view never reaches past its resource"):** a shader-visible slot is GPU state. It may only change at a point where no work that can read it is in flight, as on the console, where the title's own fences guard it. The wait is the minimal form. Frames in flight (phase 3) need the proper form: slot writes staged and applied at submission boundaries.
+
+**S.5 measured: mirroring byte-copied descriptors does not stop the open-world loss**
+- Ported the descriptor part of fxceless `a26859f` (`VICTORY_HEAP_SYNC=1`, off by default; branch `s5-heap-sync`). New `scripts/trials.sh` runs one configuration N times unattended and classifies each run.
+- **The title does copy descriptors as bytes, a lot:** per frame in the open world, 260-320 changed heap pages, 530,000-650,000 slots looked at, **~225,000 records new and mirrored**.
+- **Loss rate, Jason save, same binary:** sync on **5 of 5 lost**; sync off 4 of 5 lost. The one survivor drew 2,935 draws a frame with an `invalid` window, so it was likely not in the world yet. In practice **every run loses the device within about a minute once the world draws 12,000-25,000 draws a frame**: a fast, reliable reproducer (`bench/trials-20261125-223829-hs-on`, `…-224417-hs-off`).
+- **Kernel fault details** (`journalctl -k`): `GCVM_L2_PROTECTION_FAULT_STATUS 0x00701031`, client TCP, a read, `PERMISSION_FAULTS=0x3`, `MAPPING_ERROR=0`. The page has a page-table entry marked invalid: memory freed or never bound, not a wild address.
+- vkd3d breadcrumbs (non-sync) print nothing on loss with GE-Proton's vkd3d-proton: the config is parsed but no report is made. A breadcrumb report needs our own vkd3d-proton build.
+- **Reasoning for the next step:** the bug is timing-dependent (anything that slows or serialises the GPU hides it), the page is invalid, and it lies in no live copy of ours. That fits **memory released while the GPU still reads it** better than a view out of range, which would fault whatever the timing. `VICTORY_LEAK_RETIRED` covered only `retire()`.
+- **Found in the code:** when the title releases a shader-visible heap, its `HostHeap` (the `ID3D12DescriptorHeap` and every resource its slots hold in `kept`) is dropped at once, with no fence waited for. `HostHeap` has no `Drop` and does not go through `retire()`.
+- Next: `VICTORY_LEAK_ALL=1` (every resource and host descriptor heap the layer makes is held forever) and a log line when a title heap with a host heap is released.
+
 **Decision: back to our base; the roadmap rebuilt around pieces that fit this machine**
 - **Base:** `p1.8-fast-reads` (joshuu `003beef` plus phases 0, 1.7 and 1.8), not `fx`. On this machine it is twice as fast (317 against 610 ms per frame), and the stability bug is in both bases. `main` is advanced to it. `fx` stays as a reference for track U.
 - Carried over from `fx`: the `bench.sh` check that marks a window `invalid` when its draws fall below half their top, and the journal entries.

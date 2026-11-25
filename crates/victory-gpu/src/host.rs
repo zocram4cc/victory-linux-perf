@@ -159,6 +159,29 @@ pub(crate) fn pad_buffer(size: u64) -> u64 {
     size + *PAD.get_or_init(|| std::env::var("VICTORY_PAD_KB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 10)
 }
 
+/// `VICTORY_LEAK_ALL=1` (diagnostics of the README's "Known blocker"):
+/// every host resource the layer makes is held once more, forever, so no
+/// drop anywhere frees GPU memory. Wider than `VICTORY_LEAK_RETIRED`, which
+/// covers [`retire`] only. If the device loss goes away, memory is freed
+/// while the GPU still reads it through some other path.
+pub(crate) fn pin<T: windows::core::Interface + Clone>(made: &Option<T>) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("VICTORY_LEAK_ALL").is_some_and(|v| v == "1")) {
+        if let Some(made) = made {
+            PINNED.fetch_add(1, Ordering::Relaxed);
+            std::mem::forget(made.clone());
+        }
+    }
+}
+
+/// Submissions started and not yet finished (logs).
+pub(crate) fn running() -> u64 {
+    STARTED.load(Ordering::Acquire).saturating_sub(FINISHED.load(Ordering::Acquire))
+}
+
+/// Resources [`pin`] held, since the start.
+pub(crate) static PINNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Kinds of commands for [`HostList::serial`].
 pub(crate) const SERIAL_DISPATCH: u8 = 1;
 pub(crate) const SERIAL_DRAW: u8 = 2;
@@ -4443,6 +4466,7 @@ impl HostList {
                             &mut back,
                         )
                         .ok()?;
+                        crate::host::pin(&back);
                 }
                 Some((heap?, back?))
             })
@@ -5658,6 +5682,7 @@ impl Host {
                 &mut buffer,
             )
         };
+        crate::host::pin(&buffer);
         match made {
             Ok(()) => buffer,
             Err(e) => {
@@ -5702,6 +5727,7 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                    crate::host::pin(&buffer);
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -5810,6 +5836,7 @@ impl Meter {
         tracing::info!(
             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
         );
+        crate::descriptor::host::slot_line(frames);
         crate::descriptor::sync_line(frames);
         late_line(frames);
         let gpu_pct = card_clock_line(frames, ms);
@@ -6354,6 +6381,7 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                    crate::host::pin(&buffer);
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -6401,6 +6429,7 @@ impl Host {
                 &mut buffer,
             )
         };
+        crate::host::pin(&buffer);
         match made {
             Ok(()) => buffer,
             Err(e) => {
