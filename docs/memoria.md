@@ -133,6 +133,14 @@ La misma escena, con 5.037 draws por frame frente a 4.971:
 - En las partidas con caras, los shaders empiezan a usarse 57-135 s después de arrancar, más o menos al llegar al juego.
 - **Hipótesis H3:** el juego decide al cargar el mundo si usa los modelos detallados de las cabezas, según qué hay cargado en ese momento. Influyen el streaming de los modelos, el momento en que se salta la cinemática y lo lentos que van nuestros frames durante la carga. Si no llegaron a tiempo, se queda con un modelo de cabeza que solo pinta ojos y boca.
 - **Prueba siguiente:** ver la primera cinemática entera, sin saltarla, dos veces. Si salen caras las dos veces, el salto temprano es el disparador (carrera de streaming durante el salto).
+- **Resultado:** con la cinemática entera, 2 de 2 **sin caras**, ni siquiera dentro de la cinemática. Se usan 54-56 de los 182 shaders, no los de las cabezas. **H3 (salto de la cinemática) descartada.**
+- **Hipótesis H4:** el juego decide en la GPU qué es visible y con qué detalle (*culling* y LOD guiados por la GPU), y la CPU lee el resultado por la copia de vuelta (79 MB por frame). Si lo lee viejo o incompleto (una carrera en nuestra copia de vuelta), no emite las cabezas.
+  - **A favor:**
+    - con `INPLACE=1` la CPU lee directamente lo que escribe la GPU, y salieron caras;
+    - `VICTORY_SKIP_PIPELINES=fc5e66f8f873d3bb` se salta justo un programa de *culling* de meshlets (fxceless#3), y su salida queda sin escribir.
+  - **Pruebas:**
+    - dos partidas sin el salto (`VICTORY_SKIP_PIPELINES=`); el riesgo es un fallo de GPU a los ~9 min;
+    - dos más con `INPLACE=1`, para ver si las caras salen siempre.
 
 ## 8. El título y sus hilos (`VICTORY_MEDIR=1`)
 

@@ -4,6 +4,7 @@ Qué se probó, qué salió y qué se decidió. Lo más nuevo va arriba.
 
 ## 2026-11-25
 
+- **Sin saltar la cinemática (×2): sin caras.** H3 descartada. Nueva hipótesis H4: *culling*/LOD en la GPU leído por la CPU a través de la copia de vuelta, o el programa de *culling* que nos saltamos en AMD (`fc5e66f8`).
 - **Caras, de nuevo.**
   - Esperar 150 s y girar: no se ven. Es todo o nada por partida.
   - En las partidas con caras el juego usa 182 shaders que no usa en ninguna sin caras (`docs/datos/shaders-caras.txt`). **El juego no emite los draws de las cabezas**; no es que VIctory los descarte.
