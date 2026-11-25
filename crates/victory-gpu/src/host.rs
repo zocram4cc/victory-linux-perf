@@ -5441,6 +5441,11 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // Without a system call where every page is there (`crate::fastcopy`);
+    // a missing page makes it fail, and the kernel says which as before.
+    if len != 0 && crate::fastcopy::on() && crate::fastcopy::copy(dst, src, len) {
+        return true;
+    }
     let mut done = 0;
     // SAFETY: the destination is mapped writable memory of `len` bytes; the
     // kernel checks the source.
@@ -5780,6 +5785,7 @@ impl Meter {
         let (frame_ms_max, frame_ms_avg, _timed) = crate::frametime::take_interval();
         let remap = crate::medir::take_remap();
         let own = [0, 1].map(|i| crate::shadow::OWN_STATS[i].swap(0, Ordering::Relaxed));
+        let fast = [0, 1, 2].map(|i| crate::fastcopy::STATS[i].swap(0, Ordering::Relaxed));
         crate::frametime::record(&crate::frametime::Row {
             frame: crate::queue::frame_count(),
             frames,
@@ -5824,6 +5830,9 @@ impl Meter {
             unmaps: remap[crate::medir::UNMAPS] as f64 / frames,
             own_skip_mb: own[0] as f64 / frames / 1e6,
             own_copy_mb: own[1] as f64 / frames / 1e6,
+            fast_reads: fast[0] as f64 / frames,
+            fast_mb: fast[1] as f64 / frames / 1e6,
+            fast_faults: fast[2] as f64 / frames,
         });
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();

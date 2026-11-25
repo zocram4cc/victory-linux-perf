@@ -4,6 +4,22 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-25
 
+**Phase 1.8: profile of the submitting thread, and fast reads (branch `p1.8-fast-reads`)**
+- **Profile** (`bench.sh --perf`, scene A, 30 s). The submitting thread is busy about half the time (~170 ms per frame):
+
+  | What | Share of the thread |
+  |---|---|
+  | `memcpy` / `memcmp` in ucrtbase (copies, and the `F1_OWN` compare) | ~29 % |
+  | **Wine's `ReadProcessMemory` path:** `virtual_check_buffer_for_write` ~10 %, its libc copy ~10 %, syscall dispatch ~3 % | **~23 %** |
+  | `RtlQueryPerformanceCounter` (clock reads) | **~8 %**, caller unknown (no call graphs) |
+  | VIctory's own code: `watch::writes`, B-tree walks of the journal, blake3, merges | ~22 % |
+
+  - Wineserver: 0.08 cores, no memory-read requests. Reads stay in-process.
+  - Symbolising PE code: victory.exe was at `0x6ffffd670000` in that run; `llvm-symbolizer --obj=victory.exe` takes `0x140000000 + (address − base)`. Find the base by scoring candidate bases on plausible names.
+- **`crate::fastcopy`:** title memory is read with `rep movsb` in a small assembly routine. A read of a missing page faults, and our vectored handler (first in the chain, ahead of the crash reporter) moves the thread to the routine's failure exit; `read()` then falls back to `ReadProcessMemory` as before. This is the kernels' technique for copying from user memory. `VICTORY_F1_FAST_READ=0` turns it off. A unit test (mapped page, reserved page, reuse after a fault) passes under wine.
+- New CSV columns: `fast_reads`, `fast_mb`, `fast_faults`.
+- **Next:** measure scene A. Then find who reads the clock so often.
+
 **Phase 1.8 started: fast reads of title memory**
 - **Why:** half the bytes, same copy time, so the cost is per read, not per byte. All reads of title memory go through `ReadProcessMemory` (`host.rs::read`), one call per piece, with fallbacks to 64 KiB and 4 KiB pieces and `VirtualQuery` when a page is missing.
 - **Plan** (README 1.8): profile first, then plain `memcpy` for ranges known to be readable, then a fault safety net, then batching.
