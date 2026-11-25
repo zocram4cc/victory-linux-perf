@@ -20,6 +20,10 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 - **Fast writes (1.9):** `write_mapped` tries the same routine first (`VICTORY_F1_FAST_WRITE=0` turns it off). Unit tests under wine:
   - a write to a missing page and to a read-only page fails to the kernel path;
   - **a fast write into write-watched memory is reported by `GetWriteWatch`**, so Wine tracks our writes like the title's and the journal stays correct.
+- **First run with fast writes: device lost as loading ended.** A GPUVM fault at `0x80038cc00000` (a host GPU address, not title memory), TCP client, ring timeout. It happened where the forks' late-wait switches also faulted.
+  - **Ruled out:** a write-watch difference. A test shows Wine's kernel write (`WriteProcessMemory`) also marks the page written.
+  - The bytes written are the same either way. Leading hypothesis: the faster copy-back changes timing and exposes an existing GPU-side race (resource lifetime around loading).
+- **Decision:** fast writes off by default (`VICTORY_F1_FAST_WRITE=1` turns them on); fast reads stay on. To settle it: two more runs with fast writes on. If they fault again at the same point, take a diagnostics build with `VICTORY_D3D12_DEBUG=1` to name the command.
 
 **Phase 1.8: profile of the submitting thread, and fast reads (branch `p1.8-fast-reads`)**
 - **Profile** (`bench.sh --perf`, scene A, 30 s). The submitting thread is busy about half the time (~170 ms per frame):

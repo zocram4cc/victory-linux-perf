@@ -15,7 +15,7 @@
 //! the technique kernels use to copy from user memory.
 //!
 //! `VICTORY_F1_FAST_READ=0` turns it off. The copy-back's writes into title
-//! memory use the same routine (`VICTORY_F1_FAST_WRITE=0` turns that off).
+//! memory can use the same routine (`VICTORY_F1_FAST_WRITE=1`, off by default).
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -62,14 +62,15 @@ pub(crate) fn on() -> bool {
 }
 
 /// Whether writes into title memory (the copy-back) take the fast path too
-/// (`VICTORY_F1_FAST_WRITE`, on unless `0`). A write that faults (a page
+/// (`VICTORY_F1_FAST_WRITE=1`; off by default: its first run in the world
+/// lost the GPU device as loading ended, see docs/journal.md). A write that faults (a page
 /// not there, a guard page, a page the title made read-only) goes to the
 /// kernel as before; our own read-only guards on view memory are opened by
 /// the caller first (`crate::watch::writing`), or by their handler if one
 /// is met, as for a write of the title's.
 pub(crate) fn writes_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| on() && std::env::var_os("VICTORY_F1_FAST_WRITE").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| on() && std::env::var_os("VICTORY_F1_FAST_WRITE").is_some_and(|v| v == "1"))
 }
 
 /// Since the last frame line: fast copies, bytes, and copies that faulted
@@ -219,6 +220,30 @@ mod tests {
             GetWriteWatch(1, base.cast(), 0x4000, found.as_mut_ptr(), &mut count, &mut granularity);
             assert_eq!(count, 1);
             assert_eq!(found[0] as usize, base as usize + 0x2000);
+            VirtualFree(base.cast(), 0, MEM_RELEASE);
+        }
+    }
+
+    /// Not an assertion about our code: records what Wine's kernel write
+    /// (the copy-back's path before fast writes) does to write watching.
+    #[test]
+    fn what_the_kernel_write_does_to_write_watching() {
+        use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
+        use windows_sys::Win32::System::Memory::GetWriteWatch;
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+        // SAFETY: write-watched memory of our own.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 0x4000, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE).cast::<u8>();
+            let mut found = [std::ptr::null_mut::<core::ffi::c_void>(); 4];
+            let (mut count, mut granularity) = (4usize, 0u32);
+            GetWriteWatch(1, base.cast(), 0x4000, found.as_mut_ptr(), &mut count, &mut granularity);
+            let src = [9u8; 16];
+            let mut done = 0;
+            WriteProcessMemory(GetCurrentProcess(), base.add(0x2008).cast(), src.as_ptr().cast(), 16, &mut done);
+            count = 4;
+            GetWriteWatch(1, base.cast(), 0x4000, found.as_mut_ptr(), &mut count, &mut granularity);
+            println!("KERNEL-WRITE-WATCH: {count} page(s) reported after a kernel write");
             VirtualFree(base.cast(), 0, MEM_RELEASE);
         }
     }
