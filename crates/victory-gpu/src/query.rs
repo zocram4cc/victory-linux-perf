@@ -42,6 +42,9 @@ pub(crate) extern "system" fn create(
     let Some(&desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
+    if desc.count == 0 {
+        return E_INVALIDARG;
+    }
     tracing::debug!(?desc, "query heap");
     let heap = Box::new(Heap {
         object: Object::new(&FUNCTIONS),
@@ -155,5 +158,20 @@ mod tests {
         for left in [5, 4, 3, 2, 1, 0] {
             assert_eq!(release(heap), left);
         }
+    }
+
+    #[test]
+    fn a_query_heap_needs_a_query() {
+        let mut heap = std::ptr::null();
+        let desc = Desc {
+            kind: 0,
+            count: 0,
+            nodes: 0,
+        };
+        assert_eq!(
+            create(std::ptr::null(), &desc, &HEAP_IIDS[0], &mut heap),
+            E_INVALIDARG
+        );
+        assert!(heap.is_null());
     }
 }
