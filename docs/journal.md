@@ -4,6 +4,22 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-25
 
+**Phase 1: own write-back measured, both switches on by default**
+
+| Scene A | baseline | `F1_OWN` | `F1_CARD_MERGE` | both (×2) |
+|---|---|---|---|---|
+| ms per frame | 354 | 344 | 365 | 348 |
+| MB uploaded per frame | 216 | 108 | 230 | 110-113 |
+| MB sent up to the card | 93 | 54 | 59 | 18 |
+| hash passes | 558 | 536 | 144 | 102-104 |
+| GPU ms | 159 | 149 | 155 | 143-144 |
+| copy time | 63 ms | 64 | 67 | 66 |
+
+- **About 100 MB a frame of uploads were our own write-back.** 95 % of those pages compare equal and are now skipped (`own_skip_mb` 100-104, `own_copy_mb` 5).
+- The picture is unchanged, by the user's eye.
+- **Copy time did not drop with half the bytes.** The cost is reading title memory, which the compare has to do too. Every read goes through the kernel (`ReadProcessMemory` / `NtReadVirtualMemory`) so that pages with no backing do not crash. This confirms design rule 1 of [memory.md](memory.md) by measurement.
+- **Decision:** both switches are on by default (`=0` turns them off). Next: a fast path for reading title memory.
+
 **Phase 1: first real change (branch `p1.1-census`, both switches off by default)**
 - **Finding from reading the code:** the copy-back writes what shaders wrote into title memory. Write watch, or the view guards, then report those pages as written by the title, so the next refresh copies them again. For copies in the card's memory, `card_merge` also marks the whole merged range to go back up to the card and be rehashed, although the card already holds those bytes. The code says so itself: *"Our write shows as a title write at the copy's next refresh, which copies those pages once more (some dozens of MB a frame)"*.
 - **`VICTORY_F1_OWN=1`:** a copy remembers the pages it wrote back. At its next refresh it compares each such page with title memory (one read) instead of copying it again. If they are equal, nothing is copied or sent up. Correct by construction: a page the title wrote meanwhile differs and is copied as before. New CSV columns `own_skip_mb` and `own_copy_mb`.

@@ -153,9 +153,14 @@ Taken from the belobug fork's memory log at boot, as a reference.
 
 This still has to be measured with royale in the world; that log is not printed in the release build.
 
+## 9b. Our own write-back was half the uploads (phase 1, 25 Nov 2026)
+
+- With `VICTORY_F1_OWN`, ~100 MB a frame of the 216 MB uploaded turned out to be pages we had written back ourselves. 95 % of them were identical to the copy.
+- Skipping them halves the bytes, but **not the time**: 63-66 ms either way. The copy time is the kernel reads of title memory (`copy_mapped`, `read_into`), not the bytes moved.
+
 ## 10. Design rules drawn from the data
 
-1. **The cost is in deciding what to copy, not in copying.** Every phase 1 improvement is measured in hash passes and write-watch queries, not only in MB.
+1. **The cost is in deciding what to copy and in reading title memory through the kernel, not in moving bytes** (confirmed in §9b). Every phase 1 improvement is measured in hash passes and write-watch queries, not only in MB.
 2. **VRAM for what the GPU reads heavily. In-place system memory only for small data or data the CPU reads.** Reading in place over PCIe doubles GPU time.
 3. **The page pool (72 % of the bytes) cannot be opened through sections.** The GPU needs its own tile mapping over opened memory or VRAM; the CPU can keep its views.
 4. **Tolerate holes:** title ranges have pages with no backing.

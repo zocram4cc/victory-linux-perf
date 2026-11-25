@@ -142,10 +142,11 @@ struct Card {
 /// title's bytes go back up to the card (the card already holds what its
 /// shaders wrote), and the compare after the lists stores the hashes it
 /// makes, so the pieces that did not go back up are not found differing
-/// again. Off by default until measured.
+/// again. On by default since 25 Nov 2026 (with `VICTORY_F1_OWN`: card
+/// sends 93 -> 18 MB a frame, hash passes 558 -> 103); `=0` turns it off.
 pub(crate) fn f1_card_merge() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_F1_CARD_MERGE").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_F1_CARD_MERGE").is_none_or(|v| v != "0"))
 }
 
 /// `VICTORY_F1_OWN=1` (phase 1): pages a copy wrote into title memory
@@ -153,10 +154,11 @@ pub(crate) fn f1_card_merge() -> bool {
 /// next write-watch asking or guard, like a write of the title's. The
 /// next refresh compares such a page with title memory instead of copying
 /// it again, and leaves it (and the card side) alone when nothing else
-/// changed it. Off by default until measured.
+/// changed it. On by default since 25 Nov 2026 (uploads 216 -> 108 MB a
+/// frame in scene A, 95 % of such pages found current); `=0` turns it off.
 fn f1_own() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_F1_OWN").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_F1_OWN").is_none_or(|v| v != "0"))
 }
 
 /// With [`f1_own`]: bytes of refreshes found already current by the
