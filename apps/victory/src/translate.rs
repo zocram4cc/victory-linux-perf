@@ -412,7 +412,10 @@ pub fn warm_all(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Re
             let next = AtomicUsize::new(0);
             std::thread::scope(|s| {
                 for _ in 0..threads.min(jobs.len()) {
-                    s.spawn(|| {
+                    // Compute pipelines are made on this thread (vkd3d-proton
+                    // converts DXIL recursively): the pipeline stack.
+                    let worker = std::thread::Builder::new().stack_size(victory_shader::emit::PIPELINE_STACK);
+                    worker.spawn_scoped(s, || {
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
                             let Some(bytes) = job.bytes() else { continue };
                             let Ok(container) = Container::parse(&bytes) else { continue };
@@ -446,7 +449,7 @@ pub fn warm_all(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Re
                                 println!("{:6.0} s  {n} shaders", started.elapsed().as_secs_f64());
                             }
                         }
-                    });
+                    }).expect("a warm-up worker");
                 }
             });
         }
