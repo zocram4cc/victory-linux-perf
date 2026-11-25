@@ -4,6 +4,11 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-25
 
+**Phase 1.8 started: fast reads of title memory**
+- **Why:** half the bytes, same copy time, so the cost is per read, not per byte. All reads of title memory go through `ReadProcessMemory` (`host.rs::read`), one call per piece, with fallbacks to 64 KiB and 4 KiB pieces and `VirtualQuery` when a page is missing.
+- **Plan** (README 1.8): profile first, then plain `memcpy` for ranges known to be readable, then a fault safety net, then batching.
+- `bench.sh run --perf` records the game's and wineserver's user-space profiles during the window.
+
 **Phase 1: own write-back measured, both switches on by default**
 
 | Scene A | baseline | `F1_OWN` | `F1_CARD_MERGE` | both (×2) |

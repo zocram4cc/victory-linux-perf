@@ -56,6 +56,16 @@ scripts/bench.sh compare bench/<A> bench/<B> [...]   # table with the change aga
 
 That table goes into every performance commit message.
 
+## Profiling
+
+`--perf` records a user-space CPU profile (`perf record -e cycles:u`) of the game and of wineserver during the window. `nsenter` steps into bubblewrap's user namespace so that `perf` can attach.
+
+```sh
+scripts/bench.sh run -l profile-A --perf
+```
+
+The window's folder then also has `perf.data`, `perf-wineserver.data` and `perf.txt` (top modules and symbols). Profiling costs a little time, so do not compare its frame times with a run without it.
+
 ## Rules for figures that count
 
 - **Three runs per configuration.** If `ms_per_frame` varies by more than 10 % between them, the measurement does not count. Find the cause first: a cold shader cache, other load on the PC, a different scene…

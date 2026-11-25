@@ -138,6 +138,8 @@ Each task follows the same rules:
 | 1.4 | **Persistent staging** | `host.rs`: `upload`, `scratch`, `take_chunk` | Reused, 64 KiB-aligned upload rings instead of creating resources per frame. Check `perf` first to see whether allocation shows up. |
 | 1.5 | **Fewer alias views** | `xmem.rs`: `map_alias`, `map` | Merge contiguous pages into one view when source and target are contiguous. On 24 Nov the average was 1.0 page per call; check whether joshuu's `948e9d3` and `476a020` changed that. Drop the task if there is no contiguity. |
 | 1.6 | **Textures only when they change** | `texture.rs` | Check write watch before detiling; do not detile mips that did not change. |
+| 1.7 | **Do not re-copy our own write-back** — **done** | `shadow.rs`: `note_own`, `copy_comparing`, `card_merge`; `host.rs`: compare mode 2 | `VICTORY_F1_OWN` and `VICTORY_F1_CARD_MERGE`, on by default. Scene A: uploads 216 → 110 MB, card sends 93 → 18 MB, hash passes 558 → 103, GPU 159 → 143 ms, frame 354 → 348 ms. Copy time did not move (63-66 ms), which pointed to 1.8. |
+| 1.8 | **Fast reads of title memory** — **next** | `host.rs`: `copy_mapped`, `read`, `read_into`, `read_sparse`, `read_pieces`; `watch.rs` (handler); `xmem.rs` (remap notices) | Every read of title memory today is a `ReadProcessMemory` call per piece, so that pages with no backing do not crash. Under Wine that per-call cost, not the bytes, is the copy time. Steps: **(a)** profile scene A (`bench.sh run --perf`) to see where the time goes: `NtReadVirtualMemory` in ntdll, a wineserver round trip, or the kernel; **(b)** a "known readable" mark per range, set by a clean read and cleared by any remap, decommit or free (xmem already reports remaps), with plain `memcpy` for marked ranges; **(c)** a safety net: an access violation inside such a `memcpy` is caught by our vectored handler, the copy is abandoned and redone through the kernel; **(d)** batch what still needs the kernel into fewer, larger calls; **(e)** measure. Target: copy time and compare time well under half. |
 
 **Exit criteria:**
 - Scene A: prepare under 40 ms and copy-back under 20 ms.
@@ -280,7 +282,7 @@ Today the chain is: console shader → DXIL → dxil-spirv → SPIR-V → RADV, 
 |---|---|---|---|
 | 1.1 Memory census | maintainer | `p1.1-census` | in progress |
 | 1.2/1.3 Stop re-copying our own write-back (`VICTORY_F1_OWN`, `VICTORY_F1_CARD_MERGE`) | maintainer | `p1.1-census` | **done**: uploads −49 %, card sends −80 %, hash passes −82 %, frame −2 % |
-| 1.8 Fast reads of title memory (`memcpy` where pages are known to be there) | maintainer | | next |
+| 1.8 Fast reads of title memory (`memcpy` where pages are known to be there) | maintainer | `p1.8-fast-reads` | profiling |
 | 1.2 Cheaper write tracking | maintainer | | after 1.1 |
 | 1.3 Copy back only what the CPU reads | maintainer | | after 1.1 |
 | 0.B Baseline on a second machine (7800X3D, RX 7900 XTX, 32 GB) | collaborator (suggested) | | first task: learn the flow, second data point |

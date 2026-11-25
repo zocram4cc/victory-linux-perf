@@ -2,12 +2,14 @@
 # bench.sh: repeatable measurements of a scene, from Linux, through the
 # victory-proton launcher (phase 0.3 of the README).
 #
-#   scripts/bench.sh run [-l LABEL] [-s SECONDS] [-p PROFILE] [--keep] [VAR=VALUE ...]
+#   scripts/bench.sh run [-l LABEL] [-s SECONDS] [-p PROFILE] [--keep] [--perf] [VAR=VALUE ...]
 #       Launches the game with VICTORY_FRAMETIME_DUMP=1 (and VAR=VALUE...),
 #       waits for Enter once you are in the scene, measures SECONDS (60),
 #       and writes bench/<date>-<LABEL>/: frametime.csv (the window),
 #       summary.json, meta.json, log.txt (the window's log), and closes
-#       the game unless --keep.
+#       the game unless --keep. --perf also records a user-space CPU profile
+#       of the game and of wineserver during the window (perf.data,
+#       perf-wineserver.data, and perf.txt with the top symbols).
 #   scripts/bench.sh mark [-l LABEL] [-s SECONDS] [-p PROFILE]
 #       The same on a game that is already running (started by `run --keep`
 #       or by hand with VICTORY_FRAMETIME_DUMP=1).
@@ -134,7 +136,20 @@ measure() {
     csv0=$(wc -l <"$csv"); log0=$(stat -c %s "$log")
     srv=$(server_pid); g0=$(ticks "$pid"); s0=$(ticks "$srv"); t0=$(date +%s.%N)
     say "measuring ${secs} s..."
+    mkdir -p "$dir"
+    local perfs=()
+    if ((PERF)); then
+        # bubblewrap's user namespace keeps a profiler outside it from
+        # attaching: enter it first. User space only (perf_event_paranoid=2).
+        nsenter -t "$pid" -U --preserve-credentials perf record -q -e cycles:u -p "$pid" -o "$dir/perf.data" -- sleep "$secs" >/dev/null 2>&1 &
+        perfs+=($!)
+        if [[ -n $srv ]]; then
+            nsenter -t "$srv" -U --preserve-credentials perf record -q -e cycles:u -p "$srv" -o "$dir/perf-wineserver.data" -- sleep "$secs" >/dev/null 2>&1 &
+            perfs+=($!)
+        fi
+    fi
     sleep "$secs"
+    local p; for p in ${perfs[@]+"${perfs[@]}"}; do wait "$p" 2>/dev/null || true; done
     local g1 s1 t1; g1=$(ticks "$pid"); s1=$(ticks "$srv"); t1=$(date +%s.%N)
     game_env "$pid" >"$OUT_ROOT/.env"
     game_pid >/dev/null || die "the game closed during the window"
@@ -153,16 +168,30 @@ json.dump({
 }, open(sys.argv[1], "w"), indent=1)
 PY
     summary "$dir"
+    if ((PERF)) && [[ -f $dir/perf.data ]]; then
+        {
+            echo "== game, by module"
+            perf report -q -i "$dir/perf.data" --stdio --sort dso 2>/dev/null | head -25
+            echo; echo "== game, by symbol"
+            perf report -q -i "$dir/perf.data" --stdio --sort dso,sym 2>/dev/null | head -60
+            if [[ -f $dir/perf-wineserver.data ]]; then
+                echo; echo "== wineserver, by symbol"
+                perf report -q -i "$dir/perf-wineserver.data" --stdio --sort sym 2>/dev/null | head -25
+            fi
+        } >"$dir/perf.txt"
+        say "profile: $dir/perf.txt"
+    fi
 }
 
 parse_opts() {
-    LABEL=run SECS=60 PROFILE=${VP_PERFIL:-royale} KEEP=0 EXTRA=()
+    LABEL=run SECS=60 PROFILE=${VP_PERFIL:-royale} KEEP=0 PERF=0 EXTRA=()
     while (($#)); do
         case $1 in
             -l) LABEL=$2; shift ;;
             -s) SECS=$2; shift ;;
             -p) PROFILE=$2; shift ;;
             --keep) KEEP=1 ;;
+            --perf) PERF=1 ;;
             *=*) EXTRA+=("$1") ;;
             *) die "unknown option: $1" ;;
         esac
