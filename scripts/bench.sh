@@ -2,7 +2,7 @@
 # bench.sh: repeatable measurements of a scene, from Linux, through the
 # victory-proton launcher (phase 0.3 of the README).
 #
-#   scripts/bench.sh run [-l LABEL] [-s SECONDS] [-p PROFILE] [--keep] [--perf] [VAR=VALUE ...]
+#   scripts/bench.sh run [-l LABEL] [-s SECONDS] [-p PROFILE] [--keep] [--perf] [--auto] [VAR=VALUE ...]
 #       Launches the game with VICTORY_FRAMETIME_DUMP=1 (and VAR=VALUE...),
 #       waits for Enter once you are in the scene, measures SECONDS (60),
 #       and writes bench/<date>-<LABEL>/: frametime.csv (the window),
@@ -10,6 +10,10 @@
 #       the game unless --keep. --perf also records a user-space CPU profile
 #       of the game and of wineserver during the window (perf.data,
 #       perf-wineserver.data, and perf.txt with the top symbols).
+#       --auto needs nobody at the keyboard: it presses A through the
+#       start screen (VICTORY_KEYS, unless set), lets the intro play, waits
+#       until the world is drawn (more than 3,000 draws a frame for four
+#       rows in a row), waits 20 s more, and measures.
 #   scripts/bench.sh mark [-l LABEL] [-s SECONDS] [-p PROFILE]
 #       The same on a game that is already running (started by `run --keep`
 #       or by hand with VICTORY_FRAMETIME_DUMP=1).
@@ -128,7 +132,9 @@ measure() {
     pid=$(game_pid); [[ -n $pid ]] || die "the game is not running"
     [[ -f $csv ]] || die "no $csv yet: is VICTORY_FRAMETIME_DUMP=1 set, and has the game presented a frame?"
     log=$(readlink -f "$pdata/logs/latest.log")
-    if [[ -t 0 ]]; then
+    if ((AUTO)); then
+        wait_world "$csv" "$pid"
+    elif [[ -t 0 ]]; then
         say "get into the scene, then press Enter here (the window is ${secs} s)"
         read -r _
     fi
@@ -185,8 +191,31 @@ PY
     fi
 }
 
+# Waits until the frametime dump shows the world (4 rows in a row of more
+# than 3,000 draws a frame), then 20 s more for it to settle.
+wait_world() {
+    local csv=$1 pid=$2 i
+    say "waiting for the world (the intro plays through; up to 6 minutes)"
+    for ((i = 0; i < 360; i++)); do
+        [[ -n $(game_pid) ]] || die "the game closed before reaching the world"
+        if python3 -I - "$csv" <<'PY'
+import csv, sys
+rows = [r for r in csv.DictReader(l for l in open(sys.argv[1]) if not l.startswith("#"))]
+last = rows[-4:]
+sys.exit(0 if len(last) == 4 and all(float(r["draws"]) > 3000 for r in last) else 1)
+PY
+        then
+            say "in the world; settling for 20 s"
+            sleep 20
+            return
+        fi
+        sleep 1
+    done
+    die "the world did not come up in 6 minutes"
+}
+
 parse_opts() {
-    LABEL=run SECS=60 PROFILE=${VP_PERFIL:-royale} KEEP=0 PERF=0 EXTRA=()
+    LABEL=run SECS=60 PROFILE=${VP_PERFIL:-royale} KEEP=0 PERF=0 AUTO=0 EXTRA=()
     while (($#)); do
         case $1 in
             -l) LABEL=$2; shift ;;
@@ -194,6 +223,7 @@ parse_opts() {
             -p) PROFILE=$2; shift ;;
             --keep) KEEP=1 ;;
             --perf) PERF=1 ;;
+            --auto) AUTO=1 ;;
             *=*) EXTRA+=("$1") ;;
             *) die "unknown option: $1" ;;
         esac
@@ -208,6 +238,15 @@ run() {
     local dir; dir=$OUT_ROOT/$(date +%Y%m%d-%H%M%S)-$LABEL
     local e; for e in ${EXTRA[@]+"${EXTRA[@]}"}; do export "${e?}"; done
     export VICTORY_FRAMETIME_DUMP=1
+    # Unattended: press A (Enter) through the start screen, and nothing
+    # after (the intro plays through; A in the world would act).
+    if ((AUTO)) && [[ -z ${VICTORY_KEYS:-} ]]; then
+        # Taps through the start screen only. Holding A through the intro
+        # did not skip it (the world came at ~103 s either way) and changed
+        # the scene measured afterwards.
+        VICTORY_KEYS=$(seq 8 3 50 | sed 's/$/:Enter/' | paste -sd,)
+        export VICTORY_KEYS
+    fi
     rm -f "$DATA/perfiles/$PROFILE/cache/frametime.csv"
     mkdir -p "$OUT_ROOT"
     say "launching profile $PROFILE${EXTRA[*]:+ with ${EXTRA[*]}}"

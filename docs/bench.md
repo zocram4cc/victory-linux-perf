@@ -56,6 +56,21 @@ scripts/bench.sh compare bench/<A> bench/<B> [...]   # table with the change aga
 
 That table goes into every performance commit message.
 
+## Unattended runs
+
+`--auto` needs nobody at the keyboard:
+
+1. It presses A (`VICTORY_KEYS`, Enter) through the start screen, from 8 s to 50 s.
+2. It lets the intro cutscene play; holding A does not skip it.
+3. It waits for the world: four CSV rows in a row with more than 3,000 draws.
+4. It waits 20 s more, then measures.
+
+A run takes about 3 minutes. `VICTORY_KEYS` now works in release builds.
+
+```sh
+scripts/bench.sh run -l my-test --auto VICTORY_SOMETHING=1
+```
+
 ## Profiling
 
 `--perf` records a user-space CPU profile (`perf record -e cycles:u`) of the game and of wineserver during the window. `nsenter` steps into bubblewrap's user namespace so that `perf` can attach.
