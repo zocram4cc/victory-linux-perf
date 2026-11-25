@@ -183,11 +183,28 @@ pub(crate) fn critical_commit() -> bool {
 pub(crate) fn prefetch_limit(bytes: u64, pressure: bool, critical: bool, limited: bool, staging: u64) -> u64 {
     if critical {
         bytes.min(16 << 20)
-    } else if pressure || (limited && staging >= GIB) {
+    } else if pressure {
         bytes.min(64 << 20)
+    } else if limited && staging >= GIB {
+        bytes.min(limited_cap())
     } else {
         bytes
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_LIMITED_MB: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+fn limited_cap() -> u64 {
+    #[cfg(test)]
+    if let Some(mib) = TEST_LIMITED_MB.get() {
+        return mib << 20;
+    }
+    static MIB: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+        std::env::var("VICTORY_LIMITED_STAGING_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(64)
+    });
+    *MIB << 20
 }
 
 #[cfg(test)]
@@ -229,5 +246,13 @@ mod tests {
         assert_eq!(prefetch_limit(512 << 20, true, false, false, 0), 64 << 20);
         assert_eq!(prefetch_limit(512 << 20, true, true, false, 0), 16 << 20);
         assert_eq!(prefetch_limit(192 << 20, false, false, false, 0), 192 << 20);
+    }
+
+    #[test]
+    fn a_limited_host_prefetches_within_the_switch_value() {
+        TEST_LIMITED_MB.set(Some(32));
+        assert_eq!(prefetch_limit(512 << 20, false, false, true, GIB), 32 << 20);
+        assert_eq!(prefetch_limit(512 << 20, true, false, true, GIB), 64 << 20);
+        TEST_LIMITED_MB.set(None);
     }
 }
