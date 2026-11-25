@@ -2,21 +2,22 @@
 
 Este documento corresponde a la fase 0.2 y 0.3 del [README](../README.md).
 
-## Preparar la escena (una vez)
+## La escena
 
-1. Juega con el perfil `royale` (o con `joshuu`) hasta el **patio del prólogo** y guarda la partida allí.
-2. Si la guardaste con otro perfil, copia la partida al perfil `royale`:
-   ```sh
-   cp -a ~/Games/victory-data/perfiles/joshuu/data/<título>/saves/. ~/Games/victory-data/perfiles/royale/data/<título>/saves/
-   ```
-   Las partidas son tuyas y **no entran en el repositorio**.
+No hace falta partida guardada:
+
+1. Empieza una partida nueva.
+2. Sáltate la primera cinemática.
+3. Al llegar al primer momento en el que controlas a la protagonista, esa es la escena.
+
+Antes de medir tras actualizar el traductor, calienta la caché con `victory-proton -p royale victory warm --no-pipelines` (unos 100 s). La versión con pipelines se cuelga con RADV (fase 3.4).
 
 ## Medir
 
 | Escena | Qué hacer | Comando |
 |---|---|---|
-| A, estática | carga la partida, deja la cámara quieta, espera unos 20 s tras el primer frame del mundo, y pulsa Enter | `scripts/bench.sh run -l base-A` |
-| B, en movimiento | desde la misma partida, pulsa Enter y camina en línea recta durante 30 s | `scripts/bench.sh run -l base-B -s 30` |
+| A, estática | llega a la escena, deja la cámara quieta, espera unos 20 s tras el primer frame del mundo, y pulsa Enter | `scripts/bench.sh run -l base-A` |
+| B, en movimiento | desde el mismo punto, pulsa Enter y camina en línea recta durante 30 s | `scripts/bench.sh run -l base-B -s 30` |
 
 - **Lo que hace `run`:**
   1. Lanza el juego con `victory-proton -p royale run --no-update` y `VICTORY_FRAMETIME_DUMP=1`.

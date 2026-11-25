@@ -4,6 +4,7 @@ Qué se probó, qué salió y qué se decidió. Lo más nuevo va arriba.
 
 ## 2026-11-25
 
+- **`warm --no-pipelines` con royale:** 25.700 traducidos y 58 rechazados (joshuu rechazaba 106) en 101 s. Termina sin colgarse.
 - **Imagen de royale (base joshuu), según el usuario.**
   - **Bien:** se ve muy completo. Aparecen las paredes de la habitación y cosas que en otros forks no salían, y muchas texturas se ven bien.
   - **Fallos:**

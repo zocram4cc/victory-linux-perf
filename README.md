@@ -113,9 +113,9 @@ El orden es fijo, y cada fase depende de lo que mide la anterior.
 
 #### 0.2 Escena de referencia
 
-1. **Escena A, estática:** una partida guardada en el patio del prólogo. Se carga, se deja la cámara quieta y se miden 60 s a partir de 20 s después del primer frame del mundo.
-2. **Escena B, en movimiento:** desde la misma partida, caminar en línea recta 30 s.
-3. La partida es del usuario y **no entra en el repositorio**. Se copia a la carpeta de datos del perfil (`.../perfiles/royale/data/<título>/saves`).
+1. **Escena A, estática:** partida nueva, saltando la primera cinemática, hasta el primer momento jugable. Se deja la cámara quieta y se miden 60 s a partir de 20 s después del primer frame del mundo.
+2. **Escena B, en movimiento:** desde el mismo punto, caminar en línea recta 30 s.
+3. No hace falta partida guardada.
 4. Cómo reproducirla, en `docs/bench.md`: qué partida, qué hacer, cuánto esperar y qué switches usar.
 
 #### 0.3 `scripts/bench.sh`
