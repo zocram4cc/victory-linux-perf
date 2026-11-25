@@ -319,7 +319,7 @@ The correctness items that block speed work moved to **phase S** (above). What i
 
 ## Known blocker: timing-dependent device loss
 
-> **Read this before any speed-up work.** Every change that makes a frame faster has run into it.
+> **Cause found (25 Nov, late).** Host descriptor slots were written into the shader-visible heap while a submission ran on the GPU. `VICTORY_SLOT_WAIT=1` makes those writes wait: the open-world save holds **5 of 5** with the right picture, and fast writes hold too (3 of 3). Details below, under *Resolution*; the history is kept because it shows what was ruled out.
 
 **Symptom**
 - The GPU faults: `radv: GPUVM fault detected at address 0x8003…`. The kernel shows `[gfxhub] page fault`, client TCP (a shader memory read).
@@ -359,11 +359,20 @@ Left, since only the CPU waiting for an idle GPU helps:
 - work vkd3d keeps in flight past our wait;
 - **an out-of-range raw read (leading):** several fault addresses sit exactly on 1-2 MB boundaries, which is what a shader reading past the end of an allocation into unmapped space looks like. Raw addresses (root descriptors, title memory by address) have no bounds checks.
 
-**Status (25 Nov):**
+**Status before the resolution (25 Nov):**
 - `VICTORY_ALLOC_DUMP` placed a fault about 740 MB away from every live buffer copy and window. With the TCP (texture unit) client, it points to a **texture view reading beyond its image** (more mips or slices than the host copy has).
 - **Next step:** check every texture view against its host texture and count the mismatches. Details and every run are in [docs/journal.md](docs/journal.md) (entries of 25 Nov).
 
-**Why it matters:** it blocks fast writes, frames in flight (phase 3) and the open-world scene for measurements. Fixing it comes before any further speed work.
+**Why it mattered:** it blocked fast writes, frames in flight (phase 3) and the open-world scene for measurements.
+
+**Resolution (25 Nov, late; [journal](docs/journal.md))**
+1. A reliable reproducer: `scripts/trials.sh` with the Jason save loses the device within about a minute of the world drawing (10 of 12 runs).
+2. Ruled out: mirroring descriptors the title copies as bytes (`VICTORY_HEAP_SYNC=1`, 5 of 5 lost); every object we make leaked (`VICTORY_LEAK_ALL=1`, 4 of 4 lost); VRAM pressure (at most 8.2 of 20 GB).
+3. **`VKD3D_CONFIG=fault`** names the resource: the fault is inside a **texture made ~2 s before** the loss is reported, at an address that is *"currently mapped"*.
+4. **Mechanism:** `descriptor/host.rs` `make()` writes host slots lazily from the title's threads, **15,600-58,300 a frame while a submission runs**. Work in flight that reads such a slot sees a resource whose page-table update only the next submission waits for.
+5. **`VICTORY_SLOT_WAIT=1`:** a slot write waits until no submission runs. Open world: 5 of 5 held, 13,000 draws, 2.1 fps, right picture; ~90 writes a frame wait.
+
+**Still open:** a different, rarer fault seen once in the prologue with the wait on (SQC reading address 0, right after the sweep let ~5,000 texture copies go); being measured. The wait is the minimal form; phase 3 needs slot writes staged at submission boundaries (task S.6).
 
 ## 5. Working on this repository
 
@@ -384,9 +393,11 @@ In roadmap order. Piece letters refer to [the target](#the-target-pieces-that-fi
 
 | Task | Piece | Owner | Branch | Status |
 |---|---|---|---|---|
-| S.1 Wrong reads / device loss, Jason as reproducer: check every texture view against its host texture | D | maintainer | `p1.8-fast-reads` | **now** |
-| S.5 Evaluate fxceless `a26859f` (descriptor mirroring) | D | maintainer (agents: `vr-upstream`, `vr-architect`) | | next, with S.1 |
-| S.4 Open-world baseline (Jason, `bench.sh --auto -p royale-save`) | G | maintainer | | blocked by S.1 |
+| S.1 Wrong reads / device loss, Jason as reproducer | D | maintainer | `s5-heap-sync` | **found**: slot writes during a submission; `VICTORY_SLOT_WAIT=1` holds 5 of 5 |
+| S.6 Stage host slot writes at submission boundaries (the proper form of the wait; needed for 3.1) | D, Q | maintainer | | next |
+| S.7 Prologue null fault (SQC, address 0) seen once with the wait | L | maintainer | | measuring |
+| S.5 Evaluate fxceless `a26859f` (descriptor mirroring) | D | maintainer | `s5-heap-sync` | **done**: ported (`VICTORY_HEAP_SYNC=1`, off); not the cause; the title copies ~225,000 records a frame as bytes |
+| S.4 Open-world baseline (Jason, `bench.sh --auto -p royale-save`) | G | maintainer | | unblocked: 2.1 fps, 477 ms a frame, ~13,000 draws (first figures) |
 | S.2 Exact lifetimes for host copies | L | *open* | | after S.1 |
 | S.3 Texture coherence without the sweep | T | *open* | | after S.1 |
 | 1.3 Copy back only what the CPU reads | B | maintainer | | first after phase S; gates 3.1 |
@@ -394,7 +405,7 @@ In roadmap order. Piece letters refer to [the target](#the-target-pieces-that-fi
 | 1.1 Memory census by use | M | maintainer | `p1.1-census` | in progress (input for 1.3 and phase 2) |
 | 1.7 Stop re-copying our own write-back (`VICTORY_F1_OWN`, `VICTORY_F1_CARD_MERGE`) | B | maintainer | `p1.1-census` | **done**: uploads −49 %, hash passes −82 %, frame −2 % |
 | 1.8 Fast reads of title memory (`crate::fastcopy`) | W | maintainer | `p1.8-fast-reads` | **done**: frame 354 → 317 ms |
-| 1.9 Fast writes of title memory (`VICTORY_F1_FAST_WRITE=1`) | B | maintainer | `p1.8-fast-reads` | **off**: loses the device (the S.1 bug) |
+| 1.9 Fast writes of title memory (`VICTORY_F1_FAST_WRITE=1`) | B | maintainer | `p1.8-fast-reads` | safe with the wait (3 of 3), but no gain in the open world (2.03-2.15 fps); off |
 | 2.1 GPU and CPU bandwidth microbenchmark: VRAM, ReBAR, system memory | M | *open* | | independent research |
 | L.1 Soft-dirty / `userfaultfd` prototype, outside the game | W | *open* | | independent research |
 | U Review fxceless, joshuu and upstream since our base | — | agents (`vr-upstream`) | | standing |

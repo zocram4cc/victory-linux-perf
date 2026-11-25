@@ -67,11 +67,14 @@ for ((i = 1; i <= N; i++)); do
     [[ -n $(game_pid) ]] && { "$LAUNCHER" kill >/dev/null 2>&1 || true; sleep 5; }
     log=$(readlink -f "$DATA/perfiles/$PROFILE/logs/latest.log")
     clean=$(sed 's/\x1b\[[0-9;]*m//g' "$log" 2>/dev/null)
-    if grep -q '887A0005' <<<"$clean"; then result=lost
+    # The layer's log names the loss when it sees it first; otherwise the
+    # driver's fault is only in the launcher's output (stderr).
+    if grep -q '887A0005' <<<"$clean" || grep -qs 'GPUVM fault\|VK_ERROR_DEVICE_LOST' "$OUT_ROOT/.launcher.out"; then result=lost
     elif ((rc == 0)); then result=world
     elif grep -q 'did not come up' "$out"; then result=loading
     else result=closed
     fi
+    cp "$OUT_ROOT/.launcher.out" "$dir/launcher-$i.out" 2>/dev/null || true
     heap=$(grep -o 'per frame [0-9.]* changed heap pages, [0-9]* slots looked at, [0-9.]* whose record was new' <<<"$clean" | tail -n1)
     res=$(grep -o "$OUT_ROOT/[^ ]*-$LABEL-$i" "$out" | tail -n1)
     read -r fps ms invalid < <(python3 -I - "${res:-/nonexistent}/summary.json" <<'PY'
