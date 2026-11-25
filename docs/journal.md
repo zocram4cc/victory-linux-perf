@@ -7,6 +7,7 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 **Phase 1.8 started: fast reads of title memory**
 - **Why:** half the bytes, same copy time, so the cost is per read, not per byte. All reads of title memory go through `ReadProcessMemory` (`host.rs::read`), one call per piece, with fallbacks to 64 KiB and 4 KiB pieces and `VirtualQuery` when a page is missing.
 - **Plan** (README 1.8): profile first, then plain `memcpy` for ranges known to be readable, then a fault safety net, then batching.
+- First `--perf` run: **wineserver used 0.08 cores, with no memory-read request among its hot symbols**: title memory reads do not go through the server, so their cost is inside the game process. The game's own profile came out empty; perf errors now go to `perf.err`.
 - `bench.sh run --perf` records the game's and wineserver's user-space profiles during the window.
 
 **Phase 1: own write-back measured, both switches on by default**

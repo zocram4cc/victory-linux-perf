@@ -141,10 +141,12 @@ measure() {
     if ((PERF)); then
         # bubblewrap's user namespace keeps a profiler outside it from
         # attaching: enter it first. User space only (perf_event_paranoid=2).
-        nsenter -t "$pid" -U --preserve-credentials perf record -q -e cycles:u -p "$pid" -o "$dir/perf.data" -- sleep "$secs" >/dev/null 2>&1 &
+        # Small buffers: the game has 40+ threads, and the default ones for
+        # each go past perf_event_mlock_kb (the first profile came out empty).
+        nsenter -t "$pid" -U --preserve-credentials perf record -q -m 4 -F 999 -e cycles:u -p "$pid" -o "$dir/perf.data" -- sleep "$secs" >"$dir/perf.err" 2>&1 &
         perfs+=($!)
         if [[ -n $srv ]]; then
-            nsenter -t "$srv" -U --preserve-credentials perf record -q -e cycles:u -p "$srv" -o "$dir/perf-wineserver.data" -- sleep "$secs" >/dev/null 2>&1 &
+            nsenter -t "$srv" -U --preserve-credentials perf record -q -m 4 -F 999 -e cycles:u -p "$srv" -o "$dir/perf-wineserver.data" -- sleep "$secs" >>"$dir/perf.err" 2>&1 &
             perfs+=($!)
         fi
     fi
