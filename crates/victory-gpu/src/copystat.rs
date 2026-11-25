@@ -141,6 +141,10 @@ pub(crate) enum C {
     /// `watch::writes` askings not made because the range's first block is
     /// already known to be guarded view memory (no kernel call).
     WatchKnownView,
+    /// Refreshes of parts of copies that returned at once, the part checked
+    /// already in the submission (`crate::stamp`), and their bytes.
+    StampSkips,
+    StampSkipBytes,
 }
 const COUNTERS: usize = 80;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
@@ -1208,6 +1212,14 @@ pub(crate) fn log(frames: f64) {
         c[C::HostListNs as usize] / 1e6,
         c[C::PartsTogether as usize],
     );
+    if crate::stamp::on() {
+        tracing::info!(
+            target: "victory_gpu::host",
+            "refresh stamp per frame (VICTORY_REFRESH_STAMP=1): {:.0} refreshes skipped, {:.1} MB, as checked already in their submission",
+            c[C::StampSkips as usize],
+            mb(c[C::StampSkipBytes as usize]),
+        );
+    }
     // What is copied whole, largest first: memory nobody tells us about.
     let whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut whole: Vec<_> = whole.into_iter().flatten().collect();

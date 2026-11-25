@@ -251,6 +251,8 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
 /// The submission's one asking stands no longer: its refreshes are done,
 /// or title memory was written in a way the journal was not told.
 pub(crate) fn ask_once_end() {
+    // The asking stands no longer: what the copies checked is checked again.
+    let _changed = crate::stamp::Changed;
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     if j.kept {
         j.kept = false;
@@ -262,6 +264,8 @@ pub(crate) fn ask_once_end() {
 /// stands (the title's buffer copies, done at submission): its pages count
 /// as written after that asking, so the refreshes that follow copy them.
 pub(crate) fn wrote(at: usize, len: usize) {
+    // Our write into title memory: what the copies checked is checked again.
+    let _changed = crate::stamp::Changed;
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     if !j.kept || len == 0 {
         return;
@@ -288,6 +292,8 @@ pub(crate) fn wrote(at: usize, len: usize) {
 /// last found `page` written (0: never) and the new one, for the copy
 /// that wrote to note itself current.
 pub(crate) fn wrote_own(page: usize, others: &[usize]) -> (u64, u64) {
+    // Our write into title memory: what the copies checked is checked again.
+    let _changed = crate::stamp::Changed;
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     j.asked += 1;
@@ -926,6 +932,8 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
         .range(start / BLOCK..end.div_ceil(BLOCK))
         .copied()
         .collect();
+    // A guard opens: what the copies checked over these blocks is checked again.
+    let _changed = (!blocks.is_empty()).then_some(crate::stamp::Changed);
     for &block in &blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
@@ -998,6 +1006,8 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     if len == 0 {
         return;
     }
+    // The title's bytes are there, or a guard opened: checked again.
+    let _changed = crate::stamp::Changed;
     let mode = page_writes();
     let end = at.saturating_add(len);
     if pages {
@@ -1169,6 +1179,8 @@ pub struct Remapping {
 
 impl Drop for Remapping {
     fn drop(&mut self) {
+        // The change of what title memory shows is over (`crate::stamp`).
+        crate::stamp::advance();
         let us = self.since.elapsed().as_micros() as u64;
         REMAPS[2].fetch_add(us, std::sync::atomic::Ordering::Relaxed);
         // From the lock taken until it is let go (the frame log).
@@ -1255,6 +1267,8 @@ pub fn title_memory_reading_now(at: usize, len: usize) -> Option<Reading> {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    // What the range shows changed: checked again, however this returns.
+    let _changed = crate::stamp::Changed;
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);

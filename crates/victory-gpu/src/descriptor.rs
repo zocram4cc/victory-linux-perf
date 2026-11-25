@@ -419,6 +419,8 @@ pub(crate) extern "system" fn create_rtv(
     };
     // SAFETY: the handle is a descriptor slot, at least 112 bytes.
     unsafe { (handle as *mut RtvRecord).write_unaligned(record) };
+    #[cfg(windows)]
+    crate::stamp::advance();
 }
 
 /// Device method: a depth view, recorded as render target views are.
@@ -432,6 +434,8 @@ pub(crate) extern "system" fn create_dsv(
     if handle != 0 {
         // SAFETY: just written by `create_rtv`.
         unsafe { (handle as *mut u32).write_unaligned(DSV_TAG) };
+        #[cfg(windows)]
+        crate::stamp::advance();
     }
 }
 const DSV_TAG: u32 = u32::from_le_bytes(*b"vDSV");
@@ -865,6 +869,8 @@ fn record(handle: u64, view: View) {
     // SAFETY: the handle is a descriptor slot, at least 16 bytes.
     unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
     #[cfg(windows)]
+    crate::stamp::advance();
+    #[cfg(windows)]
     mirror(handle);
 }
 
@@ -1020,6 +1026,8 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
     if dst != 0 && src != 0 {
         // SAFETY: both ranges are descriptor slots the title owns.
         unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
+        #[cfg(windows)]
+        crate::stamp::advance();
         #[cfg(windows)]
         for i in 0..u64::from(count) {
             mirror(dst + i * step);
