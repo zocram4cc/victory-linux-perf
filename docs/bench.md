@@ -62,3 +62,14 @@ That table goes into every performance commit message.
 - **The first run after changing the shader translator warms the cache: discard it**, or run `warm` first.
 - **Same PC, same GE-Proton, patched wineserver.** `log.txt` says which was used.
 - **No other games or heavy programs open.**
+
+## Diagnostics build
+
+Some reports only exist in the diagnostics build. `copystat` is one: copies by source range and kind of memory, write-watch queries, and how much of what shaders write actually changes. Build it as its own profile and run it through the launcher with `VP_EXE`:
+
+```sh
+cargo xwin build --profile diag -p victory --features diagnostics --target x86_64-pc-windows-msvc
+VP_EXE=$PWD/target/x86_64-pc-windows-msvc/diag/victory.exe scripts/bench.sh run -l census-diag
+```
+
+Its frame times are not comparable with the release baseline: it does extra bookkeeping. Use it for *what* and *how much*, not for *how fast*.
