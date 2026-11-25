@@ -30,7 +30,7 @@ LAUNCHER=${VP_LAUNCHER:-victory-proton}
 die() { printf '\e[1;31mbench:\e[0m %s\n' "$*" >&2; exit 1; }
 say() { printf '\e[1;36mbench:\e[0m %s\n' "$*" >&2; }
 
-game_pid() { pgrep -f '^Z:.*release.victory\.exe run' | head -n1; }
+game_pid() { pgrep -f '^Z:.*(release|diag).victory\.exe run' | head -n1; }
 # The wineserver the game uses: the process whose executable is a
 # wineserver (Proton's, or the patched *-viewtree build).
 server_pid() {

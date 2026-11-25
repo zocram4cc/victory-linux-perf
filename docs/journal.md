@@ -4,6 +4,28 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-25
 
+**The saved game's device loss: what keeps it alive (all runs load the save, `royale-save`)**
+
+| Build and switches | Device lost | Notes |
+|---|---|---|
+| release (×4, also with every sweep off) | **4 of 4** | ~45-60 s in, while loading the world |
+| release, `VKD3D_CONFIG=…,breadcrumbs` | yes | vkd3d printed no breadcrumb report |
+| release, `RADV_DEBUG=hang` | no in 108 s | killed from outside |
+| release, `VKD3D_CONFIG=…,breadcrumbs,breadcrumbs_sync` | no | 0.2 fps, reached 11,878 draws a frame |
+| release, `VICTORY_DRED_DEVICE=faults` or `=breadcrumbs` (DRED setting alone) | yes, both | |
+| release, `VICTORY_DRED_DEVICE=both` | **1 of 2** | the run that lived: 2.9 fps, 13,405 draws, **picture almost white, Jason a shadow** (user) |
+| diag, no DRED | yes | |
+| diag, `VICTORY_D3D12_DRED=1` (×4, with or without our timestamps, markers or object names) | **0 of 4** | 2.3-2.7 fps, **picture right**: face, skin, water, clouds, minimap (screenshot and user) |
+| diag, DRED without the runtime settings (`VICTORY_DRED_SETTINGS=0`) | yes | |
+
+- Every release-only code path (`cfg(not(feature = "diagnostics"))`) was read: all equivalent (counters, captures, log text). The builds differ in timing, not in what they draw.
+- **Conclusion:** the loss depends on timing, as with fast writes and the forks' late wait. What helps is slowing things down or serialising the GPU (`breadcrumbs_sync`, `RADV_DEBUG=hang`), plus the extra work of the diag build with the runtime's DRED on. It is the main blocker for any speed-up. Whether it is a missing GPU barrier or a use after free is not settled.
+- The white picture in the release run that lived is a second symptom to look at once it stops crashing.
+- **New switches:**
+  - `VICTORY_DRED_DEVICE=breadcrumbs|faults|both` (any build);
+  - `VICTORY_DRED_SETTINGS=0`, `VICTORY_DRED_NAMES=0`, `VICTORY_NOTE_STAMPS=0`, `VICTORY_NOTE_MARKERS=0` (diag).
+- **Tooling:** `bench.sh` sees diag builds. In diag runs the frametime CSV is not where `--auto` looks; to fix.
+
 **Unattended runs, and a reproducible device loss**
 - **`bench.sh --auto` works:** it presses A at the start screen (`VICTORY_KEYS`, now in release builds), the intro plays through, the world is reached at ~105 s, and it measures with nobody at the keyboard. Current defaults: **327 ms per frame** (auto-keys run, ~5,080 draws, stable). Holding A does not skip the intro.
 - **The user's saved game (Jason, in the world)**, installed in a separate launcher profile `royale-save` (own data folder, same build):

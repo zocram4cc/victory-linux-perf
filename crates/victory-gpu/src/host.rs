@@ -546,13 +546,30 @@ fn create() -> windows::core::Result<Host> {
         }
         // Diagnostics: device-removed data (the command that faulted, the
         // faulting address), read when the device is removed.
-        if dred_on() {
+        // `VICTORY_DRED_SETTINGS=0`: device-removed data on for our notes,
+        // without asking the runtime for it (to tell which part matters).
+        // `VICTORY_DRED_DEVICE=breadcrumbs|faults|both` asks for one or both
+        // in any build (docs/journal.md, "which part of DRED").
+        let device_dred = std::env::var("VICTORY_DRED_DEVICE").ok();
+        let (crumbs, faults) = match device_dred.as_deref() {
+            Some("breadcrumbs") => (true, false),
+            Some("faults") => (false, true),
+            Some("both") => (true, true),
+            _ if dred_on() && std::env::var_os("VICTORY_DRED_SETTINGS").is_none_or(|v| v != "0") => (true, true),
+            _ => (false, false),
+        };
+        if crumbs || faults {
             let mut dred: Option<ID3D12DeviceRemovedExtendedDataSettings> = None;
             if D3D12GetDebugInterface(&mut dred).is_ok()
                 && let Some(dred) = dred
             {
-                dred.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-                dred.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                if crumbs {
+                    dred.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                }
+                if faults {
+                    dred.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                }
+                tracing::info!(crumbs, faults, "device-removed data asked of the runtime");
             }
         }
         let mut device: Option<ID3D12Device> = None;
@@ -1247,7 +1264,9 @@ fn timing() -> bool {
 /// Names a host object for the device-removed report, which names the
 /// allocations a page fault hit (only with device-removed data on).
 pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
+    static NAMES: OnceLock<bool> = OnceLock::new();
     if dred_on()
+        && *NAMES.get_or_init(|| std::env::var_os("VICTORY_DRED_NAMES").is_none_or(|v| v != "0"))
         && let Ok(object) = object.cast::<ID3D12Object>()
     {
         // SAFETY: a plain call on a live object.
@@ -4822,7 +4841,14 @@ impl HostList {
         {
             let started = std::time::Instant::now();
             let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
-            if let Some((heap, _)) = self.stamps() && at < STAMPS - 1 {
+            // `VICTORY_NOTE_STAMPS=0` / `VICTORY_NOTE_MARKERS=0`: leave the
+            // timestamp or the marker out (which of them keeps the device of
+            // docs/journal.md "a reproducible device loss" alive).
+            static STAMP_ON: OnceLock<bool> = OnceLock::new();
+            static MARK_ON: OnceLock<bool> = OnceLock::new();
+            let stamp_on = *STAMP_ON.get_or_init(|| std::env::var_os("VICTORY_NOTE_STAMPS").is_none_or(|v| v != "0"));
+            let mark_on = *MARK_ON.get_or_init(|| std::env::var_os("VICTORY_NOTE_MARKERS").is_none_or(|v| v != "0"));
+            if stamp_on && let Some((heap, _)) = self.stamps() && at < STAMPS - 1 {
                 // SAFETY: an open list and our query heap.
                 unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
             }
@@ -4830,10 +4856,12 @@ impl HostList {
             crate::capture::op(std::ptr::from_ref(self) as usize, || what.clone());
             let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
             const UNICODE: u32 = 0;
-            // SAFETY: an open list; the marker is copied when recorded.
-            unsafe {
-                self.list.SetMarker(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)
-            };
+            if mark_on {
+                // SAFETY: an open list; the marker is copied when recorded.
+                unsafe {
+                    self.list.SetMarker(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)
+                };
+            }
             self.notes
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
