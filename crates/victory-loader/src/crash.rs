@@ -356,6 +356,74 @@ unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
     Some(len)
 }
 
+/// Debugging aid (`VICTORY_STEP_OVER=<hex offset>,...`): title breakpoints
+/// at these image offsets are stepped over instead of ending the run, with
+/// how often each was hit. Grand Theft Auto VI 1.0.2.1's pool allocates trap
+/// on an empty pool right before returning NULL (`+0x5149aec`, `+0x63966f`,
+/// #698): stepped over, the allocation fails and the title goes on.
+#[cfg(feature = "diagnostics")]
+static STEP_OVER: std::sync::OnceLock<Vec<(usize, std::sync::atomic::AtomicU64)>> =
+    std::sync::OnceLock::new();
+
+/// Whether the breakpoint being dispatched is one listed in
+/// `VICTORY_STEP_OVER`; if so the thread resumes after it.
+///
+/// # Safety
+/// `info` comes from the system, for an exception being dispatched.
+#[cfg(feature = "diagnostics")]
+unsafe fn step_over(info: *mut EXCEPTION_POINTERS) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_IMAGE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let list = STEP_OVER.get_or_init(|| {
+        std::env::var("VICTORY_STEP_OVER")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|s| {
+                let s = s.trim().trim_start_matches('+').trim_start_matches("0x");
+                usize::from_str_radix(s, 16).ok()
+            })
+            .map(|offset| (offset, std::sync::atomic::AtomicU64::new(0)))
+            .collect()
+    });
+    if list.is_empty() {
+        return false;
+    }
+    // SAFETY: the system passes valid exception pointers.
+    let record = unsafe { &*(*info).ExceptionRecord };
+    if record.ExceptionCode != EXCEPTION_BREAKPOINT {
+        return false;
+    }
+    let at = record.ExceptionAddress as usize;
+    // SAFETY: a zeroed MEMORY_BASIC_INFORMATION is valid.
+    let mut region: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let size = size_of::<MEMORY_BASIC_INFORMATION>();
+    // SAFETY: a query of our own address space into a local structure.
+    if unsafe { VirtualQuery(at as *const _, &mut region, size) } != size || region.Type != MEM_IMAGE {
+        return false;
+    }
+    let offset = at - region.AllocationBase as usize;
+    let Some((_, count)) = list.iter().find(|(o, _)| *o == offset) else {
+        return false;
+    };
+    // SAFETY: `at` lies in a mapped image region (queried above).
+    if unsafe { *(at as *const u8) } != 0xCC {
+        return false;
+    }
+    // SAFETY: the faulting thread's context, for the exception being dispatched.
+    let ctx = unsafe { &mut *(*info).ContextRecord };
+    if ctx.Rip as usize == at {
+        ctx.Rip += 1;
+    }
+    let n = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n <= 3 || n.is_power_of_two() {
+        tracing::warn!(
+            offset = format_args!("{offset:#x}"),
+            n,
+            "stepped over the title's breakpoint (VICTORY_STEP_OVER): the code behind it goes on"
+        );
+    }
+    true
+}
+
 unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     // an instruction of the console's CPU this one lacks: emulated, the title goes on
     // SAFETY: the system passes valid exception pointers.
@@ -368,6 +436,11 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     }
     // SAFETY: the system passes valid exception pointers.
     if unsafe { emulate_amd_only(info) } {
+        return -1; // EXCEPTION_CONTINUE_EXECUTION
+    }
+    #[cfg(feature = "diagnostics")]
+    // SAFETY: as above.
+    if unsafe { step_over(info) } {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
     }
     // SAFETY: as above.
