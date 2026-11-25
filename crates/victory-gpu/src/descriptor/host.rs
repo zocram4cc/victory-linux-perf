@@ -2320,13 +2320,12 @@ impl HostHeap {
     }
 
     /// [`HostHeap::mirror`] for the pass over slots whose buffer view was
-    /// written (`heap_buffers` in the draw code): a slot it mirrors is not
-    /// handed back to the pass as changed, which made it look at every
-    /// buffer slot it mirrored again on the next frame. The copy the slot
-    /// reads ([`buffer_copy`]) comes with it when making the view resolved
-    /// it, so the pass need not look it up again.
+    /// written (`heap_buffers` in the draw code). The copy the slot reads
+    /// ([`buffer_copy`]) comes with it when making the view resolved it, so
+    /// the pass need not look it up again. A slot it mirrors is handed back
+    /// to the pass as changed unless [`pass_leaves_out`] says otherwise.
     pub(crate) fn mirror_heap_buffer(&self, index: u32, handle: u64) -> Option<(View, Option<BufferCopy>)> {
-        self.mirror_inner(index, handle, true, false, None)
+        self.mirror_inner(index, handle, true, !pass_leaves_out(), None)
     }
 
     /// [`HostHeap::mirror`] with the two choices the callers make:
@@ -2745,6 +2744,17 @@ pub(crate) type BufferCopy = (std::sync::Arc<crate::shadow::Shadow>, u64, u64);
 fn sync_tables() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_TABLES").is_some_and(|v| v == "1"))
+}
+
+/// Whether the pass over buffer views leaves the slots it mirrors out of the
+/// changed list ([`HostHeap::mirror_heap_buffer`]), so that it does not look
+/// at them again on the next frame. Off by default: the slots stay listed, as
+/// before. A slot the pass leaves out may keep a copy the title's memory no
+/// longer reads until the title writes it again or the pass looks at every
+/// slot (every 16 passes). `VICTORY_BUFFER_PASS_NO_REQUEUE=1` leaves them out.
+fn pass_leaves_out() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BUFFER_PASS_NO_REQUEUE").is_some_and(|v| v == "1"))
 }
 
 /// Since the last frame line: slots on changed heap pages that
