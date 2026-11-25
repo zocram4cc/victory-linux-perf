@@ -9476,6 +9476,15 @@ impl Meter {
                 }
             }
         }
+        // On-screen figures (`VICTORY_DEBUG_HUD=1`; DexNom/VIctory's overlay).
+        crate::debug_hud::update(hwnd, || {
+            format!(
+                "{fps:.1} FPS   {ms:.1} ms/frame   {draws:.0} draws/frame\n\
+                 CPU prep {cpu:.1} ms   heap {picked_ms:.1} ms   GPU wait {gpu:.1} ms\n\
+                 copies {copy_ms:.1} ms   textures {texture_ms:.1} ms   copy-back {back_ms:.1} ms\n\
+                 dropped {dropped:.0}/frame   indirect dropped {indirect:.0}/frame"
+            )
+        });
         if self.caption.is_none() {
             // The window's own text, read without a message.
             let mut buffer = vec![0u16; 512];

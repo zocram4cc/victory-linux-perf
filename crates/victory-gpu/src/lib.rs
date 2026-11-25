@@ -31,6 +31,8 @@ mod drvwatch;
 #[cfg(windows)]
 mod spread;
 #[cfg(windows)]
+mod debug_hud;
+#[cfg(windows)]
 mod draw;
 pub mod dxgi;
 #[cfg(windows)]
