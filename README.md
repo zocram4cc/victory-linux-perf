@@ -300,10 +300,11 @@ Today the chain is: console shader → DXIL → dxil-spirv → SPIR-V → RADV, 
 Ruled out:
 - the texture sweep;
 - objects freed through `retire()` (`VICTORY_LEAK_RETIRED=1`: still 3 of 3);
-- barriers between commands (`VICTORY_SERIAL_OPS=all`: still 2 of 2).
+- barriers between commands (`VICTORY_SERIAL_OPS=all`: still 2 of 2);
+- DirectStorage's parallel workers (`VICTORY_DSTORAGE_WORKERS=1`: still 2 of 2).
 
 Left, since only the CPU waiting for an idle GPU helps:
-- DirectStorage's worker threads writing destinations while the GPU runs;
+- GPU work our wait does not cover: the **present** (vkd3d's swapchain blit on its own queue), vkd3d's internal queues;
 - work vkd3d keeps in flight past our wait;
 - an out-of-range read on data that is not complete yet.
 

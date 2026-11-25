@@ -13,6 +13,7 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 - Not a host object freed through `retire()` (shadows, texture copies, slot views, staging).
 - Not a missing barrier between commands on the GPU.
+- Not DirectStorage's parallel loading: `VICTORY_DSTORAGE_WORKERS=1` (one worker instead of 24) still lost 2 of 2.
 - What did avoid it: **the CPU waiting for the GPU to go idle after each submission** (`RADV_DEBUG=hang`, `breadcrumbs_sync`), and the diag build with the runtime's DRED. So something the CPU side touches while the GPU still works. Candidates:
   - DirectStorage's worker threads (`victory:disk`) writing destinations during loading;
   - work vkd3d keeps in flight past our wait;
