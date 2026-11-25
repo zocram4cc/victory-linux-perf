@@ -1410,4 +1410,142 @@ mod tests {
             mem::VirtualFree(base as *mut c_void, 0, mem::MEM_RELEASE);
         }
     }
+
+    /// What one direction of one opening showed, as the table prints it.
+    #[derive(Clone)]
+    enum Alias {
+        /// The GPU and the title hold the same bytes.
+        Aliased,
+        /// Other bytes: the host made a copy where the memory should have
+        /// been shared (vkd3d-proton logs `Failed to import host memory`).
+        Stale,
+        /// The host refused the opening or the placement: its HRESULT.
+        Refused(String),
+    }
+
+    impl std::fmt::Display for Alias {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Alias::Aliased => f.write_str("ALIASED"),
+                Alias::Stale => f.write_str("NOT ALIASED (stale)"),
+                Alias::Refused(text) => f.write_str(text),
+            }
+        }
+    }
+
+    /// `K64` bytes of a pattern; two seeds differ at every byte.
+    fn pattern(seed: u8) -> Vec<u8> {
+        (0..K64).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed)).collect()
+    }
+
+    /// A heap opened on `from`, and a buffer of `bytes` placed at its start.
+    fn open_and_place(device: &ID3D12Device, from: From, bytes: u64) -> windows::core::Result<(ID3D12Heap, ID3D12Resource)> {
+        let heap = open(device, from)?;
+        let buffer = place(device, &heap, 0, bytes)?;
+        Ok((heap, buffer))
+    }
+
+    /// The first adapter that is not the software one, its name, and a
+    /// device on it: the card, under Proton.
+    fn hardware() -> Option<(ID3D12Device, String)> {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        // SAFETY: plain DXGI queries and device creation; each adapter is
+        // used only inside these calls.
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+            for i in 0.. {
+                let adapter: IDXGIAdapter = factory.EnumAdapters(i).ok()?;
+                let desc = adapter.cast::<IDXGIAdapter1>().ok()?.GetDesc1().ok()?;
+                if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0 {
+                    continue;
+                }
+                let name = String::from_utf16_lossy(&desc.Description).trim_end_matches('\0').to_owned();
+                let mut device: Option<ID3D12Device> = None;
+                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
+                return device.map(|device| (device, name));
+            }
+        }
+        None
+    }
+
+    /// Both directions over one opening of the title's memory at `title`:
+    /// the title writes and the GPU reads it back; then the GPU writes and
+    /// the title reads it at its own address. `opened` is the heap and the
+    /// buffer over it, or the host's refusal.
+    fn both_ways(rig: &mut Rig, title: *mut u8, opened: windows::core::Result<(ID3D12Heap, ID3D12Resource)>) -> windows::core::Result<[Alias; 2]> {
+        let (_heap, buffer) = match opened {
+            Ok(opened) => opened,
+            Err(e) => {
+                let refused = Alias::Refused(hr(&Err::<(), _>(e)));
+                return Ok([refused.clone(), refused]);
+            }
+        };
+        let mine = pattern(0x11);
+        // SAFETY: `K64` bytes of the title's memory, which the heap covers.
+        unsafe { std::ptr::copy_nonoverlapping(mine.as_ptr(), title, K64) };
+        let cpu_to_gpu = if rig.fetch(&buffer, 0, K64)? == mine { Alias::Aliased } else { Alias::Stale };
+        let theirs = pattern(0x77);
+        rig.store(&buffer, 0, &theirs)?;
+        let gpu_to_cpu = if same(title, &theirs) { Alias::Aliased } else { Alias::Stale };
+        Ok([cpu_to_gpu, gpu_to_cpu])
+    }
+
+    /// The three openings on the card, both directions, one line per case:
+    /// ALIASED (the GPU and the title share the bytes), NOT ALIASED (stale:
+    /// the host made a copy, so the two hold other bytes) or REFUSED (the
+    /// host's HRESULT). Fails if an accepted opening is stale. Under Proton
+    /// with `VKD3D_DEBUG=warn`, each `Failed to import host memory` line is
+    /// such a copy.
+    #[test]
+    #[ignore = "hardware: the RX 6900 XT, under Proton"]
+    fn card_openings_alias_or_refuse_both_ways() -> windows::core::Result<()> {
+        let Some((device, name)) = hardware() else { panic!("no hardware adapter") };
+        eprintln!("inplace alias: adapter \"{name}\"");
+        assert!(name.contains("6900"), "not the RX 6900 XT: \"{name}\"");
+        let mut rig = Rig::new(&device)?;
+        let mut stale = Vec::new();
+        let mut record = |label: &'static str, [cpu_to_gpu, gpu_to_cpu]: [Alias; 2]| {
+            eprintln!("inplace alias: {label}, CPU->GPU: {cpu_to_gpu}");
+            eprintln!("inplace alias: {label}, GPU->CPU: {gpu_to_cpu}");
+            if matches!(cpu_to_gpu, Alias::Stale) || matches!(gpu_to_cpu, Alias::Stale) {
+                stale.push(label);
+            }
+        };
+        // SAFETY (the whole body): each allocation and section below is the
+        // test's own, every address used lies inside it, and each heap is
+        // dropped in `both_ways` before its memory is released.
+        unsafe {
+            // (a) a whole allocation, opened by `OpenExistingHeapFromAddress`.
+            let whole = mem::VirtualAlloc(std::ptr::null(), K64, mem::MEM_RESERVE | mem::MEM_COMMIT | MEM_WRITE_WATCH, mem::PAGE_READWRITE).cast::<u8>();
+            assert!(!whole.is_null(), "VirtualAlloc");
+            let opened = open_and_place(&device, From::Region(whole as usize), K64 as u64);
+            record("(a) VirtualAlloc whole, OpenExistingHeapFromAddress", both_ways(&mut rig, whole, opened)?);
+            mem::VirtualFree(whole.cast(), 0, mem::MEM_RELEASE);
+
+            // (b) a committed part of a larger reservation, opened as `place_part` opens title memory.
+            let reserved = mem::VirtualAlloc(std::ptr::null(), 4 * K64, mem::MEM_RESERVE | MEM_WRITE_WATCH, mem::PAGE_READWRITE).cast::<u8>();
+            assert!(!reserved.is_null(), "VirtualAlloc");
+            let part = reserved.add(K64);
+            assert!(!mem::VirtualAlloc(part.cast(), K64, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null(), "commit the part");
+            let opened = place_part(&device, part as u64, K64 as u64)
+                .map(|placed| (placed.heap, placed.buffer))
+                .map_err(|e| e.unwrap_or_else(|| panic!("the part is not private memory committed whole")));
+            record("(b) VirtualAlloc part, OpenExistingHeapFromAddress1", both_ways(&mut rig, part, opened)?);
+            mem::VirtualFree(reserved.cast(), 0, mem::MEM_RELEASE);
+
+            // (c) a section made committed, viewed by the title.
+            let invalid = windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+            let section = mem::CreateFileMappingW(invalid, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_COMMIT, 0, K64 as u32, std::ptr::null());
+            assert!(!section.is_null(), "CreateFileMapping");
+            let view = mem::MapViewOfFile(section, mem::FILE_MAP_WRITE, 0, 0, K64);
+            assert!(!view.Value.is_null(), "MapViewOfFile");
+            let opened = open_and_place(&device, From::Section(section as usize), K64 as u64);
+            record("(c) SEC_COMMIT section, OpenExistingHeapFromFileMapping", both_ways(&mut rig, view.Value.cast(), opened)?);
+            mem::UnmapViewOfFile(view);
+            windows_sys::Win32::Foundation::CloseHandle(section);
+        }
+        assert!(stale.is_empty(), "NOT ALIASED (stale) in {stale:?}: the GPU and the title hold other bytes there");
+        Ok(())
+    }
 }
