@@ -2278,6 +2278,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }
+                if let Some(d) = desc.as_mut() {
+                    view_in_range(texture, d, resource);
+                }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {
                     device.CreateShaderResourceView(
@@ -3121,5 +3124,85 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 41));
+    }
+}
+
+/// Views of textures that ask for mips or array slices the host texture
+/// does not have, since the start (diagnostics of the README's "Known
+/// blocker": a shader read through such a view runs past the image's
+/// memory, where the console would read title memory).
+pub(crate) static OUT_OF_RANGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Checks a shader view's mip and slice range against `texture`; counts and
+/// logs (the first 40) views that reach past it, and with
+/// `VICTORY_CLAMP_VIEWS=1` cuts them to what the texture has.
+fn view_in_range(texture: &ID3D12Resource, d: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, resource: crate::object::This) {
+    use std::sync::atomic::Ordering::Relaxed;
+    static CLAMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let clamp = *CLAMP.get_or_init(|| std::env::var_os("VICTORY_CLAMP_VIEWS").is_some_and(|v| v == "1"));
+    // SAFETY: a live resource.
+    let own = unsafe { texture.GetDesc() };
+    let mips = u32::from(own.MipLevels.max(1));
+    let slices = u32::from(own.DepthOrArraySize.max(1));
+    // (most detailed mip, mip levels, first slice, slice count) as views of
+    // each dimension keep them; u32::MAX levels means "all from the first".
+    // SAFETY: the union member read is the one `ViewDimension` names.
+    let (mip, levels, first, count): (&mut u32, &mut u32, Option<&mut u32>, Option<&mut u32>) = unsafe {
+        let u = &mut d.Anonymous;
+        match d.ViewDimension {
+            D3D12_SRV_DIMENSION_TEXTURE1D => (&mut u.Texture1D.MostDetailedMip, &mut u.Texture1D.MipLevels, None, None),
+            D3D12_SRV_DIMENSION_TEXTURE1DARRAY => (
+                &mut u.Texture1DArray.MostDetailedMip,
+                &mut u.Texture1DArray.MipLevels,
+                Some(&mut u.Texture1DArray.FirstArraySlice),
+                Some(&mut u.Texture1DArray.ArraySize),
+            ),
+            D3D12_SRV_DIMENSION_TEXTURE2D => (&mut u.Texture2D.MostDetailedMip, &mut u.Texture2D.MipLevels, None, None),
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => (
+                &mut u.Texture2DArray.MostDetailedMip,
+                &mut u.Texture2DArray.MipLevels,
+                Some(&mut u.Texture2DArray.FirstArraySlice),
+                Some(&mut u.Texture2DArray.ArraySize),
+            ),
+            D3D12_SRV_DIMENSION_TEXTURE3D => (&mut u.Texture3D.MostDetailedMip, &mut u.Texture3D.MipLevels, None, None),
+            D3D12_SRV_DIMENSION_TEXTURECUBE => (&mut u.TextureCube.MostDetailedMip, &mut u.TextureCube.MipLevels, None, None),
+            _ => return,
+        }
+    };
+    let mips_past = *mip >= mips || (*levels != u32::MAX && mip.saturating_add(*levels) > mips);
+    let slices_past = match (&first, &count) {
+        (Some(f), Some(c)) => **f >= slices || (**c != u32::MAX && f.saturating_add(**c) > slices),
+        _ => false,
+    };
+    if !mips_past && !slices_past {
+        return;
+    }
+    let n = OUT_OF_RANGE.fetch_add(1, Relaxed);
+    if n < 40 || n.is_power_of_two() {
+        tracing::warn!(
+            ?resource,
+            dimension = d.ViewDimension.0,
+            mip = *mip,
+            levels = *levels,
+            texture_mips = mips,
+            first_slice = first.as_deref().copied(),
+            slices = count.as_deref().copied(),
+            texture_slices = slices,
+            clamped = clamp,
+            seen = n + 1,
+            "a texture view reaches past its host texture"
+        );
+    }
+    if clamp {
+        *mip = (*mip).min(mips - 1);
+        if *levels != u32::MAX {
+            *levels = (*levels).clamp(1, mips - *mip);
+        }
+        if let (Some(f), Some(c)) = (first, count) {
+            *f = (*f).min(slices - 1);
+            if *c != u32::MAX {
+                *c = (*c).clamp(1, slices - *f);
+            }
+        }
     }
 }

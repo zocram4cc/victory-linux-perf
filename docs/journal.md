@@ -4,6 +4,12 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-25
 
+**Found: `VICTORY_SKIP_PIPELINES` only worked in diagnostics builds (fixed)**
+- `pipeline::is_skipped` and the three checks in `draw.rs` were `cfg(feature = "diagnostics")`. **Every release run of ours, and of the launcher's fork profiles, never skipped `fc5e66f8f873d3bb`**, although the profile set it. Fixed: the skip works in every build. The 24 Nov finding that the GPU faulted ~9 minutes in without the skip came from release builds, where the skip did nothing.
+- It does **not** fix the saved game's loss alone: 2 runs after the fix, one lost the device, one did not (it was still loading at 1,503 draws).
+- Found by listing every diagnostics-only statement that does more than measure. The other diag-only paths are notes, traces and counters.
+- Also: texture views from `make()` never reach past their host texture (0 in a run). `VKD3D_CONFIG=fault` gave no report and no loss in that run, but a white-and-black picture, like release with DRED.
+
 **Device loss: the fault is not in a buffer copy; likely a texture read out of range**
 - `VICTORY_PAD_KB=256` (256 KiB more at the end of every host buffer made in `host.rs`): still lost 2 of 2. The faults were at `0x8003bb7f0000` and `0x800410e00000`.
 - **`VICTORY_ALLOC_DUMP=<file>`** writes, on device loss, every live host copy of a title buffer and every window: GPU address, bytes, title address, kind.
