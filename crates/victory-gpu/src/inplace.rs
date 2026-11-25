@@ -287,15 +287,19 @@ fn card_imports_alias(device: &ID3D12Device) -> bool {
     alias
 }
 
-/// [`card_imports_alias`]'s check; `None` if one of its steps failed.
+/// [`card_imports_alias`]'s check, at the size the card view opens heaps at
+/// (`CHUNK`): a private section of that size, its view opened as a part and
+/// a buffer over the whole heap. The first and the last page are checked
+/// both ways, through a view of the section and through the GPU. `None` if
+/// one of its steps failed.
 fn canary(device: &ID3D12Device) -> Option<bool> {
-    const BYTES: usize = 2 * K64;
+    const BYTES: usize = CHUNK as usize;
     let mut rig = Rig::new(device).ok()?;
     // SAFETY: a section and two views of it, made here; every address used
     // lies inside them, and the heap and buffer go before the views do.
     unsafe {
         let invalid = windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-        let section = mem::CreateFileMappingW(invalid, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_COMMIT, 0, BYTES as u32, std::ptr::null());
+        let section = mem::CreateFileMappingW(invalid, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_COMMIT, (BYTES as u64 >> 32) as u32, BYTES as u32, std::ptr::null());
         if section.is_null() {
             return None;
         }
@@ -307,11 +311,15 @@ fn canary(device: &ID3D12Device) -> Option<bool> {
             let title_bytes = title.Value.cast::<u8>();
             open(device, From::Part(card.Value as usize, BYTES)).ok().and_then(|heap| {
                 let buffer = place(device, &heap, 0, BYTES as u64).ok()?;
-                fill(title_bytes, BYTES, 0x5c);
-                let cpu_to_gpu = rig.fetch(&buffer, 0, BYTES).is_ok_and(|got| same(title_bytes, &got));
-                let new: Vec<u8> = (0..BYTES).map(|i| (i as u8) ^ 0xa3).collect();
-                let gpu_to_cpu = rig.store(&buffer, 0, &new).is_ok() && same(title_bytes, &new);
-                Some(cpu_to_gpu && gpu_to_cpu)
+                let mut alias = true;
+                for (n, at) in [0, BYTES - K64].into_iter().enumerate() {
+                    let page = title_bytes.add(at);
+                    fill(page, K64, 0x5c + n as u8);
+                    alias &= rig.fetch(&buffer, at as u64, K64).is_ok_and(|got| same(page, &got));
+                    let new: Vec<u8> = (0..K64).map(|i| (i as u8) ^ (0xa3 + n as u8)).collect();
+                    alias &= rig.store(&buffer, at as u64, &new).is_ok() && same(page, &new);
+                }
+                Some(alias)
             })
         };
         mem::UnmapViewOfFile(title);
