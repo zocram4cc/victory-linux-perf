@@ -774,20 +774,29 @@ pub(crate) fn probe(
         Type: D3D12_HEAP_TYPE_READBACK,
         ..Default::default()
     };
-    let mut buffer: Option<ID3D12Resource> = None;
-    // SAFETY: plain creation; an open list; locations naming live resources.
-    unsafe {
-        device
-            .CreateCommittedResource(
-                &heap,
-                D3D12_HEAP_FLAG_NONE,
-                &desc,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                None,
-                &mut buffer,
-            )
+    // One buffer for every present: each is waited for before the next
+    // (made and released per present, it cost a kernel call per frame).
+    static BUFFER: std::sync::OnceLock<Option<ID3D12Resource>> = std::sync::OnceLock::new();
+    let buffer = BUFFER
+        .get_or_init(|| {
+            let mut buffer: Option<ID3D12Resource> = None;
+            // SAFETY: plain creation.
+            unsafe {
+                device.CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut buffer,
+                )
+            }
             .ok()?;
-        let buffer = buffer?;
+            buffer
+        })
+        .clone()?;
+    // SAFETY: an open list; locations naming live resources.
+    unsafe {
         for i in 0..GRID * GRID {
             let (x, y) = (
                 (2 * (i % GRID) + 1) * d.Width as u32 / (2 * GRID),
