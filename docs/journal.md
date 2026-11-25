@@ -4,6 +4,19 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-25
 
+**Fast writes: 2 device losses in 3 runs; a lead in the texture sweep**
+- `VICTORY_F1_FAST_WRITE=1`, three runs:
+  - **lost the device twice**, as loading ended and a few seconds into the first cutscene (GPUVM faults on host GPU addresses, TCP client: a texture read);
+  - **when it gets through, copy-back falls from 69 to 53 ms** (−23 %) and the frame from 317 to 308 ms.
+  - Without fast writes: no device loss in ~25 runs.
+- **The crash log's trail:** 1.4 ms before the loss, the sweep (`resource::let_go_idle`) let go of **2,196 host copies of textures the title fills (1.58 GB)**, *"each held by its title texture alone (no list, no slot)"*. The fork's late-wait crash of 24 Nov also had a sweep letting go a few ms before.
+- **Why speed would expose it:**
+  - a texture copy is let go after 5 s **and** 4 frames without use;
+  - during loading, frames take seconds, so a faster copy-back reaches the 4 frames sooner;
+  - textures loaded long before become eligible right as the cutscene starts using them.
+  - In `Host::submit`, `sweep()` runs before `descriptor::make_waiting()` makes the slots the title wrote since the last submission. A texture a pending slot is about to show may still count as held by no slot.
+- **Decisive test:** `VICTORY_TEXTURE_SWEEP=0` with fast writes on. If the losses stop, fix the sweep (ordering, or count pending slots as holders) instead of hiding it. This lifetime bug would also hit phase 3.
+
 **Phase 1.8 measured: fast reads work, −10 % frame time**
 
 | Scene A | baseline | 1.7 (own write-back) | 1.8 (fast reads) |
