@@ -824,26 +824,43 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
 /// must lie in one placeholder.
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
-    // SAFETY: splits the placeholder around the range (failing harmlessly
-    // when the range is the whole placeholder), then maps the section
-    // there; both act only on placeholders.
+    const MEM_COALESCE_PLACEHOLDERS: u32 = 1;
+    // SAFETY: the reservation belongs to the title and these calls only
+    // split, merge or replace placeholders in that reservation.
     let view = unsafe {
         VirtualFree(
             base as *mut c_void,
             len,
             MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
         );
-        MapViewOfFile3(
-            slice.section.0,
-            GetCurrentProcess(),
-            base as *const c_void,
-            (slice.index * PAGE) as u64,
-            len,
-            MEM_REPLACE_PLACEHOLDER,
-            PAGE_READWRITE,
-            std::ptr::null_mut(),
-            0,
-        )
+        let replace = || {
+            MapViewOfFile3(
+                slice.section.0,
+                GetCurrentProcess(),
+                base as *const c_void,
+                (slice.index * PAGE) as u64,
+                len,
+                MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        let view = replace();
+        // Unmapping separate page views leaves separate placeholders.
+        // One section view needs a single placeholder of the same size.
+        if view.Value.is_null()
+            && len > PAGE
+            && VirtualFree(
+                base as *mut c_void,
+                len,
+                MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS,
+            ) != 0
+        {
+            replace()
+        } else {
+            view
+        }
     };
     if view.Value as usize != base {
         tracing::warn!(
@@ -1297,6 +1314,16 @@ mod tests {
         assert!(map_alias(b as u64, 0, PAGE as u64));
         assert_eq!(query(b).host.State, MEM_RESERVE);
         assert!(!map_alias(b as u64, at(a, 1) as u64, PAGE as u64));
+
+        // The first two slots at b now have separate placeholders after
+        // unmap. A contiguous replacement must join them before mapping.
+        assert!(write_physical(&pages[1..2], 0, &[42]));
+        assert_eq!(XMemMapPhysicalPages(b, 2, pages.as_ptr()), b);
+        // SAFETY: the two pages were just mapped read-write.
+        unsafe {
+            assert_eq!(b.cast::<u8>().read(), 1);
+            assert_eq!(at(b, 1).cast::<u8>().read(), 42);
+        }
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
         assert_eq!(XMemIsToolsMemAvailable(), 0);
     }
