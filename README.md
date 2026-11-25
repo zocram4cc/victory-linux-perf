@@ -138,7 +138,7 @@ Hay que portar los contadores de diagnóstico de la sesión del 24-nov, que est�
 
 1. **`xmem`:** llamadas y tiempo de `map` y `unmap`, y tiempo bajo el bloqueo de remapeo por segundo. joshuu ya tiene una parte (`e5e06c4`): se reutiliza y se completa.
 2. **Esperas del título:** una sustitución HLE de `WaitForSingleObject(Ex)`, `WaitForMultipleObjects(Ex)`, `Sleep(Ex)`, `WaitOnAddress` y `SleepConditionVariableSRW/CS`. Agrupa por hilo y por quién llama (`RtlCaptureStackBackTrace`), y marca si la espera es sobre un fence de `SetEventOnCompletion`.
-3. **Columnas nuevas en el CSV:** `remap_lock_ms`, `maps`, `unmaps`, `title_wait_ms`, para cruzarlas con el resto.
+3. **Columnas nuevas en el CSV:** `remap_ms`, `maps` y `unmaps` por frame (hecho). Las esperas del título van al log cada 5 s (`medir: waits by thread`), porque se agrupan por hilo y por quién llama.
 
 #### 0.5 Experimentos de techo (antes de escribir ninguna optimización)
 
@@ -377,5 +377,5 @@ git remote add royale   https://github.com/ligmaSec/victory-royale
 
 | Fase | Estado |
 |---|---|
-| 0 | en curso: base y README listos; siguiente, el perfil del lanzador y `bench.sh` |
+| 0 | en curso: base, perfil `royale`, `bench.sh` y `VICTORY_MEDIR` hechos; falta la primera medida real (escena A/B), los experimentos de techo y los ports de royale |
 | 1-5 | pendientes |

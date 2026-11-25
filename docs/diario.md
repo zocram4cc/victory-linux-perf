@@ -4,6 +4,9 @@ Qué se probó, qué salió y qué se decidió. Lo más nuevo va arriba.
 
 ## 2026-11-25
 
+- **Fase 0.4 (sin probar en vivo todavía).**
+  - `VICTORY_MEDIR=1` activa en la build normal los contadores de remapeo de xmem (antes solo en la build de diagnóstico) y el módulo `waitstat`: esperas del título por hilo y por quién llama, con `[fence]` si es un fence de la GPU.
+  - El CSV de frametime gana `remap_ms`, `maps` y `unmaps` por frame.
 - **Base.**
   - `main` = JoshuuDev/victory-amd `003beef`.
   - victory-royale (ligmaSec) queda en `royale-base`: fusionarlo daba 494 conflictos en 63 archivos.
