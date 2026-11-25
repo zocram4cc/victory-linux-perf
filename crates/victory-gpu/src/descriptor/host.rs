@@ -26,6 +26,10 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
+    /// A fingerprint of the record each slot held when the pass over
+    /// records copied in as bytes last looked at it
+    /// ([`HostHeap::mirror_copied`]; 0: never looked at). Made on first use.
+    copied: Mutex<Vec<u64>>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -769,6 +773,7 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
+            copied: Mutex::new(Vec::new()),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, taken)),
             free: std::sync::atomic::AtomicU32::new(DYNAMIC - 1),
@@ -1575,6 +1580,39 @@ impl HostHeap {
         D3D12_CPU_DESCRIPTOR_HANDLE {
             ptr: self.cpu + index as usize * self.step as usize,
         }
+    }
+
+    /// For a slot on a page of the title's heap that changed with no call
+    /// (`super::sync_heaps`: the title copies records into its heap as
+    /// bytes): [`HostHeap::mirror`], if the bytes of the record at `handle`
+    /// are not the ones this last saw there. True if it did.
+    ///
+    /// The page says only that something on it was written; `mirror` alone
+    /// would take every record on it for newly written each time.
+    /// `record`: the record's bytes as the caller read them through the
+    /// kernel. Ported from fxceless `a26859f`.
+    pub(crate) fn mirror_copied(&self, index: u32, handle: u64, record: &[u8]) -> bool {
+        if index >= self.count {
+            return false;
+        }
+        // Never 0, which is "never looked at".
+        let print = u64::from_le_bytes(blake3::hash(record).as_bytes()[..8].try_into().unwrap_or([1; 8])) | 1;
+        {
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            if copied.is_empty() {
+                copied.resize(self.count as usize, 0);
+            }
+            let Some(last) = copied.get_mut(index as usize) else {
+                return false;
+            };
+            // A slot never looked at that holds nothing: as it was.
+            if *last == print || (*last == 0 && record.iter().all(|&b| b == 0)) {
+                return false;
+            }
+            *last = print;
+        }
+        self.mirror(index, handle, false);
+        true
     }
 
     /// Makes host slot `index` from the record the title has at `handle`

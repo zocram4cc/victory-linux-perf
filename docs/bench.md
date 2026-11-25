@@ -71,6 +71,17 @@ A run takes about 3 minutes. `VICTORY_KEYS` now works in release builds.
 scripts/bench.sh run -l my-test --auto VICTORY_SOMETHING=1
 ```
 
+## Stability trials
+
+`scripts/trials.sh` repeats one configuration unattended and classifies each run: `lost` (the log reports `0x887A0005`), `world` (the window was measured), `loading` (the world did not come up) or `closed`. It defaults to the open-world save (`royale-save`) and a 20 s window. `-o DP-1` takes a screenshot 8 s into the window, to check for the white picture.
+
+```sh
+scripts/trials.sh -n 5 -l heap-sync-on -o DP-1 VICTORY_HEAP_SYNC=1
+scripts/trials.sh -n 5 -l heap-sync-off -o DP-1 VICTORY_HEAP_SYNC=0
+```
+
+Results go to `bench/trials-<date>-<label>/`: `trials.tsv` (one row per run, with fps and the heap-sync counter), `tally.txt`, each run's output and screenshot. Run the configurations being compared back to back, with the same binary.
+
 ## Profiling
 
 `--perf` records a user-space CPU profile (`perf record -e cycles:u`) of the game and of wineserver during the window. `nsenter` steps into bubblewrap's user namespace so that `perf` can attach.
