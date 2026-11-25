@@ -4,6 +4,16 @@ Qué se probó, qué salió y qué se decidió. Lo más nuevo va arriba.
 
 ## 2026-11-25
 
+- **Imagen de royale (base joshuu), según el usuario.**
+  - **Bien:** se ve muy completo. Aparecen las paredes de la habitación y cosas que en otros forks no salían, y muchas texturas se ven bien.
+  - **Fallos:**
+    - las cabezas no se ven, solo la boca y los ojos;
+    - algunas texturas parpadean.
+  - Va a la fase 5. No es prioritario ahora.
+- **Compilar los shaders antes de jugar.**
+  - La caché de traducciones va por el hash de las fuentes del traductor, no por el del exe. Los cambios fuera de `victory-shader` no la invalidan.
+  - `warm --no-pipelines` (solo traducción) se lanza antes de medir.
+  - Los pipelines gráficos dependen del estado que crea el juego, así que no se pueden hacer todos antes. Joshuu ya guarda la lista de los usados en ejecuciones anteriores y los empieza al cargar.
 - **Primera vez de royale (`f0b709b`) en el mundo.**
   - Lanzado a mano, sin `VICTORY_FRAMETIME_DUMP`, con la caché de shaders fría. Llega al prólogo.
   - Cifras del log en el mundo:

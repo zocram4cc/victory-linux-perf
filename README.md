@@ -310,6 +310,8 @@ Hoy la cadena es esta: shader de consola → DXIL → dxil-spirv → SPIR-V → 
 | 106 shaders sin traducir (`warm`, 25-nov) | abiertos | por familias: *"descriptor read only as data"* (caras y piel), `v_cvt_f32_f64`, SGPR de hardware, descriptores elegidos por flujo de control, primera mitad de interpolación |
 | Trazado de rayos (sombras negras) | no se ejecuta | DXR en vkd3d-proton; después de la fase 3 |
 | Parpadeo del vídeo de la intro | abierto | medir con capturas |
+| Cabezas invisibles (solo se ven boca y ojos) | abierto (visto en royale, 25-nov) | probablemente los shaders de piel *"descriptor read only as data"*; comprobar con `VICTORY_NULL_MAGENTA` qué draws se descartan |
+| Texturas que parpadean en el mundo | abierto (visto en royale, 25-nov) | ver si son texturas que se suben a medias (`texture.rs`, `VICTORY_HEAP_RECHECK`) |
 | Puerta de cada fase | | 30 minutos en el mundo sin perder el dispositivo y sin cierres |
 
 ## 5. Cómo trabajamos
