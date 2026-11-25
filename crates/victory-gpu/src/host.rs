@@ -828,6 +828,123 @@ mod tests {
         }
     }
 
+    #[test]
+    fn write_mapped_skips_unmapped_and_readonly_pages_and_marks_write_watch() {
+        use windows_sys::Win32::System::Memory::*;
+        const PAGE: usize = 4096;
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const N: usize = 4 * PAGE;
+        // SAFETY: private test allocations freed before returning.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), N, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            // Page 0: writable, Page 1: PAGE_NOACCESS (reserved), Page 2: READONLY, Page 3: writable.
+            assert_eq!(VirtualAlloc(base.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE), base.cast());
+            let p2 = base.add(2 * PAGE);
+            assert_eq!(VirtualAlloc(p2.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE), p2.cast());
+            p2.write_bytes(0x5a, PAGE);
+            let mut old = 0;
+            assert_ne!(VirtualProtect(p2.cast(), PAGE, PAGE_READONLY, &mut old), 0);
+            let p3 = base.add(3 * PAGE);
+            assert_eq!(VirtualAlloc(p3.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE), p3.cast());
+
+            let src = vec![0xa3u8; N];
+            super::write_mapped(base, src.as_ptr(), N);
+            assert!(std::slice::from_raw_parts(base, PAGE).iter().all(|&b| b == 0xa3));
+            assert!(std::slice::from_raw_parts(p2, PAGE).iter().all(|&b| b == 0x5a));
+            assert!(std::slice::from_raw_parts(p3, PAGE).iter().all(|&b| b == 0xa3));
+            assert!(!super::read_into(base, &mut vec![0u8; N]));
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+
+            // Verify `direct_copy::try_copy` triggers write-watch tracking on committed pages.
+            let ww = VirtualAlloc(
+                std::ptr::null(),
+                2 * PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+            .cast::<u8>();
+            assert!(!ww.is_null());
+            assert_eq!(ResetWriteWatch(ww.cast(), 2 * PAGE), 0);
+            let payload = vec![0x42u8; PAGE];
+            super::write_mapped(ww.add(PAGE), payload.as_ptr(), PAGE);
+            let mut dirty = [std::ptr::null_mut(); 4];
+            let mut count = dirty.len();
+            let mut granularity = 0;
+            assert_eq!(
+                GetWriteWatch(0, ww.cast(), 2 * PAGE, dirty.as_mut_ptr(), &mut count, &mut granularity),
+                0
+            );
+            assert_eq!(count, 1);
+            assert_eq!(dirty[0] as usize, ww.add(PAGE) as usize);
+            assert_ne!(VirtualFree(ww.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    #[ignore = "benchmark"]
+    fn benchmark_direct_copy_vs_kernel_calls() {
+        use std::time::Instant;
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        const SIZE: usize = 64 << 20;
+        const CHUNK: usize = 64 << 10;
+        const ITERS: usize = 4;
+        let src = vec![0x3cu8; SIZE];
+        let mut dst = vec![0u8; SIZE];
+
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            assert!(super::read_kernel(src.as_ptr(), dst.as_mut_ptr(), SIZE));
+        }
+        let read_kernel_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        let t1 = Instant::now();
+        for _ in 0..ITERS {
+            // SAFETY: valid test vectors.
+            assert!(unsafe { super::direct_copy::try_copy(dst.as_mut_ptr(), src.as_ptr(), SIZE) });
+        }
+        let read_direct_ms = t1.elapsed().as_secs_f64() * 1000.0;
+
+        let chunks = 1000;
+        let t2 = Instant::now();
+        for i in 0..chunks {
+            let off = (i * 4096) % (SIZE - CHUNK);
+            let mut done = 0;
+            // SAFETY: valid test vectors.
+            let ok = unsafe {
+                super::NtWriteVirtualMemory(
+                    GetCurrentProcess(),
+                    dst.as_mut_ptr().add(off).cast(),
+                    src.as_ptr().add(off).cast(),
+                    CHUNK,
+                    &mut done,
+                ) >= 0
+            };
+            assert!(ok);
+        }
+        let write_nt_ms = t2.elapsed().as_secs_f64() * 1000.0;
+
+        let t3 = Instant::now();
+        for i in 0..chunks {
+            let off = (i * 4096) % (SIZE - CHUNK);
+            // SAFETY: valid test vectors.
+            let ok = unsafe {
+                super::direct_copy::try_copy(dst.as_mut_ptr().add(off), src.as_ptr().add(off), CHUNK)
+            };
+            assert!(ok);
+        }
+        let write_direct_ms = t3.elapsed().as_secs_f64() * 1000.0;
+
+        eprintln!(
+            "256MB bulk read: kernel={read_kernel_ms:.2}ms ({:.0} MB/s) direct={read_direct_ms:.2}ms ({:.0} MB/s) | 1000x64K write: NtWrite={write_nt_ms:.2}ms ({:.0} MB/s) direct={write_direct_ms:.2}ms ({:.0} MB/s)",
+            256.0 / (read_kernel_ms / 1000.0),
+            256.0 / (read_direct_ms / 1000.0),
+            (chunks as f64 * 64.0 / 1024.0) / (write_nt_ms / 1000.0),
+            (chunks as f64 * 64.0 / 1024.0) / (write_direct_ms / 1000.0),
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -8270,9 +8387,137 @@ fn mapped_whole(at: usize, len: usize, write: bool) -> bool {
     mapped_run(at, at.saturating_add(len), write) == Some(at.saturating_add(len))
 }
 
+/// Whether reads and write-backs copy in-process, guarded by a vectored
+/// exception handler (`VICTORY_DIRECT_COPY=1`). Off otherwise: the kernel
+/// copies (`NtReadVirtualMemory`, `NtWriteVirtualMemory` or `WriteProcessMemory`).
+fn direct_copy_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_DIRECT_COPY").is_some_and(|v| v == "1")
+    })
+}
+
+#[cfg(target_arch = "x86_64")]
+mod direct_copy {
+    use std::sync::Once;
+
+    use windows_sys::Win32::Foundation::{
+        EXCEPTION_ACCESS_VIOLATION, EXCEPTION_IN_PAGE_ERROR, NTSTATUS,
+    };
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
+        EXCEPTION_POINTERS,
+    };
+
+    std::arch::global_asm!(
+        ".global victory_try_copy",
+        ".global victory_try_copy_op",
+        ".global victory_try_copy_end",
+        ".global victory_try_copy_fault",
+        "victory_try_copy:",
+        ".seh_proc victory_try_copy",
+        "push rsi",
+        ".seh_pushreg rsi",
+        "push rdi",
+        ".seh_pushreg rdi",
+        ".seh_endprologue",
+        "mov rdi, rcx",
+        "mov rsi, rdx",
+        "mov rcx, r8",
+        "cld",
+        "victory_try_copy_op:",
+        "rep movsb",
+        "victory_try_copy_end:",
+        "mov eax, 1",
+        "jmp victory_try_copy_done",
+        "victory_try_copy_fault:",
+        "xor eax, eax",
+        "victory_try_copy_done:",
+        "pop rdi",
+        "pop rsi",
+        "ret",
+        ".seh_endproc",
+    );
+
+    unsafe extern "C" {
+        fn victory_try_copy(dst: *mut u8, src: *const u8, len: usize) -> u8;
+        static victory_try_copy_op: u8;
+        static victory_try_copy_end: u8;
+        static victory_try_copy_fault: u8;
+    }
+
+    unsafe extern "system" fn on_fault(info: *mut EXCEPTION_POINTERS) -> i32 {
+        // SAFETY: Windows passes valid exception pointers during VEH dispatch.
+        let record = unsafe { &*(*info).ExceptionRecord };
+        let code = record.ExceptionCode;
+        if code != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
+            && code != EXCEPTION_IN_PAGE_ERROR as NTSTATUS
+        {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        // SAFETY: `ContextRecord` is valid during VEH dispatch.
+        let ctx = unsafe { &mut *(*info).ContextRecord };
+        let rip = ctx.Rip as usize;
+        let start = (&raw const victory_try_copy_op) as usize;
+        let end = (&raw const victory_try_copy_end) as usize;
+        if rip < start || rip >= end {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        // A write fault may race with `watch` re-protecting a block; let
+        // `watch` open writable blocks before reporting failure.
+        const WRITE: usize = 1;
+        if code == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
+            && record.NumberParameters >= 2
+            && record.ExceptionInformation[0] == WRITE
+            && crate::watch::handle_write_fault(record.ExceptionInformation[1])
+        {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        ctx.Rip = (&raw const victory_try_copy_fault) as u64;
+        EXCEPTION_CONTINUE_EXECUTION
+    }
+
+    fn install() {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            // SAFETY: `on_fault` only intercepts faults inside `victory_try_copy_op`.
+            unsafe {
+                AddVectoredExceptionHandler(1, Some(on_fault));
+            }
+        });
+    }
+
+    /// Copies `len` bytes from `src` to `dst` in-process, returning `false` on
+    /// an access violation or in-page error at either pointer.
+    ///
+    /// # Safety
+    ///
+    /// Any valid mapped bytes covered by `dst[..len]` and `src[..len]` must be
+    /// safe for unsynchronized read/write of disjoint buffers.
+    pub(super) unsafe fn try_copy(dst: *mut u8, src: *const u8, len: usize) -> bool {
+        if len == 0 {
+            return true;
+        }
+        install();
+        // SAFETY: `victory_try_copy` preserves callee-saved registers and any
+        // fault inside `victory_try_copy_op` jumps to `victory_try_copy_fault`.
+        unsafe { victory_try_copy(dst, src, len) != 0 }
+    }
+}
+
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
 /// readable.
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    if direct_copy_enabled() {
+        // SAFETY: `dst` is caller-owned writable memory of `len` bytes; faults on
+        // `src` are intercepted by `direct_copy::try_copy`.
+        return unsafe { direct_copy::try_copy(dst, src, len) };
+    }
+    read_kernel(src, dst, len)
+}
+
+fn read_kernel(src: *const u8, dst: *mut u8, len: usize) -> bool {
     // `VirtualQuery` walks the page tables to the region's end: ~0.6 ms in
     // the title's big pools, where most copies are under a kilobyte. Only a
     // large read is worth the question.
@@ -8344,8 +8589,16 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let direct = direct_writes();
+    #[cfg(target_arch = "x86_64")]
+    let in_process = direct_copy_enabled();
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
+        #[cfg(target_arch = "x86_64")]
+        if in_process {
+            // SAFETY: `from` is our mapped host copy of `n` bytes; guards were
+            // opened by the caller (`crate::watch::writing`) or by `on_fault`.
+            return unsafe { direct_copy::try_copy(at as *mut u8, from, n) };
+        }
         let mut done = 0;
         if direct {
             // SAFETY: as below; the kernel checks the destination and
