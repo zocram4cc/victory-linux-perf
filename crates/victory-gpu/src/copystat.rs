@@ -1011,6 +1011,18 @@ fn process_times() -> (u64, u64) {
     (micros(user), micros(kernel))
 }
 
+/// The process's processor time since the last call, as a percent of
+/// `elapsed` (one processor is 100; all threads count). 0 at the first call.
+pub(crate) fn cpu_percent(elapsed: std::time::Duration) -> f64 {
+    static LAST: Mutex<Option<u64>> = Mutex::new(None);
+    let (user, kernel) = process_times();
+    let now = user + kernel;
+    let Some(before) = LAST.lock().unwrap_or_else(|e| e.into_inner()).replace(now) else {
+        return 0.0;
+    };
+    now.saturating_sub(before) as f64 / elapsed.as_micros().max(1) as f64 * 100.0
+}
+
 fn submitter(all: &mut Vec<(u32, Submitter)>, id: u32) -> &mut Submitter {
     let at = match all.iter().position(|s| s.0 == id) {
         Some(at) => at,

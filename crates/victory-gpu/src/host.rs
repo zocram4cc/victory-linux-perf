@@ -134,6 +134,16 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
     ok.then_some(m.ullAvailPhys)
 }
 
+/// The host device's adapter name and dedicated video memory, when DXGI
+/// named it (the frametime dump's hardware line).
+pub(crate) fn adapter_summary() -> Option<(String, u64)> {
+    let adapter = host()?.adapter.as_ref()?;
+    // SAFETY: a plain DXGI adapter query that fills the structure it returns.
+    let desc = unsafe { adapter.GetDesc1() }.ok()?;
+    let end = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+    Some((String::from_utf16_lossy(&desc.Description[..end]), desc.DedicatedVideoMemory as u64))
+}
+
 /// How long host copies of textures the title fills must have been idle to
 /// be let go, in milliseconds, and how many bytes of them go at most (the
 /// longest idle first): none but those of ten minutes while what is in use
@@ -705,15 +715,16 @@ fn card_clock_watch(clock: &'static CardClock) {
 }
 
 /// For the frame-rate line: [`CARD_CLOCK_US`] per frame, `ms` being the
-/// frame's time.
-fn card_clock_line(frames: f64, ms: f64) {
+/// frame's time. Returns the card's busy percentage the line shows.
+fn card_clock_line(frames: f64, ms: f64) -> f64 {
     let [idle, behind, stood] = [0, 1, 2].map(|i| CARD_CLOCK_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+    let busy = if ms > 0.0 { (100.0 * (1.0 - idle / ms)).clamp(0.0, 100.0) } else { 0.0 };
     tracing::info!(
-        "the card's clock per frame: nothing of ours queued {idle:.1} ms (the card about {:.0}% busy by this count), \
+        "the card's clock per frame: nothing of ours queued {idle:.1} ms (the card about {busy:.0}% busy by this count), \
          {behind:.1} ms of that while the submitting thread was working (the card idle behind us), the rest while the title \
-         had not submitted; the submitting thread stood waiting for the card {stood:.1} ms",
-        if ms > 0.0 { (100.0 * (1.0 - idle / ms)).clamp(0.0, 100.0) } else { 0.0 }
+         had not submitted; the submitting thread stood waiting for the card {stood:.1} ms"
     );
+    busy
 }
 
 /// Of the preparing: title memory copies (microseconds, bytes) and texture
@@ -8523,6 +8534,7 @@ impl Meter {
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
+        crate::frametime::tick();
         self.frames += 1;
         #[cfg(feature = "diagnostics")]
         {
@@ -8562,25 +8574,23 @@ impl Meter {
         crate::descriptor::sync_line(frames);
         late_line(frames);
         crate::queue::behind_line(frames);
-        card_clock_line(frames, ms);
+        let gpu_pct = card_clock_line(frames, ms);
         #[cfg(feature = "diagnostics")]
         spans::line(frames);
         crate::shadow::back_line(frames);
         #[cfg(feature = "diagnostics")]
         split_line(frames);
-        {
-            let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
-            if passes + compares > 0.0 {
-                tracing::info!(
-                    "our passes over copies in the card's memory per frame: {passes:.0} hash passes over {pieces:.0} pieces after \
-                     ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes",
-                    if rehash_runs() { "on" } else { "off" }
-                );
-            }
+        let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
+        if passes + compares > 0.0 {
+            tracing::info!(
+                "our passes over copies in the card's memory per frame: {passes:.0} hash passes over {pieces:.0} pieces after \
+                 ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes",
+                if rehash_runs() { "on" } else { "off" }
+            );
         }
+        let [own, asking, still, all] =
+            [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
         {
-            let [own, asking, still, all] =
-                [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
             if all >= 1.0 {
                 tracing::info!(
                     "texture refreshes per frame, all threads: {all:.1} ms, of them {own:.1} ms waiting for a texture another thread \
@@ -8625,6 +8635,55 @@ impl Meter {
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
+        // `VICTORY_FRAMETIME_DUMP`: one row per summary interval, with the
+        // buckets above and the worst and mean frame measured at each present.
+        let (frame_ms_max, frame_ms_avg, _timed) = crate::frametime::take_interval();
+        #[cfg(feature = "diagnostics")]
+        let (ram_mb, cpu_pct) = (
+            crate::copystat::process_memory().1 as f64 / (1 << 20) as f64,
+            crate::copystat::cpu_percent(elapsed),
+        );
+        #[cfg(not(feature = "diagnostics"))]
+        let (ram_mb, cpu_pct) = (0.0, 0.0);
+        let row = crate::frametime::Row {
+            frame: crate::queue::presented(),
+            frames,
+            fps,
+            ms,
+            frame_ms_max,
+            frame_ms_avg,
+            cpu_prepare_ms: cpu,
+            gpu_ms: gpu,
+            gpu_pct,
+            copies_ms: copy_ms,
+            copies_mb: copy_mb,
+            textures_ms: texture_ms,
+            textures_mb: texture_mb,
+            copyback_ms: back_ms,
+            copyback_mb: back_mb,
+            draws,
+            dropped,
+            making: crate::pipeline::making() as f64,
+            indirect,
+            heap_passes: picked,
+            heap_ms: picked_ms,
+            texture_refresh_ms: all,
+            card_passes: passes,
+            card_compares: compares,
+            card_sent_mb: card[0] as f64 / frames / 1e6,
+            card_ranges: card[1] as f64 / frames,
+            card_pieces: card[2] as f64 / frames,
+            card_fetched: card[3] as f64 / frames,
+            card_fetched_mb: card[4] as f64 / frames / 1e6,
+            card_waits: card[5] as f64 / frames,
+            card_wait_ms: card[6] as f64 / frames / 1e3,
+            twins_into_depth: twin_to_depth,
+            twins_into_colour: twin_to_colour,
+            depth_planes: planes,
+            ram_mb,
+            cpu_pct,
+        };
+        crate::frametime::record(&row);
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
             tracing::info!(

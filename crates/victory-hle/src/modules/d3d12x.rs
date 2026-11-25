@@ -78,6 +78,13 @@ pub fn use_shader_cache(dir: std::path::PathBuf) {
     let _ = dir;
 }
 
+/// The frame-time dump (`VICTORY_FRAMETIME_DUMP=1` writes `dump`) and the
+/// title build's label for its header.
+pub fn use_frametime_dump(dump: std::path::PathBuf, build: String) {
+    victory_gpu::frametime::use_dump_path(dump);
+    victory_gpu::frametime::use_build_label(build);
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "d3d12x",
