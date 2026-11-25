@@ -1,7 +1,7 @@
 //! Diagnostics: where the submission copies of title memory go (which
 //! ranges, how often, of what memory) and what limits their rate, logged
-//! with the frame-rate line. `VICTORY_COPY_MODE=plain` copies without the
-//! mapped-page guard, `none` skips the copies (both for timing only).
+//! with the frame-rate line. `VICTORY_COPY_MODE` (`crate::medir::copy_mode`)
+//! changes how copies run, for timing only.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -133,16 +133,6 @@ static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
     COUNT[c as usize].fetch_add(n, Relaxed);
-}
-
-/// How copies run: 0 guarded (as always), 1 plain, 2 not at all.
-pub(crate) fn mode() -> u8 {
-    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("VICTORY_COPY_MODE").as_deref() {
-        Ok("plain") => 1,
-        Ok("none") => 2,
-        _ => 0,
-    })
 }
 
 /// Per source range (start, length): copies, bytes, microseconds, memory type.
