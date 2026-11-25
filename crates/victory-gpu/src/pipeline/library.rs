@@ -512,7 +512,29 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     // The rejected bytes are let go (a mapped file is unmapped) before the
     // empty library is made: nothing reads them any more.
     drop(blob);
-    let library = make(&[]).ok()?;
+    // The slice wrapper passes a non-null pointer even for zero bytes.
+    // vkd3d-proton requires a null blob pointer to create an empty library.
+    let mut raw = std::ptr::null_mut();
+    // SAFETY: no blob is read, and a successful output is an owned interface.
+    let made = unsafe {
+        (device.vtable().CreatePipelineLibrary)(
+            device.as_raw(),
+            std::ptr::null(),
+            0,
+            &ID3D12PipelineLibrary::IID,
+            &raw mut raw,
+        )
+        .ok()
+        .and_then(|()| {
+            if raw.is_null() {
+                return Err(windows::Win32::Foundation::E_POINTER.into());
+            }
+            ID3D12PipelineLibrary::from_raw(raw).cast::<ID3D12PipelineLibrary1>()
+        })
+    };
+    let library = made
+        .map_err(|e| tracing::info!(error = %e, "the host refused an empty pipeline library"))
+        .ok()?;
     Some(Library {
         library,
         _blob: Blob::None,
