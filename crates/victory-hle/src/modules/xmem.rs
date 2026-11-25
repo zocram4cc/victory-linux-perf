@@ -789,7 +789,7 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 /// in place of what `to` shows; `from` 0 unmaps. The GPU's page-mapping
 /// copies (`victory_gpu`, queue `CopyPageMappingsBatchX`):
 /// the title maps pages into a pool view, then has the GPU map them into its tiled
-/// heap. Page by page; false if a source page is not mapped physical memory.
+/// heap. False if a source page is not mapped physical memory.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let mut physical = physical();
@@ -797,21 +797,25 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (start, end) = reach(&physical, to, len);
     let _changing = victory_gpu::title_memory_remapping(start, end - start);
     unmap(&mut physical, to, len);
+    if from != 0
+        && len > PAGE
+        && len.is_multiple_of(PAGE)
+        && victory_gpu::resource::batch_page_mappings()
+        && let Some(first) = alias_slice(&physical, from)
+        && (1..len / PAGE).all(|i| {
+            alias_slice(&physical, from + i * PAGE).is_some_and(|s| {
+                Arc::ptr_eq(&s.section, &first.section) && s.index == first.index + i
+            })
+        })
+        && map(&mut physical, to, len, first)
+    {
+        return true;
+    }
     for k in (0..len).step_by(PAGE) {
         if from == 0 {
             break;
         }
-        let at = from + k;
-        let Some(slice) = physical
-            .views
-            .range(..=at)
-            .next_back()
-            .filter(|(base, (size, _))| at < *base + size)
-            .map(|(base, (_, s))| Slice {
-                index: s.index + (at - base) / PAGE,
-                section: s.section.clone(),
-            })
-        else {
+        let Some(slice) = alias_slice(&physical, from + k) else {
             return false;
         };
         if !map(&mut physical, to + k, PAGE, slice) {
@@ -819,6 +823,18 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
         }
     }
     true
+}
+
+fn alias_slice(physical: &Physical, at: usize) -> Option<Slice> {
+    physical
+        .views
+        .range(..=at)
+        .next_back()
+        .filter(|(base, (size, _))| at < *base + size)
+        .map(|(base, (_, s))| Slice {
+            index: s.index + (at - base) / PAGE,
+            section: s.section.clone(),
+        })
 }
 
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
@@ -1323,6 +1339,22 @@ mod tests {
         unsafe {
             assert_eq!(b.cast::<u8>().read(), 1);
             assert_eq!(at(b, 1).cast::<u8>().read(), 42);
+        }
+        assert!(map_alias(a as u64, b as u64, (2 * PAGE) as u64));
+        let allocation = query(at(a, 1)).host.AllocationBase;
+        let expected = if victory_gpu::resource::batch_page_mappings() {
+            a
+        } else {
+            at(a, 1)
+        };
+        assert_eq!(allocation, expected);
+        // A one-page update can split the view and leaves both neighbours intact.
+        assert!(map_alias(at(a, 1) as u64, b as u64, PAGE as u64));
+        // SAFETY: all three pages are mapped and readable.
+        unsafe {
+            assert_eq!(a.cast::<u8>().read(), 1);
+            assert_eq!(at(a, 1).cast::<u8>().read(), 1);
+            assert_eq!(at(a, 2).cast::<u8>().read(), 7);
         }
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
         assert_eq!(XMemIsToolsMemAvailable(), 0);

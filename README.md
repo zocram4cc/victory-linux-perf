@@ -129,6 +129,9 @@ morning. Still far from the console's 33 ms.
   windows on (960 are compute dispatches; about 1,000 are mesh records
   the title keeps scattered through a 100 MB argument buffer, which a
   window of records at one step cannot serve).
+- `VICTORY_BATCH_PAGE_MAPPINGS=1` tries one host view for consecutive
+  texture-streaming pages. A failed batch retries the original mappings
+  in order. This is experimental.
 - Measured and found to give nothing (switches left in, off):
   `VICTORY_REFRESH_ONCE`, `VICTORY_ASYNC_PRESENT`, `VICTORY_VIEW_KNOWN`,
   `VICTORY_SPREAD`, `VICTORY_QUEUE2=3`, `VICTORY_WINDOW_JUMP`. Each has an
