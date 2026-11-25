@@ -1739,8 +1739,23 @@ fn back_piece(
     if differs == 0 {
         return None;
     }
+    mask_runs(mask, runs);
+    Some((first, n))
+}
+
+/// The runs of `mask`'s non-zero bytes, as (offset, length), into `runs`;
+/// stretches of zero words are passed over a word at a time. Where a
+/// shader wrote here and there in a piece, most of its mask is zeros: the
+/// byte-by-byte search ran at 2-4 GB/s, this at 10-27 (`mask_runs_speed`),
+/// with the same runs (`word_search_finds_the_byte_runs`).
+fn mask_runs(mask: &[u8], runs: &mut Vec<(usize, usize)>) {
+    let n = mask.len();
+    let zero_word = |i: usize| i + 8 <= n && mask[i..i + 8] == [0; 8];
     let mut i = 0;
     while i < n {
+        while zero_word(i) {
+            i += 8;
+        }
         while i < n && mask[i] == 0 {
             i += 1;
         }
@@ -1752,7 +1767,6 @@ fn back_piece(
             runs.push((start, i - start));
         }
     }
-    Some((first, n))
 }
 
 /// Since the last frame-rate line, of [`Shadow::merge_under_writes`]: pages
@@ -4295,4 +4309,122 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod mask_runs_tests {
+    use super::mask_runs;
+
+    /// The byte-by-byte run search `mask_runs` replaces, kept as the
+    /// reference.
+    fn runs_bytes(mask: &[u8]) -> Vec<(usize, usize)> {
+        let (n, mut runs, mut i) = (mask.len(), Vec::new(), 0);
+        while i < n {
+            while i < n && mask[i] == 0 {
+                i += 1;
+            }
+            let start = i;
+            while i < n && mask[i] != 0 {
+                i += 1;
+            }
+            if i > start {
+                runs.push((start, i - start));
+            }
+        }
+        runs
+    }
+
+    /// A small deterministic generator (xorshift).
+    fn next(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    /// Masks of every length up to 40 and some long ones, dense, sparse and
+    /// in between, runs touching word edges and the end: the same runs as
+    /// the byte-by-byte search.
+    #[test]
+    fn word_search_finds_the_byte_runs() {
+        let mut state = 0x2545_f491_4f6c_dd1d;
+        let lens: Vec<usize> = (0..=40).chain([63, 64, 65, 4095, 4096, 65536]).collect();
+        for &len in &lens {
+            for density in [1u64, 2, 7, 64, 4096] {
+                for _ in 0..50 {
+                    let mask: Vec<u8> = (0..len)
+                        .map(|_| {
+                            if next(&mut state).is_multiple_of(density) {
+                                (next(&mut state) as u8) | 1
+                            } else {
+                                0
+                            }
+                        })
+                        .collect();
+                    let mut runs = Vec::new();
+                    mask_runs(&mask, &mut runs);
+                    assert_eq!(runs, runs_bytes(&mask), "length {len}, density {density}");
+                }
+            }
+        }
+    }
+
+    /// `cargo test --release -p victory-gpu --lib mask_runs_speed -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn mask_runs_speed() {
+        const N: usize = 64 << 10;
+        for (name, every) in [
+            ("all bytes written", 1usize),
+            ("every 16th dword", 64),
+            ("1 byte per 4 KiB", 4096),
+        ] {
+            let mask: Vec<u8> = (0..N).map(|i| u8::from(i.is_multiple_of(every))).collect();
+            let time = |f: &dyn Fn(&[u8]) -> usize| {
+                let start = std::time::Instant::now();
+                for _ in 0..4000 {
+                    std::hint::black_box(f(std::hint::black_box(&mask)));
+                }
+                (4000 * N) as f64 / start.elapsed().as_secs_f64() / 1e9
+            };
+            let bytes = time(&|m| runs_bytes(m).len());
+            let words = time(&|m| {
+                let mut r = Vec::new();
+                mask_runs(m, &mut r);
+                r.len()
+            });
+            eprintln!("{name}: byte by byte {bytes:.2} GB/s, by words {words:.2} GB/s");
+        }
+    }
+
+    /// `cargo test --release -p victory-gpu --lib mask_runs_sparse_64_mib -- --ignored --nocapture`
+    /// The run search on a 64 MiB mask where a few bytes are set here and
+    /// there, as a copy's span looks when a shader wrote a little: the same
+    /// runs (asserted first), and the speed of each search.
+    #[test]
+    #[ignore]
+    fn mask_runs_sparse_64_mib() {
+        const N: usize = 64 << 20;
+        for (name, every, width) in [("1 byte per 4 KiB", 4096usize, 1usize), ("8 bytes per 64 KiB", 65536, 8)] {
+            let mask: Vec<u8> = (0..N).map(|i| u8::from(i % every < width)).collect();
+            let mut words = Vec::new();
+            mask_runs(&mask, &mut words);
+            let bytes = runs_bytes(&mask);
+            assert_eq!(words, bytes, "{name}");
+            let time = |f: &dyn Fn(&[u8]) -> usize| {
+                let start = std::time::Instant::now();
+                for _ in 0..8 {
+                    std::hint::black_box(f(std::hint::black_box(&mask)));
+                }
+                (8 * N) as f64 / start.elapsed().as_secs_f64() / 1e9
+            };
+            let by_bytes = time(&|m| runs_bytes(m).len());
+            let by_words = time(&|m| {
+                let mut r = Vec::new();
+                mask_runs(m, &mut r);
+                r.len()
+            });
+            eprintln!("{name} ({} runs): byte by byte {by_bytes:.2} GB/s, by words {by_words:.2} GB/s", bytes.len());
+        }
+    }
 }
