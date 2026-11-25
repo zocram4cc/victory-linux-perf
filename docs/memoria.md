@@ -4,7 +4,7 @@ Este documento reúne todo lo que se sabe de cómo usa la memoria el título y d
 
 Cada dato lleva su fuente. Cuando se mida algo nuevo, se añade aquí.
 
-## 1. Cuánta memoria se mueve (escena A, línea base `176cc10`)
+## 1. Cuánta memoria se mueve (escena A, línea base `176cc10`; escena B: 2,6 fps, 386 ms, 229 MB de subida y 86 MB de vuelta)
 
 | Qué | Por frame | Fuente |
 |---|---|---|
@@ -108,11 +108,19 @@ La misma escena, con 5.037 draws por frame frente a 4.971:
 | `INPLACE_PROBE=1` + `MEDIR=1` (una vez) | **bien**, las de todos los personajes |
 | `MEDIR=1` solo | invisibles |
 | `INPLACE_PROBE=1` solo | invisibles |
+| `INPLACE_PROBE=1` + `MEDIR=1` (×2 más, cámara quieta) | invisibles |
+| **base B, sin switches, caminando** | **bien: cara completa con piel e iluminación** (captura del usuario) |
 
 **Lectura:**
 - Con los datos leídos en sitio se ven. Esto apunta a que **las copias del host de esos datos llegan viejas o incompletas**, no a shaders sin traducir.
 - Que una sola ejecución de `PROBE+MEDIR` las mostrara y por separado no, apunta a algo **no determinista**: una carrera entre las escrituras del título y nuestras copias, o el orden de carga.
-- **Siguiente prueba:** repetir `PROBE+MEDIR` dos veces para ver si es reproducible, y localizar el draw de la cabeza (fase 1.7).
+- **Actualizado tras 9 ejecuciones:** las caras **no dependen de los switches**. Se ven cuando **la cámara se mueve o se acerca**: en la base B sin switches, caminando, se ven bien; con la cámara quieta, en ninguna.
+- **Dos hipótesis:**
+  - **H1, nivel de detalle:** la cabeza cercana usa otro modelo o material que sí se dibuja bien. La de lejos, o la de la cámara fija del principio, usa uno que no se dibuja: sería un shader sin traducir o un draw descartado entre los ~340 por frame.
+  - **H2, copias viejas:** los datos de la cara llegan después de la primera copia, y el host no los refresca hasta que algo lo fuerza (`INPLACE=1`, que lee en sitio, también las mostraba).
+- **Pruebas para separarlas (fase 1.7):**
+  - escena A esperando 2 minutos sin mover la cámara, y después girarla: si aparece con el tiempo, H2; si solo al acercarse, H1;
+  - cruzar el momento en que aparece con los draws descartados y los hashes de pipeline del log.
 
 ## 8. El título y sus hilos (`VICTORY_MEDIR=1`)
 

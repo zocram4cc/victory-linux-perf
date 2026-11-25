@@ -31,6 +31,14 @@
 
 Los datos completos están en `bench/` (local).
 
+## Escena B (caminando 30 s), commit `b6660c1`, una ejecución
+
+| fps | ms por frame | preparar | GPU | copias | copia de vuelta |
+|---|---|---|---|---|---|
+| 2,6 | 386 | 144 | 167 | 69 ms / 229 MB | 70 ms / 86 MB |
+
+Moverse cuesta un 9 % más que la escena estática, por más copias. **Se ven las caras** (ver `memoria.md` §7). Faltan dos ejecuciones más para que cuente como línea base.
+
 ## Experimentos de techo (fase 0.5), 25-nov-2026
 
 | Ejecución | fps | ms por frame | GPU | copias | Imagen (según el usuario) |

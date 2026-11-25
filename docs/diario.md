@@ -4,6 +4,11 @@ Qué se probó, qué salió y qué se decidió. Lo más nuevo va arriba.
 
 ## 2026-11-25
 
+- **Caras.**
+  - `PROBE+MEDIR` ×2 con la cámara quieta: no se ven.
+  - **Base B sin switches, caminando: se ven perfectas** (captura del usuario: cara completa, piel, luz).
+  - Conclusión: dependen del movimiento o la cercanía, no de los switches. Hipótesis H1 (nivel de detalle) y H2 (copias viejas), en `memoria.md` §7.
+- **Escena B:** 2,6 fps, 386 ms (+9 % sobre la A).
 - **Segunda tanda de techos.**
   - **Sin copias:** 5,9 fps y 170 ms por frame, con los mismos draws. El techo es ×2, y lo que queda es una cadena en serie.
   - **`plain`:** se cierra al leer una página sin respaldo. Los buffers tienen huecos.
