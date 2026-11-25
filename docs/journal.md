@@ -4,6 +4,12 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**S.8 first step: the pool had stopped the sweep; fixed**
+- The sweep lets a texture copy go only when `crate::host::references` says its title texture alone holds it (1). The pool's own reference made that 2 for every pool texture, so **nothing was ever let go**: that, not the title, is why the gate run reached 37,700 live textures and 18.9 GB of VRAM.
+- Fix: the pool keeps a set of what it holds, and `references()` leaves its reference out. A copy the sweep lets go then reaches the pool's `collect` with no other holder, goes through `retire()`, and its block is reused.
+- **Jason save, 2 runs of 120 s** (`bench/trials-…-s8-sweep`): both held, with blocks given back and reused (5-28 a frame). 25,800 live textures, 9.2 GB in use (against 37,700 and 13.3 GB), VRAM at most 17.8 GB. The heaps themselves are never released (11.5 GB made); trimming empty heaps is the rest of S.8.
+- **Rule 7 holds:** the sweep's "unused for 5 s" now only chooses *which* copy to let go. Whether it is safe comes from exact holders (no list, no slot) and `retire()` (no running submission), and the block reaches the allocator only after that.
+
 **Stability gate: 10 minutes in the open world with the new defaults (pool and slot wait), no loss; the picture more complete**
 - Jason save, one run with a 600 s window (`bench/trials-20261126-002900-gate10`): held to the end. Frame 363 ms on average (2.77 fps), window marked `invalid` because the draws varied; not a speed figure yet.
 - **The picture is more complete than with committed textures:** the house shows its painted boards, towels on the railing and wood detail, where the screenshots with committed textures and the wait showed it dark and flat. Textures that failed or went stale on fresh memory now hold. To be checked against S.3 (texture coherence).

@@ -113,13 +113,17 @@ pub(crate) fn long_ago(moment: u64, ms: u64, frames: u64) -> bool {
 pub(crate) fn references(object: &impl Interface) -> u32 {
     type Method = unsafe extern "system" fn(*mut std::ffi::c_void) -> u32;
     let raw = object.as_raw();
+    // The texture pool's own reference is not a holder (`crate::pool`): a
+    // texture only the pool and its title texture hold counts as 1, so the
+    // sweep can let it go as before.
+    let pool = u32::from(crate::pool::holds(raw as usize));
     // SAFETY: a live COM object, whose first three methods are those of
     // `IUnknown` (query, add a reference, release one); the pair leaves the
     // count as it was, and the release returns it. The first is not called.
     unsafe {
         let methods = *raw.cast::<*const [Method; 3]>();
         ((*methods)[1])(raw);
-        ((*methods)[2])(raw)
+        ((*methods)[2])(raw).saturating_sub(pool)
     }
 }
 

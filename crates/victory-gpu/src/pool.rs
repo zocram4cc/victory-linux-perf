@@ -70,6 +70,15 @@ struct Pool {
 
 static POOL: Mutex<Option<Pool>> = Mutex::new(None);
 
+/// The textures the pool holds, by their COM pointer, under a lock of its
+/// own (`crate::host::references` asks for every texture the sweep visits).
+static HELD: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+
+/// Whether the pool holds the COM object at `raw`.
+pub(crate) fn holds(raw: usize) -> bool {
+    on() && HELD.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|h| h.contains(&raw))
+}
+
 /// Since the last frame line: textures placed, textures that fell back to
 /// committed memory (no ready room), blocks given back, heaps made; then,
 /// as levels, bytes in use and bytes in all heaps; then textures the pool
@@ -245,6 +254,7 @@ pub(crate) unsafe fn place(
         }
         return None;
     };
+    HELD.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(resource.as_raw() as usize);
     pool.live.push(Live {
         resource: resource.clone(),
         heap: index,
@@ -335,6 +345,11 @@ pub(crate) fn collect() {
         }
         REFS[4].store(started.elapsed().as_micros() as u64, Relaxed);
         pool.live = live;
+        if let Some(held) = HELD.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            for l in &dead {
+                held.remove(&(l.resource.as_raw() as usize));
+            }
+        }
         dead.into_iter().map(|l| Freed(Some(l.resource), l.heap, l.offset, l.bytes)).collect()
     };
     // Outside the lock: `retire` may drop at once, and `Freed` takes it.
