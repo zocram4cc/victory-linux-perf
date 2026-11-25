@@ -4,6 +4,18 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-25
 
+**Branch `fx`: the base moved to fxceless/main (`d510ee4`)**
+- Carried over by hand (the old commits do not apply):
+  - `VICTORY_SKIP_PIPELINES` and `VICTORY_KEYS` in release builds; fxceless still has both diagnostics-only;
+  - `crate::fastcopy` (reads only; writes off);
+  - docs and `bench.sh`, which now reads the log's frame-rate lines when there is no frametime CSV (fxceless has none).
+- Not carried yet: `medir` (waitstat, CSV columns), `F1_OWN` / `F1_CARD_MERGE` (fxceless has `VICTORY_BACK_OWN_VIEW` for the same purpose), and the diagnostic switches of the device-loss hunt.
+- fxceless has no `victory warm`. The first run after a translator change is the warm-up.
+- **Scene A on Linux, fxceless defaults: 610 ms per frame (1.7 fps)**, against 317 ms on our old base. The layer is faster (prepare 62 ms, GPU 52-66 ms), copy-back slower (145 ms). But the card is idle ~420 ms a frame **"while the title had not submitted"**: the title itself stalls, where on the old base it waited ~2 ms.
+- fxceless's 10 fps switch set (`JOIN_PARTS`, `BACK_OWN_VIEW`, `INDIRECT_GATHER`, `CARD_REHASH_RUNS`) changes nothing here: 603 ms, title idle ~427 ms.
+- fxceless also reports washed-out frames in ~6 of 21 runs with no switch (our white picture) and an open-world device loss "with the card out of room for new textures". Both are base bugs, not Linux ones.
+- **Bisect under way** (`2119b0e`, good per the old base, .. `fxceless/main`) on how long the title waits per frame. It runs in a worktree, unattended (`scratchpad/bisect/step.sh`).
+
 **Our base is behind: fxceless moved a long way today**
 - `RADV_DEBUG=allbos`: still lost 2 of 2, so not memory missing from a submission.
 - Release with the skip fixed and `VICTORY_DRED_DEVICE=both`: 1 of 2 lost; the other loaded with the 3D picture blown out to white (HUD right; screenshot). That looks like auto-exposure fed a wrong value. Forced held submissions do not correlate with the losses.
