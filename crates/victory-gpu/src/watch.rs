@@ -1815,6 +1815,171 @@ fn view_guard() -> bool {
 #[cfg(feature = "diagnostics")]
 pub(crate) static ALIASES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
+/// Whether the guards change the protection of a run of blocks with one call
+/// where one call can (`VICTORY_GUARD_RUNS=0`: block by block when they give
+/// write access back and when they guard a page's other views, and a range
+/// across views is first asked for whole, as before).
+///
+/// A change of protection is a call into the kernel that ends with every
+/// processor dropping what it knew of the pages (under Wine an `mprotect`),
+/// whatever the range: Marvisak/VIctory PR 2849 (Therecalloftheonion) counted
+/// ~3,800 of them a frame and PR 2848 (pes7) 13,624 blocks opened in 76 ms a
+/// frame, a call each. One call cannot cross from one view to the next (it is
+/// refused whole), so runs are cut where the views the runtime told of begin
+/// and end ([`view_pieces`]), and a run is changed in one call only where
+/// Windows says its blocks are alike ([`alike`]).
+fn guard_runs() -> bool {
+    #[cfg(test)]
+    if let Some(on) = RUNS_IN_TEST.get() {
+        return on;
+    }
+    crate::toggled!("VICTORY_GUARD_RUNS")
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`guard_runs`], for what this thread does, and the calls of [`change`]
+    /// it made: opening, setting.
+    static RUNS_IN_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static CALLS_IN_TEST: std::cell::Cell<[u64; 2]> = const { std::cell::Cell::new([0; 2]) };
+}
+
+/// Since the last line ([`protects_line`]): the guards' changes of protection
+/// that give write access back, the blocks they covered and how many were
+/// refused; then the same of those that make blocks read-only (what is put
+/// back as it was counts with its kind).
+static PROTECTS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+const OPENING: usize = 0;
+const SETTING: usize = 3;
+
+/// `VirtualProtect` of `n` blocks from `block` on, counted in [`PROTECTS`].
+fn change(kind: usize, block: usize, n: usize, protect: u32, old: &mut u32) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    // SAFETY: title view memory (or what the caller found in its place); only
+    // its protection changes.
+    let done =
+        unsafe { windows_sys::Win32::System::Memory::VirtualProtect((block * BLOCK) as *const _, n * BLOCK, protect, old) } != 0;
+    PROTECTS[kind].fetch_add(1, Relaxed);
+    PROTECTS[kind + 1].fetch_add(n as u64, Relaxed);
+    PROTECTS[kind + 2].fetch_add(u64::from(!done), Relaxed);
+    #[cfg(test)]
+    CALLS_IN_TEST.set({
+        let mut calls = CALLS_IN_TEST.get();
+        calls[kind / SETTING] += 1;
+        calls
+    });
+    done
+}
+
+/// With the frame line (`victory_gpu::host`): [`PROTECTS`] per frame.
+pub(crate) fn protects_line() {
+    use std::sync::atomic::Ordering::Relaxed;
+    static FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let frame = crate::queue::presented();
+    let frames = frame.saturating_sub(FRAME.swap(frame, Relaxed)).max(1);
+    let c: [f64; 6] = std::array::from_fn(|i| PROTECTS[i].swap(0, Relaxed) as f64 / frames as f64);
+    tracing::info!(
+        target: "victory_gpu::host",
+        "the guards' changes of protection per frame over {frames} frames (VICTORY_GUARD_RUNS=0: block by block, now {}): \
+         giving write access back {:.1} calls for {:.1} blocks ({:.2} refused); making read-only {:.1} calls for {:.1} blocks \
+         ({:.2} refused)",
+        if guard_runs() { "in runs" } else { "block by block" },
+        c[0],
+        c[1],
+        c[2],
+        c[3],
+        c[4],
+        c[5]
+    );
+}
+
+/// Blocks `[first, last)` cut where a view the runtime told of begins or
+/// ends: no change of protection crosses there.
+fn view_pieces(first: usize, last: usize) -> Vec<(usize, usize)> {
+    let mut pieces = Vec::new();
+    let mut at = first;
+    if last - first > 1 {
+        for edge in crate::inplace::view_edges(first * BLOCK, last.saturating_mul(BLOCK)) {
+            let edge = edge / BLOCK;
+            if edge > at {
+                pieces.push((at, edge));
+                at = edge;
+            }
+        }
+    }
+    pieces.push((at, last));
+    pieces
+}
+
+/// How many of the blocks `[first, last)`, from the first on, one change of
+/// protection can take with nothing to put back: committed memory of one
+/// region (one view, one allocation), read-only or read-write throughout.
+/// 0: what is at `first` is not for us to change without a look at what it
+/// was (code, memory the title protects itself, nothing).
+fn alike(first: usize, last: usize) -> usize {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READONLY, PAGE_READWRITE, VirtualQuery,
+    };
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery((first * BLOCK) as *const _, &mut info, size_of_val(&info)) };
+    if n == 0 || info.State != MEM_COMMIT || !matches!(info.Protect, PAGE_READONLY | PAGE_READWRITE) {
+        return 0;
+    }
+    ((info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK).min(last).saturating_sub(first)
+}
+
+/// [`protect_alias`] ahead for `blocks`, where they follow one another and
+/// are alike: one change of protection for the run ([`guard_runs`]). What is
+/// left (a block alone, one that is not alike, a call refused) is
+/// `protect_alias`'s as before.
+fn protect_alias_runs(g: &mut Guards, mut blocks: Vec<usize>) {
+    use windows_sys::Win32::System::Memory::PAGE_READONLY;
+    let rest = rest();
+    blocks.retain(|&block| !g.protected.contains(block) && !g.left_alone(block) && !g.rests(block, rest));
+    blocks.sort_unstable();
+    blocks.dedup();
+    let mut i = 0;
+    while i < blocks.len() {
+        let first = blocks[i];
+        let mut last = first + 1;
+        i += 1;
+        while i < blocks.len() && blocks[i] == last {
+            last += 1;
+            i += 1;
+        }
+        for (mut at, to) in view_pieces(first, last) {
+            while to - at > 1 {
+                let n = alike(at, to);
+                if n > 1 {
+                    // Ahead of the protection.
+                    (at..at + n).for_each(|block| PROTECTED.set(block));
+                    let mut old = 0;
+                    #[cfg(feature = "diagnostics")]
+                    let started = std::time::Instant::now();
+                    let done = change(SETTING, at, n, PAGE_READONLY, &mut old);
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        tally(5, n as u64);
+                        tally(8, started.elapsed().as_nanos() as u64);
+                    }
+                    for block in at..at + n {
+                        if done {
+                            g.protected.insert(block);
+                            #[cfg(feature = "diagnostics")]
+                            crate::faultbook::note(crate::faultbook::What::Alias, block, 0, 0);
+                        } else {
+                            PROTECTED.clear(block);
+                        }
+                    }
+                }
+                at += n.max(1);
+            }
+        }
+    }
+}
+
 /// Of the blocks `[from, to)`, which are read-only by our hand where they
 /// can be: every other view of their pages is made read-only too. Where one
 /// cannot be (the kernel writes through it now, or the runtime is changing
@@ -1822,7 +1987,16 @@ pub(crate) static ALIASES: [std::sync::atomic::AtomicU64; 3] = [const { std::syn
 /// told as written at every asking, until it can. Whether all are covered.
 fn cover(g: &mut Guards, from: usize, to: usize) -> bool {
     let mut all = true;
-    for (page, others) in elsewhere(from * BLOCK, (to - from) * BLOCK) {
+    let shown = elsewhere(from * BLOCK, (to - from) * BLOCK);
+    if guard_runs() {
+        let others = shown
+            .iter()
+            .filter(|(page, _)| g.protected.contains(page / BLOCK))
+            .flat_map(|(_, others)| others.iter().map(|other| other / BLOCK))
+            .collect();
+        protect_alias_runs(g, others);
+    }
+    for (page, others) in shown {
         let block = page / BLOCK;
         if !g.protected.contains(block) {
             continue; // not there, or not ours to guard
@@ -1849,7 +2023,7 @@ fn cover(g: &mut Guards, from: usize, to: usize) -> bool {
 /// One that is clean stays so: had the page been written since its copies
 /// took it, [`open`] would have opened it. Whether it is read-only now.
 fn protect_alias(g: &mut Guards, block: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE};
     g.aliased.insert(block);
     if g.protected.contains(block) {
         return true;
@@ -1862,8 +2036,7 @@ fn protect_alias(g: &mut Guards, block: usize) -> bool {
     let mut old = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
-    // SAFETY: title view memory; only its protection changes.
-    let done = unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0;
+    let done = change(SETTING, block, 1, PAGE_READONLY, &mut old);
     #[cfg(feature = "diagnostics")]
     {
         tally(5, 1);
@@ -1877,8 +2050,8 @@ fn protect_alias(g: &mut Guards, block: usize) -> bool {
     }
     if done {
         // Not for us to guard: as it was.
-        // SAFETY: as above.
-        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, old, &mut old) };
+        let was = old;
+        change(SETTING, block, 1, was, &mut old);
     }
     PROTECTED.clear(block);
     false
@@ -1886,25 +2059,17 @@ fn protect_alias(g: &mut Guards, block: usize) -> bool {
 
 /// [`protect`] for one range, without the other views of its pages.
 fn protect_here(g: &mut Guards, from: usize, to: usize) {
-    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE};
     let set = |from: usize, to: usize| {
         let mut old = 0;
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
-        // SAFETY: title view memory; only its protection changes.
-        let mut done = unsafe {
-            VirtualProtect(
-                (from * BLOCK) as *const _,
-                (to - from) * BLOCK,
-                PAGE_READONLY,
-                &mut old,
-            ) != 0
-        };
+        let mut done = change(SETTING, from, to - from, PAGE_READONLY, &mut old);
         if done && !matches!(old, PAGE_READWRITE | PAGE_READONLY) {
             // What is there is not for us to guard (code, or memory the
             // title protects itself): as it was.
-            // SAFETY: as above.
-            unsafe { VirtualProtect((from * BLOCK) as *const _, (to - from) * BLOCK, old, &mut old) };
+            let was = old;
+            change(SETTING, from, to - from, was, &mut old);
             done = false;
         }
         #[cfg(feature = "diagnostics")]
@@ -1920,28 +2085,47 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
     };
     // Ahead of the protection (`PROTECTED`).
     (from..to).for_each(|block| PROTECTED.set(block));
-    if set(from, to) {
-        note(g, from, to);
-        return;
-    }
-    let mut uncommitted_until = from;
-    for block in from..to {
-        // (Not one question a block of a region that is not there.)
-        if block >= uncommitted_until && set(block, block + 1) {
-            note(g, block, block + 1);
+    // One call for all of it, then block by block if that is refused. In
+    // runs: one call for as many blocks as Windows says are alike, within
+    // each view the runtime told of (a call across two views is refused, and
+    // every block of the range then had a call of its own), and none for a
+    // block that is not plain read-only or read-write memory throughout: a
+    // call's answer names its first page's old protection alone, and a page
+    // further on that the title guards itself (`PAGE_GUARD`) lost that.
+    let runs = guard_runs();
+    let pieces = if runs { view_pieces(from, to) } else { vec![(from, to)] };
+    for (from, to) in pieces {
+        if !runs && set(from, to) {
+            note(g, from, to);
             continue;
         }
-        PROTECTED.clear(block);
-        if block >= uncommitted_until {
-            uncommitted_until = uncommitted_end(block);
-            #[cfg(feature = "diagnostics")]
-            tally(9, 1);
-        }
-        if block < uncommitted_until {
-            g.absent.insert(block);
-            if known_holes() && placeholder(block) {
-                g.held.insert(block);
+        let mut uncommitted_until = from;
+        let mut block = from;
+        while block < to {
+            // (Not one question a block of a region that is not there.)
+            let n = match block < uncommitted_until {
+                true => 0,
+                false if runs => alike(block, to),
+                false => 1,
+            };
+            if n > 0 && set(block, block + n) {
+                note(g, block, block + n);
+                block += n;
+                continue;
             }
+            PROTECTED.clear(block);
+            if block >= uncommitted_until {
+                uncommitted_until = uncommitted_end(block);
+                #[cfg(feature = "diagnostics")]
+                tally(9, 1);
+            }
+            if block < uncommitted_until {
+                g.absent.insert(block);
+                if known_holes() && placeholder(block) {
+                    g.held.insert(block);
+                }
+            }
+            block += 1;
         }
     }
 }
@@ -2001,9 +2185,10 @@ fn open(g: &mut Guards, start: usize, end: usize) -> usize {
     here
 }
 
-/// Gives write access back to `blocks`, guarded ones.
+/// Gives write access back to `blocks`, guarded ones: block by block, or
+/// ([`guard_runs`]) those that follow one another in one view with one call.
 fn unguard(g: &mut Guards, blocks: &[usize]) {
-    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE};
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // All of them before the first can be written: a write through one is a
@@ -2013,19 +2198,49 @@ fn unguard(g: &mut Guards, blocks: &[usize]) {
         g.clean.remove(block);
         PUBLISHED.clear(block);
     }
-    for &block in blocks {
+    let one = |block: usize| {
         let mut old = 0;
-        // SAFETY: a block we made read-only.
-        unsafe {
-            if VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) != 0
-                && !matches!(old, PAGE_READONLY | PAGE_READWRITE)
-            {
-                // Not what we left there: the address is other memory's
-                // (code's, say), which keeps its protection.
-                VirtualProtect((block * BLOCK) as *const _, BLOCK, old, &mut old);
-            }
+        // A block we made read-only.
+        if change(OPENING, block, 1, PAGE_READWRITE, &mut old) && !matches!(old, PAGE_READONLY | PAGE_READWRITE) {
+            // Not what we left there: the address is other memory's
+            // (code's, say), which keeps its protection.
+            let was = old;
+            change(OPENING, block, 1, was, &mut old);
         }
         PROTECTED.clear(block);
+    };
+    if guard_runs() && blocks.len() > 1 {
+        let mut sorted = blocks.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let mut i = 0;
+        while i < sorted.len() {
+            let first = sorted[i];
+            let mut last = first + 1;
+            i += 1;
+            while i < sorted.len() && sorted[i] == last {
+                last += 1;
+                i += 1;
+            }
+            for (mut at, to) in view_pieces(first, last) {
+                while at < to {
+                    // Only blocks Windows says are alike go in one call: its
+                    // answer names the first one's old protection alone, and
+                    // other memory at a guarded address keeps its own.
+                    let n = if to - at > 1 { alike(at, to) } else { 0 };
+                    let mut old = 0;
+                    if n > 1 && change(OPENING, at, n, PAGE_READWRITE, &mut old) {
+                        (at..at + n).for_each(|block| PROTECTED.clear(block));
+                        at += n;
+                    } else {
+                        one(at);
+                        at += 1;
+                    }
+                }
+            }
+        }
+    } else {
+        blocks.iter().copied().for_each(one);
     }
     #[cfg(feature = "diagnostics")]
     if !blocks.is_empty() {
@@ -3902,6 +4117,271 @@ mod tests {
         let top = usize::MAX - 16;
         writing(top, PAGE);
         title_memory_remapped(top, usize::MAX);
+    }
+
+    /// The changes of protection this thread made since the last asking:
+    /// those that gave write access back, those that made read-only.
+    fn calls() -> [u64; 2] {
+        CALLS_IN_TEST.replace([0; 2])
+    }
+
+    /// Views of `sizes` blocks one after the other in one placeholder, each
+    /// of its own bytes of one section; `told`: the runtime's book of views
+    /// has them. The section, the first address, the views.
+    fn views_in_a_row(
+        sizes: &[usize],
+        told: bool,
+    ) -> (usize, usize, Vec<windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS>) {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE_PLACEHOLDER, MapViewOfFile3,
+            PAGE_NOACCESS, VirtualAlloc2,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let total: usize = sizes.iter().sum();
+        // SAFETY: a fresh placeholder, split where the views meet, and a
+        // pagefile section of its size mapped into the parts.
+        unsafe {
+            let p = VirtualAlloc2(
+                GetCurrentProcess(),
+                std::ptr::null(),
+                total * BLOCK,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
+                std::ptr::null_mut(),
+                0,
+            ) as usize;
+            assert_ne!(p, 0);
+            let section =
+                CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, (total * BLOCK) as u32, std::ptr::null());
+            assert!(!section.is_null());
+            let mut views = Vec::new();
+            let mut at = 0;
+            for &n in sizes {
+                // (Refused for the last part, which is a placeholder of its own already.)
+                VirtualFree((p + at * BLOCK) as *mut _, n * BLOCK, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+                let view = MapViewOfFile3(
+                    section,
+                    GetCurrentProcess(),
+                    (p + at * BLOCK) as *const _,
+                    (at * BLOCK) as u64,
+                    n * BLOCK,
+                    MEM_REPLACE_PLACEHOLDER,
+                    PAGE_READWRITE,
+                    std::ptr::null_mut(),
+                    0,
+                );
+                assert_eq!(view.Value as usize, p + at * BLOCK);
+                if told {
+                    crate::inplace::title_memory_view(p + at * BLOCK, n * BLOCK, section as usize, (at * BLOCK) as u64);
+                }
+                views.push(view);
+                at += n;
+            }
+            (section as usize, p, views)
+        }
+    }
+
+    /// What [`views_in_a_row`] made goes, the guards told first.
+    fn drop_row(
+        section: usize,
+        p: usize,
+        views: Vec<windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS>,
+        sizes: &[usize],
+    ) {
+        use windows_sys::Win32::System::Memory::{MEM_PRESERVE_PLACEHOLDER, UnmapViewOfFile2};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        title_memory_remapped(p, sizes.iter().sum::<usize>() * BLOCK);
+        // SAFETY: our views, our placeholders, our section.
+        unsafe {
+            for view in views {
+                UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER);
+            }
+            let mut at = 0;
+            for &n in sizes {
+                VirtualFree((p + at * BLOCK) as *mut _, 0, MEM_RELEASE);
+                at += n;
+            }
+            windows_sys::Win32::Foundation::CloseHandle(section as *mut std::ffi::c_void);
+        }
+    }
+
+    /// A write of ours over a run of guarded blocks gives write access back
+    /// with one change of protection, not one a block; what is open and what
+    /// is told written afterwards is the same either way.
+    #[test]
+    fn a_write_over_guarded_blocks_opens_them_with_one_call() {
+        use windows_sys::Win32::System::Memory::PAGE_READONLY;
+        for (runs, opening) in [(false, 8), (true, 1)] {
+            RUNS_IN_TEST.set(Some(runs));
+            let (section, p, views) = views_in_a_row(&[8], false);
+            let pages: Vec<usize> = (p / PAGE..p / PAGE + 8).collect();
+            assert_eq!(guard(p, p + 8 * BLOCK), Some(pages.clone()));
+            assert_eq!(guard(p, p + 8 * BLOCK), Some(Vec::new()), "nothing written yet");
+            assert!((0..8).all(|block| protection(p + block * BLOCK) == PAGE_READONLY));
+            calls();
+            writing(p, 8 * BLOCK);
+            assert_eq!(calls(), [opening, 0], "changes of protection, in runs: {runs}");
+            assert!((0..8).all(|block| writable(p + block * BLOCK)));
+            assert_eq!(guard(p, p + 8 * BLOCK), Some(pages), "in runs: {runs}");
+            drop_row(section, p, views, &[8]);
+        }
+        RUNS_IN_TEST.set(None);
+    }
+
+    /// A write that begins and ends inside guarded blocks opens the blocks it
+    /// touches, in one call, and leaves those before and after read-only.
+    #[test]
+    fn a_write_inside_guarded_blocks_opens_its_own_and_no_others() {
+        use windows_sys::Win32::System::Memory::PAGE_READONLY;
+        for (runs, opening) in [(false, 4), (true, 1)] {
+            RUNS_IN_TEST.set(Some(runs));
+            let (section, p, views) = views_in_a_row(&[8], false);
+            assert_eq!(guard(p, p + 8 * BLOCK).map(|written| written.len()), Some(8));
+            assert_eq!(guard(p, p + 8 * BLOCK), Some(Vec::new()), "nothing written yet");
+            calls();
+            // From inside block 2 to inside block 5.
+            writing(p + 2 * BLOCK + 100, 3 * BLOCK);
+            assert_eq!(calls(), [opening, 0], "changes of protection, in runs: {runs}");
+            for block in 0..8 {
+                let open = (2..6).contains(&block);
+                assert_eq!(
+                    protection(p + block * BLOCK),
+                    if open { PAGE_READWRITE } else { PAGE_READONLY },
+                    "block {block}, in runs: {runs}"
+                );
+            }
+            assert_eq!(guard(p, p + 8 * BLOCK), Some((p / PAGE + 2..p / PAGE + 6).collect()), "in runs: {runs}");
+            assert_eq!(calls(), [0, 1], "the four are guarded again together");
+            assert!((0..8).all(|block| protection(p + block * BLOCK) == PAGE_READONLY));
+            drop_row(section, p, views, &[8]);
+        }
+        RUNS_IN_TEST.set(None);
+    }
+
+    /// Guarded blocks that follow one another in three views: a change of
+    /// protection is made for each view's part, none across two (which is
+    /// refused whole, and then every block had a call of its own). Told of
+    /// the views, the guards cut there; not told, they are guarded as before
+    /// and opened by what Windows says is one region.
+    #[test]
+    fn runs_of_guarded_blocks_are_cut_where_views_meet() {
+        use windows_sys::Win32::System::Memory::PAGE_READONLY;
+        const SIZES: [usize; 3] = [2, 3, 1];
+        // Told of the views, in runs: calls to guard all, to open all, to open blocks 1 to 3.
+        for (told, runs, setting, opening, part) in
+            [(true, true, 3, 3, 2), (true, false, 7, 6, 3), (false, true, 3, 3, 2), (false, false, 7, 6, 3)]
+        {
+            RUNS_IN_TEST.set(Some(runs));
+            let (section, p, views) = views_in_a_row(&SIZES, told);
+            let pages: Vec<usize> = (p / PAGE..p / PAGE + 6).collect();
+            calls();
+            assert_eq!(guard(p, p + 6 * BLOCK), Some(pages.clone()));
+            assert_eq!(calls(), [0, setting], "to guard, told: {told}, in runs: {runs}");
+            assert!((0..6).all(|block| protection(p + block * BLOCK) == PAGE_READONLY));
+            writing(p, 6 * BLOCK);
+            assert_eq!(calls(), [opening, 0], "to open, told: {told}, in runs: {runs}");
+            assert!((0..6).all(|block| writable(p + block * BLOCK)));
+            assert_eq!(guard(p, p + 6 * BLOCK), Some(pages));
+            calls();
+            // The last block of the first view and the first two of the second.
+            writing(p + BLOCK, 3 * BLOCK);
+            assert_eq!(calls(), [part, 0], "to open a part, told: {told}, in runs: {runs}");
+            for block in 0..6 {
+                let open = (1..4).contains(&block);
+                assert_eq!(
+                    protection(p + block * BLOCK),
+                    if open { PAGE_READWRITE } else { PAGE_READONLY },
+                    "block {block}, told: {told}, in runs: {runs}"
+                );
+            }
+            assert_eq!(guard(p, p + 6 * BLOCK), Some((p / PAGE + 1..p / PAGE + 4).collect()));
+            drop_row(section, p, views, &SIZES);
+        }
+        RUNS_IN_TEST.set(None);
+    }
+
+    /// Other memory that came to lie at a guarded address between guarded
+    /// blocks keeps its protection when the run is opened: no call takes it
+    /// along with its neighbours.
+    #[test]
+    fn other_memory_inside_a_run_keeps_its_protection() {
+        use windows_sys::Win32::System::Memory::{MEM_PRESERVE_PLACEHOLDER, PAGE_EXECUTE_READ, PAGE_READONLY, UnmapViewOfFile2};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        const SIZES: [usize; 4] = [1, 1, 1, 2];
+        for runs in [false, true] {
+            RUNS_IN_TEST.set(Some(runs));
+            let (section, p, mut views) = views_in_a_row(&SIZES, false);
+            assert_eq!(guard(p, p + 5 * BLOCK).map(|written| written.len()), Some(5));
+            assert!((0..5).all(|block| protection(p + block * BLOCK) == PAGE_READONLY));
+            // Not told of what comes: the second view goes, code is there.
+            let gone = views.remove(1);
+            // SAFETY: our view.
+            assert_ne!(unsafe { UnmapViewOfFile2(GetCurrentProcess(), gone, MEM_PRESERVE_PLACEHOLDER) }, 0);
+            private_at(p + BLOCK, PAGE_EXECUTE_READ);
+            writing(p, 5 * BLOCK);
+            for block in 0..5 {
+                assert_eq!(
+                    protection(p + block * BLOCK),
+                    if block == 1 { PAGE_EXECUTE_READ } else { PAGE_READWRITE },
+                    "block {block}, in runs: {runs}"
+                );
+            }
+            drop_row(section, p, views, &SIZES);
+        }
+        RUNS_IN_TEST.set(None);
+    }
+
+    /// The other views of a run of guarded pages are made read-only with one
+    /// change of protection, not one a block; a write through one of them is
+    /// told at the guarded view as before.
+    #[test]
+    fn the_other_views_of_a_guarded_run_are_guarded_with_one_call() {
+        use windows_sys::Win32::System::Memory::PAGE_READONLY;
+        const SIZE: usize = 4 * BLOCK;
+        for (runs, setting) in [(false, 5), (true, 2)] {
+            RUNS_IN_TEST.set(Some(runs));
+            let (section, guarded, other) = two_views(SIZE);
+            let pages: Vec<usize> = (guarded / PAGE..guarded / PAGE + 4).collect();
+            calls();
+            assert_eq!(guard(guarded, guarded + SIZE), Some(pages));
+            assert_eq!(calls(), [0, setting], "the view and its other view, in runs: {runs}");
+            for view in [guarded, other] {
+                assert!((0..4).all(|block| protection(view + block * BLOCK) == PAGE_READONLY), "in runs: {runs}");
+            }
+            assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()), "nothing written yet");
+            // SAFETY: the other view, opened by the handler.
+            unsafe { ((other + BLOCK + 8) as *mut u8).write(1) };
+            assert_eq!(guard(guarded, guarded + SIZE), Some(vec![guarded / PAGE + 1]), "in runs: {runs}");
+            drop_views(section, &[guarded, other], SIZE);
+        }
+        RUNS_IN_TEST.set(None);
+    }
+
+    /// A page the title guards itself (`PAGE_GUARD`) inside a range that is
+    /// taken keeps its guard: its block is left as it is, and the blocks
+    /// around it are made read-only.
+    #[test]
+    fn a_page_the_title_guards_inside_a_range_keeps_its_guard() {
+        use windows_sys::Win32::System::Memory::{PAGE_GUARD, PAGE_READONLY, VirtualProtect};
+        RUNS_IN_TEST.set(Some(true));
+        let (section, p, views) = views_in_a_row(&[4], false);
+        let guarded = p + BLOCK + KERNEL_PAGE;
+        let mut old = 0;
+        // SAFETY: a page of our view.
+        assert_ne!(unsafe { VirtualProtect(guarded as *const _, KERNEL_PAGE, PAGE_READWRITE | PAGE_GUARD, &mut old) }, 0);
+        assert_eq!(guard(p, p + 4 * BLOCK).map(|written| written.len()), Some(4));
+        assert_eq!(protection(guarded), PAGE_READWRITE | PAGE_GUARD, "the title's guard is gone");
+        assert_eq!(protection(p + BLOCK), PAGE_READWRITE, "its block is left as it was");
+        for block in [0, 2, 3] {
+            assert_eq!(protection(p + block * BLOCK), PAGE_READONLY, "block {block}");
+        }
+        // Told as written at every asking: nothing sees a write to it.
+        assert!(guard(p, p + 4 * BLOCK).is_some_and(|written| written.contains(&(p / PAGE + 1))));
+        assert_eq!(protection(guarded), PAGE_READWRITE | PAGE_GUARD);
+        writing(p, 4 * BLOCK);
+        assert_eq!(protection(guarded), PAGE_READWRITE | PAGE_GUARD, "nor when the range is opened");
+        drop_row(section, p, views, &[4]);
+        RUNS_IN_TEST.set(None);
     }
 }
 
