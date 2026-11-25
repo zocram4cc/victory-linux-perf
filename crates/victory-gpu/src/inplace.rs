@@ -1534,16 +1534,27 @@ mod tests {
             record("(b) VirtualAlloc part, OpenExistingHeapFromAddress1", both_ways(&mut rig, part, opened)?);
             mem::VirtualFree(reserved.cast(), 0, mem::MEM_RELEASE);
 
-            // (c) a section made committed, viewed by the title.
+            // (d) the page pool's shape: a section with a view of our own
+            // kept mapped and opened by its address, and the title writing
+            // and reading through another view of the same pages (aliases on
+            // the RX 6900 XT under Proton with the stock libdrm).
             let invalid = windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
             let section = mem::CreateFileMappingW(invalid, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_COMMIT, 0, K64 as u32, std::ptr::null());
             assert!(!section.is_null(), "CreateFileMapping");
-            let view = mem::MapViewOfFile(section, mem::FILE_MAP_WRITE, 0, 0, K64);
-            assert!(!view.Value.is_null(), "MapViewOfFile");
-            let opened = open_and_place(&device, From::Section(section as usize), K64 as u64);
-            record("(c) SEC_COMMIT section, OpenExistingHeapFromFileMapping", both_ways(&mut rig, view.Value.cast(), opened)?);
-            mem::UnmapViewOfFile(view);
+            let card_view = mem::MapViewOfFile(section, mem::FILE_MAP_WRITE, 0, 0, K64);
+            let title_view = mem::MapViewOfFile(section, mem::FILE_MAP_WRITE, 0, 0, K64);
+            assert!(!card_view.Value.is_null() && !title_view.Value.is_null(), "MapViewOfFile");
+            let opened = open_and_place(&device, From::Region(card_view.Value as usize), K64 as u64);
+            record("(d) section, our own view opened by OpenExistingHeapFromAddress, title's other view", both_ways(&mut rig, title_view.Value.cast(), opened)?);
+            mem::UnmapViewOfFile(title_view);
+            mem::UnmapViewOfFile(card_view);
             windows_sys::Win32::Foundation::CloseHandle(section);
+            // Not tested: `OpenExistingHeapFromFileMapping`. vkd3d-proton
+            // maps a view, imports it and unmaps it at once
+            // (libs/vkd3d/device.c, d3d12_device_OpenExistingHeapFromFileMapping):
+            // the import is either refused (a copy, stale) or left pointing
+            // at no memory, and the next submission that touches it is
+            // rejected (-EFAULT) and the device lost. (d) is the way.
         }
         assert!(stale.is_empty(), "NOT ALIASED (stale) in {stale:?}: the GPU and the title hold other bytes there");
         Ok(())
