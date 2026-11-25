@@ -98,7 +98,7 @@ cpu_prepare_ms,gpu_ms,gpu_pct,copies_ms,copies_mb,textures_ms,textures_mb,\
 copyback_ms,copyback_mb,draws,dropped,making,indirect,heap_passes,heap_ms,\
 texture_refresh_ms,card_passes,card_compares,card_sent_mb,card_ranges,\
 card_pieces,card_fetched,card_fetched_mb,card_waits,card_wait_ms,\
-twins_into_depth,twins_into_colour,depth_planes,ram_mb,cpu_pct\n";
+twins_into_depth,twins_into_colour,depth_planes,ram_mb,cpu_pct,remap_ms,maps,unmaps\n";
 
 /// The `#` block a dump starts with: the machine and the switches, so a file
 /// from another PC can be compared and reproduced. `pandas.read_csv(...,
@@ -359,6 +359,11 @@ pub(crate) struct Row {
     pub depth_planes: f64,
     pub ram_mb: f64,
     pub cpu_pct: f64,
+    /// Per frame, with `VICTORY_MEDIR=1` (`crate::medir`): time under the
+    /// remapping lock in ms, maps and unmaps of title memory.
+    pub remap_ms: f64,
+    pub maps: f64,
+    pub unmaps: f64,
 }
 
 /// Appends `r` when the dump is on.
@@ -379,7 +384,7 @@ pub(crate) fn record(r: &Row) {
          {texture_refresh_ms:.3},{card_passes:.3},{card_compares:.3},{card_sent_mb:.3},\
          {card_ranges:.3},{card_pieces:.3},{card_fetched:.3},{card_fetched_mb:.3},\
          {card_waits:.3},{card_wait_ms:.3},{twins_into_depth:.3},{twins_into_colour:.3},\
-         {depth_planes:.3},{ram_mb:.3},{cpu_pct:.3}",
+         {depth_planes:.3},{ram_mb:.3},{cpu_pct:.3},{remap_ms:.3},{maps:.3},{unmaps:.3}",
         frame = r.frame,
         frames = r.frames,
         fps = r.fps,
@@ -416,6 +421,9 @@ pub(crate) fn record(r: &Row) {
         depth_planes = r.depth_planes,
         ram_mb = r.ram_mb,
         cpu_pct = r.cpu_pct,
+        remap_ms = r.remap_ms,
+        maps = r.maps,
+        unmaps = r.unmaps,
     );
     let _ = file.flush();
 }

@@ -107,6 +107,9 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         return E_NOTIMPL;
     }
     waiters.push((value, event as usize));
+    if crate::medir::on() {
+        medir_fence_events().lock().unwrap_or_else(|e| e.into_inner()).insert(event as usize);
+    }
     S_OK
 }
 /// Moves the fence to `value` and sets the events that waited for it.
@@ -190,4 +193,15 @@ mod tests {
         unsafe { CloseHandle(event) };
         assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
     }
+}
+
+fn medir_fence_events() -> &'static Mutex<std::collections::HashSet<usize>> {
+    static SET: std::sync::OnceLock<Mutex<std::collections::HashSet<usize>>> = std::sync::OnceLock::new();
+    SET.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// With `VICTORY_MEDIR=1`: whether the title passed this event to
+/// `SetEventOnCompletion` (`victory-hle`'s waitstat tags such waits).
+pub fn medir_is_fence_event(h: usize) -> bool {
+    crate::medir::on() && medir_fence_events().lock().unwrap_or_else(|e| e.into_inner()).contains(&h)
 }

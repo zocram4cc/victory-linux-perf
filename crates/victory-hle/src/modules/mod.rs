@@ -25,6 +25,8 @@ pub mod lifecycle;
 #[cfg(windows)]
 pub mod media;
 #[cfg(windows)]
+pub mod waitstat;
+#[cfg(windows)]
 pub mod net;
 pub mod speech;
 pub mod storage;
@@ -70,5 +72,10 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(xmem::module());
     #[cfg(windows)]
     all.push(xsystem::module());
+    // Only when measuring: it stands between the title and every wait.
+    #[cfg(windows)]
+    if victory_gpu::medir::on() {
+        all.push(waitstat::module());
+    }
     all
 }

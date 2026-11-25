@@ -5773,6 +5773,7 @@ impl Meter {
         // `VICTORY_FRAMETIME_DUMP`: one row per summary interval, with the
         // buckets above and the worst/mean frame measured at each present.
         let (frame_ms_max, frame_ms_avg, _timed) = crate::frametime::take_interval();
+        let remap = crate::medir::take_remap();
         crate::frametime::record(&crate::frametime::Row {
             frame: crate::queue::frame_count(),
             frames,
@@ -5810,6 +5811,11 @@ impl Meter {
             depth_planes: planes,
             ram_mb: crate::frametime::private_mb(),
             cpu_pct: crate::frametime::cpu_pct(),
+            remap_ms: remap[crate::medir::UNMAP_US] as f64 / frames / 1e3
+                + remap[crate::medir::MAP_US] as f64 / frames / 1e3
+                + remap[crate::medir::BOOKS_US] as f64 / frames / 1e3,
+            maps: remap[crate::medir::MAPS] as f64 / frames,
+            unmaps: remap[crate::medir::UNMAPS] as f64 / frames,
         });
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();

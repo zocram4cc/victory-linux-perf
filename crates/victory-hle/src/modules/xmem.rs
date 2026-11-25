@@ -779,12 +779,21 @@ fn changing(physical: &Physical, base: usize, len: usize) -> victory_gpu::Remapp
 #[cfg(feature = "diagnostics")]
 static REMAP_TIME: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
-#[cfg(feature = "diagnostics")]
 fn remap_time(k: usize, since: std::time::Instant) {
-    use std::sync::atomic::Ordering::Relaxed;
-    REMAP_TIME[k].fetch_add(since.elapsed().as_micros() as u64, Relaxed);
+    // [unmaps, their µs, maps, their µs, bookkeeping µs]: `k` is the µs
+    // slot; 1 and 3 also count one call in the slot before.
+    let us = since.elapsed().as_micros() as u64;
+    #[cfg(feature = "diagnostics")]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        REMAP_TIME[k].fetch_add(us, Relaxed);
+        if k != 4 {
+            REMAP_TIME[k - 1].fetch_add(1, Relaxed);
+        }
+    }
+    victory_gpu::medir::add_remap(k, us);
     if k != 4 {
-        REMAP_TIME[k - 1].fetch_add(1, Relaxed);
+        victory_gpu::medir::add_remap(k - 1, 1);
     }
 }
 
@@ -814,7 +823,6 @@ fn remap_time_line() {
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
 /// must lie in one placeholder.
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
-    #[cfg(feature = "diagnostics")]
     let began = std::time::Instant::now();
     // SAFETY: splits the placeholder around the range (failing harmlessly
     // when the range is the whole placeholder), then maps the section
@@ -851,9 +859,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
     }
-    #[cfg(feature = "diagnostics")]
     remap_time(3, began);
-    #[cfg(feature = "diagnostics")]
     let books = std::time::Instant::now();
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
@@ -864,7 +870,6 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         shown.push(base + k * PAGE);
     }
     physical.views.insert(base, (len, slice));
-    #[cfg(feature = "diagnostics")]
     remap_time(4, books);
     true
 }
@@ -920,11 +925,10 @@ fn commit_limit_message(
 /// Returns `[base, base + len)` to placeholders; views reaching past it
 /// are mapped again outside it.
 fn unmap(physical: &mut Physical, base: usize, len: usize) {
-    #[cfg(feature = "diagnostics")]
     let began = std::time::Instant::now();
-    #[cfg(feature = "diagnostics")]
     let _timed = Defer(move || {
         remap_time(1, began);
+        #[cfg(feature = "diagnostics")]
         remap_time_line();
     });
     // No bytes: no view to return. The search below would still find the
@@ -1556,10 +1560,8 @@ mod tests {
 
 /// Runs its closure when dropped (diagnostics timing of a function with
 /// several returns).
-#[cfg(feature = "diagnostics")]
 struct Defer<F: FnMut()>(F);
 
-#[cfg(feature = "diagnostics")]
 impl<F: FnMut()> Drop for Defer<F> {
     fn drop(&mut self) {
         (self.0)();
