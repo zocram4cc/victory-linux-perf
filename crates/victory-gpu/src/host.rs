@@ -8967,6 +8967,26 @@ impl Meter {
                 }
             });
         }
+        // On-screen figures (`VICTORY_DEBUG_HUD=1`): the same row the dump writes.
+        crate::debug_hud::update(hwnd, || {
+            format!(
+                "{fps:.1} FPS   {ms:.1} ms/frame   {draws:.0} draws/frame\n\
+                 CPU prep {cpu:.1} ms   heap {heap:.1} ms   GPU wait {gpu:.1} ms\n\
+                 copies {copies:.1} ms   textures {textures:.1} ms   copy-back {back:.1} ms\n\
+                 dropped {dropped:.0}/frame   indirect dropped {indirect:.0}/frame",
+                fps = row.fps,
+                ms = row.ms,
+                draws = row.draws,
+                cpu = row.cpu_prepare_ms,
+                heap = row.heap_ms,
+                gpu = row.gpu_ms,
+                copies = row.copies_ms,
+                textures = row.textures_ms,
+                back = row.copyback_ms,
+                dropped = row.dropped,
+                indirect = row.indirect,
+            )
+        });
         if self.caption.is_none() {
             // The window's own text, read without a message.
             let mut buffer = vec![0u16; 512];
