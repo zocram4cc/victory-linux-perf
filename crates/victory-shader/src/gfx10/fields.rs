@@ -807,6 +807,7 @@ fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
         _ => {}
     }
     let (mut whole, mut derivs, mut packed): (u8, u8, u8) = (0, 0, coords);
+    let mut g16 = false;
     if let Some(rest) = name
         .strip_prefix("image_sample")
         .or_else(|| name.strip_prefix("image_gather4"))
@@ -816,15 +817,86 @@ fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
                 "o" | "b" | "c" => whole += 1,
                 "d" | "cd" => derivs = grads,
                 "l" | "cl" => packed += 1,
+                "g16" => g16 = true,
                 _ => {}
             }
         }
     } else if name.contains("_mip") {
         packed += 1;
     }
-    if a16 {
-        whole + 2 * derivs.div_ceil(2) + packed.div_ceil(2)
+    let grad_dwords = if a16 || g16 {
+        2 * derivs.div_ceil(2)
     } else {
-        whole + 2 * derivs + packed
+        2 * derivs
+    };
+    let coord_dwords = if a16 { packed.div_ceil(2) } else { packed };
+    whole + grad_dwords + coord_dwords
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_sample_g16_packs_gradients_without_a16() {
+        // Non-g16 `image_sample_d`: 32-bit gradients unless a16 is set.
+        assert_eq!(image_addr_dwords("image_sample_d", 1, false), 6); // 2D: 4 grads + 2 coords
+        assert_eq!(image_addr_dwords("image_sample_d", 2, false), 9); // 3D: 6 grads + 3 coords
+        assert_eq!(image_addr_dwords("image_sample_d", 3, false), 7); // Cube: 4 grads + 3 coords
+        assert_eq!(image_addr_dwords("image_sample_d", 1, true), 3); // 2D a16: 2 grads + 1 coord
+
+        // RDNA2 `_g16` opcodes always pack gradients as 16-bit pairs even when a16=false.
+        assert_eq!(image_addr_dwords("image_sample_d_g16", 0, false), 3); // 1D: 2 + 1
+        assert_eq!(image_addr_dwords("image_sample_d_g16", 1, false), 4); // 2D: 2 + 2
+        assert_eq!(image_addr_dwords("image_sample_d_g16", 2, false), 7); // 3D: 4 + 3
+        assert_eq!(image_addr_dwords("image_sample_d_g16", 3, false), 5); // Cube: 2 + 3
+        assert_eq!(image_addr_dwords("image_sample_d_g16", 5, false), 5); // 2D_ARRAY: 2 + 3
+        assert_eq!(image_addr_dwords("image_sample_c_d_cl_o_g16", 1, false), 7); // 2D: o(1)+c(1)+grads(2)+coords+cl(3)
+        assert_eq!(image_addr_dwords("image_sample_c_d_cl_o_g16", 1, true), 6); // 2D a16: o(1)+c(1)+grads(2)+ceil(3/2)(2)
+
+        // End-to-end MIMG decode for 2D `image_sample_d_g16` (opcode 0x0a2: low 7 bits in
+        // w0[24:18], bit 7 in w0[0]; dim=1, a16=false):
+        // Sequential mode (nsaddr=0) decodes 4 consecutive address VGPRs, not 6.
+        let w0_seq: u32 = (0x3C << 26) | ((0x0a2 & 0x7F) << 18) | (0xF << 8) | (1 << 3) | 1;
+        let w1: u32 = (4 << 8) | 10; // vdst=v4, vaddr=v10, a16=0
+        let seq_bytes: Vec<u8> = [w0_seq, w1, 0xBF81_0000]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        let inst = crate::gfx10::decode(&seq_bytes).unwrap().remove(0);
+        assert_eq!(inst.name(), Some("image_sample_d_g16"));
+        let Fields::Image { addr, .. } = inst.fields(false) else {
+            panic!("expected Fields::Image");
+        };
+        assert_eq!(
+            addr,
+            vec![Operand::Vector {
+                reg: 10,
+                dwords: 4
+            }]
+        );
+
+        // NSA mode (nsaddr=1 -> 1 extra dword w2 carrying VGPRs 11, 12, 13):
+        // Must decode exactly 4 VGPRs (v10, v11, v12, v13) without reading past words.len() into v0.
+        let w0_nsa = w0_seq | (1 << 1);
+        let w2_nsa: u32 = 11 | (12 << 8) | (13 << 16);
+        let nsa_bytes: Vec<u8> = [w0_nsa, w1, w2_nsa, 0xBF81_0000]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        let inst = crate::gfx10::decode(&nsa_bytes).unwrap().remove(0);
+        assert_eq!(inst.name(), Some("image_sample_d_g16"));
+        let Fields::Image { addr, .. } = inst.fields(false) else {
+            panic!("expected Fields::Image");
+        };
+        assert_eq!(
+            addr,
+            vec![
+                Operand::Vector { reg: 10, dwords: 1 },
+                Operand::Vector { reg: 11, dwords: 1 },
+                Operand::Vector { reg: 12, dwords: 1 },
+                Operand::Vector { reg: 13, dwords: 1 },
+            ]
+        );
     }
 }
