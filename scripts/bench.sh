@@ -72,8 +72,8 @@ for k in rows[0]:
 out = {"rows": len(rows), "columns": cols}
 # A window whose scene changed (a pause menu, a load) does not count.
 dr = cols.get("draws")
-if dr and dr["min"] < 0.5 * dr["p50"]:
-    out["invalid"] = f"draws fell to {dr['min']:.0f} (median {dr['p50']:.0f}): the scene changed during the window"
+if dr and dr["min"] < 0.5 * dr["max"]:
+    out["invalid"] = f"draws fell to {dr['min']:.0f} (top {dr["max"]:.0f}): the scene changed during the window"
     print(f"WARNING: {out['invalid']}")
 meta = os.path.join(d, "meta.json")
 if os.path.exists(meta):
