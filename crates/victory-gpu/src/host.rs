@@ -8966,6 +8966,7 @@ impl Meter {
         // the rest of its row is made with the counters, by the meter's thread.
         let (frame_ms_max, frame_ms_avg, _timed) = crate::frametime::take_interval();
         let presented = crate::queue::presented();
+        let hud_window = hwnd.0 as usize;
         // The lines (every second, and more every 5 s: sorting, system
         // calls, some forty lines written) are made by a thread of ours
         // ([`meter_lines`]), not by the presenting thread, the lane: about
@@ -9116,6 +9117,27 @@ impl Meter {
                 cpu_pct,
             };
             crate::frametime::record(&row);
+            // On-screen figures (`VICTORY_DEBUG_HUD=1`): the same row the dump
+            // writes (the HUD has a thread of its own: this only hands it the text).
+            crate::debug_hud::update(HWND(hud_window as *mut _), || {
+                format!(
+                    "{fps:.1} FPS   {ms:.1} ms/frame   {draws:.0} draws/frame\n\
+                     CPU prep {cpu:.1} ms   heap {heap:.1} ms   GPU wait {gpu:.1} ms\n\
+                     copies {copies:.1} ms   textures {textures:.1} ms   copy-back {back:.1} ms\n\
+                     dropped {dropped:.0}/frame   indirect dropped {indirect:.0}/frame",
+                    fps = row.fps,
+                    ms = row.ms,
+                    draws = row.draws,
+                    cpu = row.cpu_prepare_ms,
+                    heap = row.heap_ms,
+                    gpu = row.gpu_ms,
+                    copies = row.copies_ms,
+                    textures = row.textures_ms,
+                    back = row.copyback_ms,
+                    dropped = row.dropped,
+                    indirect = row.indirect,
+                )
+            });
             if !five {
                 return;
             }
