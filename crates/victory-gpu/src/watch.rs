@@ -2557,7 +2557,9 @@ fn title_memory_changed(at: usize, len: usize) -> std::sync::MutexGuard<'static,
 /// Registers the handler that takes writes to guarded blocks, once, ahead
 /// of the crash reporter's.
 pub(crate) fn install() {
-    use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
+    use windows_sys::Win32::Foundation::{
+        EXCEPTION_ACCESS_VIOLATION, NTSTATUS, STATUS_GUARD_PAGE_VIOLATION,
+    };
     use windows_sys::Win32::System::Diagnostics::Debug::{
         AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
         EXCEPTION_POINTERS,
@@ -2583,7 +2585,14 @@ pub(crate) fn install() {
             || r.ExceptionInformation[0] != WRITE
         {
             return match ours {
-                Some(exit) => fail(exit),
+                Some(exit) => {
+                    // A guard page of title memory fails the copy as the kernel's read would: the
+                    // fault cleared its guard flag, so it is set again.
+                    if r.ExceptionCode == STATUS_GUARD_PAGE_VIOLATION && r.NumberParameters >= 2 {
+                        rearm_guard(r.ExceptionInformation[1]);
+                    }
+                    fail(exit)
+                }
                 None if r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
                     && r.NumberParameters >= 2
                     && r.ExceptionInformation[0] == READ
@@ -2649,6 +2658,24 @@ pub(crate) fn install() {
     ONCE.call_once(|| unsafe {
         AddVectoredExceptionHandler(1, Some(on_write));
     });
+}
+
+/// Sets the guard flag again on the page holding `at`, with the protection it has
+/// now: the fault that reported it cleared the flag.
+fn rearm_guard(at: usize) {
+    use windows_sys::Win32::System::Memory::{
+        MEMORY_BASIC_INFORMATION, PAGE_GUARD, VirtualProtect, VirtualQuery,
+    };
+    let page = at / KERNEL_PAGE * KERNEL_PAGE;
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let mut old = 0;
+    // SAFETY: a valid out pointer of the right size; a protection change of one committed page.
+    unsafe {
+        if VirtualQuery(page as *const _, &mut info, size_of_val(&info)) != 0 {
+            VirtualProtect(page as *const _, KERNEL_PAGE, info.Protect | PAGE_GUARD, &mut old);
+        }
+    }
 }
 
 /// Whether `at` is committed read-write memory now.

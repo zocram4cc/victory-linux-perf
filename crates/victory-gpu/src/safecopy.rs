@@ -362,8 +362,9 @@ pub(crate) fn failing_exit(at: usize) -> Option<usize> {
 mod tests {
     use super::*;
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc,
-        VirtualFree, VirtualProtect,
+        MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_GUARD,
+        PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualProtect,
+        VirtualQuery,
     };
 
     struct Pages(*mut u8, usize);
@@ -717,5 +718,31 @@ mod tests {
                 });
             }
         });
+    }
+
+    /// Whether the page at `at` is a guard page.
+    fn guarded(at: usize) -> bool {
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: a valid out pointer of the right size.
+        assert_ne!(unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) }, 0);
+        info.Protect & PAGE_GUARD != 0
+    }
+
+    /// A guard page in the source fails the copy, and stays a guard page: the
+    /// fault that reported it cleared the flag, so it is set again.
+    #[test]
+    fn a_guard_page_fails_the_copy_and_stays_a_guard_page() {
+        assert!(on());
+        let (a, mut to) = (Pages::new(2 << 12), vec![0u8; 2 << 12]);
+        let mut old = 0;
+        // SAFETY: pages of our allocation; the second is made a guard page.
+        unsafe {
+            assert_ne!(
+                VirtualProtect(a.0.add(4096).cast(), 4096, PAGE_READWRITE | PAGE_GUARD, &mut old),
+                0
+            );
+            assert!(!copy(to.as_mut_ptr(), a.0, 8192));
+        }
+        assert!(guarded(a.0.addr() + 4096), "the guard flag was consumed");
     }
 }
