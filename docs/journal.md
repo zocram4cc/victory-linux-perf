@@ -13,11 +13,17 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 - Not a host object freed through `retire()` (shadows, texture copies, slot views, staging).
 - Not a missing barrier between commands on the GPU.
+- **Not caused by phase 1:** with `VICTORY_F1_OWN=0 VICTORY_F1_CARD_MERGE=0 VICTORY_F1_FAST_READ=0` the save still lost 2 of 2. The base has the bug.
+- Not the copies in the card's memory: `VICTORY_CARD_BUFFERS=0` still lost 2 of 2.
 - Not DirectStorage's parallel loading: `VICTORY_DSTORAGE_WORKERS=1` (one worker instead of 24) still lost 2 of 2.
 - What did avoid it: **the CPU waiting for the GPU to go idle after each submission** (`RADV_DEBUG=hang`, `breadcrumbs_sync`), and the diag build with the runtime's DRED. So something the CPU side touches while the GPU still works. Candidates:
   - DirectStorage's worker threads (`victory:disk`) writing destinations during loading;
   - work vkd3d keeps in flight past our wait;
   - a GPU read out of range on data not complete yet.
+- **Fault addresses so far:** `0x80038cc00000`, `0x80036a000000`, `0x8003b080e000`, `0x8002f0c73000`, `0x800335e04000`, `0x8003378e1000`, `0x80038cc00000`. Several sit exactly on 1-2 MB boundaries: a shader reading past the end of an allocation into unmapped address space.
+  - Reads through descriptors are bounds-checked (D3D12 robustness), but raw addresses are not: root descriptors, and title memory read by address (`memory.rs`).
+  - Whether a read past the end faults depends on what lies after the allocation, which changes with timing and allocation order. That would explain why DRED or the diag build hide it, and why the one release run that lived drew an almost white picture (garbage instead of a fault).
+  - **Leading hypothesis now: an out-of-range raw read.**
 
 **The saved game's device loss: what keeps it alive (all runs load the save, `royale-save`)**
 

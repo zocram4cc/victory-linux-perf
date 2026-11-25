@@ -301,12 +301,14 @@ Ruled out:
 - the texture sweep;
 - objects freed through `retire()` (`VICTORY_LEAK_RETIRED=1`: still 3 of 3);
 - barriers between commands (`VICTORY_SERIAL_OPS=all`: still 2 of 2);
-- DirectStorage's parallel workers (`VICTORY_DSTORAGE_WORKERS=1`: still 2 of 2).
+- DirectStorage's parallel workers (`VICTORY_DSTORAGE_WORKERS=1`: still 2 of 2);
+- the card copies (`VICTORY_CARD_BUFFERS=0`: still 2 of 2);
+- phase 1's changes (all three off: still 2 of 2; the base has the bug).
 
 Left, since only the CPU waiting for an idle GPU helps:
 - GPU work our wait does not cover: the **present** (vkd3d's swapchain blit on its own queue), vkd3d's internal queues;
 - work vkd3d keeps in flight past our wait;
-- an out-of-range read on data that is not complete yet.
+- **an out-of-range raw read (leading):** several fault addresses sit exactly on 1-2 MB boundaries, which is what a shader reading past the end of an allocation into unmapped space looks like. Raw addresses (root descriptors, title memory by address) have no bounds checks.
 
 **Next step:** an allocation journal (`VICTORY_ALLOC_LOG=1`) that matches the fault address against buffers alive and recently freed. Details and every run are in [docs/journal.md](docs/journal.md) (entries of 25 Nov).
 
