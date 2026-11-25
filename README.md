@@ -151,6 +151,19 @@ Each task follows the same rules:
 
 > **Measured ceiling ([memory.md](docs/memory.md) §5):** phases 1-2 alone give ×2 at most. If phase 1 stalls, tasks 3.1-3.2 (frames in flight) move ahead of phase 2.
 
+### Phase S: stability foundation — **now, before phases 2-3** (reordered 25 Nov 2026)
+
+**Why it moved ahead.** Phase 5 was meant to run "in parallel". Instead, every speed-up so far (fast writes, the forks' late wait) ran into the same bug, and the one open-world scene we have (the user's saved game, Jason) loses the device or draws wrong data in release builds. Phase 2 rewrites exactly the memory paths where this lives, and phase 3 makes timing tighter. Building speed on top would put pieces in before the base holds.
+
+| # | Task | Exit |
+|---|---|---|
+| S.1 | **Wrong reads / device loss** ([Known blocker](#known-blocker-timing-dependent-device-loss)), with the saved game as the reproducer | release build loads Jason 5 of 5 with the right picture |
+| S.2 | **Exact lifetimes** for host copies (design rule 7 in [memory.md](docs/memory.md)) | fast writes on: no device loss in 5 prologue runs |
+| S.3 | **Texture coherence:** no reliance on the sweep recreating copies to pick up changes | `VICTORY_TEXTURE_FREE=0`: same picture as with freeing |
+| S.4 | **Two reference scenes:** prologue (A, B) and open world (Jason, `royale-save`), both measured with `bench.sh --auto` | baselines for both in [baseline.md](docs/baseline.md) |
+
+The phase closes when S.1-S.4 hold. Then phases 2 and 3, measured in both scenes.
+
 ### Phase 2: shared CPU/GPU memory, no copies
 
 **Goal:** the GPU reads and writes **title memory directly**, as on the console. This is the main architectural change.
@@ -252,7 +265,7 @@ Today the chain is: console shader → DXIL → dxil-spirv → SPIR-V → RADV, 
 
 ### Phase 5: stability and visual completeness
 
-**Runs in parallel from phase 1.** Every phase uses it as its exit gate.
+The correctness items that block speed work moved to **phase S** (above). What is left here: missing shaders, ray tracing, and the 30-minute gate of every phase.
 
 | Topic | Status | What to do |
 |---|---|---|

@@ -4,6 +4,11 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-25
 
+**Roadmap reordered: phase S (stability foundation) before phases 2-3**
+- The user's point: the prologue is a closed space, and the game has to work anywhere. Every speed-up ran into the same correctness bug, and phase 2 rewrites the paths where it lives.
+- Phase 1 stays (small, measured, harmless), except fast writes, which stay off.
+- New phase S: wrong reads / device loss (Jason as reproducer), exact lifetimes, texture coherence, and an open-world reference scene. Exit: release loads Jason 5 of 5 with the right picture.
+
 **Found: `VICTORY_SKIP_PIPELINES` only worked in diagnostics builds (fixed)**
 - `pipeline::is_skipped` and the three checks in `draw.rs` were `cfg(feature = "diagnostics")`. **Every release run of ours, and of the launcher's fork profiles, never skipped `fc5e66f8f873d3bb`**, although the profile set it. Fixed: the skip works in every build. The 24 Nov finding that the GPU faulted ~9 minutes in without the skip came from release builds, where the skip did nothing.
 - It does **not** fix the saved game's loss alone: 2 runs after the fix, one lost the device, one did not (it was still loading at 1,503 draws).
