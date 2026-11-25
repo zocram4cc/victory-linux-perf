@@ -5482,6 +5482,11 @@ fn direct_writes() -> bool {
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // Without a system call where every page takes it (`crate::fastcopy`);
+    // a page that does not goes to the kernel below, as before.
+    if len != 0 && crate::fastcopy::writes_on() && crate::fastcopy::copy(dst, src, len) {
+        return;
+    }
     let direct = direct_writes();
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);

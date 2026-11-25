@@ -14,7 +14,8 @@
 //! caller then reads as before, through the kernel, piece by piece. This is
 //! the technique kernels use to copy from user memory.
 //!
-//! `VICTORY_F1_FAST_READ=0` turns it off.
+//! `VICTORY_F1_FAST_READ=0` turns it off. The copy-back's writes into title
+//! memory use the same routine (`VICTORY_F1_FAST_WRITE=0` turns that off).
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -60,8 +61,19 @@ pub(crate) fn on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_F1_FAST_READ").is_none_or(|v| v != "0"))
 }
 
+/// Whether writes into title memory (the copy-back) take the fast path too
+/// (`VICTORY_F1_FAST_WRITE`, on unless `0`). A write that faults (a page
+/// not there, a guard page, a page the title made read-only) goes to the
+/// kernel as before; our own read-only guards on view memory are opened by
+/// the caller first (`crate::watch::writing`), or by their handler if one
+/// is met, as for a write of the title's.
+pub(crate) fn writes_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| on() && std::env::var_os("VICTORY_F1_FAST_WRITE").is_none_or(|v| v != "0"))
+}
+
 /// Since the last frame line: fast copies, bytes, and copies that faulted
-/// (and went to the kernel instead).
+/// (and went to the kernel instead); reads and writes together.
 pub(crate) static STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// `STATUS_GUARD_PAGE_VIOLATION`.
@@ -121,9 +133,10 @@ fn install() {
     });
 }
 
-/// Copies `len` bytes from `src` (title memory, possibly with missing
-/// pages) to `dst` (ours, mapped and writable). False if a source page is
-/// not readable; `dst` may then hold part of the bytes.
+/// Copies `len` bytes from `src` to `dst`, one of them title memory
+/// (possibly with missing pages), the other ours. False if a page of the
+/// title's side cannot be read or written; part of the bytes may have been
+/// copied then.
 pub(crate) fn copy(dst: *mut u8, src: *const u8, len: usize) -> bool {
     #[cfg(all(windows, target_arch = "x86_64"))]
     {
@@ -166,6 +179,46 @@ mod tests {
             assert!(!super::copy(out.as_mut_ptr(), base.add(0x1000), 16));
             assert!(super::copy(out.as_mut_ptr(), base.add(8), 16));
             assert_eq!(out[0], 8);
+            VirtualFree(base.cast(), 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn writes_fail_on_missing_and_read_only_pages() {
+        use windows_sys::Win32::System::Memory::PAGE_READONLY;
+        // SAFETY: memory of our own: a writable page, a read-only one, and
+        // a reserved one.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 0x3000, MEM_RESERVE, PAGE_READWRITE).cast::<u8>();
+            assert!(!VirtualAlloc(base.cast(), 0x1000, MEM_COMMIT, PAGE_READWRITE).is_null());
+            assert!(!VirtualAlloc(base.add(0x1000).cast(), 0x1000, MEM_COMMIT, PAGE_READONLY).is_null());
+            let src = vec![7u8; 0x3000];
+            assert!(super::copy(base, src.as_ptr(), 0x1000));
+            assert_eq!(*base.add(0xfff), 7);
+            assert!(!super::copy(base.add(0x1000), src.as_ptr(), 16));
+            assert!(!super::copy(base.add(0x2000), src.as_ptr(), 16));
+            VirtualFree(base.cast(), 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn a_fast_write_is_seen_by_write_watching() {
+        use windows_sys::Win32::System::Memory::GetWriteWatch;
+        const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+        // SAFETY: write-watched memory of our own; the answer buffer holds
+        // `count` entries.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 0x4000, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE).cast::<u8>();
+            assert!(!base.is_null());
+            let mut found = [std::ptr::null_mut::<core::ffi::c_void>(); 4];
+            let (mut count, mut granularity) = (4usize, 0u32);
+            GetWriteWatch(1, base.cast(), 0x4000, found.as_mut_ptr(), &mut count, &mut granularity);
+            let src = [9u8; 16];
+            assert!(super::copy(base.add(0x2008), src.as_ptr(), 16));
+            count = 4;
+            GetWriteWatch(1, base.cast(), 0x4000, found.as_mut_ptr(), &mut count, &mut granularity);
+            assert_eq!(count, 1);
+            assert_eq!(found[0] as usize, base as usize + 0x2000);
             VirtualFree(base.cast(), 0, MEM_RELEASE);
         }
     }

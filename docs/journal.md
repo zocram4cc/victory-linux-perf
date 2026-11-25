@@ -17,6 +17,9 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 - **17,190 reads of title memory per frame** (288 MB), each one a system call before. 20 per frame meet a missing or guard page and take the kernel path.
 - No crash after the guard-page fix.
 - **Copy-back did not move.** It writes with `NtWriteVirtualMemory` (`host.rs::write_mapped`), the same per-call cost in the other direction. **Next: fast writes**, the same technique.
+- **Fast writes (1.9):** `write_mapped` tries the same routine first (`VICTORY_F1_FAST_WRITE=0` turns it off). Unit tests under wine:
+  - a write to a missing page and to a read-only page fails to the kernel path;
+  - **a fast write into write-watched memory is reported by `GetWriteWatch`**, so Wine tracks our writes like the title's and the journal stays correct.
 
 **Phase 1.8: profile of the submitting thread, and fast reads (branch `p1.8-fast-reads`)**
 - **Profile** (`bench.sh --perf`, scene A, 30 s). The submitting thread is busy about half the time (~170 ms per frame):
