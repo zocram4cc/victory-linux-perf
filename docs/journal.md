@@ -12,6 +12,7 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
   - the compare after the lists stores its hashes (`compare = 2`, as the relay already does), so pieces that were not sent up are not found differing again.
 - Builds. The `shadow::` unit tests pass under wine. `watch::tests::writes_in_partly_committed_view_blocks_are_reported` fails only when run together with other tests (shared state); alone it passes, and the file was not touched.
 - **To measure:** scene A with each switch and with both, against the baseline, checking the picture for corruption.
+
 **Repository**
 - The documentation moved to English. The Spanish originals are in `docs/history/es/`.
 - A collaborator joins, working on a separate branch.
