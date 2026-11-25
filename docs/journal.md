@@ -4,6 +4,14 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-25
 
+**Decision: back to our base; the roadmap rebuilt around pieces that fit this machine**
+- **Base:** `p1.8-fast-reads` (joshuu `003beef` plus phases 0, 1.7 and 1.8), not `fx`. On this machine it is twice as fast (317 against 610 ms per frame), and the stability bug is in both bases. `main` is advanced to it. `fx` stays as a reference for track U.
+- Carried over from `fx`: the `bench.sh` check that marks a window `invalid` when its draws fall below half their top, and the journal entries.
+- **README section 4 now opens with the target architecture:** seven pieces (M memory placement, W write tracking, B copy-back, L lifetimes, T textures, Q submission and fences, D descriptors and views), each with its guarantee, today's state, the target on this machine and its phases. Lessons from `fx` fix the order: **B (1.3) comes before Q (3.1)**, because overlapping while the copy-back is large puts it on the title's critical path.
+- New: task S.5 (evaluate fxceless's descriptor mirroring `a26859f` as a cause of the wrong reads), track U (upstream intake, one measured change at a time), track L (soft-dirty / `userfaultfd` prototype, moved out of phase 4), track G (gates).
+- **This machine:** ReBAR is on (BAR0 32 GiB over 20 GB of VRAM), so CPU-visible VRAM is not limited to 256 MB. Phase 2.1 also measures CPU write bandwidth into it.
+- **Agents:** [AGENTS.md](../AGENTS.md) sets out the rules and roles of the pi subagents (scout, architect, worker, reviewer, analyst, upstream). They write code in worktrees and read results; game runs stay with the maintainer.
+
 **fx on Linux: why it is slower, and a measurement trap**
 - **The bisect was wrong in its premise.** The title stalls (~280-460 ms a frame) at every fxceless commit tested, back to `3bff182`. What made the old base fast is not in fxceless's line at all; it came from joshuu/myokex commits fxceless did not take. joshuu's remapping commits `948e9d3` and `476a020`, ported, change nothing.
 - **fxceless's new defaults** (`c96b4f2`):
@@ -14,7 +22,7 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 - **With the relay, the title waits for the relay thread's landing.** Per frame it waits 55-72 ms for the card and 100-122 ms for fetches of card copies' pieces, 158-176 ms landing in all. The card is idle while the title waits.
 - With the old defaults (`RELAY=0`, `WIDE_BACK=0`, card 16-512 MB, 128 lists): **7.5 s a frame** (copy-back 6.3 s). fxceless rebuilt the copy-back around the relay, so it cannot simply be turned off.
 - `VICTORY_QUEUE2=1`: 623 ms. `VICTORY_ASYNC_SUBMIT=1`: 660 ms. No gain.
-- **Trap:** a `CARD_BUFFERS_MIN_MB=16` run read "140 ms" because the game went to a 199-draw screen (pause?) during the window. In the world it was 1.5 fps, the same. `bench.sh` now marks a window `invalid` when draws fall below half their median.
+- **Trap:** a `CARD_BUFFERS_MIN_MB=16` run read "140 ms" because the game went to a 199-draw screen (pause?) during the window. In the world it was 1.5 fps, the same. `bench.sh` now marks a window `invalid` when draws fall below half their top.
 - `waitstat` on fx: the same waits as the old base (one thread ~700 ms/s at `title+0x4e7f358`). The title's `mwaitx` wait is native on this Ryzen and not seen.
 
 **Branch `fx`: the base moved to fxceless/main (`d510ee4`)**

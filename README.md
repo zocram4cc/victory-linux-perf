@@ -105,6 +105,40 @@ The order is fixed, and each phase depends on what the previous one measured.
 - Frame-rate targets are **hypotheses**: they get confirmed or corrected by measurement, in [docs/journal.md](docs/journal.md).
 - Time estimates are rough.
 
+### The target: pieces that fit this machine
+
+The roadmap builds one architecture for **one platform**: Linux, GE-Proton, vkd3d-proton, RADV, an RX 7900 XT (RDNA3, 20 GB) and a Ryzen 9 9900X (24 threads). Other forks tune for Windows and NVIDIA. We tune for what this platform gives us:
+- **ReBAR is on:** BAR0 is 32 GiB, so the CPU can address all of the VRAM (`/sys/bus/pci/devices/0000:03:00.0/resource`, 25 Nov).
+- **Spare CPU:** the title uses 1.4 of 24 threads ([memory.md](docs/memory.md) §8).
+- **An open stack:** we already patch the wineserver, and vkd3d-proton, wine's ntdll and RADV's settings are all ours to change.
+- **Linux kernel tools:** soft-dirty bits and `userfaultfd` track writes without page faults through Wine.
+
+Each piece owns one job and states what it guarantees to the others. A phase builds or replaces pieces; it does not add a shortcut that a later phase must undo.
+
+| Piece | Job | Guarantee to the others | Today | Target on this machine | Phases |
+|---|---|---|---|---|---|
+| **M** Memory placement | where each kind of title memory lives for the GPU | one GPU address per title range, valid while any list can reach it | every buffer copied into a host copy | by kind (§2.2): VRAM through ReBAR for what the CPU writes and the GPU reads heavily; opened title memory for small or CPU-read data; plain VRAM for GPU-only data | 1.1, 2 |
+| **W** Write tracking | what the title changed since the GPU last saw it | no missed write; cost proportional to what changed | write watch, guards, 558 hash passes, kernel reads | write watch asked once per submission; reads without system calls (done, 1.8); then soft-dirty or `userfaultfd` (track L) | 1.2, 1.8, L |
+| **B** Copy-back | what the GPU wrote that the CPU will read | the CPU never reads a stale byte | 79 MB a frame, on the critical path | only ranges the CPU reads, fetched when touched (1.3); none for in-place memory (2) | 1.3, 2.5 |
+| **L** Lifetimes | when a host object can be freed or a page remapped | nothing is freed or remapped while a list can reach it | time and frame heuristics; frees the GPU still reads | exact references plus fence-based deferred release | S.2, 3.2 |
+| **T** Textures | console-tiled images to host images | the host image matches title memory at every draw | detile on change detection that misses some updates | change detection without relying on the sweep; detiling on spare cores | S.3, 1.6, 3.3 |
+| **Q** Submission and fences | ordering CPU and GPU work | the title's fence signals mean what they mean on the console | every submission waited for | frames in flight, signals at GPU completion, **copy-back off the critical path first** | 3.1, 3.5 |
+| **D** Descriptors and views | title descriptor tables to host descriptors | a view never reaches past its resource | a fault outside every copy of ours, likely a view out of range | views checked against their resource; descriptor records mirrored when the title copies them as bytes (fxceless `a26859f`) | S.1, S.5 |
+
+**Lessons that fixed this order (25 Nov, branch `fx`, [journal](docs/journal.md)):**
+1. **Overlap before the copy-back is small makes Linux slower.** fxceless's relay thread overlaps submissions but lands the copy-back on the title's critical path. On RADV the title then waits ~430 ms a frame: 610 ms per frame against our 317 ms. So **B (1.3) comes before Q (3.1)**.
+2. **Another fork's speed-up is a hypothesis here, not a result.** fxceless measures on Windows and NVIDIA. Its changes enter our base one at a time, behind a switch, and only when `bench.sh` on this machine shows a gain (track U).
+3. **Every switch must work in release builds.** Three of ours and fxceless's were diagnostics-only, which made weeks of runs mean something else.
+4. **A measurement window must hold one scene.** A pause screen once read as a 4× speed-up; `bench.sh` now marks such windows `invalid`.
+
+### Standing tracks (alongside the phases)
+
+| Track | What | Rule |
+|---|---|---|
+| **U** Upstream intake | review fxceless, joshuu and upstream commits ([AGENTS.md](AGENTS.md): `vr-upstream`) | port one change at a time, behind a switch, measured here; record the verdict in the journal |
+| **L** Linux write tracking | prototype soft-dirty (`/proc/self/pagemap`) or `userfaultfd` write-protect, alone, outside the game | it replaces W only if the prototype beats today's write watch per 4 KiB page; needs a Unix side (a Wine unixlib or a helper process) |
+| **G** Gates | the 30-minute run, the open-world scene and the screenshots | every phase passes them before merging into `main` |
+
 ### Phase 0: base, reference scene, measurement — **done** (25 Nov 2026)
 
 | # | Task | Status |
@@ -136,7 +170,7 @@ Each task follows the same rules:
 |---|---|---|---|
 | 1.1 | **Memory census by use** | `shadow.rs`, `watch.rs`, `host.rs` | Classify every copied range (CPU-writes/GPU-reads, GPU-writes/CPU-reads, GPU-only, texture), with size and frequency per frame. Logged with `VICTORY_MEDIR=1`. It is the input for 1.3 and for all of phase 2. |
 | 1.2 | **Cheaper write tracking** | `watch.rs`, `host.rs::card_before` | Replace the 558 hash passes per frame with the write-watch answer: only compare what has dirty pages, and ask once per submission. Measure `VICTORY_ASK_ONCE` first. |
-| 1.3 | **Copy back only what the CPU reads** | `host.rs`: `card_back`, `hand_back` | Using the census, skip GPU-written ranges the CPU never reads. Guard them against reading (`PAGE_NOACCESS` or a guard page) and fetch only when the title touches them. Target: 79 MB down to under 10 MB per frame. |
+| 1.3 | **Copy back only what the CPU reads** — **first after phase S; it gates 3.1** | `host.rs`: `card_back`, `hand_back` | Using the census, skip GPU-written ranges the CPU never reads. Guard them against reading (`PAGE_NOACCESS` or a guard page) and fetch only when the title touches them. Target: 79 MB down to under 10 MB per frame. |
 | 1.4 | **Persistent staging** | `host.rs`: `upload`, `scratch`, `take_chunk` | Reused, 64 KiB-aligned upload rings instead of creating resources per frame. Check `perf` first to see whether allocation shows up. |
 | 1.5 | **Fewer alias views** | `xmem.rs`: `map_alias`, `map` | Merge contiguous pages into one view when source and target are contiguous. On 24 Nov the average was 1.0 page per call; check whether joshuu's `948e9d3` and `476a020` changed that. Drop the task if there is no contiguity. |
 | 1.6 | **Textures only when they change** | `texture.rs` | Check write watch before detiling; do not detile mips that did not change. |
@@ -161,8 +195,11 @@ Each task follows the same rules:
 | S.2 | **Exact lifetimes** for host copies (design rule 7 in [memory.md](docs/memory.md)) | fast writes on: no device loss in 5 prologue runs |
 | S.3 | **Texture coherence:** no reliance on the sweep recreating copies to pick up changes | `VICTORY_TEXTURE_FREE=0`: same picture as with freeing |
 | S.4 | **Two reference scenes:** prologue (A, B) and open world (Jason, `royale-save`), both measured with `bench.sh --auto` | baselines for both in [baseline.md](docs/baseline.md) |
+| S.5 | **Descriptor records copied as bytes** (piece D): evaluate fxceless `a26859f` (*"byte-copied descriptor records are mirrored, views off their copy's elements get their own bytes"*, 1,188 lines in 13 files) as a cause of the wrong reads; port it behind a switch if the census shows such copies in the Jason scene | the Jason loss rate with and without it, 5 runs each |
 
 The phase closes when S.1-S.4 hold. Then phases 2 and 3, measured in both scenes.
+
+**Note:** fxceless sees the same washed-out picture (~6 of 21 runs) and an open-world device loss on its own base, so moving to another base would not have removed this phase.
 
 ### Phase 2: shared CPU/GPU memory, no copies
 
@@ -177,8 +214,10 @@ The phase closes when S.1-S.4 hold. Then phases 2 and 3, measured in both scenes
 - **The page pool through sections does not:** `SEC_RESERVE` is refused, and with `SEC_COMMIT` the GPU does not see the views.
 - **Reading in place over PCIe** (~27 GB/s) makes GPU time 2-2.5× longer.
 
+**Known about this machine:** ReBAR is on (BAR0 32 GiB covers all 20 GB of VRAM), so CPU-visible VRAM is not limited to 256 MB.
+
 **Still to measure:**
-- A microbenchmark of GPU bandwidth reading 200 MB from VRAM, from ReBAR and from system memory.
+- A microbenchmark of GPU bandwidth reading 200 MB from VRAM, from ReBAR and from system memory, and of **CPU write bandwidth into ReBAR** (the title would write vertices and constants straight into it).
 - Whether `D3D12_HEAP_TYPE_GPU_UPLOAD` (ReBAR) exists in this vkd3d-proton. Its log already says *"HVV access is viable"*.
 
 #### 2.2 Placement by kind of memory
@@ -229,7 +268,7 @@ This is the largest job of the phase.
 
 | # | Task | Where | How |
 |---|---|---|---|
-| 3.1 | **Frames in flight** | `host.rs` (`submit`, `settle`), `queue.rs`, `fence.rs` | Drop *"every submission is waited for"*. Each submission carries its fence value, and the title's signals complete when the GPU reaches them. Allow 2-3 frames in flight. What `late` and `relay` do today gets rewritten on top of zero-copy memory, which does not have the problem of reading half-remapped pages. |
+| 3.1 | **Frames in flight** (needs 1.3: lesson 1) | `host.rs` (`submit`, `settle`), `queue.rs`, `fence.rs` | Drop *"every submission is waited for"*. Each submission carries its fence value, and the title's signals complete when the GPU reaches them. Allow 2-3 frames in flight. What `late` and `relay` do today gets rewritten on top of zero-copy memory, which does not have the problem of reading half-remapped pages. |
 | 3.2 | **Safe remapping** | `xmem.rs` + `host.rs` | A page the GPU is using is not remapped until its fence passes: a deferred-release queue. This is what breaks `VICTORY_LATE_WAIT` on AMD today. |
 | 3.3 | **Multithreaded recording** | `list.rs`, `draw.rs` | The title records from 5 threads. Translate each list on its own thread, not on the submitting one. |
 | 3.4 | **Non-blocking pipelines** | `pipeline/make.rs`, `library.rs`, `apps/victory/src/translate.rs` | Measure how long draws still wait for pipelines. **Fix the `victory warm` hang**: with pipelines on RADV, it waits forever once the compute pipelines are done. Run `warm` from the launcher after each update. |
@@ -255,10 +294,7 @@ Today the chain is: console shader → DXIL → dxil-spirv → SPIR-V → RADV, 
    - native sparse binding for tiled heaps;
    - direct `VK_EXT_external_memory_host`;
    - `VK_EXT_descriptor_buffer` for the title's descriptor heaps.
-4. **Linux write tracking:**
-   - `userfaultfd` write-protect mode, or soft-dirty bits from `/proc/self/pagemap`, instead of page faults handled by Wine.
-   - This needs a Unix side: a Wine unixlib, or a helper process sharing memory through `memfd`.
-   - Prototype it in isolation first to see whether it pays.
+4. **Linux write tracking** moved to track L, so its prototype does not wait for this phase.
 5. **Wine stays.** The title is a Windows PE importing the Windows API; dropping Wine would mean rewriting all of that.
 
 **Exit criteria:** same picture as D3D12, a measurably shorter frame, and no loss of stability.
@@ -337,27 +373,39 @@ Left, since only the CPU waiting for an idle GPU helps:
 4. **Write it down.** Add a dated entry to [docs/journal.md](docs/journal.md) for what you tried, what came out of it and what you decided, failures included. Memory figures go to [docs/memory.md](docs/memory.md).
 5. **Everything in the repository is in English:** code, comments, docs, commit messages.
 6. **No game data in the repository:** no files, screenshots, saves or names. Comparison screenshots stay in `bench/`, which is not committed.
-7. **Pull in joshuu and fxceless** at the start of each phase: `git fetch joshuu && git merge joshuu/victory-amd`. If one of their changes touches the same code as a phase in progress, integrate it first.
+7. **Other forks come in through track U:** one change at a time, behind a switch, kept only if `bench.sh` on this machine shows a gain. Do not merge a fork's branch wholesale.
 8. **Test on Linux with the launcher.** It sets up wine, vkd3d-proton, the patched wineserver and the read-only sandbox. Do not launch anything while someone is playing on the same machine: starting our wineserver kills the running game.
 9. **Claim a task** on the [task board](#6-task-board) before starting it, so two people do not work on the same code.
+10. **Agents:** the pi subagents and their rules are described in [AGENTS.md](AGENTS.md). They write code and read results; game runs are done by the maintainer.
 
 ## 6. Task board
 
-| Task | Owner | Branch | Status |
-|---|---|---|---|
-| 1.1 Memory census | maintainer | `p1.1-census` | in progress |
-| 1.2/1.3 Stop re-copying our own write-back (`VICTORY_F1_OWN`, `VICTORY_F1_CARD_MERGE`) | maintainer | `p1.1-census` | **done**: uploads −49 %, card sends −80 %, hash passes −82 %, frame −2 % |
-| 1.8 Fast reads of title memory (`rep movsb` + fault recovery, `VICTORY_F1_FAST_READ`) | maintainer | `p1.8-fast-reads` | **done**: frame 354 → 317 ms, prepare −17 % |
-| 1.9 Fast writes of title memory (copy-back, `VICTORY_F1_FAST_WRITE=1`) | maintainer | `p1.8-fast-reads` | **off**: lost the device once as loading ended; reproducing |
-| 1.2 Cheaper write tracking | maintainer | | after 1.1 |
-| 1.3 Copy back only what the CPU reads | maintainer | | after 1.1 |
-| 0.B Baseline on a second machine (7800X3D, RX 7900 XTX, 32 GB) | collaborator (suggested) | | first task: learn the flow, second data point |
-| 0.6 Port royale's DXC clamp and copy-back read | *open* | | good first task |
-| 3.4 Fix the `victory warm` hang with pipelines on RADV | collaborator (suggested) | | independent of phases 1-2; needs Linux |
-| 2.1 GPU bandwidth microbenchmark (VRAM, ReBAR, system memory) | *open* | | independent research |
-| 5 `fc5e66f8` AMD fault: find the access and fix instead of skipping | collaborator (suggested) | | shader translator; needs an AMD card |
-| 5 Refused shaders (58), by family | *open* | | shader translator |
-| 5 `VICTORY_INPLACE=2` device loss | *open* | | needed before 2.4 |
+In roadmap order. Piece letters refer to [the target](#the-target-pieces-that-fit-this-machine).
+
+| Task | Piece | Owner | Branch | Status |
+|---|---|---|---|---|
+| S.1 Wrong reads / device loss, Jason as reproducer: check every texture view against its host texture | D | maintainer | `p1.8-fast-reads` | **now** |
+| S.5 Evaluate fxceless `a26859f` (descriptor mirroring) | D | maintainer (agents: `vr-upstream`, `vr-architect`) | | next, with S.1 |
+| S.4 Open-world baseline (Jason, `bench.sh --auto -p royale-save`) | G | maintainer | | blocked by S.1 |
+| S.2 Exact lifetimes for host copies | L | *open* | | after S.1 |
+| S.3 Texture coherence without the sweep | T | *open* | | after S.1 |
+| 1.3 Copy back only what the CPU reads | B | maintainer | | first after phase S; gates 3.1 |
+| 1.2 Cheaper write tracking (ask write watch once per submission) | W | *open* | | |
+| 1.1 Memory census by use | M | maintainer | `p1.1-census` | in progress (input for 1.3 and phase 2) |
+| 1.7 Stop re-copying our own write-back (`VICTORY_F1_OWN`, `VICTORY_F1_CARD_MERGE`) | B | maintainer | `p1.1-census` | **done**: uploads −49 %, hash passes −82 %, frame −2 % |
+| 1.8 Fast reads of title memory (`crate::fastcopy`) | W | maintainer | `p1.8-fast-reads` | **done**: frame 354 → 317 ms |
+| 1.9 Fast writes of title memory (`VICTORY_F1_FAST_WRITE=1`) | B | maintainer | `p1.8-fast-reads` | **off**: loses the device (the S.1 bug) |
+| 2.1 GPU and CPU bandwidth microbenchmark: VRAM, ReBAR, system memory | M | *open* | | independent research |
+| L.1 Soft-dirty / `userfaultfd` prototype, outside the game | W | *open* | | independent research |
+| U Review fxceless, joshuu and upstream since our base | — | agents (`vr-upstream`) | | standing |
+| 0.B Baseline on a second machine (7800X3D, RX 7900 XTX, 32 GB) | G | collaborator (suggested) | | first task: learn the flow, second data point |
+| 0.6 Port royale's DXC clamp and copy-back read | — | *open* | | good first task |
+| 3.4 Fix the `victory warm` hang with pipelines on RADV | — | collaborator (suggested) | | independent; needs Linux |
+| 5 `fc5e66f8` AMD fault: find the access and fix instead of skipping | — | collaborator (suggested) | | shader translator; needs an AMD card |
+| 5 Refused shaders (58), by family | — | *open* | | shader translator |
+| 5 `VICTORY_INPLACE=2` device loss | M | *open* | | needed before 2.4 |
+
+**Branch `fx`** (fxceless/main plus our Linux pieces) is kept for reference and for track U. It is not the base: on this machine it runs at 610 ms per frame.
 
 ## 7. Risks and open decisions
 
@@ -402,6 +450,7 @@ The base fork's own notes, with its switches and diagnostics, are in [docs/fork-
 | Branch | What it is |
 |---|---|
 | `main` | our line: joshuu plus the roadmap |
+| `fx` | fxceless/main plus our Linux pieces; reference only (track U) |
 | `royale-base` | ligmaSec/victory-royale as it was, for reference |
 | `p<phase>.<task>-<name>` | work in progress per task |
 
