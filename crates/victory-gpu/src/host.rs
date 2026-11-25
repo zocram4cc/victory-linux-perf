@@ -8578,6 +8578,15 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         spans::line(frames);
         crate::shadow::back_line(frames);
+        if crate::shadow::copy_compare() {
+            let [all, same] = [0, 1].map(|i| {
+                crate::shadow::COPY_COMPARED[i].swap(0, Ordering::Relaxed) as f64 / 1e6 / frames
+            });
+            tracing::info!(
+                "refreshes compared per frame (VICTORY_COPY_COMPARE=1): {all:.1} MB the title wrote, {same:.1} MB of it \
+                 the same bytes as before (not put in, not sent up)"
+            );
+        }
         #[cfg(feature = "diagnostics")]
         split_line(frames);
         let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);

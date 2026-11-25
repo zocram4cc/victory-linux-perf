@@ -2024,6 +2024,29 @@ fn land_echo() -> bool {
 /// bytes a landing was noted in that were the title's too.
 pub(crate) static ECHO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// Whether a refresh compares the 4 KiB parts that a copy held before and
+/// the title has written since ([`Shadow::copy_compared`]), and puts in and
+/// sends up only those whose bytes differ (`VICTORY_COPY_COMPARE=1`; off by
+/// default).
+///
+/// The write watch says which parts were written, not whether their bytes
+/// changed. In the old tree's first 150 world frames 146 of the 180 MB a
+/// frame the title wrote held the same bytes already, and each went up
+/// anyway. A part is compared with the copy's own CPU side, which the card's
+/// side holds too ([`send_changed`] rests on the same): equal, it has nothing
+/// to send. Whole parts only: a part with any byte different goes as before.
+pub(crate) fn copy_compare() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("VICTORY_COPY_COMPARE").is_some_and(|v| v == "1")
+    });
+    *ON
+}
+
+/// Since the last frame-rate line, with [`copy_compare`]: bytes the title
+/// wrote into parts of copies that held them before, and of those the bytes
+/// that held the same (not put in, not sent up).
+pub(crate) static COPY_COMPARED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 /// Whether a refresh of a copy in the card's memory takes, and sends up,
 /// the dwords that title memory changed and no others
 /// (`VICTORY_SEND_CHANGED=1`; off: the 64 KiB pages written since it last
@@ -2681,6 +2704,38 @@ mod landing_tests {
         copy.take_landed(from, to);
         assert_eq!(copy.take_dirty(), []);
         drop(room);
+    }
+}
+
+#[cfg(test)]
+mod compare_tests {
+    use super::{KERNEL_PAGE, Shadow};
+
+    /// With the switch on, a part of a copy that the title rewrote with the
+    /// bytes the copy held is neither put in nor sent up; a part with one byte
+    /// changed goes up whole.
+    #[test]
+    fn a_part_rewritten_with_the_same_bytes_sends_nothing() {
+        const PARTS: usize = 4;
+        let len = PARTS * KERNEL_PAGE;
+        let mut room = vec![7u8; len + KERNEL_PAGE];
+        let title = (room.as_ptr() as usize).next_multiple_of(KERNEL_PAGE);
+        let at = title - room.as_ptr() as usize;
+        let mut side = vec![7u8; len];
+        let copy = Shadow::unbacked(title as u64, side.as_mut_ptr(), len as u64, true);
+        let (from, to) = (title, title + len);
+        // Taken before: all of it goes up.
+        assert_eq!(copy.copy_compared(from, to, false), len);
+        assert_eq!(copy.take_dirty(), [(0, len)]);
+        // Written with the bytes it holds: nothing goes up.
+        room[at..at + len].fill(7);
+        assert_eq!(copy.copy_compared(from, to, true), 0);
+        assert_eq!(copy.take_dirty(), []);
+        // One byte of part 2 changes: that part goes up whole, the others not.
+        room[at + 2 * KERNEL_PAGE + 9] = 8;
+        assert_eq!(copy.copy_compared(from, to, true), KERNEL_PAGE);
+        assert_eq!(copy.take_dirty(), [(2 * KERNEL_PAGE, 3 * KERNEL_PAGE)]);
+        assert_eq!(side[2 * KERNEL_PAGE + 9], 8);
     }
 }
 
@@ -3904,15 +3959,16 @@ impl Shadow {
     /// [`Shadow::take`] of `runs` (from, to, known), on several threads if
     /// they are long: the big heap's copy has some 4 MB of them in each of
     /// 14 refreshes a frame, on one thread while the others had nothing.
+    /// Returns the bytes put in.
     fn take_all(&self, runs: Vec<(usize, usize, bool)>) -> usize {
         const LONG: usize = 1 << 20;
         const PART: usize = 256 << 10;
-        let bytes = runs.iter().map(|r| r.1 - r.0).sum();
+        let bytes: usize = runs.iter().map(|r| r.1 - r.0).sum();
         if bytes < LONG || !crate::watch::light() {
-            for (from, to, known) in runs {
-                self.take(from, to, known);
-            }
-            return bytes;
+            return runs
+                .into_iter()
+                .map(|(from, to, known)| self.take(from, to, known))
+                .sum();
         }
         let mut parts = Vec::with_capacity(bytes / PART + runs.len());
         for (from, to, known) in runs {
@@ -3925,14 +3981,16 @@ impl Shadow {
             }
         }
         let this = std::ptr::from_ref(self) as usize;
+        let put = Arc::new(AtomicU64::new(0));
+        let sum = put.clone();
         wide_each(parts.len(), move |i| {
             // SAFETY: `wide_each` returns when every part is done, before
             // the borrow of `self` ends. The parts lie apart.
             let this = unsafe { &*(this as *const Shadow) };
             let (from, to, known) = parts[i];
-            this.take(from, to, known);
+            sum.fetch_add(this.take(from, to, known) as u64, Ordering::Relaxed);
         });
-        bytes
+        put.load(Ordering::Relaxed) as usize
     }
 
     /// What shaders wrote in `[from, to)` (offsets) was put into title memory.
@@ -3980,12 +4038,15 @@ impl Shadow {
                 at = next;
             }
         }
+        let mut bytes = 0;
         TITLE.with_borrow_mut(|title| {
             for (from, to, noted) in runs {
                 if !noted {
-                    self.copy(from, to);
+                    bytes += self.copy_compared(from, to, copy_compare());
                     continue;
                 }
+                // Noted pages count whole, as they always did.
+                bytes += to - from;
                 title.resize(to - from, 0);
                 // (Pages that are not there read as zeros.)
                 crate::host::copy_mapped(title.as_mut_ptr(), from as *const u8, to - from, false);
@@ -4009,7 +4070,7 @@ impl Shadow {
                 }
             }
         });
-        to - from
+        bytes
     }
 
     /// Copies title memory `[from, to)` (inside the buffer) into the copy;
@@ -4023,7 +4084,7 @@ impl Shadow {
             if known && self.card.is_some() && self.landing.load(Ordering::Acquire) && land_echo() && !crate::host::upcheck::on() {
                 return self.take_landed(from, to);
             }
-            return self.copy(from, to);
+            return self.copy_compared(from, to, known && copy_compare());
         };
         let whole = !known && card.before.lock().unwrap_or_else(|e| e.into_inner()).is_none();
         let start = self.start as usize;
@@ -4082,6 +4143,67 @@ impl Shadow {
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
         to - from
+    }
+
+    /// [`Shadow::copy`] of `[from, to)`, which the copy held before (parts of
+    /// it the title wrote since). With `compare` ([`copy_compare`]) each 4 KiB
+    /// part whose title bytes equal the copy's own is neither put in nor noted
+    /// changed, so nothing of it goes up; a part with any byte different is put
+    /// in whole, as `copy` puts it. Returns the bytes put in.
+    fn copy_compared(&self, from: usize, to: usize, compare: bool) -> usize {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (from.max(start), to.min(end));
+        if from >= to {
+            return 0;
+        }
+        // (A window the CPU maps in card memory would be read across the bus.)
+        if !compare || self.mapped || crate::host::upcheck::on() {
+            return self.copy(from, to);
+        }
+        thread_local! {
+            /// A chunk of title memory, as read.
+            static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let mut put = 0;
+        TITLE.with_borrow_mut(|title| {
+            title.resize(PAGE, 0);
+            let mut at = from;
+            while at < to {
+                let n = (PAGE - at % PAGE).min(to - at);
+                let title = &mut title[..n];
+                // (Pages that are not there read as zeros.)
+                crate::host::copy_mapped(title.as_mut_ptr(), at as *const u8, n, false);
+                // SAFETY: inside the mapping of the copy's CPU side, which nothing else
+                // reads or writes there (as in `take`).
+                let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at - start), n) };
+                let mut runs: Vec<(usize, usize)> = Vec::new();
+                let mut part = 0;
+                while part < n {
+                    let len = (KERNEL_PAGE - (at + part) % KERNEL_PAGE).min(n - part);
+                    let (was, now) = (title[part..].as_ptr(), held[part..].as_ptr());
+                    // SAFETY: `len` bytes of each, inside both.
+                    if unsafe { crate::safecopy::differ(was, now, len) } {
+                        held[part..part + len].copy_from_slice(&title[part..part + len]);
+                        let off = at - start + part;
+                        match runs.last_mut() {
+                            Some(last) if last.1 == off => last.1 += len,
+                            _ => runs.push((off, off + len)),
+                        }
+                        put += len;
+                    }
+                    part += len;
+                }
+                // After the bytes are in: a snapshot taken meanwhile is not current.
+                for &(a, b) in &runs {
+                    self.changed(a, b);
+                }
+                self.card_changed_runs(runs.into_iter());
+                at += n;
+            }
+        });
+        COPY_COMPARED[0].fetch_add((to - from) as u64, Ordering::Relaxed);
+        COPY_COMPARED[1].fetch_add((to - from - put) as u64, Ordering::Relaxed);
+        put
     }
 
     /// Whether shaders read and write this copy in the card's own memory
