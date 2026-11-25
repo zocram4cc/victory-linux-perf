@@ -4,6 +4,15 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-25
 
+**Correction: `VICTORY_TEXTURE_SWEEP=0` turns off two things**
+- It stops `resource::let_go_idle` (freeing host texture copies), **and** `HostHeap::texture_sweep`, a repair pass. That pass finds descriptor slots left showing nothing (a texture a shader would read as black) and puts them back in the upload queue.
+- So the missing lighting, window and models in the sweep-off runs were most likely the repair pass being off, **not** stale textures. "Bug 2" as written above is unproven.
+- What texture.rs does say about staleness: *"Only textures read through descriptor tables are brought up to date (directly indexed views are not known per draw)"*. Textures picked by index get rechecks at 4-400 frames after upload (joshuu, `VICTORY_HEAP_RECHECK`), plus remap notices.
+- **New switches:**
+  - `VICTORY_TEXTURE_FREE=0` keeps every host copy alive and leaves the repair pass on;
+  - `VICTORY_TEXTURE_IDLE_MS` and `VICTORY_TEXTURE_IDLE_FRAMES` (5000 and 4) make the freeing aggressive, to reproduce the lifetime bug on purpose.
+- The `crumbs-a` run (fast writes plus vkd3d breadcrumbs) got through without a loss, so there is nothing to read yet.
+
 **Sweep test: two texture bugs, not one**
 
 | Run (fast writes on) | ms per frame | Device | Picture |

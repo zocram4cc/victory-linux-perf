@@ -1410,12 +1410,25 @@ pub(crate) fn room() -> bool {
 #[cfg(windows)]
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
-    const IDLE_MS: u64 = 5_000;
-    const IDLE_FRAMES: u64 = 4;
+    // `VICTORY_TEXTURE_SWEEP=0` also turns off the descriptor heaps'
+    // repair pass (`HostHeap::texture_sweep`); `VICTORY_TEXTURE_FREE=0`
+    // keeps every host copy alive without touching that pass (docs/memory.md
+    // 9d: freeing is what loses the device under a faster frame).
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
+    if !*ON.get_or_init(|| {
+        std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")
+            && std::env::var_os("VICTORY_TEXTURE_FREE").is_none_or(|v| v != "0")
+    }) {
         return;
     }
+    // How long a copy must go unused: 5 s and 4 frames. For reproducing
+    // the lifetime bug of docs/memory.md 9d on purpose, lower them with
+    // `VICTORY_TEXTURE_IDLE_MS` and `VICTORY_TEXTURE_IDLE_FRAMES`.
+    static IDLE: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+    let (idle_ms, idle_frames) = *IDLE.get_or_init(|| {
+        let n = |name: &str, default: u64| std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default);
+        (n("VICTORY_TEXTURE_IDLE_MS", 5_000), n("VICTORY_TEXTURE_IDLE_FRAMES", 4))
+    });
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
@@ -1430,7 +1443,7 @@ pub(crate) fn let_go_idle() {
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             let idle = made.as_ref().is_some_and(|(host, _)| {
-                crate::host::long_ago(r.host.used.load(Relaxed), IDLE_MS, IDLE_FRAMES)
+                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, idle_frames)
                     && std::sync::Arc::strong_count(host) == 1
                     && crate::host::references(&host.texture) == 1
             });
