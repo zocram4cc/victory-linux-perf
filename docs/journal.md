@@ -4,6 +4,19 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-25
 
+**Freeing vs fast writes: three more runs**
+
+| Run | Lost device | Picture (user) | ms |
+|---|---|---|---|
+| fast writes, `VICTORY_TEXTURE_FREE=0` (a) | no | lighting missing, **Lucia's orange shirt black** | 289 |
+| fast writes, `VICTORY_TEXTURE_FREE=0` (b, moving) | no | textures more broken and flat | 327 |
+| no fast writes, freeing aggressive (`IDLE_MS=500`, `IDLE_FRAMES=1`), breadcrumbs | **no** | — | 314 |
+
+- **Freeing alone does not lose the device, even when aggressive.** The losses need fast writes **and** freeing together.
+- **With fast writes and no freeing, the picture breaks.** With freeing on, it looked as usual: textures recreated from title memory come back right.
+- Open question: does the picture break because freeing is off (textures go stale, and freeing was hiding it), or because fast writes write something wrong? To settle it: `VICTORY_TEXTURE_FREE=0` **without** fast writes.
+- Note: the sweep's trail lines reach the log only when the device is lost, so a run without a loss does not show what was freed.
+
 **Correction: `VICTORY_TEXTURE_SWEEP=0` turns off two things**
 - It stops `resource::let_go_idle` (freeing host texture copies), **and** `HostHeap::texture_sweep`, a repair pass. That pass finds descriptor slots left showing nothing (a texture a shader would read as black) and puts them back in the upload queue.
 - So the missing lighting, window and models in the sweep-off runs were most likely the repair pass being off, **not** stale textures. "Bug 2" as written above is unproven.
