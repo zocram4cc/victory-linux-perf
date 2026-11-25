@@ -278,13 +278,14 @@ Today the chain is: console shader → DXIL → dxil-spirv → SPIR-V → RADV, 
 
 | Task | Owner | Branch | Status |
 |---|---|---|---|
-| 1.1 Memory census | maintainer | `p1.1-census` | next |
+| 1.1 Memory census | maintainer | `p1.1-census` | in progress |
 | 1.2 Cheaper write tracking | maintainer | | after 1.1 |
 | 1.3 Copy back only what the CPU reads | maintainer | | after 1.1 |
+| 0.B Baseline on a second machine (7800X3D, RX 7900 XTX, 32 GB) | collaborator (suggested) | | first task: learn the flow, second data point |
 | 0.6 Port royale's DXC clamp and copy-back read | *open* | | good first task |
-| 3.4 Fix the `victory warm` hang with pipelines on RADV | *open* | | independent of phases 1-2 |
+| 3.4 Fix the `victory warm` hang with pipelines on RADV | collaborator (suggested) | | independent of phases 1-2; needs Linux |
 | 2.1 GPU bandwidth microbenchmark (VRAM, ReBAR, system memory) | *open* | | independent research |
-| 5 `fc5e66f8` AMD fault: find the access and fix instead of skipping | *open* | | shader translator |
+| 5 `fc5e66f8` AMD fault: find the access and fix instead of skipping | collaborator (suggested) | | shader translator; needs an AMD card |
 | 5 Refused shaders (58), by family | *open* | | shader translator |
 | 5 `VICTORY_INPLACE=2` device loss | *open* | | needed before 2.4 |
 
