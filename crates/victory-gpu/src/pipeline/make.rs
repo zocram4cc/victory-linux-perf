@@ -360,6 +360,7 @@ fn workers() -> bool {
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
+                .stack_size(victory_shader::emit::PIPELINE_STACK)
                 .spawn(|| {
                     // Below the title's own threads (loading, recording).
                     // SAFETY: a plain call on our own thread.

@@ -294,25 +294,29 @@ pub fn run(
             let next = AtomicUsize::new(0);
             std::thread::scope(|s| {
                 for _ in 0..threads.min(jobs.len()) {
-                    s.spawn(|| {
-                        let mut t = Tally {
-                            list,
-                            ..Tally::default()
-                        };
-                        let mut checks = Checks {
-                            keep: (!pairs.is_empty()).then(|| kept.clone()),
-                            validator: validate
-                                .then(|| Validator::load(dll.as_deref()).ok())
-                                .flatten(),
-                            host: pipelines
-                                .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
-                                .flatten(),
-                        };
-                        while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                            translate(job, entry.path(), &seen, &mut t, &mut checks);
-                        }
-                        lock(&total).merge(t);
-                    });
+                    // Pipeline creation converts DXIL on this thread.
+                    std::thread::Builder::new()
+                        .stack_size(victory_shader::emit::PIPELINE_STACK)
+                        .spawn_scoped(s, || {
+                            let mut t = Tally {
+                                list,
+                                ..Tally::default()
+                            };
+                            let mut checks = Checks {
+                                keep: (!pairs.is_empty()).then(|| kept.clone()),
+                                validator: validate
+                                    .then(|| Validator::load(dll.as_deref()).ok())
+                                    .flatten(),
+                                host: pipelines
+                                    .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
+                                    .flatten(),
+                            };
+                            while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                                translate(job, entry.path(), &seen, &mut t, &mut checks);
+                            }
+                            lock(&total).merge(t);
+                        })
+                        .expect("a translation worker");
                 }
             });
         }
