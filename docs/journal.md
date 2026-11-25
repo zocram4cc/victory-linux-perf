@@ -4,6 +4,19 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-25
 
+**fx on Linux: why it is slower, and a measurement trap**
+- **The bisect was wrong in its premise.** The title stalls (~280-460 ms a frame) at every fxceless commit tested, back to `3bff182`. What made the old base fast is not in fxceless's line at all; it came from joshuu/myokex commits fxceless did not take. joshuu's remapping commits `948e9d3` and `476a020`, ported, change nothing.
+- **fxceless's new defaults** (`c96b4f2`):
+  - relay on (copy-back by its own thread, stage 3 sending ahead);
+  - wide copy-back;
+  - card copies from 1 MiB to 1,024 MB;
+  - 256 lists in the air.
+- **With the relay, the title waits for the relay thread's landing.** Per frame it waits 55-72 ms for the card and 100-122 ms for fetches of card copies' pieces, 158-176 ms landing in all. The card is idle while the title waits.
+- With the old defaults (`RELAY=0`, `WIDE_BACK=0`, card 16-512 MB, 128 lists): **7.5 s a frame** (copy-back 6.3 s). fxceless rebuilt the copy-back around the relay, so it cannot simply be turned off.
+- `VICTORY_QUEUE2=1`: 623 ms. `VICTORY_ASYNC_SUBMIT=1`: 660 ms. No gain.
+- **Trap:** a `CARD_BUFFERS_MIN_MB=16` run read "140 ms" because the game went to a 199-draw screen (pause?) during the window. In the world it was 1.5 fps, the same. `bench.sh` now marks a window `invalid` when draws fall below half their median.
+- `waitstat` on fx: the same waits as the old base (one thread ~700 ms/s at `title+0x4e7f358`). The title's `mwaitx` wait is native on this Ryzen and not seen.
+
 **Branch `fx`: the base moved to fxceless/main (`d510ee4`)**
 - Carried over by hand (the old commits do not apply):
   - `VICTORY_SKIP_PIPELINES` and `VICTORY_KEYS` in release builds; fxceless still has both diagnostics-only;

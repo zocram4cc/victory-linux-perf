@@ -70,6 +70,11 @@ for k in rows[0]:
     pick = lambda q: s[min(len(s) - 1, int(round(q * (len(s) - 1))))]
     cols[k] = {"mean": statistics.fmean(vals), "p50": pick(0.5), "p95": pick(0.95), "max": s[-1], "min": s[0]}
 out = {"rows": len(rows), "columns": cols}
+# A window whose scene changed (a pause menu, a load) does not count.
+dr = cols.get("draws")
+if dr and dr["min"] < 0.5 * dr["p50"]:
+    out["invalid"] = f"draws fell to {dr['min']:.0f} (median {dr['p50']:.0f}): the scene changed during the window"
+    print(f"WARNING: {out['invalid']}")
 meta = os.path.join(d, "meta.json")
 if os.path.exists(meta):
     m = json.load(open(meta))
