@@ -1122,8 +1122,8 @@ impl Staging {
         // is noted, a mapping is announced by the runtime. While neither
         // happened the texture is as it was. What the guard cannot see (a
         // write to the same pages through another view) is still found by
-        // the hash, which is taken every eighth frame only, by the
-        // texture's address, so the textures take turns.
+        // the hash, which is taken every eighth frame only (see
+        // `VICTORY_TEXTURE_HASH_EVERY`), by the texture's address, so the textures take turns.
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         // A texture that changed without the guard seeing it is hashed at
@@ -1134,11 +1134,16 @@ impl Staging {
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
-            const HASH_EVERY: u64 = 8;
+            static HASH_EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            let hash_every = *HASH_EVERY.get_or_init(|| {
+                parse_texture_hash_every(
+                    std::env::var("VICTORY_TEXTURE_HASH_EVERY").ok().as_deref(),
+                )
+            });
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
             let frame = crate::frame::current();
-            let turn = frame.wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY)
+            let turn = frame.wrapping_add((start >> 16) as u64).is_multiple_of(hash_every)
                 && last.ahead.is_none_or(|at| frame > at + 1);
             // Linear pictures of one level are what the processor draws (the
             // planes of a movie), through a view of its own.
@@ -1805,6 +1810,26 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+/// Parses `VICTORY_TEXTURE_HASH_EVERY=<frames>` (Neptune VI): how often a
+/// guarded texture is hashed anyway. Unset or not a number gives 8; the
+/// setting is at least 1.
+fn parse_texture_hash_every(setting: Option<&str>) -> u64 {
+    setting.and_then(|v| v.parse::<u64>().ok()).unwrap_or(8).max(1)
+}
+
+#[cfg(test)]
+mod texture_hash_every_tests {
+    use super::parse_texture_hash_every;
+
+    #[test]
+    fn hash_every_setting_defaults_to_eight_parses_frames_and_is_at_least_one() {
+        assert_eq!(parse_texture_hash_every(None), 8);
+        assert_eq!(parse_texture_hash_every(Some("32")), 32);
+        assert_eq!(parse_texture_hash_every(Some("soon")), 8);
+        assert_eq!(parse_texture_hash_every(Some("0")), 1);
+    }
 }
 
 #[cfg(test)]

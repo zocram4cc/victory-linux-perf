@@ -1426,7 +1426,8 @@ fn workers() -> &'static Workers {
         more: std::sync::Condvar::new(),
     });
     STARTED.call_once(|| {
-        let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
+        let logical_cpus = std::thread::available_parallelism().ok().map(|n| n.get());
+        let n = wide_threads(std::env::var("VICTORY_WIDE_THREADS").ok().as_deref(), logical_cpus);
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 let workers = WORKERS.get().expect("made above");
@@ -1446,6 +1447,32 @@ fn workers() -> &'static Workers {
         }
     });
     workers
+}
+
+/// Threads kept for [`wide`]: a quarter of the logical processors, 2 to 6, or
+/// `VICTORY_WIDE_THREADS=<n>` (Neptune VI) for 2 to 24 instead.
+fn wide_threads(setting: Option<&str>, logical_cpus: Option<usize>) -> usize {
+    match setting.and_then(|v| v.parse::<usize>().ok()) {
+        Some(n) => n.clamp(2, 24),
+        None => logical_cpus.map_or(4, |n| n / 4).clamp(2, 6),
+    }
+}
+
+#[cfg(test)]
+mod wide_threads_tests {
+    use super::wide_threads;
+
+    #[test]
+    fn wide_threads_setting_defaults_to_a_quarter_of_the_processors_and_is_clamped() {
+        assert_eq!(wide_threads(None, Some(16)), 4);
+        assert_eq!(wide_threads(None, Some(4)), 2);
+        assert_eq!(wide_threads(None, Some(64)), 6);
+        assert_eq!(wide_threads(None, None), 4);
+        assert_eq!(wide_threads(Some("12"), Some(16)), 12);
+        assert_eq!(wide_threads(Some("many"), Some(16)), 4);
+        assert_eq!(wide_threads(Some("1"), None), 2);
+        assert_eq!(wide_threads(Some("40"), None), 24);
+    }
 }
 
 /// Runs `jobs` on the kept threads and on this one, and returns when all

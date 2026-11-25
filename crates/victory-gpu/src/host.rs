@@ -131,22 +131,59 @@ pub(crate) fn adapter_summary() -> Option<(String, u64)> {
 /// scaled down under VRAM pressure. Never returns less than 1,000 ms so
 /// handles not yet recorded into a list or slot remain protected.
 pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
-    const NORMAL_MS: u64 = 5_000;
-    const MODERATE_MS: u64 = 2_500;
-    const HIGH_MS: u64 = 1_000;
+    let [normal, moderate, high] = vram_idle_times();
     let Some([budget, used, ..]) = video_memory else {
-        return NORMAL_MS;
+        return normal;
     };
     if budget == 0 {
-        return NORMAL_MS;
+        return normal;
     }
     let used_pct = (u128::from(used) * 100) / u128::from(budget);
     if used_pct >= 85 {
-        HIGH_MS
+        high
     } else if used_pct >= 75 {
-        MODERATE_MS
+        moderate
     } else {
-        NORMAL_MS
+        normal
+    }
+}
+
+/// The idle times of [`vram_idle_ms`] (normal, moderate, high), read from
+/// `VICTORY_VRAM_IDLE_MS` once.
+fn vram_idle_times() -> [u64; 3] {
+    static TIMES: OnceLock<[u64; 3]> = OnceLock::new();
+    *TIMES.get_or_init(|| {
+        parse_vram_idle_times(std::env::var("VICTORY_VRAM_IDLE_MS").ok().as_deref())
+    })
+}
+
+/// Parses `VICTORY_VRAM_IDLE_MS=<normal>,<moderate>,<high>` (Neptune VI) over
+/// the defaults 5,000, 2,500 and 1,000 ms. A part that is not a number keeps
+/// its default; each time is raised to at least 1,000 ms, so the floor of
+/// [`vram_idle_ms`] holds whatever the setting says.
+fn parse_vram_idle_times(setting: Option<&str>) -> [u64; 3] {
+    const DEFAULTS: [u64; 3] = [5_000, 2_500, 1_000];
+    let mut times = DEFAULTS;
+    if let Some(setting) = setting {
+        for (to, part) in times.iter_mut().zip(setting.split(',')) {
+            if let Ok(ms) = part.trim().parse::<u64>() {
+                *to = ms.max(DEFAULTS[2]);
+            }
+        }
+    }
+    times
+}
+
+#[cfg(test)]
+mod vram_idle_tests {
+    use super::parse_vram_idle_times;
+
+    #[test]
+    fn vram_idle_setting_defaults_parses_and_keeps_the_one_second_floor() {
+        assert_eq!(parse_vram_idle_times(None), [5_000, 2_500, 1_000]);
+        assert_eq!(parse_vram_idle_times(Some("15000,2500,1000")), [15_000, 2_500, 1_000]);
+        assert_eq!(parse_vram_idle_times(Some("soon,4000")), [5_000, 4_000, 1_000]);
+        assert_eq!(parse_vram_idle_times(Some("15000,500,250")), [15_000, 1_000, 1_000]);
     }
 }
 
