@@ -40,6 +40,8 @@ pub mod frame;
 #[cfg(windows)]
 pub mod framelog;
 #[cfg(windows)]
+mod heap_worker;
+#[cfg(windows)]
 mod host;
 #[cfg(windows)]
 pub use host::world_since;

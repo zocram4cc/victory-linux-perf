@@ -203,6 +203,11 @@ pub(crate) struct Detached {
 
 #[cfg(windows)]
 impl Detached {
+    /// A closed list of ours, to run among a title's.
+    pub(crate) fn ours(host: crate::host::HostList) -> Self {
+        Detached { host, _uploads: Vec::new(), _state: Default::default() }
+    }
+
     pub(crate) fn host(&self) -> &crate::host::HostList {
         &self.host
     }
@@ -250,7 +255,7 @@ fn pools() -> bool {
 /// A host list open for recording: one that has run, as a title's list is
 /// after its reset, or a new one.
 #[cfg(windows)]
-fn fresh_list() -> Option<crate::host::HostList> {
+pub(crate) fn fresh_list() -> Option<crate::host::HostList> {
     let idle = {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         let taken = idle.0.pop();
