@@ -82,6 +82,14 @@ scripts/trials.sh -n 5 -l heap-sync-off -o DP-1 VICTORY_HEAP_SYNC=0
 
 Results go to `bench/trials-<date>-<label>/`: `trials.tsv` (one row per run, with fps and the heap-sync counter), `tally.txt`, each run's output and screenshot. Run the configurations being compared back to back, with the same binary.
 
+### The open-world scene (Jason save, `royale-save`)
+
+The save shows the house from outside for about 45 s after the world comes up (11,000-16,000 draws a frame), then cuts indoors to Jason at the TV (2,400-8,000 draws, varying between runs). Measure the outside, which is the heavy open-world part:
+
+```sh
+BENCH_SETTLE=5 scripts/trials.sh -n 3 -l world-out -s 30 -o DP-1
+```
+
 ## Profiling
 
 `--perf` records a user-space CPU profile (`perf record -e cycles:u`) of the game and of wineserver during the window. `nsenter` steps into bubblewrap's user namespace so that `perf` can attach.

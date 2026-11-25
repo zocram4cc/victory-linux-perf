@@ -10,8 +10,8 @@
 #   world    the world came up and the window was measured
 #   loading  the world did not come up in time
 #   closed   the game closed for another reason
-# With -o (a monitor, e.g. DP-1) a screenshot is taken 8 s into the window,
-# to check the picture (white or washed-out frames are a known symptom).
+# With -o (a monitor, e.g. DP-1) screenshots are taken 8 s into the window
+# and near its end, to check the picture (white or washed-out frames are a known symptom).
 #
 # Results: bench/trials-<date>-LABEL/{trials.tsv,run-N.out,shot-N.png}, and a
 # one-line tally at the end. Like bench.sh, never while someone is playing.
@@ -59,6 +59,8 @@ for ((i = 1; i <= N; i++)); do
             sleep 8
             grim -o "$OUTPUT" "$dir/shot-$i.png" 2>/dev/null || true
             shot=1
+            # And one near the window's end, to see whether the scene changed.
+            ( sleep $((SECS > 12 ? SECS - 12 : 1)); grim -o "$OUTPUT" "$dir/shot-$i-end.png" 2>/dev/null ) &
         fi
         sleep 2
     done

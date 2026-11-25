@@ -197,7 +197,7 @@ PY
 }
 
 # Waits until the frametime dump shows the world (4 rows in a row of more
-# than 3,000 draws a frame), then 20 s more for it to settle.
+# than 3,000 draws a frame), then BENCH_SETTLE s (default 20) to settle.
 wait_world() {
     local csv=$1 pid=$2 i
     say "waiting for the world (the intro plays through; up to 6 minutes)"
@@ -210,8 +210,11 @@ last = rows[-4:]
 sys.exit(0 if len(last) == 4 and all(float(r["draws"]) > 3000 for r in last) else 1)
 PY
         then
-            say "in the world; settling for 20 s"
-            sleep 20
+            # BENCH_SETTLE: seconds to wait after that (default 20). The
+            # open-world save shows the house from outside for ~45 s, then
+            # cuts indoors: measure the outside with BENCH_SETTLE=5 -s 30.
+            say "in the world; settling for ${BENCH_SETTLE:-20} s"
+            sleep "${BENCH_SETTLE:-20}"
             return
         fi
         sleep 1

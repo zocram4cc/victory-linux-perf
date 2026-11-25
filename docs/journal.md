@@ -4,6 +4,11 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**The open-world scene is two scenes: outside, then indoors**
+- Draws in the world windows stepped down partway (16,000 → 2,400, 14,000 → 8,100, 14,000 → 6,100) with no input: the A taps stop at 50 s and the world comes at ~78 s.
+- A screenshot at the window's end shows why: after ~45 s of the house from outside, the save **cuts indoors to Jason at the TV** (prompts "PHONE", "TV (X)"). The TV's video plays right. The interior shows **white speckles on the floor and blown-out areas**: a lighting fault for S.3 / phase 5, not stability.
+- `bench.sh` takes `BENCH_SETTLE` (seconds after the world is detected, default 20). The open-world baseline measures the outside: `BENCH_SETTLE=5 scripts/trials.sh -n 3 -l world-out -s 30` ([bench.md](bench.md)). `trials.sh` now also takes a screenshot near the window's end.
+
 **S.8 first step: the pool had stopped the sweep; fixed**
 - The sweep lets a texture copy go only when `crate::host::references` says its title texture alone holds it (1). The pool's own reference made that 2 for every pool texture, so **nothing was ever let go**: that, not the title, is why the gate run reached 37,700 live textures and 18.9 GB of VRAM.
 - Fix: the pool keeps a set of what it holds, and `references()` leaves its reference out. A copy the sweep lets go then reaches the pool's `collect` with no other holder, goes through `retire()`, and its block is reused.
