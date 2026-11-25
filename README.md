@@ -1,377 +1,201 @@
-# VIctory fork (work in progress)
+# victory-royale (privado)
 
-## This branch: victory-amd + a DirectStorage read fix
+VIctory centrado en Linux. El objetivo es una arquitectura que permita jugar **de forma fluida y estable** a un título de Xbox Series con GE-Proton, en lugar de los 2-4 fps de los forks actuales.
 
-A fork of [myokex/victory-amd](https://github.com/myokex/victory-amd) at `070df42`
-with a DirectStorage fix on top (the fix alone is on `fix-dstorage-guard-race`; this fork's
-default branch, `victory-amd`, also has the shader work below):
+> Este repositorio no contiene archivos del juego. Cada uno usa su propia copia, volcada de una consola suya. El código es GPL-3.0-or-later, como VIctory.
 
-- **Kernel reads into title memory are read beside and copied in.** With the guard
-  over all the views of a page (on by default in `070df42`), a raw DirectStorage
-  request could fail with `ERROR_INVALID_USER_BUFFER` (`0x800706f8`) and the title
-  stopped itself seconds after the world's first frame: 2 runs out of 2. Those reads
-  now land in a buffer and are copied in from user mode, where the guard takes the
-  write; `fread` does the same. With the fix and the guard on, a run went 5.5 minutes
-  past the world's first frame without a failed request.
+- [De dónde parte](#de-dónde-parte)
+- [Por qué va lento hoy](#por-qué-va-lento-hoy)
+- [La ruta](#la-ruta)
+- [Reglas de trabajo](#reglas-de-trabajo)
+- [Compilar y ejecutar](#compilar-y-ejecutar)
+- [Ramas y remotos](#ramas-y-remotos)
 
-### Branch `phase2-shader-classes`: more of the title's shaders, one more pipeline
+## De dónde parte
 
-On top of the fix above, in this fork's default branch (`git clone https://github.com/JoshuuDev/victory-amd`)
-and on `phase2-shader-classes`:
+La base es [JoshuuDev/victory-amd](https://github.com/JoshuuDev/victory-amd) (`003beef`, 25-nov-2026). Es el fork que mejor renderiza el mundo, y viene en esta cadena:
 
-- **Doubles and wave sums of doubles.** The translator emits `double` (through
-  `makeDouble`/`splitDouble`) for `v_add_f64`, `v_mul_f64`, `v_cvt_f32_f64` and
-  `v_cvt_f64_f32`, and `v_permlane16/x16_b32`; the whole-wave simulation follows the
-  console compiler's expansion of a wave sum of doubles. The water passes' transmittance
-  and volumetrics compute programs translate.
-- **Descriptors read only for their size; a first half kept in a half register.** An
-  image descriptor picked by a computed index and read only for its size takes the kind
-  of a sampled load of the same table (`shortcut:` in the code); a buffer whose record
-  count the code tests takes the count from the host view; a `v_fma_mix*` result over an
-  interpolation's first half keeps 0 in the other half. Puddles, the shallow water
-  simulation and some deferred surfaces translate.
-- **No blending into targets the host cannot blend into.** The console's hardware
-  ignores blending on integer render targets (`R8_UINT`); D3D12 refuses the pipeline. It
-  is made now, with blending off there. A refused pipeline also logs its state.
+| Capa | Repositorio | Qué aporta |
+|---|---|---|
+| 1 | [Marvisak/VIctory](https://github.com/Marvisak/VIctory) `ffe310e` | el loader, la emulación del sistema de Xbox, el backend D3D12 y el traductor de shaders |
+| 2 | [fxceless/victory-fork](https://github.com/fxceless/victory-fork) | que el mundo se dibuje: cinemáticas y prólogo con texturas |
+| 3 | [myokex/victory-amd](https://github.com/myokex/victory-amd) | arreglos para AMD (texturas por memoria real, dispatches partidos, vistas recortadas) |
+| 4 | JoshuuDev/victory-amd | arreglo de DirectStorage, más shaders traducidos y el bloqueo de remapeo por cada 16 MB |
 
-Over the title's shader corpus: 48 more programs translate, none fewer, all validated and
-accepted by the AMD driver. In the prologue, programs that do not translate at runtime
-went from 11 to 1, refused pipelines from 1 to 0, and a run with no controller reaches
-outdoor gameplay. Ray-traced light still does not run (shadowed areas are black), and
-frames are 350-500 ms with spikes of seconds where texture refreshes wait for the
-runtime's remapping of title memory. `cargo test --workspace`: 519 passed.
+**Por qué no se parte de [ligmaSec/victory-royale](https://github.com/ligmaSec/victory-royale):** es el VIctory oficial con unos 700 commits de PRs abiertos, más un lanzador y una CI para Linux. No lleva el trabajo de renderizado de fxceless, y según su README el mundo sale casi negro. Fusionarlo con joshuu da **494 conflictos en 63 archivos**, casi todos en el núcleo de GPU, porque son dos reescrituras independientes del mismo código. Su historia completa se conserva en la rama `royale-base`. Lo que interesa de ahí se porta a mano en la fase 0.
 
-### Frametime dump
+## Por qué va lento hoy
 
-From [skornuta/victory-frametime](https://github.com/skornuta/victory-frametime) (GPL-3.0, as
-upstream), on branch `frametime-dump`. Build first: `cargo build --release -p victory`.
-Run with `VICTORY_FRAMETIME_DUMP=1` and the CSV is at
-`%LOCALAPPDATA%\victory\cache\frametime.csv` (`victory config` prints `cache_dir`); or name
-the file: `VICTORY_FRAMETIME_DUMP=<path>` (its folder must exist). The log prints
-`frametime dump path=...` when the first frame lands. One row per ~1 s: time per frame and
-its parts (preparing, copies, textures, GPU, copy-back), the worst and average single
-frame, the card's busy share, the process's private memory and processor use.
+Estas son las medidas en un RX 7900 XT con RADV, GE-Proton11-14 y el [wineserver parcheado](https://github.com/datingesp-hash/victory-proton). La escena es el patio del prólogo, con los switches por defecto.
 
-The file starts with a `#` block describing the machine (processor, graphics card and
-driver, memory, Windows version, motherboard, display) and every `VICTORY_*` switch that
-is set, including paths such as `VICTORY_DATA_DIR`: look at it before sharing a dump.
+| Medida | Valor |
+|---|---|
+| frame completo | ~600 ms (1,6-2,1 fps) |
+| VIctory preparando el frame | 100-130 ms, de ellos ~50-60 ms copiando **150-190 MB** hacia la GPU |
+| GPU | 75-105 ms; ocupada **25-39 %** del frame |
+| copia de vuelta a la memoria del título | ~50 ms, **70-100 MB** |
+| pasadas de hash sobre copias en la GPU | 1.100-1.300 por frame |
+| CPU del proceso | ~1,1 núcleos de 24 |
+| esperas del título en fences de la GPU | ninguna |
 
-Tested on one machine only: Windows 11, Radeon RX 7800 XT 16 GB (driver
-32.0.32015.7029), Ryzen 7 7700X, 32 GB RAM, Series X profile. Other GPUs,
-NVIDIA's especially, may behave differently.
+En la Xbox, la CPU y la GPU comparten **una sola memoria**. En el PC están separadas, así que en cada frame VIctory tiene que:
 
-**No game files, code or assets are here, and none are shared.** Shaders are
-translated on your machine from your own copy of the game.
+1. Averiguar qué ha escrito el título, protegiendo páginas y calculando hashes.
+2. Subirlo a la GPU.
+3. Dejar que la GPU dibuje.
+4. Bajar lo que la GPU escribió a la memoria del título.
 
-### Reproducing the check run
+Todo esto ocurre **en serie**: el título, después la preparación, la GPU y la copia de vuelta. No hay nada saturado. La GPU espera a la CPU y la CPU espera a las copias. En Windows ocurre lo mismo, por eso fxceless también va a ~2 fps.
 
-1. Install Git, Visual Studio Build Tools (MSVC C++ workload and a Windows 10/11 SDK),
-   [rustup](https://rustup.rs), and a current GPU driver. The pinned Rust toolchain is
-   installed by itself on the first build.
-2. Get the code and set up the config:
+**Conclusión:** subir los fps exige **dejar de copiar la memoria**, no optimizar los shaders ni el streaming. Los shaders ya se guardan en disco y apenas afectan a los fps estables. La GPU no es el límite.
 
-   ```powershell
-   git clone https://github.com/JoshuuDev/victory-amd
-   cd victory-amd
-   copy victory.example.toml victory.toml   # set game_dir to your own dump, outside the repo
-   cargo test --workspace                   # optional; needs no game data
-   cargo build --profile diag -p victory --features diagnostics
-   ```
+## La ruta
 
-3. **Recommended, about 4 minutes: translate the shaders ahead of time.** Without it,
-   each shader is translated the first time the title uses it, and what it draws is
-   left out until then: the opening cutscene and the world's first minutes show missing
-   objects and effects, and run slower. With it, every shader is ready from the first
-   frame. The translations are made on your machine from your own copy of the game, and
-   are kept in the cache for later runs. Use the same build as the runs (the cache key
-   includes it) and no shader-related `VICTORY_*` switches:
+El orden es fijo, y cada fase depende de lo que mide la anterior. Una fase se cierra cuando se cumplen sus **criterios de salida** en la escena de referencia. Los objetivos de fps son hipótesis que hay que confirmar con medidas.
 
-   ```powershell
-   target\diag\victory.exe warm
-   ```
+### Fase 0: base, escena de referencia y medición
 
-   Run it again after updating this repository: a change to the translator makes the
-   cached translations stale, and they are made again.
+Sin medidas repetibles no se puede saber si un cambio mejora algo.
 
-4. Run the title with a fresh data folder and a log:
+1. **Base.** El fork joshuu está en `main`, con el remoto `joshuu` para traer sus avances (ver [Ramas y remotos](#ramas-y-remotos)).
+2. **Escena de referencia.**
+   - Una partida guardada en el patio del prólogo, con la cámara quieta durante 60 s tras cargar, más una segunda escena con movimiento (caminar 30 s por el patio).
+   - Se documenta en `docs/bench.md` cómo reproducirla. La partida es del usuario y no entra en el repositorio.
+3. **`victory bench`.** Un subcomando, o un script en `scripts/`, que lanza la escena y vuelca un JSON con:
+   - fps medio, p50, p99 y peor frame;
+   - el tiempo de cada fase del frame: título, preparación, espera de GPU, GPU y copia de vuelta;
+   - los MB subidos y bajados por frame;
+   - el % de ocupación de la GPU;
+   - el tiempo bajo el bloqueo de remapeo;
+   - las llamadas a map/unmap y su coste;
+   - la CPU de wineserver.
 
-   ```powershell
-   $env:VICTORY_LOG = 'info'
-   $env:VICTORY_DATA_DIR = 'D:\victory-data\check-1'   # any new folder outside the repo
-   Start-Process target\diag\victory.exe -NoNewWindow -Wait -RedirectStandardError check-1.log `
-     -ArgumentList 'run', '"<game dir>\<the title''s exe>"', '--execute', '--console', 'series-x'
-   ```
+   Se aprovecha el volcado de frametime de joshuu (`VICTORY_FRAMETIME_DUMP`) y los contadores que ya existen en los logs.
+4. **Instrumentación permanente.** Se portan los contadores de diagnóstico de la sesión de medidas:
+   - tiempos de map/unmap y del bloqueo en `xmem.rs`;
+   - esperas del título por quien las llama, una sustitución HLE de `WaitFor*`, `Sleep*`, `WaitOnAddress` y `SleepConditionVariable*`.
 
-   Go through the first-time setup and legal screens with a controller; they do not
-   advance by themselves. The test window is the first minutes after the story's world
-   starts loading. Let it run about 7 minutes, then close it.
-5. Passed if `VICTORY_DATA_DIR\<title id>\crashes.log` does not exist and the log has no
-   `dstorage: request failed` line. The log names the world's start in a line with
-   `the first frame of 500 draws or more`. Without the fix, the same run stops within
-   about 25 seconds of that line.
+   Van detrás de `VICTORY_MEDIR=1`, sin coste cuando está apagado.
+5. **Requisitos de Linux** asumidos en todas las medidas: el wineserver con árbol de vistas, `d3dcompiler_47` nativo, `VKD3D_CONFIG=descriptor_heap` y GE-Proton ≥ 11-13.
+6. **Traer de royale, portado a mano:**
+   - la compilación del *clamp* de argumentos indirectos con DXC cuando falla D3DCompile (`652aed4`), para no depender de winetricks;
+   - la lectura comprobada en el mismo proceso para las copias de vuelta bajo Wine (`0d34233`).
 
-To repeat it without a controller: copy `saves` and `storage` from the data folder of a run
-stopped before the first autosave into a new data folder. Setup and legal screens are then
-done, and the story starts from the beginning again.
+**Salida:**
+- `docs/baseline.md` con las cifras de la escena, de tres ejecuciones con una variación de menos del 10 %.
+- El juego llega al mundo sin perder el dispositivo en 10 minutos.
 
-## victory-amd
+### Fase 1: abaratar las copias que hay hoy
 
-This copy is a fork of
-[fxceless/victory-fork](https://github.com/fxceless/victory-fork), itself a fork
-of [VIctory](https://github.com/Marvisak/VIctory). It adds fixes found while
-running on an AMD card, tested on one machine only: Windows 11, Radeon RX 7800 XT
-16 GB (driver 32.0.32029.2010), Ryzen 5 7500F, 32 GB RAM.
+Son mejoras dentro de la arquitectura actual. Cada una se mide por separado y todas pueden desactivarse con un switch.
 
-State on that machine (2026-11-25, Series X profile): the prologue's cutscene and
-the first room are drawn, with the player moving, at 2 to 3 frames per second.
-Runs of 8 minutes mostly end without a device loss; one ended with
-`DXGI_ERROR_DEVICE_HUNG` after about 5 and a half minutes, cause unknown. Lamps
-were dark in one run. The first room's walls were missing in several runs; with the
-guard over all the views of a page (below) they were there in two runs out of two,
-too few to call it fixed. Some shots of the opening cutscene come out white.
-Ray-traced light does not run.
+1. **Detección de escrituras más barata.** Sustituir las 1.100-1.300 pasadas de hash por frame por información de páginas escritas, agrupando las consultas de *write watch*. No se vuelve a calcular el hash de lo que no ha cambiado.
+2. **Copiar de vuelta solo lo que la CPU lee.** Registrar qué recursos escritos por la GPU lee el título desde la CPU (con protección de lectura en esos rangos) y bajar solo esos, no 70-100 MB por frame.
+3. **Staging persistente.** Ring buffers de subida reutilizados y alineados, sin asignar memoria en cada frame.
+4. **Menos vistas en los alias.** Fusionar páginas contiguas de `map_alias` en vistas más grandes cuando la granularidad del título lo permita, para reducir tanto el trabajo del wineserver como el bloqueo de remapeo.
+5. **Solapar frames.** Preparar el frame N+1 mientras la GPU ejecuta el N, cuando no dependan entre sí.
 
-What it changes over `victory-fork` (each is explained in a comment where it is):
+**Salida:**
+- Preparación de menos de 40 ms y copia de vuelta de menos de 20 ms en la escena de referencia.
+- Sin regresiones visuales: capturas comparadas con la línea base.
+- Hipótesis: 4-6 fps.
 
-- Texture views are told apart by the memory their mips really take, so textures
-  streamed in part are not taken for one another and are uploaded from their first
-  mip that is there.
-- Views of placed textures the host lost sight of are put back
-  (`VICTORY_TEXTURE_SWEEP`).
-- Dispatches of more than 65,535 groups are made in two parts (the final gather at
-  2560x1440 asks for 115,200).
-- DirectStorage requests read their page array when they run, and wait for it.
-- The list of pipelines to make early keeps what earlier runs listed, and compute
-  pipelines get their own waiting time while a world loads.
-- A write of the title's through one view of a physical page is seen by the copies
-  taken through its other views (`VICTORY_VIEW_GUARD=0` turns it off).
-- Textures picked by index are looked at again after their upload
-  (`VICTORY_HEAP_RECHECK=0` turns it off).
-- View indices past the host heap are clamped on AMD too.
-- Programs that stop the AMD driver's compiler, or take it minutes and tens of GB,
-  are left out (ray-tracing resolves).
-- Diagnostics: `VICTORY_NULL_MAGENTA`, `victory warm`, more captures.
+### Fase 2: memoria compartida CPU/GPU, sin copias (el núcleo)
 
-The guard over all the views of a page is code of
-[victory-fork #115](https://github.com/fxceless/victory-fork/pull/115) by Spexivus
-with [its correction](https://github.com/Spexivus/victory-fork/pull/1) by joroyt and
-a part of [VIctory #1122](https://github.com/Marvisak/VIctory/pull/1122) by tightfall,
-adapted here. The second look at textures is fxceless's idea (victory-fork `a803c87`),
-written anew. Other parts were prompted by pull requests and issues of VIctory and
-victory-fork, and their code was written anew. Developed with [Claude Code](https://claude.com/claude-code).
+Que la GPU lea y escriba **directamente la memoria del título**, como en la consola.
 
-A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
-compatibility layer that runs an Xbox Series title natively on Windows from
-files the user supplies. This fork follows upstream
-`main` and adds fixes aimed at one goal: getting the game's world to render
-correctly and playably on one particular PC.
+1. **Prueba en este PC.** `crates/victory-gpu/src/inplace.rs` ya tiene una prueba de `OpenExistingHeapFromAddress`, `OpenExistingHeapFromAddress1` y `OpenExistingHeapFromFileMapping` (`VICTORY_INPLACE_PROBE`).
+   - Ejecutarla con vkd3d-proton y RADV, que implementa la primera con `VK_EXT_external_memory_host`.
+   - Anotar qué acepta, con qué límites (memoria bloqueada, alineación, protección uniforme) y qué ancho de banda tiene la GPU leyendo memoria del sistema por PCIe frente a VRAM.
+2. **Clasificar la memoria del título por uso**, con un censo por región en la escena de referencia:
+   - **CPU escribe, GPU lee** (constantes, vértices, argumentos): memoria del título importada como heap de la GPU, o en VRAM visible por la CPU (ReBAR). Cero copias.
+   - **GPU escribe, CPU lee** (poco frecuente): memoria del sistema importada, coherente.
+   - **Solo GPU** (render targets, buffers intermedios): solo VRAM, y nunca se copia de vuelta salvo que la CPU la lea (fase 1.2).
+   - **Texturas con *tiling* de consola**: siguen necesitando conversión (*detile*), pero solo cuando cambian.
+3. **Pool de páginas compatible.** `xmem` reserva hoy la memoria del título con `SEC_RESERVE`, que `OpenExistingHeapFromFileMapping` no acepta. Hay que rediseñar la reserva para que las regiones de GPU se puedan abrir como heap, ya sean secciones `SEC_COMMIT` o asignaciones completas.
+4. **Coherencia.** En las regiones sin copias se quitan las protecciones de escritura y las pasadas de hash. Las barreras y los fences del título bastan, como en la consola.
+5. **Ruta conmutable** con `VICTORY_ZEROCOPY=1` hasta que sea la ruta por defecto.
 
-**This repository contains no game files, code or assets.** You need your own
-copy of the game. It is not affiliated with or endorsed by the game's
-developer or publisher.
+**Salida:**
+- Los MB subidos y bajados por frame caen más de un 80 %.
+- El frame lo limitan la GPU o la CPU del propio título, no VIctory.
+- Hipótesis: 10-20 fps.
 
-## Credits
+### Fase 3: trabajo en paralelo y ritmo de frames
 
-- **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
-  contributors is the base of everything here: the loader, the runtime
-  services, the Direct3D 12 back end and the shader recompiler. Licensed
-  GPL-3.0-or-later; so is this fork. Upstream's history is kept intact below
-  the single commit that carries this fork's changes.
-- **[XCL](https://github.com/ivall/xcl)** by ivall and its contributors
-  (GPL-2.0-only) was used as a reference for how the same title behaves under
-  another layer. Fixes inspired by it were written anew in VIctory's code.
-- This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
+1. **Separar el envío del título del envío al host.** Dos o tres frames en vuelo, fences por frame y sin la cadena en serie.
+2. **Grabación de comandos en varios hilos.** El título graba desde 5 hilos, y la traducción de listas a la GPU del host debe repartirse igual.
+3. **Pipelines sin bloquear.**
+   - Compilar en hilos de trabajo, con la caché en disco que ya existe.
+   - Arreglar el cuelgue de `victory warm` al terminar la fase de pipelines de cómputo: con RADV se queda en espera para siempre.
+   - Lanzar `warm` automáticamente tras cada actualización.
+4. **Frame pacing.** Controlar la cola de presentación y la latencia.
 
-## Status of this fork (2026-11-25)
+**Salida:**
+- La GPU está ocupada más del 70 % en la escena de referencia.
+- El p99 del frametime es menor que el doble de la mediana.
+- No hay pausas al repetir una escena ya vista.
 
-**Not playable yet: 2.5 to 4 frames per second, and shadowed areas are black.**
-Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
-32 GB RAM. The Series X profile is used throughout.
+### Fase 4: backend Vulkan nativo (solo si las medidas lo justifican)
 
-| Stage | State in this fork |
-|-------|--------------------|
-| Boot, menus, start screen | works, 30 fps (as upstream) |
-| Opening cutscene | plays from start to finish, in order, lit: title cards, credits cards, night and dusk shots |
-| Saves | the game autosaves a checkpoint and loads it again |
-| First gameplay scene (the prologue) | renders: characters, textures, sky, sunlit exterior; HUD, pause menu and pad input work |
-| Light in shadow | missing: the game's ray-traced bounce light and ray-traced lamp and sun shadows do not run yet, so anything the sun does not hit directly is black |
-| Frame rate in the world | 2-4 fps: 420-450 ms per frame by default, 240-350 ms with the newer switches (`VICTORY_RELAY=2`, or `VICTORY_LATE_WAIT=3 VICTORY_WIDE_BACK=1 VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_CARD_BUFFERS_MB=1024`); it started at 3-6 seconds per frame |
-| Stability | no driver hang or device loss in normal runs (a hang introduced by the wave64 update was found and fixed: its barrier form for 64-lane programs is now off unless `VICTORY_WAVE_WIDE=1`) |
+Hoy la cadena es esta: shader de consola → DXIL → dxil-spirv → SPIR-V → RADV, y D3D12 → vkd3d-proton → Vulkan.
 
-### What this fork changed (summary)
+1. **Decisión con datos.** Tras las fases 2 y 3, medir con `perf` qué parte del frame se va en vkd3d-proton y dxil-spirv. Si es menos del 15 %, esta fase se aplaza.
+2. **Generar SPIR-V directamente** desde el IR de `victory-shader`, como segundo backend junto a DXIL.
+3. ***Sparse binding*** para los heaps con *tiles*, en lugar de miles de vistas de 64 KiB (`map_alias`).
+4. **Detección de escrituras propia de Linux:**
+   - `userfaultfd` en modo protección de escritura, o los bits *soft-dirty*, en lugar de fallos de página gestionados por Wine.
+   - Requiere una parte Unix (una *unixlib* de Wine o un proceso auxiliar con memoria compartida por `memfd`), porque el código PE no llama a Linux directamente.
+   - Hay que estudiarlo antes de decidir.
+5. **Wine se queda.** El título es un PE de Windows que importa la API de Windows, y quitar Wine significaría reescribirlo.
 
-Rendering:
-- Meshlet culling read its scene buffers as the wrong kind of view, so the world drew almost nothing; fixed.
-- Per-draw descriptor tables could run out, after which draws used slots never made for them and the card hung; fixed.
-- Light packed by the game's compute shaders was read back through empty copies (sky, probes, fog); fixed for every mip level and layer.
-- The fog reconstruction, shadow-mask, hair, blend-shape skinning, fire and several material programs did not translate; fixed.
-- Gathers at a named mip level (with and without an offset) read level 0; fixed.
-- Implicit-level samples outside pixel shaders produced invalid DXIL in 730 compute programs; fixed.
-- Rectangle lists, depth and stencil twins for depth textures written by compute, texture read-backs.
-- Ray tracing, in progress and off by default: the game's own structure-builder programs translate, title memory can be read by raw address from shaders, the hardware ray/box and ray/triangle test is emulated in DXIL (checked against a reference on the GPU), and 59 of the 64 trace programs translate. Nothing is lit by it yet. See [docs/fork-ray-tracing.md](docs/fork-ray-tracing.md).
+**Salida:** el mismo resultado visual que con D3D12 y un frame más corto, medido.
 
-Speed and memory:
-- Waits for memory values, write-watch queries and page queries no longer walk page tables per call.
-- Large title buffers get a copy in card memory, with shader writes found by hashing on the card.
-- Submissions can be sent ahead of the wait for the card (`VICTORY_LATE_WAIT`), with a relay thread that lands results as the card finishes (`VICTORY_RELAY`): in a first five-minute run the card's idle time behind the submitting thread fell from about 136 to 30 ms per frame.
-- Title memory can be opened as a graphics heap so that buffers are used in place instead of copied (`VICTORY_INPLACE`, first stage only; a probe confirmed the approach on the test GPU).
-- The bindless texture queue no longer uploads stale views; the view table no longer grows without bound; the pipeline library is mapped instead of read into memory.
-- An intermittent device loss was traced to the pipeline library file being replaced while mapped; fixed.
+### Fase 5: estabilidad y completitud visual (en paralelo desde la fase 1)
 
-- Translated shaders get clean-up passes over the finished module (dead code, constant folding, reuse of values, branch facts); the pack's host instruction count falls by about 43 %, worth about 20 ms of GPU time per frame on the test machine (`VICTORY_SHADER_OPT=0` turns them off).
+- **Fallos de GPU en AMD:** el shader `fc5e66f8f873d3bb` ([fxceless/victory-fork#3](https://github.com/fxceless/victory-fork/issues/3)) y los *late-wait* que fallan al acabar la carga ([#184](https://github.com/fxceless/victory-fork/issues/184)).
+- **Shaders sin traducir.** `warm` encuentra 106: caras y piel ("descriptor read only as data"), `v_cvt_f32_f64`, SGPR de hardware y descriptores elegidos por flujo de control.
+- **Trazado de rayos** (DXR en vkd3d-proton) para las sombras negras.
+- **Puerta de cada fase:** 30 minutos de juego sin perder el dispositivo y sin cierres.
 
-Most of the newer speed changes sit behind environment switches that are off
-by default (`VICTORY_LATE_WAIT`, `VICTORY_RELAY`, `VICTORY_WIDE_BACK`,
-`VICTORY_CARD_BUFFERS_MIN_MB`, `VICTORY_INPLACE`, `VICTORY_BVH_BUILDER`, ...).
-Each is described in a comment where it is read.
+## Reglas de trabajo
 
-### Known problems
+- **Primero medir.** Cada commit de rendimiento incluye en el mensaje las cifras antes y después en la escena de referencia.
+- **Todo cambio de arquitectura va detrás de un switch** hasta que sea la ruta por defecto, para poder comparar en la misma compilación.
+- **Sin datos del juego en el repositorio:** ni archivos, ni capturas, ni partidas, ni nombres.
+- **Traer los avances de joshuu y fxceless** con regularidad, sobre todo en la fase 0 y la fase 1, antes de divergir mucho.
+- **Probar en Linux** con el [lanzador](https://github.com/datingesp-hash/victory-proton), que ya pone wine, vkd3d-proton, el wineserver y el sandbox de solo lectura.
 
-- Everything in shadow is black (see above).
-- The interior of the first gameplay room is sometimes not drawn after the cutscene hands over to gameplay.
-- Around 24 GB of memory is in use during play.
-- A few style lints are switched off for this fork in the workspace `Cargo.toml` until the newer code is tidied.
-- Many changes here are specific to this title and this GPU, and some are marked `shortcut:` in the code where they approximate what the console does.
+## Compilar y ejecutar
 
-Everything below this line is upstream VIctory's own README, unchanged; its
-status section describes upstream, not this fork.
+Con el lanzador, añadiendo este repositorio como perfil:
 
----
-
-# VIctory
-
-Runs the title (Xbox Series X|S) natively on Windows, from files
-the user supplies.
-
-The title's x86-64 code runs unchanged inside our process; VIctory supplies
-the platform underneath it and converts the title's data, ahead of time where
-it can and on first use where it must (shaders). See
-[docs/architecture.md](docs/architecture.md).
-
-## Status (2026-11-23)
-
-**Not playable yet.** The title boots, runs its menus at its own 30 fps and
-loads the world, where rendering fails.
-
-| Stage | State |
-|-------|-------|
-| Boot, first-boot screens (accessibility, language, settings, legal) | works, 30 fps |
-| Intro video with sound | works |
-| Start screen, profile and saves | works |
-| Loading into the world (about 50 s) | works |
-| The world (first mission's intro) | reached and runs with indirect draws; its title card renders, the scene after it is still dark; 0.5-1.8 s per frame |
-
-Tested on one machine: Windows 11, AMD RX 6700 XT.
-
-> **Warning.** Entering the world on a real GPU can currently hang it, and
-> Windows then resets the display driver (every monitor goes black for a
-> moment). To look further, use a diagnostics build with
-> `VICTORY_D3D12_WARP=1`, which renders on the software adapter.
-
-What each part does today and what it still needs:
-
-| Subsystem | Today | Needs |
-|-----------|-------|-------|
-| Loader | Runs the title's executable and its DLLs in our process; crash reports name the faulting code and are kept in `crashes.log` | – |
-| Runtime services | One signed-in offline user, licences, packages, saves that survive a kill at any step, text entry dialog | Speech is silent; the dialog and relaunch are untested live |
-| Network | Offline by design: the title cannot reach the network | – |
-| Files and streaming | Archives and streamed data read, zlib and BCPack decoded in parallel | Loading is limited by writes into title memory |
-| Input | XInput pads, keyboard, keyboard stand-in pad | Trigger rumble |
-| Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
-| GPU: menus | Draws, compute and presentation on host D3D12; only changed title memory is copied | Frame pacing drifts on one screen in release builds |
-| GPU: world | Mesh pipelines, shader-written buffers, descriptor lifetimes, indirect execution (arguments clamped), pipelines made by worker threads and kept on disk | Most of the scene is still missing (untranslated shaders drop draws); frames take seconds; real queries, depth bounds, HDR and scaling are missing |
-| Shaders | Console GPU code recompiled to DXIL at first use, cached on disk. Menus: all. World: mesh 8,191 of 8,506, vertex/pixel 10,617 of 12,346, compute 1,643 of 2,539 | 64-bit image atomics, merged geometry stages, the ray-tracing builder's shaders; some compute programs need a GPU with 64-lane waves |
-| Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
-| Series S mode | Runs through the menus to the loading screen | The world, as above |
-
-## Getting started
-
-Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
-shader model 6.6 (and mesh shaders for the world), Rust (pinned in
-`rust-toolchain.toml`).
-
-The title also needs several GiB of available Windows commit at startup.
-Check **Committed** under **Task Manager → Performance → Memory**. If
-`crashes.log` reports Windows error 1455, close other applications or increase
-the Windows paging file size, then retry.
-
-```powershell
-cargo xtask install-hooks                # asset-policy check on every commit
-copy victory.example.toml victory.toml   # then set your paths (outside the repo)
-cargo test --workspace                   # needs no game data
-cargo run -p victory -- config           # check your paths
+```sh
+victory-proton profile add https://github.com/datingesp-hash/victory-royale-private royale main
+victory-proton -p royale
 ```
 
-Run the title:
+Es privado: git tiene que poder autenticarse en GitHub (por ejemplo con `gh auth setup-git`).
 
-```powershell
-cargo build --release -p victory
-target\release\victory.exe run <game dir>\<the title's exe> --execute
+Para compilar a mano, desde Linux, con [cargo-xwin](https://github.com/rust-cross/cargo-xwin):
+
+```sh
+cargo xwin build --release -p victory --target x86_64-pc-windows-msvc
 ```
 
-The window caption shows the framerate. Saves, settings and `crashes.log`
-are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
-data under the cache folder.
+Las notas del fork base, con sus switches y diagnósticos, están en [docs/fork-joshuu-README.md](docs/fork-joshuu-README.md).
 
-Input: XInput pads. With none connected the keyboard is a pad while the
-title's window has focus:
+## Ramas y remotos
 
-| Keys | Pad |
-|------|-----|
-| W A S D / I J K L | left / right stick |
-| arrows | D-pad |
-| Enter, Backspace, X, Y | A, B, X, Y |
-| Q / E, Z / C | shoulders, triggers |
-| F / H | stick clicks |
-| Esc, Tab | Menu, View |
+| Rama | Qué es |
+|---|---|
+| `main` | nuestra línea: joshuu más esta ruta |
+| `royale-base` | ligmaSec/victory-royale tal cual, como referencia |
 
-## Commands
-
+```sh
+git remote add joshuu   https://github.com/JoshuuDev/victory-amd
+git remote add fxceless https://github.com/fxceless/victory-fork
+git remote add upstream https://github.com/Marvisak/VIctory
+git remote add royale   https://github.com/ligmaSec/victory-royale
+git fetch joshuu && git merge joshuu/victory-amd   # traer avances de la base
 ```
-victory inspect <exe|dll> [--imports] [--exports]
-victory census [paths...] [--missing] [--strict]
-victory lib-exports <import.lib> [--list]
-victory shader-info [paths...] [--verbose] [--disasm]
-victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
-victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
-            [--console series-x|series-s] [-- <title arguments>]
-victory config
-```
-
-Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
-info and above).
-
-## Debugging
-
-A release build has no debugging aids. Build them in with
-
-```powershell
-cargo build --profile diag -p victory --features diagnostics   # target\diag\victory.exe
-```
-
-| Variable | Effect |
-|----------|--------|
-| `VICTORY_LOG=<target>=debug,...` | debug and trace output |
-| `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
-| `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
-| `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
-| `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
-| `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
-| `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
-| `VICTORY_D3D12_DEBUG=1` | host debug layer |
-| `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
-| `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
-| `VICTORY_PIPELINE_WAIT_MS=24` | reduce the per-frame wait for background pipeline creation from the default of 500 ms. A draw can be omitted until its pipeline is ready |
-| `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
-| `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
-| `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
-| `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
-| `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
-| `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
-
-Every build appends crashes and host GPU failures to `crashes.log` in the
-title's data folder.
-
-## License
-
-GPL-3.0-or-later. See [LICENSE](LICENSE).
