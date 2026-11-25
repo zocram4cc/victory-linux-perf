@@ -929,6 +929,32 @@ mod tests {
         );
     }
 
+    /// A guard page in the source (title memory may hold some) fails the
+    /// copy like an unmapped page, and stays a guard page for the title: the
+    /// fault that reported it cleared the flag, so it is set again.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn direct_copy_fails_on_a_guard_page_and_keeps_it_guarded() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_READWRITE,
+            VirtualAlloc, VirtualFree, VirtualProtect, VirtualQuery,
+        };
+        const PAGE: usize = 4096;
+        // SAFETY: two fresh pages; the second is made a guard page.
+        unsafe {
+            let src = VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_COMMIT, PAGE_READWRITE).cast::<u8>();
+            assert!(!src.is_null());
+            let mut old = 0;
+            assert_ne!(VirtualProtect(src.add(PAGE).cast(), PAGE, PAGE_READWRITE | PAGE_GUARD, &mut old), 0);
+            let mut dst = vec![0u8; 2 * PAGE];
+            assert!(!super::direct_copy::try_copy(dst.as_mut_ptr(), src, 2 * PAGE));
+            let mut info = MEMORY_BASIC_INFORMATION::default();
+            assert_ne!(VirtualQuery(src.add(PAGE).cast(), &mut info, size_of_val(&info)), 0);
+            assert_ne!(info.Protect & PAGE_GUARD, 0, "the guard flag was consumed");
+            VirtualFree(src.cast(), 0, MEM_RELEASE);
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -6473,7 +6499,7 @@ mod direct_copy {
     use std::sync::Once;
 
     use windows_sys::Win32::Foundation::{
-        EXCEPTION_ACCESS_VIOLATION, EXCEPTION_IN_PAGE_ERROR, NTSTATUS,
+        EXCEPTION_ACCESS_VIOLATION, EXCEPTION_IN_PAGE_ERROR, NTSTATUS, STATUS_GUARD_PAGE_VIOLATION,
     };
     use windows_sys::Win32::System::Diagnostics::Debug::{
         AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
@@ -6523,6 +6549,7 @@ mod direct_copy {
         let code = record.ExceptionCode;
         if code != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
             && code != EXCEPTION_IN_PAGE_ERROR as NTSTATUS
+            && code != STATUS_GUARD_PAGE_VIOLATION
         {
             return EXCEPTION_CONTINUE_SEARCH;
         }
@@ -6544,8 +6571,31 @@ mod direct_copy {
         {
             return EXCEPTION_CONTINUE_EXECUTION;
         }
+        // A guard page (title memory has some) fails the copy as the kernel's
+        // read would. Raising the fault cleared its guard flag: it is set
+        // again, so the title still sees its own first touch.
+        if code == STATUS_GUARD_PAGE_VIOLATION && record.NumberParameters >= 2 {
+            rearm_guard(record.ExceptionInformation[1]);
+        }
         ctx.Rip = (&raw const victory_try_copy_fault) as u64;
         EXCEPTION_CONTINUE_EXECUTION
+    }
+
+    /// Sets the guard flag again on the page holding `at`, with the
+    /// protection it has now.
+    fn rearm_guard(at: usize) {
+        use windows_sys::Win32::System::Memory::{
+            MEMORY_BASIC_INFORMATION, PAGE_GUARD, VirtualProtect, VirtualQuery,
+        };
+        let page = at & !0xfff;
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        let mut old = 0;
+        // SAFETY: plain queries and a protection change of one committed page.
+        unsafe {
+            if VirtualQuery(page as *const _, &mut info, size_of_val(&info)) != 0 {
+                VirtualProtect(page as *const _, 0x1000, info.Protect | PAGE_GUARD, &mut old);
+            }
+        }
     }
 
     fn install() {
@@ -6559,7 +6609,7 @@ mod direct_copy {
     }
 
     /// Copies `len` bytes from `src` to `dst` in-process, returning `false` on
-    /// an access violation or in-page error at either pointer.
+    /// an access violation, in-page error or guard page at either pointer.
     ///
     /// # Safety
     ///
