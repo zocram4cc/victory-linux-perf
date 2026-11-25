@@ -4,6 +4,11 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**Stability gate: 10 minutes in the open world with the new defaults (pool and slot wait), no loss; the picture more complete**
+- Jason save, one run with a 600 s window (`bench/trials-20261126-002900-gate10`): held to the end. Frame 363 ms on average (2.77 fps), window marked `invalid` because the draws varied; not a speed figure yet.
+- **The picture is more complete than with committed textures:** the house shows its painted boards, towels on the railing and wood detail, where the screenshots with committed textures and the wait showed it dark and flat. Textures that failed or went stale on fresh memory now hold. To be checked against S.3 (texture coherence).
+- **VRAM:** 18.8-18.9 GB of 20.4 GB from the first minute on, GTT 4.5-5.9 GB (sampled every 5 s). The pool holds 37,700 textures, 13.3 GB in 14.6 GB of heaps. It did not grow during the static 10 minutes, but walking will: S.8 (bound texture memory) is the next task.
+
 **The texture pool on by default; what holds 35,000 textures**
 - 4 KiB small-resource alignment: 98 % of pool textures take it, yet use barely falls (12.3 GB for 34,700 textures, ~360 KB each on average). The bytes are real.
 - **Live textures by references besides the pool's** (`texture pool:` frame line): none with 0, ~12,000-13,000 with 1 (their title texture), ~22,000 with 2 (also a descriptor slot, which keeps its last view alive by design), ~930 with more. Nothing is given back because the title never lets these textures go, not because the count is wrong. The committed path holds the same set.
