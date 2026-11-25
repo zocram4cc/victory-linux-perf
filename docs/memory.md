@@ -166,6 +166,12 @@ This still has to be measured with royale in the world; that log is not printed 
 - Only ~20 reads per frame meet a missing or guard page.
 - Guard pages exist in title ranges, for example at `0x11000`. A direct read must put the guard back.
 
+## 9d. Texture copies: a lifetime bug and a staleness bug (25 Nov 2026)
+
+- **Lifetime:** `resource::let_go_idle` frees a host texture copy after 5 s and 4 frames without use, *"held by its title texture alone (no list, no slot)"*. A faster frame (fast writes, or the forks' late wait) makes it free copies the GPU still reads: 2,196 copies (1.58 GB) let go 1.4 ms before a device loss. With `VICTORY_TEXTURE_SWEEP=0`, no loss in 3 runs.
+- **Staleness:** with the sweep off, lighting, a window and many models go missing. Freed copies are remade fresh from title memory later, so the sweep was hiding texture updates that change detection misses.
+- **Design consequence for phase 2:** the new memory system must track texture references exactly (no "unused for N seconds" heuristics), and must not rely on recreating copies to pick up changes.
+
 ## 10. Design rules drawn from the data
 
 1. **The cost is in deciding what to copy and in reading title memory through the kernel, not in moving bytes** (confirmed in §9b). Every phase 1 improvement is measured in hash passes and write-watch queries, not only in MB.
@@ -174,3 +180,4 @@ This still has to be measured with royale in the world; that log is not printed 
 4. **Tolerate holes:** title ranges have pages with no backing.
 5. **Zero-copy alone is not enough (×2 at most).** It has to be combined with frames in flight (phase 3).
 6. **Correctness matters:** any new cache must guarantee the GPU sees the title's latest write.
+7. **Exact lifetimes:** a host resource is freed only when no list, slot or pending view can reach it. Time- or frame-based idleness is not a proof (§9d).

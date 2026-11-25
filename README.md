@@ -262,7 +262,8 @@ Today the chain is: console shader → DXIL → dxil-spirv → SPIR-V → RADV, 
 | Intro video flicker | open | screenshots |
 | Ray tracing (black shadows) | not run | DXR on vkd3d-proton, after phase 3 |
 | `VICTORY_INPLACE=2` device loss | open | needed for phase 2.4 |
-| **Texture sweep lets go of copies the GPU still reads** (suspected) | under test | 2,196 copies let go 1.4 ms before a device loss; exposed by any speed-up (fast writes, late wait). Test with `VICTORY_TEXTURE_SWEEP=0`; fix the order in `Host::submit` (`sweep` before `make_waiting`) or count pending slots as holders |
+| **Texture sweep frees copies the GPU still reads** | confirmed (0 losses of 3 with the sweep off, 2 of 3 with it on) | find the unheld reference (vkd3d breadcrumbs); blocks fast writes and phase 3 |
+| **Texture copies go stale** (hidden by the sweep) | confirmed: with the sweep off, lighting, a window and many models go missing | change detection for textures misses updates (`texture.rs`); likely behind flicker and missing pieces |
 | Exit gate of every phase | | 30 minutes in the world without a device loss or crash |
 
 ## 5. Working on this repository

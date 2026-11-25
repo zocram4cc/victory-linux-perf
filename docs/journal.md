@@ -4,6 +4,20 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-25
 
+**Sweep test: two texture bugs, not one**
+
+| Run (fast writes on) | ms per frame | Device | Picture |
+|---|---|---|---|
+| sweep on (3 runs) | 308 (when it got through) | **lost 2 of 3** | — |
+| `VICTORY_TEXTURE_SWEEP=0` a | 307 | ok | — |
+| `VICTORY_TEXTURE_SWEEP=0` b | 303 | ok | **lighting missing** |
+| `VICTORY_TEXTURE_SWEEP=0` c | **294** (3.4 fps) | ok | **lighting, a window and many models missing** |
+
+- **Same draws in every run** (~4,980 per frame, ~340 dropped), so the game emits the same work. What is missing is wrong **data** (stale textures or buffers), not missing draws.
+- **Bug 1 (lifetime):** with the sweep on, a faster frame lets it free host texture copies that the GPU still reads. With the sweep off, no device loss in 3 runs. Every slot path I read (`HostHeap::keep`, `mirror`, `make_waiting`) holds its texture, so the unheld reference is somewhere else. Next: let the GPU name it (`VKD3D_CONFIG=descriptor_heap,breadcrumbs`, and the trail).
+- **Bug 2 (staleness):** with the sweep off, textures go stale and stay so. The sweep was hiding it: copies it frees are made again later from title memory, fresh. So change detection for textures misses some updates. This is a phase 1-2 correctness problem (`texture.rs`, `VICTORY_HEAP_RECHECK`), and probably related to the flicker and missing pieces seen before.
+- Fast reads, own write-back and card merge stay on. Fast writes stay off until bug 1 is fixed.
+
 **Fast writes: 2 device losses in 3 runs; a lead in the texture sweep**
 - `VICTORY_F1_FAST_WRITE=1`, three runs:
   - **lost the device twice**, as loading ended and a few seconds into the first cutscene (GPUVM faults on host GPU addresses, TCP client: a texture read);
