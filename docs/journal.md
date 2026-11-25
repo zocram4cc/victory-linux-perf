@@ -4,6 +4,12 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-25
 
+**S.6 step 1 measured: the open world makes hundreds of host textures a frame, all over title memory; the pool built**
+- New frame lines: host textures made per frame, by size and by the title texture's backing (`resource.rs` `TEXTURES_MADE`, `MADE_KINDS`).
+- Jason save, settled in the world (`bench/trials-…-texsize`, `…-texkinds`): **60-635 host textures made a frame, 15-200 MB a frame**, 0.3-3.5 ms creating. About 95 % are under 1 MiB, the largest 10 MB. **All of them are textures the title makes "at a title address"** (over its own memory: streaming); none placed in a title heap, none committed. 10-50 % repeat the address and description of one made before. The sweep let none go in that window, so this is the title's own churn, not ours.
+- Each of those got fresh committed memory: each was a chance for the S.1 race. A console texture is a view over memory; ours was an allocation.
+- **`pool.rs` (`VICTORY_TEXTURE_POOL=1`, off):** host textures up to 64 MiB are placed in 256 MiB heaps made up front (2 GiB by default). A heap is used only after a submission sent after its creation has finished. First fit with alignment from `GetResourceAllocationInfo`. The pool holds one reference to each texture; at each submission boundary, a texture only the pool holds goes through `retire()` and its block comes back afterwards (design rule 7, exact lifetimes). The allocator's tests pass (run natively; the Windows test binary needs vkd3d's DLLs in its prefix).
+
 **`VICTORY_SLOT_WAIT` on by default; the prologue had the bug too; S.6 designed**
 - **Open world:** 5 of 5 held with the wait (`bench/trials-20261125-232200-slot-wait5` makes the fifth). Fast writes with the wait: 3 of 3 held (they lost the device before), but no gain in the open world (2.03-2.15 fps against 2.10), so they stay off.
 - **Prologue, 3 runs each:** without the wait 1 of 3 lost, with a TCP fault on a texture (the S.1 kind); with the wait 0 of 3. Frame 358-364 ms with the wait against 359-372 without: no measured cost. Both sets of windows are marked `invalid` because the intro cutscene pulls the draws down during the window, so this is a rough comparison.

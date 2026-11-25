@@ -1309,6 +1309,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             r.host.refused.store(true, Relaxed);
             return None;
         };
+        made_kind(r);
         let twin = twin_texture(&r.desc, &texture);
         // One line per depth texture with unordered access: its address is
         // the one target dumps and the captured frame's list of commands
@@ -1690,23 +1691,49 @@ fn host_texture(
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
     };
-    let mut texture: Option<ID3D12Resource> = None;
+    let mut texture: Option<ID3D12Resource>;
+    let started = std::time::Instant::now();
     // SAFETY: the description has the host layout (checked size, same
     // fields); the out pointer is ours.
-    let made = unsafe {
-        host.device.CreateCommittedResource(
-            &heap,
-            D3D12_HEAP_FLAG_NONE,
+    let initial = D3D12_RESOURCE_STATES(crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32);
+    // In memory mapped ahead of time when the pool is on (roadmap S.6).
+    // SAFETY: as below.
+    texture = unsafe {
+        crate::pool::place(
+            &host.device,
             (&raw const d).cast(),
-            D3D12_RESOURCE_STATES(
-                crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
-            ),
-            // The same layout: format, then color or depth and stencil.
+            initial,
             clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast()),
-            &mut texture,
         )
     };
+    let made = if texture.is_some() {
+        Ok(())
+    } else {
+        unsafe {
+            host.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                (&raw const d).cast(),
+                initial,
+                // The same layout: format, then color or depth and stencil.
+                clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast()),
+                &mut texture,
+            )
+        }
+    };
     crate::host::pin(&texture);
+    if texture.is_some() {
+        use std::sync::atomic::Ordering::Relaxed;
+        // SAFETY: the same description the texture was made from.
+        let info = unsafe { host.device.GetResourceAllocationInfo(0, &[*(&raw const d).cast::<D3D12_RESOURCE_DESC>()]) };
+        let bytes = info.SizeInBytes;
+        TEXTURES_MADE[0].fetch_add(1, Relaxed);
+        TEXTURES_MADE[1].fetch_add(bytes, Relaxed);
+        TEXTURES_MADE[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+        TEXTURES_MADE[3].fetch_max(bytes, Relaxed);
+        let class = match bytes >> 20 { 0 => 4, 1..=3 => 5, 4..=63 => 6, _ => 7 };
+        TEXTURES_MADE[class].fetch_add(1, Relaxed);
+    }
     if let Err(e) = made {
         tracing::warn!(error = %e, desc = ?d, "no host texture");
     }
@@ -1716,6 +1743,62 @@ fn host_texture(
         });
     }
     texture
+}
+
+/// Host textures made since the last frame line, by the title texture's
+/// backing (committed, placed in a title heap, at a title address), and
+/// how many of them had the address and description of one made before
+/// (a pool reusing by both would serve those). Roadmap S.6.
+pub(crate) static MADE_KINDS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+#[cfg(windows)]
+fn made_kind(r: &Resource) {
+    use std::sync::atomic::Ordering::Relaxed;
+    static SEEN: std::sync::Mutex<Option<std::collections::HashSet<(usize, [u8; 64])>>> = std::sync::Mutex::new(None);
+    let kind = match r.backing {
+        Backing::Committed(_) => 0,
+        Backing::Placed { .. } => 1,
+        Backing::Address(_) => 2,
+    };
+    MADE_KINDS[kind].fetch_add(1, Relaxed);
+    // SAFETY: a plain-old-data description, read as bytes.
+    let bytes: [u8; 64] = unsafe {
+        let mut b = [0u8; 64];
+        let n = std::mem::size_of::<ResourceDesc>().min(64);
+        std::ptr::copy_nonoverlapping((&raw const r.desc).cast::<u8>(), b.as_mut_ptr(), n);
+        b
+    };
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let seen = seen.get_or_insert_with(Default::default);
+    if !seen.insert((r.data() as usize, bytes)) {
+        MADE_KINDS[3].fetch_add(1, Relaxed);
+    }
+}
+
+/// Host textures made since the last frame line (roadmap S.6, sizing the
+/// pre-mapped pool): count, bytes, microseconds in creation, the largest,
+/// then counts under 1 MiB, 1-4 MiB, 4-64 MiB and 64 MiB or more.
+pub(crate) static TEXTURES_MADE: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
+/// With the frame line: host textures made per frame.
+pub(crate) fn textures_made_line(frames: f64) {
+    let v = TEXTURES_MADE.each_ref().map(|a| a.swap(0, std::sync::atomic::Ordering::Relaxed));
+    if v[0] == 0 {
+        return;
+    }
+    tracing::info!(
+        "host textures made per frame: {:.1} ({:.1} MB, {:.2} ms creating; the largest {} MB); by size: {} under 1 MiB, {} of 1-4 MiB, {} of 4-64 MiB, {} of 64 MiB or more",
+        v[0] as f64 / frames,
+        v[1] as f64 / 1e6 / frames,
+        v[2] as f64 / 1e3 / frames,
+        v[3] >> 20,
+        v[4], v[5], v[6], v[7]
+    );
+    let k = MADE_KINDS.each_ref().map(|a| a.swap(0, std::sync::atomic::Ordering::Relaxed));
+    tracing::info!(
+        "host textures made, by the title texture's backing: {} committed, {} placed in a title heap, {} at a title address; {} with the address and description of one made before",
+        k[0], k[1], k[2], k[3]
+    );
 }
 
 /// A texture's console memory and description; `None` for buffers.

@@ -174,6 +174,11 @@ pub(crate) fn pin<T: windows::core::Interface + Clone>(made: &Option<T>) {
     }
 }
 
+/// Submissions finished and started so far.
+pub(crate) fn submissions() -> (u64, u64) {
+    (FINISHED.load(Ordering::Acquire), STARTED.load(Ordering::Acquire))
+}
+
 /// Submissions started and not yet finished (logs).
 pub(crate) fn running() -> u64 {
     STARTED.load(Ordering::Acquire).saturating_sub(FINISHED.load(Ordering::Acquire))
@@ -3991,6 +3996,8 @@ impl Host {
         // Descriptor records the title copied into placed heaps as bytes,
         // before the lists that index those slots run (VICTORY_HEAP_SYNC).
         crate::descriptor::sync_heaps();
+        // Pool textures nobody else holds go back, after what runs now.
+        crate::pool::collect();
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
         crate::descriptor::make_waiting();
@@ -5837,6 +5844,8 @@ impl Meter {
             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
         );
         crate::descriptor::host::slot_line(frames);
+        crate::resource::textures_made_line(frames);
+        crate::pool::pool_line(frames);
         crate::descriptor::sync_line(frames);
         late_line(frames);
         let gpu_pct = card_clock_line(frames, ms);

@@ -34,6 +34,8 @@ mod host;
 mod indirect;
 #[cfg(windows)]
 mod inplace;
+#[cfg(windows)]
+mod pool;
 mod fastcopy;
 pub mod medir;
 pub mod list;
