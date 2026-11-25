@@ -345,7 +345,7 @@ Speed and memory:
 - Large title buffers get a copy in card memory, with shader writes found by hashing on the card.
 - Submissions can be sent ahead of the wait for the card (`VICTORY_LATE_WAIT`), with a relay thread that lands results as the card finishes (`VICTORY_RELAY`): in a first five-minute run the card's idle time behind the submitting thread fell from about 136 to 30 ms per frame.
 - Independent host-copy refreshes run in parallel by default on systems with at least four logical CPUs (`VICTORY_WIDE_REFRESH=0` disables this; `=1` forces it). This targets the serial memory reads that previously cost about 45–50 ms per frame on the test run.
-- Title memory can be opened as a graphics heap so that buffers are used in place instead of copied (`VICTORY_INPLACE`, first stage only; a probe confirmed the approach on the test GPU).
+- Title memory can be opened as a graphics heap so that buffers are used in place instead of copied: `VICTORY_INPLACE=1` for private memory, `2` for title buffers too, `3` also for the page pool's view memory over a card view of its section. Level 3 needs a driver whose import of a shared view aliases it; a one-time canary checks that, and without it view memory is copied as before. Opt-in: on the test card, level 1 made the frame slower.
 - The bindless texture queue no longer uploads stale views; the view table no longer grows without bound; the pipeline library is mapped instead of read into memory.
 - An intermittent device loss was traced to the pipeline library file being replaced while mapped; fixed.
 

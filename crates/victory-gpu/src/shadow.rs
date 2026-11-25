@@ -71,6 +71,8 @@ pub(crate) struct Shadow {
     card: Option<Card>,
     /// A window of title memory outside buffers, not a title buffer's copy.
     window: bool,
+    /// With `place`: the title memory is view memory, placed over a card view.
+    view: bool,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
     /// heap opened on the title memory itself, so shaders read and write
     /// the title's own bytes and nothing is copied either way. The heap,
@@ -1970,7 +1972,7 @@ impl Drop for Shadow {
     fn drop(&mut self) {
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
-            crate::inplace::gone(self.window, self.len);
+            crate::inplace::gone(self.window, self.len, self.view);
             return;
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
@@ -2216,6 +2218,9 @@ pub(crate) fn let_go_idle() {
             format!("sweep: {went} host copies of windows of title memory let go ({} KiB), held by no list and no slot", bytes >> 10)
         });
     }
+    let views = gone.iter().filter(|s| s.view).count() as u64;
+    let placed = gone.iter().filter(|s| s.place.is_some()).count() as u64;
+    crate::inplace::let_go_placed(views, placed - views, true);
     for shadow in gone {
         LET_GO[0].fetch_add(1, Ordering::Relaxed);
         LET_GO[1].fetch_add(shadow.len, Ordering::Relaxed);
@@ -2311,6 +2316,7 @@ impl Shadow {
         LIVE[1].fetch_sub(len, Ordering::Relaxed);
         *shadow.watched.get_mut() = NOT_WATCHED;
         shadow.window = window;
+        shadow.view = placed.view;
         shadow.place = Some((placed.heap, placed.bias));
         shadow
     }
@@ -2347,6 +2353,7 @@ impl Shadow {
             },
             card: None,
             window: false,
+            view: false,
             place: None,
         }
     }
@@ -2369,11 +2376,11 @@ impl Shadow {
     /// a GPU-side dirty mask would save that if big ranges make it slow.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         // In place the shaders write title memory itself: no snapshot, no
-        // compare, nothing to copy back, and no wait on its account.
-        // shortcut: another host copy of the same bytes (a title buffer
-        // inside this one with a copy of its own, a texture in it) is not
-        // told: the card's writes are not seen by write watching.
-        if self.place.is_some() {
+        // compare, and nothing to copy back. At level 3 the list still
+        // declares the range, and its completion tells the write watch what
+        // was written (`copy_back_with`): the other copies of those pages
+        // take them at their next refresh.
+        if self.place.is_some() && !crate::inplace::notifies() {
             return;
         }
         let len = len.min(self.left(address));
@@ -2508,6 +2515,12 @@ impl Shadow {
     /// that differ from the snapshot, found beforehand ([`find_all`]).
     pub(crate) fn copy_back_with(&self, address: usize, len: usize, found: Option<Vec<(usize, usize)>>) -> usize {
         if self.place.is_some() {
+            // In place there is nothing to copy; at level 3 the pages the
+            // shaders wrote are told to the write watch.
+            if crate::inplace::notifies() {
+                let (from, to) = self.inside(address, len);
+                crate::inplace::wrote(from, to);
+            }
             return 0;
         }
         let snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
@@ -3631,6 +3644,8 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
             }
         }
     }
+    let views = gone.iter().filter(|s| s.view).count() as u64;
+    crate::inplace::let_go_placed(views, gone.len() as u64 - views, false);
     let n = gone.len() as u64;
     for shadow in gone {
         crate::host::retire(shadow);
@@ -4455,8 +4470,8 @@ mod placed_tests {
             let (a, b) = (first.Value as u64, second.Value as u64);
             crate::inplace::title_memory_view(a as usize, 4 * K64, section as usize, 0);
             crate::inplace::title_memory_view(b as usize, 4 * K64, section as usize, 4 * K64 as u64);
-            let wa = crate::inplace::place_on(&device, a, 2 * K64 as u64, true, true).expect("the window over the first view is not placed in place");
-            let wb = crate::inplace::place_on(&device, b, 2 * K64 as u64, true, true).expect("the window over the second view is not placed in place");
+            let wa = crate::inplace::place_on(&device, a, 2 * K64 as u64, true, 3).expect("the window over the first view is not placed in place");
+            let wb = crate::inplace::place_on(&device, b, 2 * K64 as u64, true, 3).expect("the window over the second view is not placed in place");
             let (ka, kb) = ((a, 2 * K64 as u64), (b, 2 * K64 as u64));
             {
                 let mut loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());

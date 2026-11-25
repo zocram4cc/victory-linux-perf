@@ -67,24 +67,38 @@ pub(crate) fn probe_level() -> u8 {
 /// buffers that lies in private memory committed whole is not copied: a
 /// part of the title's allocation is opened as a host heap and the window
 /// is a buffer placed over it ([`place_for`]). 2: title buffers too,
-/// except the big ones in the card's memory.
+/// except the big ones in the card's memory. 3: view memory too, where one
+/// run of a committed section is shown: the window or buffer is placed
+/// over our card view of the section ([`place_card`]). Scattered views are
+/// still copied.
 ///
 /// What stage 1 covers is private memory (`XMemVirtualAlloc`'s). View
-/// memory (the page pool) is turned down here: its section is made
-/// reserved, which the host refuses, and what a view shows changes when
-/// the title maps pages.
+/// memory (the page pool, one section made committed on Wine) is placed at
+/// 3 only: a section made reserved is refused by the host, and what a view
+/// shows changes when the title maps or unmaps pages, which the runtime
+/// tells us ([`crate::title_memory_remapped`]) and which lets the placements
+/// over that range go. Title writes do not let go of anything.
 ///
-/// What it assumes, for 2: nothing reads title memory that a submission
-/// not yet run writes through such a buffer. With every submission waited
-/// for (the default) that holds; with `VICTORY_LATE_WAIT` it does not,
-/// since the flights' rules know shader writes only by the ranges copies
-/// declare. Do not combine 2 with late wait.
+/// What it assumes, for 2 and 3: nothing reads title memory that a
+/// submission not yet run writes through such a buffer. With every
+/// submission waited for (the default) that holds; with `VICTORY_LATE_WAIT`
+/// it does not, since the flights' rules know shader writes only by the
+/// ranges copies declare. Do not combine 2 or 3 with late wait.
 ///
 /// shortcut: while a window is in place the title cannot decommit, free
 /// or protect its pages (the call fails with error 87; the probe shows
 /// it). The title's heaps are allocated once and kept, and nothing of the
 /// kind was seen; [`title_memory_freeing`] is there for the runtime to
 /// call before such a call once it takes them over.
+///
+/// At 3 a placement is not exclusive: other host copies of its pages stay
+/// (windows and buffers overlap by their grid), and the write watch does not
+/// see shader writes through a placement. So when its list has run, the
+/// pages those writes covered are told to the journal (`wrote`), and the
+/// copies that hold them refresh them as after a copy-back. Nothing is
+/// copied into the placement. 3 also needs a driver whose import of a
+/// section's view aliases it: `card_imports_alias` checks that once, and
+/// with the stock libdrm on this kernel (ANONONLY) it refuses.
 pub(crate) fn level() -> u8 {
     static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *LEVEL.get_or_init(|| std::env::var("VICTORY_INPLACE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
@@ -99,10 +113,44 @@ fn most() -> u64 {
 }
 
 /// In place now: windows and their bytes, title buffers and their bytes;
-/// then, since the start: asks turned down because the memory is a view
-/// or not private memory committed whole, because the host refused,
-/// because of [`most`]; and what was let go because its memory changed.
+/// then, since the start: asks turned down (view memory not one run of a
+/// committed section at this level, or not private memory committed whole),
+/// asks the host refused, asks over [`most`]; and what was let go because
+/// its memory changed.
 static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+/// Of [`STATS`]' windows and title buffers, the view memory ones: windows
+/// and bytes, title buffers and bytes.
+static VIEW: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Rates since the start, by kind of memory (`KIND_PRIVATE`, `KIND_VIEW`)
+/// and event (`PLACED`, `REMAP`, `IDLE`, `OPENS`, `OPEN_BYTES`, `OPEN_US`).
+static RATES: [[AtomicU64; 6]; 2] = [const { [const { AtomicU64::new(0) }; 6] }; 2];
+
+/// What [`say`] logged last: the rates then, and the frame.
+static SAID: Mutex<([[u64; 6]; 2], u64)> = Mutex::new(([[0; 6]; 2], 0));
+
+const KIND_PRIVATE: usize = 0;
+const KIND_VIEW: usize = 1;
+const PLACED: usize = 0;
+/// Let go because the title remapped their memory.
+const REMAP: usize = 1;
+/// Let go because nothing asked for them for a while.
+const IDLE: usize = 2;
+const OPENS: usize = 3;
+const OPEN_BYTES: usize = 4;
+const OPEN_US: usize = 5;
+
+fn rate(kind: usize, event: usize, n: u64) {
+    RATES[kind][event].fetch_add(n, Ordering::Relaxed);
+}
+
+/// Counts one heap opened of `bytes`, which took since `started`.
+fn opened(kind: usize, bytes: u64, started: std::time::Instant) {
+    rate(kind, OPENS, 1);
+    rate(kind, OPEN_BYTES, bytes);
+    rate(kind, OPEN_US, started.elapsed().as_micros() as u64);
+}
 
 /// A buffer placed over title memory, and its heap.
 pub(crate) struct Placed {
@@ -112,6 +160,8 @@ pub(crate) struct Placed {
     pub(crate) gpu: u64,
     /// Bytes from the buffer's first byte to the title memory's first.
     pub(crate) bias: u64,
+    /// View memory, placed over a card view ([`place_card`]).
+    pub(crate) view: bool,
 }
 
 /// Opens the 64 KiB pages that hold title memory `[start, start + len)`
@@ -124,42 +174,65 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
     if !private_whole(at as usize, bytes as usize) {
         return Err(None);
     }
+    let started = std::time::Instant::now();
     let heap = open(device, From::Part(at as usize, bytes as usize)).map_err(Some)?;
+    opened(KIND_PRIVATE, bytes, started);
     let buffer = place(device, &heap, 0, bytes).map_err(Some)?;
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
-    Ok(Placed { buffer, heap, gpu, bias: start - at })
+    Ok(Placed { buffer, heap, gpu, bias: start - at, view: false })
 }
 
-/// Title memory `[start, start + len)` in place, for a window outside
-/// buffers or a title buffer, if [`level`] asks for it and the memory can
-/// be opened; `None` leaves the caller to make a copy, as before.
+/// Title memory `[start, start + len)` in place, if [`level`] asks for it
+/// and the memory can be opened; `None` leaves the caller to make a copy,
+/// as before.
 pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
-    if level() < if window { 1 } else { 2 } {
-        return None;
-    }
-    // View memory: known from the runtime without asking Windows.
-    if cover(start as usize, len as usize) != Cover::None {
-        STATS[4].fetch_add(1, Ordering::Relaxed);
-        return None;
-    }
-    if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len > most() {
-        STATS[6].fetch_add(1, Ordering::Relaxed);
+    let level = level();
+    if level == 0 {
         return None;
     }
     let host = crate::host::host()?;
-    match place_part(&host.device, start, len) {
+    place_on(&host.device, start, len, window, level)
+}
+
+/// [`place_for`] on `device` at `level`. Private memory: windows from 1,
+/// title buffers at 2 only (3 is stage 1 with view memory, so the title
+/// buffers of private memory stay copies there). View memory, one run of a
+/// section: windows and title buffers at 3.
+pub(crate) fn place_on(device: &ID3D12Device, start: u64, len: u64, window: bool, level: u8) -> Option<Placed> {
+    if level == 0 || (!window && level < 2) {
+        return None;
+    }
+    let private = if window { level >= 1 } else { level == 2 };
+    let placed = match route(cover(start as usize, len as usize), level >= 3) {
+        // Not asked for at this level: nothing to count.
+        Route::Private if !private => return None,
+        Route::Private if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len > most() => Err(No::Over),
+        Route::Private => place_part(device, start, len).map_err(|e| e.map_or(No::Turned, No::Host)),
+        Route::Card { section, offset } => place_card(device, section, offset, len),
+        Route::Turned => Err(No::Turned),
+    };
+    match placed {
         Ok(placed) => {
             let at = if window { 0 } else { 2 };
             STATS[at].fetch_add(1, Ordering::Relaxed);
             STATS[at + 1].fetch_add(len, Ordering::Relaxed);
+            if placed.view {
+                VIEW[at].fetch_add(1, Ordering::Relaxed);
+                VIEW[at + 1].fetch_add(len, Ordering::Relaxed);
+            }
+            rate(usize::from(placed.view), PLACED, 1);
             Some(placed)
         }
-        Err(None) => {
+        Err(No::Turned) => {
             STATS[4].fetch_add(1, Ordering::Relaxed);
             None
         }
-        Err(Some(e)) => {
+        Err(No::Over) => {
+            STATS[6].fetch_add(1, Ordering::Relaxed);
+            None
+        }
+        Err(No::Host(e)) => {
             if STATS[5].fetch_add(1, Ordering::Relaxed) < 8 {
                 tracing::warn!(start = format_args!("{start:#x}"), len, error = %e, "title memory not opened in place: a copy instead");
             }
@@ -168,9 +241,188 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     }
 }
 
-/// Where a window of view memory lies in the card view's heaps: the heap
-/// (`lo..hi`, section offsets), the buffer in it (`at` and `bytes`) and the
-/// window's bias in the buffer (see [`card_span`]).
+/// Why title memory is not placed; each reason has its count in [`STATS`].
+enum No {
+    /// Not in place by the rules: a copy instead.
+    Turned,
+    /// Over `VICTORY_INPLACE_MB`.
+    Over,
+    /// The host refused.
+    Host(windows::core::Error),
+}
+
+/// The card view's heaps are cut on this many bytes of a section, each
+/// opened when a window first needs it (see [`place_card`]). 64 MiB: an
+/// opening took 29.5 ms and pinned 64 MB (RX 6900 XT under Proton, patched
+/// libdrm; 0.46 ms per MB at every size from 64 MiB to 6 GiB). 256 MiB would
+/// stall the first use for 118 ms.
+const CHUNK: u64 = 64 << 20;
+
+/// The card view's heaps by section and span (`lo` and `hi`, section
+/// offsets). Each opening pins its pages in the PC's memory, so a heap is
+/// opened once and kept with its section.
+static HEAPS: Mutex<BTreeMap<(usize, u64, u64), ID3D12Heap>> = Mutex::new(BTreeMap::new());
+
+/// Whether the driver's import of a section's view aliases the title's bytes
+/// on this device. When the kernel refuses to pin the view's shared pages
+/// (`ANONONLY` in libdrm), vkd3d-proton imports a copy and logs it (`Failed
+/// to import host memory`), and the GPU reads other bytes with no error. So
+/// a card view is placed only after a canary has aliased both ways: a
+/// private section of two pages, made as the title's are, its view opened
+/// as a part, a buffer placed over it. Decided once, on the first placement.
+fn card_imports_alias(device: &ID3D12Device) -> bool {
+    static DECIDED: Mutex<Option<bool>> = Mutex::new(None);
+    let mut decided = DECIDED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(alias) = *decided {
+        return alias;
+    }
+    let alias = canary(device).unwrap_or(false);
+    tracing::info!(
+        target: "victory_gpu::host",
+        alias,
+        "card views: the driver's import of a section view {}",
+        if alias { "aliases the title's bytes: view memory is placed" } else { "copies instead: view memory is refused" }
+    );
+    *decided = Some(alias);
+    alias
+}
+
+/// [`card_imports_alias`]'s check; `None` if one of its steps failed.
+fn canary(device: &ID3D12Device) -> Option<bool> {
+    const BYTES: usize = 2 * K64;
+    let mut rig = Rig::new(device).ok()?;
+    // SAFETY: a section and two views of it, made here; every address used
+    // lies inside them, and the heap and buffer go before the views do.
+    unsafe {
+        let invalid = windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        let section = mem::CreateFileMappingW(invalid, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_COMMIT, 0, BYTES as u32, std::ptr::null());
+        if section.is_null() {
+            return None;
+        }
+        let card = mem::MapViewOfFile(section, mem::FILE_MAP_WRITE, 0, 0, 0);
+        let title = mem::MapViewOfFile(section, mem::FILE_MAP_WRITE, 0, 0, 0);
+        let verdict = if card.Value.is_null() || title.Value.is_null() {
+            None
+        } else {
+            let title_bytes = title.Value.cast::<u8>();
+            open(device, From::Part(card.Value as usize, BYTES)).ok().and_then(|heap| {
+                let buffer = place(device, &heap, 0, BYTES as u64).ok()?;
+                fill(title_bytes, BYTES, 0x5c);
+                let cpu_to_gpu = rig.fetch(&buffer, 0, BYTES).is_ok_and(|got| same(title_bytes, &got));
+                let new: Vec<u8> = (0..BYTES).map(|i| (i as u8) ^ 0xa3).collect();
+                let gpu_to_cpu = rig.store(&buffer, 0, &new).is_ok() && same(title_bytes, &new);
+                Some(cpu_to_gpu && gpu_to_cpu)
+            })
+        };
+        mem::UnmapViewOfFile(title);
+        mem::UnmapViewOfFile(card);
+        windows_sys::Win32::Foundation::CloseHandle(section);
+        verdict
+    }
+}
+
+/// Title memory that is one run of `section` from `offset` on, placed over
+/// our card view of the section (level 3). The view maps the whole section
+/// once and keeps it: a heap opened on it pins its pages, and the title's
+/// own views of the section, and their unmapping, do not touch it. Heaps
+/// are cut on [`CHUNK`] bytes of the section and opened when a window first
+/// needs one, so a window costs one placed buffer once its heap stands. (A
+/// heap over the whole section would stall its first use for 3.9 s and pin
+/// 6.1 GB at once; a heap per window pays the import again for every window,
+/// 0.46 ms per MB each time.)
+fn place_card(device: &ID3D12Device, section: usize, offset: u64, len: u64) -> Result<Placed, No> {
+    let (section_bytes, committed) = views().sections.iter().find(|s| s.0 == section).map(|s| (s.1, s.2)).ok_or(No::Turned)?;
+    // Only a committed section is opened: a heap takes committed pages, and
+    // a section made reserved is turned down as before.
+    if !committed {
+        return Err(No::Turned);
+    }
+    // The driver must alias a view it imports, or the view is a copy here.
+    if !card_imports_alias(device) {
+        return Err(No::Turned);
+    }
+    let span = card_span(offset, len, section_bytes, CHUNK).ok_or(No::Turned)?;
+    let base = card_base(section, section_bytes).ok_or_else(|| No::Host(windows::core::Error::empty()))?;
+    let key = (section, span.lo, span.hi);
+    let mut heaps = HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let known = heaps.get(&key).cloned();
+    let heap = match known {
+        Some(heap) => heap,
+        None => {
+            let pinned: u64 = heaps.keys().map(|k| k.2 - k.1).sum();
+            if pinned + (span.hi - span.lo) > most() {
+                return Err(No::Over);
+            }
+            let started = std::time::Instant::now();
+            let heap = card_heap(device, base, span.lo, span.hi).map_err(No::Host)?;
+            opened(KIND_VIEW, span.hi - span.lo, started);
+            let ms = started.elapsed().as_secs_f64() * 1000.0;
+            tracing::info!(
+                target: "victory_gpu::host",
+                section = format_args!("{section:#x}"),
+                at = format_args!("{:#x}", span.lo),
+                mb = (span.hi - span.lo) >> 20,
+                ms = format_args!("{ms:.1}"),
+                pinned_mb = (pinned + span.hi - span.lo) >> 20,
+                "card view: a heap opened on title pages"
+            );
+            heaps.insert(key, heap.clone());
+            heap
+        }
+    };
+    drop(heaps);
+    let buffer = place(device, &heap, span.at, span.bytes).map_err(No::Host)?;
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() } + span.bias;
+    Ok(Placed { buffer, heap, gpu, bias: span.bias, view: true })
+}
+
+/// The address of our view of `section` (`section_bytes` long), mapped once
+/// and kept. `None` if the host refused the view.
+fn card_base(section: usize, section_bytes: u64) -> Option<usize> {
+    let mut own = OWN.lock().unwrap_or_else(|e| e.into_inner());
+    own.get_or_insert_with(Default::default).entry(section).or_insert_with(|| map_own(section, section_bytes)).as_ref().map(|own| own.base)
+}
+
+/// Opens bytes `[lo, hi)` of our view at `base` as a heap. The pages are
+/// committed first, which costs nothing where they are.
+fn card_heap(device: &ID3D12Device, base: usize, lo: u64, hi: u64) -> windows::core::Result<ID3D12Heap> {
+    let at = base + lo as usize;
+    let bytes = (hi - lo) as usize;
+    // SAFETY: a range of our own view.
+    let committed = unsafe { mem::VirtualAlloc(at as *const c_void, bytes, mem::MEM_COMMIT, mem::PAGE_READWRITE) };
+    if committed.is_null() {
+        return Err(windows::core::Error::from_thread());
+    }
+    open(device, From::Part(at, bytes))
+}
+
+/// Our view of the whole of `section` (`section_bytes` long): mapped once and
+/// kept, since a heap opened on it needs it to stand. `None` if the host
+/// refused the view.
+fn map_own(section: usize, section_bytes: u64) -> Option<Own> {
+    // SAFETY: a section handle the runtime gave us, alive as long as the
+    // title's views of it are; the view is ours and stays.
+    let at = unsafe { mem::MapViewOfFile(section as *mut c_void, mem::FILE_MAP_WRITE, 0, 0, 0) };
+    if at.Value.is_null() {
+        tracing::warn!(
+            section,
+            error = %std::io::Error::last_os_error(),
+            "no view of our own on a section of title pages: what shaders wrote goes back the old way, and view memory is not placed"
+        );
+        return None;
+    }
+    tracing::info!(section, mb = section_bytes >> 20, "a view of our own on a section of title pages (what shaders wrote, or the card view)");
+    Some(Own {
+        base: at.Value as usize,
+        bytes: section_bytes,
+        committed: vec![0; (section_bytes as usize).div_ceil(K64).div_ceil(64)],
+    })
+}
+
+/// Where a window of view memory lies in the card view's heaps (see
+/// [`card_span`]): the heap, as section offsets `lo..hi`; the buffer in it,
+/// `at` and `bytes`; and the window's bias in the buffer.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct CardSpan {
     pub(crate) lo: u64,
@@ -180,13 +432,21 @@ pub(crate) struct CardSpan {
     pub(crate) bias: u64,
 }
 
-/// The heap and the buffer of a window of `len` bytes at section offset
-/// `offset`. Stub: red first.
-pub(crate) fn card_span(_offset: u64, _len: u64, _section_bytes: u64, _chunk: u64) -> Option<CardSpan> {
-    None
+/// The heap and buffer of a window of `len` bytes at section offset
+/// `offset`, for heaps cut on `chunk` bytes of a section `section_bytes`
+/// long. The buffer is the window's 64 KiB pages, and the heap is the
+/// chunks they lie in, so a window across a cut has one heap on both
+/// sides. `None` if the window is empty or not inside the section.
+pub(crate) fn card_span(offset: u64, len: u64, section_bytes: u64, chunk: u64) -> Option<CardSpan> {
+    let end = offset.checked_add(len).filter(|&end| len > 0 && end <= section_bytes)?;
+    let first = offset & !(K64 as u64 - 1);
+    let pages_end = end.next_multiple_of(K64 as u64);
+    let lo = first / chunk * chunk;
+    let hi = pages_end.next_multiple_of(chunk).min(section_bytes);
+    Some(CardSpan { lo, hi, at: first - lo, bytes: pages_end - first, bias: offset - first })
 }
 
-/// Where a window is placed, by what the views say. Stub: red first.
+/// Where a window is placed, by what the views say.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Route {
     /// No view holds it: private memory, placed as before.
@@ -197,22 +457,55 @@ pub(crate) enum Route {
     Turned,
 }
 
-/// Stub: red first.
-pub(crate) fn route(_cover: Cover, _view: bool) -> Route {
-    Route::Turned
-}
-
-/// [`place_for`] on `device`, with `view` saying whether view memory may be
-/// placed. Stub: red first.
-pub(crate) fn place_on(_device: &ID3D12Device, _start: u64, _len: u64, _window: bool, _view: bool) -> Option<Placed> {
-    None
+/// The route of a window whose views say `cover`: view memory is placed
+/// only when the level allows it (`view`).
+pub(crate) fn route(cover: Cover, view: bool) -> Route {
+    match cover {
+        Cover::None => Route::Private,
+        Cover::Run(section, offset) if view => Route::Card { section, offset },
+        _ => Route::Turned,
+    }
 }
 
 /// What [`place_for`] gave is gone.
-pub(crate) fn gone(window: bool, bytes: u64) {
+pub(crate) fn gone(window: bool, bytes: u64, view: bool) {
     let at = if window { 0 } else { 2 };
     STATS[at].fetch_sub(1, Ordering::Relaxed);
     STATS[at + 1].fetch_sub(bytes, Ordering::Relaxed);
+    if view {
+        VIEW[at].fetch_sub(1, Ordering::Relaxed);
+        VIEW[at + 1].fetch_sub(bytes, Ordering::Relaxed);
+    }
+}
+
+/// Placed title memory let go: `view` of them view memory, `private` of
+/// them not, by a remap of their memory (`idle` false) or by idleness.
+pub(crate) fn let_go_placed(view: u64, private: u64, idle: bool) {
+    let event = if idle { IDLE } else { REMAP };
+    rate(KIND_VIEW, event, view);
+    rate(KIND_PRIVATE, event, private);
+}
+
+/// Shaders wrote through a placement at level 3: their list has run, and the
+/// pages they covered are told to the write watch (`wrote`).
+static NOTIFIED: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a placement tells the write watch what its shaders wrote (level 3).
+pub(crate) fn notifies() -> bool {
+    level() >= 3
+}
+
+/// Shaders wrote title memory `[from, to)` through a placement, and the list
+/// has run. Nothing is copied, the placement is the memory; the pages count
+/// as written in the write-watch journal, so every host copy that holds them
+/// refreshes them at its next refresh. A view's other title addresses count
+/// too, page by page.
+pub(crate) fn wrote(from: usize, to: usize) {
+    for page in from / K64..to.div_ceil(K64) {
+        let others: Vec<usize> = pages_of(page * K64).into_iter().map(|at| at / K64).collect();
+        crate::watch::wrote_own(page, &others);
+        NOTIFIED.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Title memory `[at, at + len)` is about to show something else, or the
@@ -232,13 +525,25 @@ pub fn title_memory_freeing(at: usize, len: usize) {
 /// The line of what is in place, as [`say`] logs it.
 fn line() -> String {
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
+    let v: Vec<u64> = VIEW.iter().map(|s| s.load(Ordering::Relaxed)).collect();
+    let (heaps, pinned) = {
+        let heaps = HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        (heaps.len(), heaps.keys().map(|k| k.2 - k.1).sum::<u64>())
+    };
     format!(
-        "title memory in place: {} windows {} MB, {} title buffers {} MB (no copy, no refresh, no copy-back); turned down: {} view memory or not private memory committed whole, \
+        "title memory in place: {} windows {} MB, {} title buffers {} MB (no copy, no refresh, no copy-back), of them view memory {} windows {} MB and {} title buffers {} MB; \
+         card view: {} heaps, {} MB pinned; turned down: {} (view memory not one run of a committed section at this level, or not private memory committed whole), \
          {} refused by the host, {} over VICTORY_INPLACE_MB; {} let go because their memory changed",
         s[0],
         s[1] >> 20,
         s[2],
         s[3] >> 20,
+        v[0],
+        v[1] >> 20,
+        v[2],
+        v[3] >> 20,
+        heaps,
+        pinned >> 20,
         s[4],
         s[5],
         s[6],
@@ -246,7 +551,26 @@ fn line() -> String {
     )
 }
 
-/// Every ten seconds while [`level`] is on, the line of what is in place.
+/// One kind's rates over `frames` frames, as [`say`] logs them.
+fn rates_text(c: &[u64; 6], frames: f64) -> String {
+    format!(
+        "placed {} ({:.2} a frame), let go by a remap {} ({:.2}), let go idle {} ({:.2}), heaps opened {} ({} MB in {:.1} ms)",
+        c[PLACED],
+        c[PLACED] as f64 / frames,
+        c[REMAP],
+        c[REMAP] as f64 / frames,
+        c[IDLE],
+        c[IDLE] as f64 / frames,
+        c[OPENS],
+        c[OPEN_BYTES] >> 20,
+        c[OPEN_US] as f64 / 1000.0
+    )
+}
+
+/// Every ten seconds while [`level`] is on: the line of what is in place
+/// (`victory_gpu::inplace`), and the rates since the last line on
+/// `victory_gpu::host`, the target the launcher logs at info, by kind of
+/// memory and per frame.
 fn say() {
     static LAST: AtomicU64 = AtomicU64::new(0);
     let now = crate::host::now_ms();
@@ -255,6 +579,18 @@ fn say() {
         return;
     }
     tracing::info!("{}", line());
+    let counts: [[u64; 6]; 2] = std::array::from_fn(|kind| std::array::from_fn(|event| RATES[kind][event].load(Ordering::Relaxed)));
+    let frames = crate::queue::frame_count();
+    let (before, frames_before) = std::mem::replace(&mut *SAID.lock().unwrap_or_else(|e| e.into_inner()), (counts, frames));
+    let delta: [[u64; 6]; 2] = std::array::from_fn(|kind| std::array::from_fn(|event| counts[kind][event] - before[kind][event]));
+    let (over, secs) = ((frames - frames_before).max(1) as f64, now.saturating_sub(last) as f64 / 1000.0);
+    tracing::info!(
+        target: "victory_gpu::host",
+        "in place over {over} frames in {secs:.1} s: view memory {}; private memory {}; pages written through placements, told to the write watch: {} since the start",
+        rates_text(&delta[KIND_VIEW], over),
+        rates_text(&delta[KIND_PRIVATE], over),
+        NOTIFIED.load(Ordering::Relaxed)
+    );
 }
 
 /// What a heap is opened on.
@@ -549,29 +885,7 @@ pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
     let view = own
         .get_or_insert_with(Default::default)
         .entry(section)
-        .or_insert_with(|| {
-            // SAFETY: a section handle the runtime gave us, alive as long
-            // as the title's views of it are; the view is ours and stays.
-            let at = unsafe { mem::MapViewOfFile(section as *mut c_void, mem::FILE_MAP_WRITE, 0, 0, 0) };
-            if at.Value.is_null() {
-                tracing::warn!(
-                    section,
-                    error = %std::io::Error::last_os_error(),
-                    "no view of our own on a section of title pages: what shaders wrote goes back the old way there"
-                );
-                return None;
-            }
-            tracing::info!(
-                section,
-                mb = section_bytes >> 20,
-                "a view of our own on a section of title pages, for what shaders wrote (VICTORY_BACK_OWN_VIEW=1)"
-            );
-            Some(Own {
-                base: at.Value as usize,
-                bytes: section_bytes,
-                committed: vec![0; (section_bytes as usize).div_ceil(K64).div_ceil(64)],
-            })
-        })
+        .or_insert_with(|| map_own(section, section_bytes))
         .as_mut()?;
     if offset + bytes.len() as u64 > view.bytes {
         return None;
@@ -1678,8 +1992,8 @@ pub(crate) mod tests {
             title_memory_view(a as usize, 4 * K64, section as usize, 0);
             title_memory_view(b as usize, 4 * K64, section as usize, 0);
             let (wa, wb) = (a.add(AT), b.add(AT));
-            let pa = place_on(&device, wa as u64, WINDOW as u64, true, true).expect("the window over a is not placed in place");
-            let pb = place_on(&device, wb as u64, WINDOW as u64, true, true).expect("the window over b is not placed in place");
+            let pa = place_on(&device, wa as u64, WINDOW as u64, true, 3).expect("the window over a is not placed in place");
+            let pb = place_on(&device, wb as u64, WINDOW as u64, true, 3).expect("the window over b is not placed in place");
             assert_eq!(pa.bias, AT as u64, "the window's bias in its buffer");
             // Before the remap: the title writes and the GPU reads through
             // both windows; the GPU writes and the title reads at both.
@@ -1700,7 +2014,7 @@ pub(crate) mod tests {
             // After the remap: the title writes pages 4..8 and the GPU reads
             // them through a window placed anew; the GPU's write shows at
             // `b`, and pages 0..4 keep what the GPU wrote there before.
-            let pb = place_on(&device, wb as u64, WINDOW as u64, true, true).expect("the remapped window is not placed in place");
+            let pb = place_on(&device, wb as u64, WINDOW as u64, true, 3).expect("the remapped window is not placed in place");
             fill(wb, WINDOW, 0x63);
             assert!(rig.fetch(&pb.buffer, pb.bias, WINDOW)? == bytes_of(WINDOW, 0x63), "b: the GPU reads the remapped pages");
             rig.store(&pb.buffer, pb.bias, &bytes_of(WINDOW, 0x84))?;
