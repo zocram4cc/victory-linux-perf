@@ -127,5 +127,10 @@ Repeated in a later batch (ab3, 4 more runs of journal + constants): frame 48.6 
 scripts\play.ps1 -Exe <exe> -More @{VICTORY_PORT_JOURNAL='1'; VICTORY_PORT_CONSTANTS='1'}
 ```
 
+Picture check (after a report on the PR of a black world with `PORT_CONSTANTS` alone under Wine
+11.22 / RADV / vkd3d-proton on an RX 7900 XT): one run each of base and journal + constants on
+this Windows build, frames saved in the world. With journal + constants the world is drawn as
+in base (frame 3000: the lit street with the credits; 3400: the car's interior) [fact]. Only this
+cutscene was looked at; the waterfront save, Wine and constants without journal were not.
 Not measured here: `VICTORY_PORT_CBV=1` (it changes translated shaders: needs its own translate
 and warm run), Series S with FidelityFX, the street-chase scene, longer sessions, other CPUs.
