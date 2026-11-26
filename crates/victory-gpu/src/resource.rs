@@ -2287,6 +2287,8 @@ impl HostTexture {
         let flags = unsafe { texture.GetDesc() }.Flags.0 as u32;
         HOST_TEXTURES[0].fetch_add(1, Relaxed);
         HOST_TEXTURES[1].fetch_add(bytes, Relaxed);
+        // Lists sent before must not find it in a slot they read by index.
+        crate::pool::unseen_any(&texture);
         HostTexture {
             texture,
             state: std::sync::atomic::AtomicU32::new(state),
@@ -2312,6 +2314,7 @@ impl HostTexture {
         HOST_TEXTURES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // SAFETY: a live texture.
         let flags = unsafe { texture.GetDesc() }.Flags.0 as u32;
+        crate::pool::unseen_any(&texture);
         HostTexture {
             texture,
             state: std::sync::atomic::AtomicU32::new(state),

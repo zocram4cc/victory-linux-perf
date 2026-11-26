@@ -355,6 +355,22 @@ static NEW_PENDING: std::sync::LazyLock<Mutex<std::collections::HashSet<(usize, 
 /// Slots held back by [`show_new_later`] since the start.
 pub(crate) static NEW_LATER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Slots of first uploads on the copy queue ([`HostHeap::texture_slot_show_ahead`])
+/// held past that upload until the drawing queue's submissions begun before
+/// their texture had finished, since the start (`VICTORY_PUBLISH_SAFE`).
+pub(crate) static AHEAD_HELD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The submission after which a slot shown once its texture's upload on
+/// the copy queue has run may change: under `safe` (Wine,
+/// [`crate::pool::publish_safe`]) the newest begun when its texture was made
+/// if one of those may still run (`begun`), else none (0: when the upload
+/// has run, as elsewhere). That upload's fence says nothing of the drawing
+/// queue, where lists sent before the texture existed may read the slot by
+/// index: the fork's own account of its device losses with the pool.
+fn ahead_after(safe: bool, begun: Option<u64>) -> u64 {
+    if safe { begun.unwrap_or(0) } else { 0 }
+}
+
 /// The submissions begun when the host texture `view` shows was made, if
 /// one begun before that may still run ([`crate::pool::begun_before`]). The
 /// host texture is made here if it is not yet, as [`make`] would.
@@ -2353,8 +2369,14 @@ impl HostHeap {
         }
         let (heap, key) = (std::ptr::from_ref(self) as usize, record_key(handle));
         let late = Some(crate::frame::current());
+        // The copy queue's run says nothing of the drawing queue's: lists
+        // sent there before the texture was made may still read this slot.
+        let safe = crate::pool::publish_safe() && show_new_later();
+        let begun = if safe { super::view(handle).as_ref().and_then(begun_before) } else { None };
+        let after = ahead_after(safe, begun);
+        AHEAD_HELD.fetch_add(u64::from(after != 0), std::sync::atomic::Ordering::Relaxed);
         job.then(move || {
-            let flip = Flip { after: 0, heap, index, handle, key, late };
+            let flip = Flip { after, heap, index, handle, key, late };
             FLIPS.lock().unwrap_or_else(|e| e.into_inner()).push(flip);
         });
     }
@@ -4893,6 +4915,16 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A first upload's slot waits for the drawing queue's lists begun
+    /// before its texture under Wine; elsewhere, or with none of those
+    /// left, it changes when the upload has run.
+    #[test]
+    fn first_uploads_wait_for_lists_sent_before_their_texture() {
+        assert_eq!(ahead_after(true, Some(7)), 7);
+        assert_eq!(ahead_after(true, None), 0);
+        assert_eq!(ahead_after(false, Some(7)), 0);
+    }
 
     /// A view of a host copy that begins at a later level shows the same
     /// levels of it.

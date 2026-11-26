@@ -8880,6 +8880,14 @@ impl Meter {
                     u8::from(crate::descriptor::host::show_new_later()),
                     crate::descriptor::host::NEW_LATER.load(Ordering::Relaxed)
                 );
+                if crate::pool::publish_safe() {
+                    tracing::info!(
+                        "every host texture new to lists sent before it, not only pooled ones; first uploads on the copy queue held for those lists (VICTORY_PUBLISH_SAFE), since the start: {} textures, {} held; slots switched once those lists had run: {}",
+                        crate::pool::UNSEEN_ANY.load(Ordering::Relaxed),
+                        crate::descriptor::host::AHEAD_HELD.load(Ordering::Relaxed),
+                        crate::descriptor::host::FLIPPED[0].load(Ordering::Relaxed)
+                    );
+                }
                 if crate::resource::held_only() {
                     let [copies, bytes, grown, whole] = [0, 1, 2, 3].map(|i| crate::resource::HELD[i].load(Ordering::Relaxed));
                     let [flipped, missed] = [0, 1].map(|i| crate::descriptor::host::FLIPPED[i].load(Ordering::Relaxed));
