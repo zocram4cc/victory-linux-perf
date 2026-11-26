@@ -109,10 +109,14 @@ mod upload;
 #[cfg(windows)]
 mod watch;
 #[cfg(windows)]
+mod wcskip; // VICTORY_SKIP_WC_BACK (on), VICTORY_SKIP_WC_MIN_KB=1024
+#[cfg(windows)]
 mod texback;
 
 #[cfg(windows)]
 pub use host::on_failure;
+#[cfg(windows)]
+pub use wcskip::title_memory_reserved;
 
 /// Whether `switch` is on now, if it is one of those `VICTORY_AB` turns on and
 /// off while the title runs (`ab`).

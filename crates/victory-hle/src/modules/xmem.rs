@@ -186,6 +186,10 @@ pub extern "system" fn XMemVirtualAlloc(
     if !at.is_null() && constrained && kind & MEM_COMMIT == 0 && flags & ADDRESS_32BIT != 0 {
         LOW_RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner()).push((at as usize, size));
     }
+    // What the title asked for, for VICTORY_SKIP_WC_BACK (write-combining reservations).
+    if base.is_null() {
+        victory_gpu::title_memory_reserved(at as usize, size, asked);
+    }
     note_protection(asked, kind, flags, at as usize, size);
     at
 }
