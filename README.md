@@ -23,6 +23,8 @@ You need rustup, clang, lld and llvm (`sudo dnf install rustup clang lld llvm` o
 
 **For speed, a patched wineserver.** The title maps memory views by the hundred thousand, and Wine's wineserver keeps each process's views in a list it walks on every map. [GE-Proton PR #1016](https://github.com/GloriousEggroll/proton-ge-custom/pull/1016) keeps them in a tree instead. Built into a copy of GE-Proton11-14 at `~/.local/share/victory/proton/GE-Proton11-14-viewtree` (GE's own patch set, then that patch, then `make server/wineserver`, with the copy's `files/bin/wineserver` replaced), it took the opening cutscenes on an RTX 5080 from 7.7 to 22 frames a second on average, and the long stalls went away. The launcher uses that copy when it is there; `--stock-wineserver` runs Proton as shipped.
 
+**The first launch translates the title's shaders** before the game starts (about 70 s; a few seconds after that), and makes the pipelines earlier runs drew. Without it a first run shows a black screen for minutes while they are made on demand. It runs again by itself whenever the build or a `VICTORY_*` switch changes; `VICTORY_PREBUILD=0` skips it.
+
 Cross-compile with [cargo-xwin](https://github.com/rust-cross/cargo-xwin); it downloads Microsoft's CRT and Windows SDK, whose licence you accept with `XWIN_ACCEPT_LICENSE=1`:
 
 ```sh

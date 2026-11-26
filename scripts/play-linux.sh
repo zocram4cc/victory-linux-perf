@@ -223,6 +223,41 @@ if [[ -n "$bench" ]]; then
   export VICTORY_KEYS="$keys"
 fi
 
+# The title holds 19-21 GB in the world on a 30 GB PC; with less than that
+# free it swaps, whatever else is set. Other programs held 12 GB and 9 GB of
+# swap at the start of the 2026-11-26 runs.
+avail_gb=$(awk '/^MemAvailable:/ {printf "%d", $2 / 1048576}' /proc/meminfo)
+if (( avail_gb < 20 )); then
+  echo "note: ${avail_gb} GB of RAM is free; the title wants about 20 GB in the world, so closing other programs first cuts its swapping and stutter." >&2
+fi
+
+# The title's shaders translated, and the pipelines earlier runs drew made,
+# before the first frame: once per build and set of VICTORY_* switches. On a
+# cold cache a first run otherwise drew a black screen for minutes while
+# they were made on demand. About 70 s for the whole set the first time
+# (and after a translator change), a few seconds when they are cached.
+# VICTORY_PREBUILD=0 skips it; the log is in the cache folder.
+if [[ "${VICTORY_PREBUILD:-1}" != 0 ]]; then
+  switches=$(env | grep -E '^VICTORY_' | grep -vE '^VICTORY_(KEYS|FRAMES_CSV|RUNS_DIR|PREBUILD)=' | sort)
+  stamp="$(sha256sum "$exe" | cut -c1-16) $(printf '%s' "$switches" | sha256sum | cut -c1-16)"
+  stamp_file="$cache/prebuilt"
+  if [[ "$(cat "$stamp_file" 2>/dev/null)" != "$stamp" ]]; then
+    log="$cache/prebuild.log"
+    echo "New build or switches: translating the title's shaders first (about 70 s the first time; log: $log)..." >&2
+    if umu-run "$win_exe" shaders "$(winpath "$game/shaders.rpf")" > "$log" 2>&1; then
+      sed 's/\x1b\[[0-9;]*m//g' "$log" | grep -E 'shaders in the cache, .*translate' >&2 || true
+      if [[ -s "$cache/pipelines/early-pipelines.txt" ]]; then
+        echo "making the pipelines earlier runs drew..." >&2
+        VICTORY_LOG=warn umu-run "$win_exe" warm --used >> "$log" 2>&1 || true
+        sed 's/\x1b\[[0-9;]*m//g' "$log" | grep -E ' made in ' | tail -1 >&2 || true
+      fi
+      printf '%s\n' "$stamp" > "$stamp_file"
+    else
+      echo "warning: translating the shaders failed (see $log); the run translates them as it goes" >&2
+    fi
+  fi
+fi
+
 # The run's folder.
 runs="${VICTORY_RUNS_DIR:-$HOME/.local/share/victory/runs}"
 run="$runs/$(date +%Y%m%d-%H%M%S)${bench:+-bench-$bench}"
@@ -246,11 +281,20 @@ python3 -I "$repo/scripts/victory-report.py" --write-run-json "$run" --start \
 # script only, which then asks the title to end.
 echo "run folder: $run"
 setsid umu-run "$win_exe" run "$(winpath "$game/game_scarlett_master.exe")" --console series-s --execute \
-  > >(python3 -I -u -c 'import re, sys, time
+  > >(python3 -I -u -c 'import re, signal, sys, time
+# Runs until the title closes its output: Ctrl-C and a closed terminal are
+# for the script above, which stops the title.
+signal.signal(signal.SIGINT, signal.SIG_IGN)
+signal.signal(signal.SIGHUP, signal.SIG_IGN)
 colour = re.compile(r"\x1b\[[0-9;]*m")
+screen = True
 with open(sys.argv[1], "a", buffering=1, errors="replace") as log:
     for line in sys.stdin:
-        sys.stdout.write(line)
+        if screen:
+            try:
+                sys.stdout.write(line)
+            except OSError:
+                screen = False  # the terminal is gone: the log goes on
         log.write(time.strftime("%H:%M:%S ") + colour.sub("", line))' "$run/victory.log") 2>&1 &
 title=$!
 "$repo/scripts/victory-sampler.sh" "$run" $$ "$title" &
@@ -267,7 +311,9 @@ stop() {
   wine=$("$repo/scripts/victory-title-pid.sh" "$title") && kill -TERM "$wine" 2>/dev/null || true
   kill -TERM -- -"$title" 2>/dev/null || true
 }
-trap stop INT TERM
+# A closed terminal (SIGHUP) stops the title as Ctrl-C does, and the run's
+# end is still written.
+trap stop INT TERM HUP
 if (( bench_secs > 0 )); then
   ( sleep "$bench_secs"; kill -TERM $$ 2>/dev/null ) &
   timer=$!
@@ -277,7 +323,7 @@ code=0
 while kill -0 "$title" 2>/dev/null; do
   wait "$title" && code=0 || code=$?
 done
-trap - INT TERM
+trap - INT TERM HUP
 [[ -n "${timer:-}" ]] && kill "$timer" 2>/dev/null || true
 kill "$sampler" 2>/dev/null || true
 wait 2>/dev/null || true
