@@ -85,6 +85,16 @@ fn build() -> [u8; 32] {
         }
         // And which clean-up passes ran over the translated code.
         bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
+        // And whether loops get one latch: under Wine (`VICTORY_ONE_LATCH`:
+        // `0` never, `1` on any host). vkd3d-proton's DXIL converter recursed
+        // without end on the loops with two back edges of six compute
+        // programs (559d9f0184e15fe3, a1b20bc47e3c9597, e8c962358d862e3f,
+        // 17829ac71aab4e8d, 32ed072b9f845048, afeea48bbb9913ad): their
+        // pipelines stayed "being made" for good, each holding a worker, and
+        // every world frame spent its whole wait budget on them. DXC writes
+        // one latch a loop and Windows drivers take both forms, so nothing
+        // changes for a Windows host.
+        bytes.push(u8::from(victory_shader::emit::one_latch()));
         bytes
     });
     let mut hash = blake3::Hasher::new();

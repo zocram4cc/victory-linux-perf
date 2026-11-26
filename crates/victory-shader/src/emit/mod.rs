@@ -192,6 +192,37 @@ pub fn group_sync() -> u8 {
     })
 }
 
+/// Whether every loop gets one latch (`bitcode::Module::one_latch`): under
+/// Wine (`VICTORY_ONE_LATCH`: `0` never, `1` on any host). vkd3d-proton's
+/// DXIL converter recurses without end on loops with several back edges,
+/// which DXC never writes; Windows drivers take both forms, so nothing
+/// changes for a Windows host. Part of the translation: the shader cache
+/// keys on it (`victory-gpu`'s does).
+pub fn one_latch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var_os("VICTORY_ONE_LATCH") {
+        Some(v) => v != "0",
+        None => on_wine(),
+    })
+}
+
+/// Whether we run under Wine (its ntdll exports `wine_get_version`); the
+/// same probe as `victory_gpu::wine::on_wine`, which this crate cannot use.
+#[cfg(windows)]
+fn on_wine() -> bool {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    // SAFETY: plain lookups in ntdll, always loaded.
+    unsafe {
+        let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+        !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+    }
+}
+
+#[cfg(not(windows))]
+fn on_wine() -> bool {
+    false
+}
+
 /// Whether buffer atomics of the ray-tracing structure builder stand between
 /// two fences (`VICTORY_BVH_FENCES=0`: they do not). Part of the
 /// translation: the shader cache keys on it.
