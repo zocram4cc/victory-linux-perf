@@ -876,8 +876,11 @@ const STAMPS: u32 = 4096;
 const CENSUS_STAMPS: u32 = 8192;
 /// G.1 keys for work that is not a title pipeline's.
 pub(crate) const GPU_KEY_START: u64 = 1;
-pub(crate) const GPU_KEY_COMPARE: u64 = 2;
 pub(crate) const GPU_KEY_INDIRECT: u64 = 3;
+pub(crate) const GPU_KEY_BARRIER: u64 = 4;
+pub(crate) const GPU_KEY_BUFFER_BARRIER: u64 = 5;
+pub(crate) const GPU_KEY_GROUPS: u64 = 6;
+pub(crate) const GPU_KEY_STATE: u64 = 7;
 
 /// G.1 (`VICTORY_GPU_CENSUS=1`): GPU time per draw or dispatch, summed by
 /// title pipeline, on the frame line. Off by default.
@@ -905,12 +908,22 @@ fn gpu_census_line(frames: f64) {
         .take(20)
         .map(|(k, (us, n))| format!("{k:#x} {:.1} ms ({:.0}x)", *us as f64 / 1e3 / frames, *n as f64 / frames))
         .collect();
+    let count = |k: u64| census.get(&k).map_or(0.0, |v| v.1 as f64 / frames);
     tracing::info!(
-        "GPU census per frame (G.1): {:.1} ms timed; before the first draw of lists {:.1}, our compares {:.1}, our indirect passes {:.1}; {} title pipelines; costliest: {}",
+        "GPU census per frame (G.1): {:.1} ms timed; our indirect clamps {:.1} ms ({:.0}x); after the title's barriers {:.1} ms ({:.0}x), \
+         after buffer barriers made global {:.1} ms ({:.0}x), after waits for groups (global) {:.1} ms ({:.0}x), after our state transitions {:.1} ms ({:.0}x); \
+         {} title pipelines; costliest: {}",
         total as f64 / 1e3 / frames,
-        own(GPU_KEY_START),
-        own(GPU_KEY_COMPARE),
         own(GPU_KEY_INDIRECT),
+        count(GPU_KEY_INDIRECT),
+        own(GPU_KEY_BARRIER),
+        count(GPU_KEY_BARRIER),
+        own(GPU_KEY_BUFFER_BARRIER),
+        count(GPU_KEY_BUFFER_BARRIER),
+        own(GPU_KEY_GROUPS),
+        count(GPU_KEY_GROUPS),
+        own(GPU_KEY_STATE),
+        count(GPU_KEY_STATE),
         top.len(),
         list.join(", ")
     );
