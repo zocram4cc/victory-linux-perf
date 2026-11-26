@@ -36,7 +36,9 @@ try() { # LABEL FILE
     scripts/ktrials.sh -n 1 -l "$1" -s 15 VICTORY_NATIVE_COMPUTE=1 "VICTORY_NATIVE_COMPUTE_ONLY=$(winpath "$2")" >/dev/null 2>&1
     measure "$1"
 }
-ls -d "$DUMP"/218_* | sed 's|.*/218_||' | sort >"$WORK/all.txt"
+# K_ALL=<file>: the candidates (e.g. the programs that translate, from
+# `p4_fspx --ok`); default: every program in the dump.
+if [[ -n ${K_ALL:-} ]]; then sort "$K_ALL" >"$WORK/all.txt"; else ls -d "$DUMP"/218_* | sed 's|.*/218_||' | sort >"$WORK/all.txt"; fi
 for ((round = 1; round <= rounds; round++)); do
     grep -vxFf "$BAD" "$WORK/all.txt" >"$WORK/cand.txt" || true
     n=$(wc -l <"$WORK/cand.txt")

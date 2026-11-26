@@ -56,6 +56,10 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let dir = std::path::PathBuf::from(args.get(1).expect("DUMP_DIR"));
     let verbose = args.iter().any(|a| a == "-v");
+    // `--ok FILE`: the code addresses (directory names after `218_`) of the
+    // programs that translate, one a line.
+    let ok_file = args.iter().position(|a| a == "--ok").and_then(|i| args.get(i + 1)).cloned();
+    let mut ok_list = Vec::new();
     let mut errors: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let (mut ok, mut total) = (0, 0);
     let mut dirs: Vec<_> = std::fs::read_dir(&dir).expect("dump dir").flatten().map(|e| e.path()).collect();
@@ -76,7 +80,10 @@ fn main() {
             .and_then(|c| victory_shader::native_programs(c.part(victory_shader::FourCC::ACCC).unwrap().data).map_err(|e| format!("fspx: {e}")));
         let result = parsed.and_then(|_| victory_shader::emit::translate(&c).map(|_| ()).map_err(|e| format!("translate: {e}")));
         match result {
-            Ok(()) => ok += 1,
+            Ok(()) => {
+                ok += 1;
+                ok_list.push(name.trim_start_matches("218_").to_owned());
+            }
             Err(e) => {
                 // One group per kind of error: without the code offset.
                 let e = match (e.find(" code at "), e.rfind(": ")) {
@@ -88,6 +95,9 @@ fn main() {
         }
     }
     println!("{ok} of {total} translate");
+    if let Some(f) = ok_file {
+        std::fs::write(f, ok_list.join("\n") + "\n").expect("write --ok file");
+    }
     let mut by: Vec<_> = errors.into_iter().collect();
     by.sort_by_key(|(_, v)| std::cmp::Reverse(v.len()));
     for (e, v) in by {
