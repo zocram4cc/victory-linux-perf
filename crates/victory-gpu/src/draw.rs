@@ -950,7 +950,7 @@ static NULL_ROOT_SEEN: std::sync::Mutex<Option<std::collections::HashSet<(String
 /// through `sets::Sets`: zeros the list holds already are not given again.
 /// True when the list holds the zeros there after the call; false, with
 /// nothing bound, with the switch off or without the zeros.
-fn bind_null_root(&mut self, l: &ID3D12GraphicsCommandList, param: u32, compute: bool, srv: bool, pipeline: &str, why: NullRoot) -> bool {
+fn bind_null_root(sets: &mut sets::Sets, l: &ID3D12GraphicsCommandList, param: u32, compute: bool, srv: bool, pipeline: &str, why: NullRoot) -> bool {
     if !null_roots_on() {
         return false;
     }
@@ -966,7 +966,7 @@ fn bind_null_root(&mut self, l: &ID3D12GraphicsCommandList, param: u32, compute:
         }
     }
     let bound = if srv { Bound::Srv(gpu) } else { Bound::Cbv(gpu) };
-    if self.sets.root(compute, param, bound) {
+    if sets.root(compute, param, bound) {
         // SAFETY: an open list; a live buffer of ours.
         unsafe {
             match (compute, srv) {
@@ -1908,7 +1908,7 @@ impl State {
                             }
                             None => {
                                 once!("a shader picks buffers from a view heap that is not set");
-                                self.bind_null_root(l, param, compute, true, &p.name, NullRoot::Ours);
+                                bind_null_root(&mut self.sets, l, param, compute, true, &p.name, NullRoot::Ours);
                             }
                         }
                         continue;
@@ -1922,7 +1922,7 @@ impl State {
                             return false;
                         }
                         if !tabled {
-                            self.bind_null_root(l, param, compute, srv, &p.name, NullRoot::NeverSet);
+                            bind_null_root(&mut self.sets, l, param, compute, srv, &p.name, NullRoot::NeverSet);
                         }
                         continue;
                     };
@@ -1939,7 +1939,7 @@ impl State {
                         continue;
                     }
                     let Some(mut gpu) = root_view(list, address, srv) else {
-                        self.bind_null_root(l, param, compute, srv, &p.name, NullRoot::NoCopy);
+                        bind_null_root(&mut self.sets, l, param, compute, srv, &p.name, NullRoot::NoCopy);
                         continue;
                     };
                     if biased {
@@ -1952,7 +1952,7 @@ impl State {
                         ));
                     }
                     // (Bound as before if the zeros are not there.)
-                    if !root_address_ok(gpu) && self.bind_null_root(l, param, compute, srv, &p.name, NullRoot::NearZero) {
+                    if !root_address_ok(gpu) && bind_null_root(&mut self.sets, l, param, compute, srv, &p.name, NullRoot::NearZero) {
                         continue;
                     }
                     let bound = if srv { Bound::Srv(gpu) } else { Bound::Cbv(gpu) };
