@@ -341,6 +341,14 @@ pub(crate) fn batch_on() -> bool {
     })
 }
 
+/// `VICTORY_INDIRECT_BATCH_CARDS=0` leaves records in card copies to the
+/// clamp before their draw. On by default with the batch: a card copy is
+/// brought up to date by lists that run before the submission's lists.
+pub(crate) fn batch_cards() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_BATCH_CARDS").is_none_or(|v| v != "0"))
+}
+
 /// A clamp left for the list's prelude ([`batch_on`]).
 #[derive(Clone)]
 pub(crate) struct Batched {

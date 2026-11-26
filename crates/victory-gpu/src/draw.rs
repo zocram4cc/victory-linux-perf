@@ -2567,7 +2567,7 @@ impl State {
                 2
             } else if max != 1 || count.is_some() {
                 3
-            } else if args.carded() {
+            } else if args.carded() && !crate::indirect::batch_cards() {
                 4
             } else if list.gpu_writes(arguments as usize, len as usize) {
                 5
