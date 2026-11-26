@@ -285,7 +285,12 @@ static BUILDER: Mutex<Builder> = Mutex::new(Builder {
     rests: 0,
 });
 
-/// Whether `shaders` are a pipeline of the structure builder.
+/// Whether `shaders` are a pipeline of the structure builder: one of the
+/// compute programs of `XboxBvhBuilder.dll`, all of which spill their user
+/// data. The title's own programs that spill too are not the builder (its
+/// facial animation among them: with the spill test alone, faces did not
+/// move while the builder was off, 2026-11-26) and keep running: in build
+/// 1.0.2.1 the builder's programs are the ones in [`BUILDER_1_0_2_1`].
 #[cfg(windows)]
 fn of_builder(shaders: &[Arc<Shader>]) -> bool {
     use victory_shader::{Container, FourCC};
@@ -296,10 +301,42 @@ fn of_builder(shaders: &[Arc<Shader>]) -> bool {
     let Ok(c) = Container::parse(&shader.container) else {
         return false;
     };
-    c.part(FourCC::DXIL)
+    let spilled = c
+        .part(FourCC::DXIL)
         .and_then(|part| victory_shader::native_programs(part.data).ok())
-        .is_some_and(|programs| programs.iter().any(victory_shader::spill::is_spilled))
+        .is_some_and(|programs| programs.iter().any(victory_shader::spill::is_spilled));
+    if !spilled {
+        return false;
+    }
+    if BUILDER_1_0_2_1.contains(&shader.hash.as_str()) {
+        return true;
+    }
+    static SAID: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+    if SAID.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(shader.hash.clone()) {
+        tracing::info!(hash = %shader.hash, "a compute program spills its user data but is not the ray-tracing builder's: it runs while the builder is off");
+    }
+    false
 }
+
+/// The compute programs of `XboxBvhBuilder.dll` in build 1.0.2.1: the first
+/// 16 hex digits of the BLAKE3 of each shader container ([`Shader`]'s
+/// hash), all 52 of the DLL's containers (`victory shader-info` on the DLL).
+#[cfg(windows)]
+const BUILDER_1_0_2_1: [&str; 52] = [
+    "0dd520d405264736", "0ddab4b63b1394e0", "14394a322f6dd5c2", "162216b9cfd91aaf",
+    "190fbf0ebe040169", "198f6dfd2b81bcea", "28918b7150a7aad5", "35e51bb27a463294",
+    "39321a95223001ed", "3b90165a77d95cdf", "3cea4534bbc15632", "3df629ffc3d0a2a6",
+    "4b5aedc0e96b0770", "4ddd6f9702fab2a7", "4f3227f524514cd8", "5062bc7a48e842f8",
+    "5279ae36796c31fc", "5326ef52f27f5a41", "54b3e5465215e92e", "5552dac6a2b7a1fd",
+    "5c09eb42b7a3c362", "5e19e7c728d956df", "5e68767498c57eb6", "6b7cb8a6572efff1",
+    "6f6a359d1166bb27", "77360df21e12ea43", "7bb5b1b91d283a28", "894c91654720595f",
+    "8bb4592836034757", "9205d2655bf8cc88", "93be497edd442293", "9fc111d3be79364f",
+    "a197f50cd8481541", "a63e2dfc25ba3155", "b0fc38d36f25b863", "bb55c842c391589f",
+    "be6862bb8ce8d9e9", "c42a31951201f9a0", "c85822de2e41cfaa", "caa78b8ca62bc3d6",
+    "cb9647e77864cb3a", "ce2fc10ab6471ab8", "db36ed4ffef76056", "e63d22c4def9ba6a",
+    "e95858837a9aa22d", "eaaf3a4f6c87b080", "eb89347fa4f5dc34", "f28a33a89eaa2caa",
+    "f6e47efa50226beb", "f6eb6498409ca974", "f94e5d8bf4e1cf05", "ffd93c8a029ff016",
+];
 
 /// `VICTORY_BVH_QUARANTINE=1`: what the structure builder's stages store
 /// stays in the host's copies and is not copied back into title memory. A
