@@ -4,6 +4,12 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**S.7 traced: a root view left at address 0; the 1.3 read census built**
+- The only SQC fault on record (kernel log, 25 Nov 23:30:38; prologue run `royale/logs/20261125-232915-run.log`): *SQC (data) reading address 0x0*, `PERMISSION_FAULTS 0x3`. The SQC is the scalar cache: constant buffer loads. 100 ms before, the sweep had let go of 252 texture copies and a texture staging buffer.
+- `draw.rs`: a root CBV or SRV whose title address does not resolve to a host copy (`root_view` returns `None`, or the title never set the root) was **skipped with `continue`**. vkd3d then leaves the root descriptor at 0, and the shader's constant loads read address 0: that fault exactly.
+- **Fix (`9e3e8e5`):** such a root view is bound to 64 KiB of zeros in the list's scratch; the first 8 are logged with their address, and the frame line keeps the count (`root views bound to zeros so far`). If the count shows up in prologue runs, the next question is why the address had no host copy (a window the sweep let go?).
+- **1.3 step 1 (`5395625`), `VICTORY_BACK_CENSUS=1`, off:** `census.rs`. `write_mapped` (all of its callers are copy-backs) notes pages; after the bottom-of-pipe writes they get `PAGE_GUARD` (private read-write pages only); at the next submission's start the guards left are lifted, before we read title memory. A guard fault from the title's code counts as touched (read or write first). Faults at fastcopy's copy instruction (it resumes the copy) or in our own image are counted apart, as the layer's own. Kernel reads of a guarded page would fail, so the census needs the fast reads (on by default) and is off with the relay.
+
 **The open world is a serial chain; the order of the roadmap holds**
 - The layer's card clock, open world outside: **the card has nothing of ours queued 212-284 ms a frame (busy 48-57 %), 173-228 ms of that while our submitting thread is working**; the thread then waits for the card ~265 ms. CPU and card never overlap. Overlapped, the frame would fall towards ~270 ms (phase 3, ~1.8×).
 - Within our thread's work: **408-437 MB a frame snapshotted on the CPU** to find what shaders wrote in title buffers' copies (copy-back, piece B), plus 72 ms / 46 MB of copy-back.
