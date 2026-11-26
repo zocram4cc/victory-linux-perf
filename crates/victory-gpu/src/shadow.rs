@@ -2857,6 +2857,10 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     n
 }
 
+/// M.1: of the windows under written buffer copies, those used in the
+/// last two frames, and those whose asks reached the overlapping bytes.
+pub(crate) static WINDOW_USE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 /// 1.3 (`VICTORY_BACK_OVERLAP=1`): the other host copies whose title
 /// range overlaps `[at, end)`, besides `own`: buffer copies, windows, and
 /// the bytes of overlap. Aliases (other addresses of the same pages) are
@@ -2882,6 +2886,15 @@ pub(crate) fn overlapping_by_kind(at: u64, end: u64, own: &Arc<Shadow>) -> (u64,
         if key.0 + key.1 > at && !Arc::ptr_eq(shadow, own) {
             windows += 1;
             bytes += (key.0 + key.1).min(end) - key.0.max(at);
+            // M.1: is the window in use, and do its asks reach the overlap?
+            let frame = crate::frame::current();
+            if (shadow.used.load(Ordering::Relaxed) >> 32) + 2 >= frame {
+                WINDOW_USE[0].fetch_add(1, Ordering::Relaxed);
+            }
+            let (lo, hi) = (shadow.asked[0].load(Ordering::Relaxed), shadow.asked[1].load(Ordering::Relaxed));
+            if lo < end && hi > at {
+                WINDOW_USE[1].fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
     (copies, windows, bytes)

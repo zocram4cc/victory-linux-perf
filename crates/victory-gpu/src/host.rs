@@ -5906,9 +5906,12 @@ impl Meter {
             if ranges > 0.0 {
                 tracing::info!(
                     "copy-back ranges per frame (1.3 overlap): {ranges:.0} declared ({:.1} MB), {overlapped:.0} overlapped by {copies:.0} other host copies ({:.1} MB of overlap); \
-                     written buffer copy over another buffer copy {bb:.0}, over a window {bw:.0}; written window over a buffer copy {wb:.0}, over another window {ww:.0}",
+                     written buffer copy over another buffer copy {bb:.0}, over a window {bw:.0}; written window over a buffer copy {wb:.0}, over another window {ww:.0}; \
+                     of the windows met, {:.0} used in the last two frames, {:.0} asked for in the overlapping bytes",
                     bytes / 1e6,
-                    over / 1e6
+                    over / 1e6,
+                    crate::shadow::WINDOW_USE[0].swap(0, Ordering::Relaxed) as f64 / frames,
+                    crate::shadow::WINDOW_USE[1].swap(0, Ordering::Relaxed) as f64 / frames,
                 );
             }
         }
