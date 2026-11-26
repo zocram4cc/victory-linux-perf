@@ -461,6 +461,11 @@ fn library() -> Option<&'static Library> {
 /// The library in `blob`, or an empty one if the host rejects the blob (an
 /// adapter or driver change, damage).
 fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
+    // `VICTORY_PIPELINE_LIBRARY=0`: no library, as this tree was before K.1
+    // (an empty one was refused under Proton), for measuring against.
+    if std::env::var_os("VICTORY_PIPELINE_LIBRARY").is_some_and(|v| v == "0") {
+        return None;
+    }
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
         if bytes.is_empty() {
             // An empty library is asked for with a null blob: vkd3d-proton
