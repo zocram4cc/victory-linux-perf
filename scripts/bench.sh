@@ -273,7 +273,18 @@ run() {
     measure "$PROFILE" "$LABEL" "$SECS" "$dir"
     cp "$OUT_ROOT/.launcher.out" "$dir/launcher.out" 2>/dev/null || true
     if ((KEEP)); then say "the game keeps running (bench.sh mark measures again)"
-    else "$LAUNCHER" kill >/dev/null 2>&1 || true; wait "$launcher" 2>/dev/null || true; fi
+    else
+        # Closed for sure: after a profile the first kill was sometimes not
+        # enough, and a game left open blocks the next run.
+        local tries
+        for ((tries = 0; tries < 5; tries++)); do
+            [[ -z $(game_pid) ]] && break
+            "$LAUNCHER" kill >/dev/null 2>&1 || true
+            sleep 3
+        done
+        [[ -z $(game_pid) ]] || say "WARNING: the game is still running; close it with: $LAUNCHER kill"
+        wait "$launcher" 2>/dev/null || true
+    fi
     say "results: $dir"
 }
 
