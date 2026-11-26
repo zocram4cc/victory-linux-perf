@@ -395,6 +395,34 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
             first_points_at = format_args!("{first:x?}"),
             "a pipeline creation method that is not implemented: the title goes without this pipeline"
         );
+        // P.4: the first bytes of the description's (pointer, length)
+        // blocks and of the containers its table names, to decode them.
+        if calls <= 2 {
+            let head = |at: u64| -> String {
+                let mut bytes = [0u8; 48];
+                #[cfg(windows)]
+                if at != 0 && crate::host::read_into(at as *const u8, &mut bytes) {
+                    return bytes.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join("");
+                }
+                let _ = &mut bytes;
+                "-".into()
+            };
+            if let Some(w) = &description {
+                for pair in w[1..13].chunks(2) {
+                    tracing::warn!(slot = format_args!("{:#x}", SLOT), at = format_args!("{:#x}", pair[0]), len = format_args!("{:#x}", pair[1]), bytes = head(pair[0]), "P.4 block");
+                }
+                // The table: entries of 6 words; up to 8 of them.
+                #[cfg(windows)]
+                for i in 0..8u64 {
+                    let mut entry = [0u8; 48];
+                    if w[0] == 0 || !crate::host::read_into((w[0] + i * 48) as *const u8, &mut entry) {
+                        break;
+                    }
+                    let q: Vec<u64> = entry.as_chunks::<8>().0.iter().map(|c| u64::from_le_bytes(*c)).collect();
+                    tracing::warn!(slot = format_args!("{:#x}", SLOT), entry = i, words = format_args!("{q:x?}"), container = head(q[3]), "P.4 table entry");
+                }
+            }
+        }
     }
     E_NOTIMPL
 }
