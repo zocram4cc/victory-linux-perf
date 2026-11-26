@@ -1430,7 +1430,18 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
+        // C.1 (`VICTORY_DYNAMIC_NO_WAIT=1`): a dynamic slot is the recording
+        // list's own, given back only when that list has run, so no running
+        // submission reads it: it is written without waiting for them
+        // (`slot_wait` cost the recording threads ~1 s a frame, 26 Nov).
+        let free = dynamic_no_wait() && index >= self.count;
+        if free {
+            NO_WAIT.with(|w| w.set(true));
+        }
         let kept = make(view, self.cpu(index));
+        if free {
+            NO_WAIT.with(|w| w.set(false));
+        }
         if kept.is_none() {
             null_for(view, self.cpu(index));
         }
@@ -2308,9 +2319,24 @@ pub(crate) static SLOT_WRITES: [std::sync::atomic::AtomicU64; 4] = [const { std:
 /// textures made ~2 s before the loss is reported, and the address is
 /// mapped). The write waits until no submission runs (at most 2 s);
 /// `VICTORY_SLOT_WAIT=0` turns that off. Always counted.
+thread_local! {
+    /// Set while a dynamic slot is made ([`HostHeap::make_at`]).
+    static NO_WAIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `VICTORY_DYNAMIC_NO_WAIT=1` (C.1): dynamic slots are made without
+/// [`slot_wait`]. Off until measured.
+fn dynamic_no_wait() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DYNAMIC_NO_WAIT").is_some_and(|v| v == "1"))
+}
+
 fn slot_wait() {
     use std::sync::atomic::Ordering::Relaxed;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if NO_WAIT.with(|w| w.get()) {
+        return;
+    }
     SLOT_WRITES[0].fetch_add(1, Relaxed);
     if crate::host::running() == 0 {
         return;
