@@ -51,7 +51,7 @@ The mission's seven avenues, ranked by measured share of the submitting thread's
 | 3 | 1. Lock waits on the submit path | end-of-submission wait for the heaps' records 10.2 ms (**22 %**); the thread's own lock waits ~0 | the submitting thread waits for the records job and the journal's single lock | `VICTORY_PORT_JOURNAL=1` (upstream #7) | prepare **47.1 (45.5..48.7) → 44.3 (42.9..45.4), −6.0 %**; frame −3.5 %; end wait 10.0 → 5.1 ms; journal note waits 1.65 → 0.24 ms | **keep** |
 | 3b | 1. Lock waits, other threads | guards' lock 37-41 ms a frame on all threads, **≈0 %** of prepare | one global write lock for every guard change | `VICTORY_PORT_GUARD=1` (upstream #6) | lock waits 41.6 → 12.7 ms (−70 %); frame +1.4 %, prepare +1.9 % (noise) | drop: off the critical path [deduction] |
 | 4 | 4. Descriptor and table work | part of the 10.2 ms wait above; records job 19.6 ms on its thread | ~430,000 slots looked at a frame, ~17,600 mirrored | `VICTORY_PORT_DESCRIPTORS=1` (upstream #2) | frame −1.1 %, prepare −0.9 % (noise); records 19.6 → 17.3 ms | drop |
-| 5 | 5. Kernel and OS calls | asking the write watch 3.4 ms (**7 %**) | all threads: 316 `GetWriteWatch` askings a frame over 1,982 MB, 2.8 ms (~9 µs each); **0 `VirtualQuery` a frame**; 759 blocks made read-only, 4.4 ms changing protections; remap moves 6.9 ms | none | — | not pursued: 7 % share, ~9 µs a call on native Windows; the cost the mission warns of is a Wine/Proton one [deduction] |
+| 5 | 5. Kernel and OS calls | asking the write watch 3.4 ms (**7 %**); protection changes and the title's remaps are not on the submitting thread | all threads, per frame: 316 `GetWriteWatch` askings over 1,982 MB, 2.8 ms (~9 µs each); **0 `VirtualQuery`**; 759 blocks made read-only, 4.4 ms of `VirtualProtect`; 378 guard faults; the title's remaps unmap 2.8 MB (its `CopyPageMappings` sat on the critical chain in 2 of 5 timeline frames, 20-55 ms). ("moves" 6.9 ms in the log is the kernel's read of title memory in `copy_mapped`, part of avenue 3's copies, not remapping) | `VICTORY_GUARD_REST=10000` (a written block stays open 10 ms instead of 3 before it is guarded again: fewer re-protections and faults), on top of journal + constants | frame **48.6 (48.2..49.5) → 48.6 (47.8..49.7), −0.2 %**; prepare 41.1 → 41.4, +0.9 % (noise); blocks made read-only 627 → 587, guard faults 291 → 281, protection time 3.84 → 3.79 ms | drop: the mechanism hardly moves and neither does the frame; the write-watch share (7 %) is ~9 µs a call on native Windows, so the cost the mission warns of is a Wine/Proton one [deduction] |
 | 6 | 6. Allocation and page-fault churn | not attributable to prepare: no named part of the submitting thread is allocation | all threads: 5,638 page faults and 378 guard faults a frame; host lists made 0.5 a frame (1.0 ms); kernel time 55 ms a frame (16 % of the process's CPU) | none | — | not pursued: no measured share of prepare; would need a sampler to place the faults |
 | 7 | 7. Command-list translation hot spots | **0 %** directly: translation runs on 8 recording threads beside the submitting thread | 31,782 list calls a frame, 215 ms of those threads' time; on the critical chain only 1.4 ms a frame ("recording: inside our list calls", timeline) | none | — | not pursued: off prepare's path; no on-CPU sampler on this PC to find hot spots |
 | — | (extra) CPU oversubscription | "woken, not running yet" 8-18 ms on the chain in the timeline | 6.6 of 8 logical CPUs busy; pools sized for 24 threads | `VICTORY_THIN_THREADS=4 VICTORY_UNDER_THREADS=3 VICTORY_VIEW_THREADS=3` | one screening run: frame 53.7, prepare 45.1 vs 54.4 / 45.2 | drop (n=1, no sign of a gain) |
@@ -100,6 +100,7 @@ Changes of mine kept in the branch, with tests:
 - `VICTORY_PORT_GUARD=1`: −70 % lock waits, no frame or prepare change (4 runs each).
 - `VICTORY_PORT_DESCRIPTORS=1`: −1 %, inside noise (4 runs each).
 - Smaller thread pools for 8 CPUs: no change in one screening run.
+- `VICTORY_GUARD_REST=10000` (avenue 5, protection changes): frame −0.2 %, prepare +0.9 %, 4 runs each on top of journal + constants (batch ab3); blocks re-protected only −6 %.
 - Cutting refresh spans (`VICTORY_REFRESH_PIECE_KB`): title crashes 4/4. Pieces of one span put
   several threads in one host copy at once; until then every span of a flush was its own copy
   (3,424 spans in 3,424 copies, [fact]), so its per-copy state is not made for that [deduction].
@@ -119,6 +120,8 @@ same build, 4 runs each ([fact]):
 | frame p90 | 118.3 (98.7..168.2) | 100.8 (72.1..139.5) | −14.8 % (wide spread) |
 | worst frame per second (median) | 155.1 | 151.6 | −2.3 % (noise) |
 | copy-back | 30.3 ms | 24.2 ms | −20 % |
+
+Repeated in a later batch (ab3, 4 more runs of journal + constants): frame 48.6 ms (48.2..49.5), prepare 41.1 ms (40.5..41.5), the same as in ab2 [fact].
 
 ```powershell
 scripts\play.ps1 -Exe <exe> -More @{VICTORY_PORT_JOURNAL='1'; VICTORY_PORT_CONSTANTS='1'}
