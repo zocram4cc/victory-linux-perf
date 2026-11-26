@@ -1,5 +1,65 @@
 > **victory-royale (private), branch `k7900`:** this tree plus our pieces. The plan, what carries over and in what order: [docs/royale/PLAN.md](docs/royale/PLAN.md); where things stand and how every piece works: [docs/royale/STATUS.md](docs/royale/STATUS.md).
 
+## victory-royale: what the tests of 26 Nov 2026 found
+
+Measured on an RX 7900 XT 20 GB, Ryzen 9 9900X (two CCDs), 32 GB, CachyOS (kernel 7.3), Mesa/RADV 26.3.1, Jason's house, release builds, unattended runs (`scripts/ktrials.sh`). Day log: [docs/royale/k-journal.md](docs/royale/k-journal.md); setup and tools: [docs/royale/STATUS.md](docs/royale/STATUS.md).
+
+### 1. The wineserver was what held this machine at half the author's frame rate
+
+| | fps (median per run) | ms a frame | write watch a frame | wineserver's share of CPU samples |
+|---|---|---|---|---|
+| this tree, GE-Proton11-14, stock wineserver | 8.2-8.4 | 119-122 | 17-26 ms | 10.6-16.4 % |
+| this tree, GE-Proton11-14, **view-tree wineserver** | **17.0-19.8** | **51-59** | **3.8-4.7 ms** | ~1 % |
+
+- **The cause:** the title maps GPU memory 64 KiB at a time and has tens of thousands of views. Every `map_view` / `unmap_view` made the stock server walk them all (`is_valid_view_addr`, `req_unmap_view` in the profile). Every thread that maps memory or asks the write watch waits on the server.
+- **The fix:** keep the views in a red-black tree by (process, base), in [linux/wineserver/](linux/wineserver/). It went upstream as kroeeee's PR #1; the author already ran a similar patch on Proton Experimental, which is why he saw 17-19 fps and we did not.
+- **Ruled out first, with the author:** zram vs disk swap (21.5 vs 22.9 ms write watch), one CCD only (20.5), THP for shmem (already `advise`), ntsync off (worse: 31.4). A stale build of our own old view-tree patch (24 Nov) still walked the list. Rebuilt from source, it fell back to the list in no run (the patch now prints a line if it ever does).
+- **World entry** dropped from 112-120 s to 43-61 s with it.
+
+### 2. What else was measured
+
+- **Pipeline library (K.1):** vkd3d-proton refuses `CreatePipelineLibrary` with a non-null pointer of length 0, and an empty Rust slice is non-null, so this tree ran with no library ("pipelines are not kept"). A null blob fixes it (~2,250 pipelines loaded a run), but **no measurable fps gain in this tree**: it makes pipelines off the title's threads and Mesa's cache holds the compiled code.
+- **Noise:** the same build gave 6.2 and 9.0 fps in two runs. **Decide on 3+ runs.**
+- **Moving into new areas:** the frame grows to 200-660 ms for a few seconds while the layer's own parts shrink; the profile has `title-main` at 33 %. That is the title's own streaming, outside the layer. What looks broken meanwhile (objects appearing and vanishing, black patches, Jason black and white, blur) matches the work dropped for want of a pipeline, which rises from ~200-350 to 600-1,058 a frame there: section 3.
+- **The author's tree on Proton Experimental:** a black picture once at start (fine on relaunch), the intro flickers (known), the start screen waits for A.
+
+### 3. P.4: the pipelines no fork makes (device methods 0x1c8 and 0x218)
+
+The title asks for ~12,900 pipelines through two console device methods the layer does not implement; the title then goes without them. One dump (`VICTORY_NATIVE_PSO_DUMP`, ported from fxceless): **10,206 distinct 0x1c8 descriptions (graphics) and 2,680 of 0x218 (compute)**.
+
+- **0x218 is an `FSPX` program taken apart**, the format this tree already reads for `ACCC` parts (`victory_shader::native::fspx_program`):
+
+  | description words | FSPX piece |
+  |---|---|
+  | (1, 2), 0x1c bytes | kind 0, pipeline registers: thread-group size at +0x0c, RSRC1 / RSRC2 at +0x14 / +0x18, flags (bit 4 wave32) at +0x12 |
+  | (3, 4), 0x14 bytes | kind 1, pipeline metadata (a hash) |
+  | (5, 6), in title GPU memory | kind 6, the GFX10 code |
+  | (7, 8) | kind 7, program metadata: `0x403`, size − 0x14, code dwords; 0x41 resource, 0x42 view, 0x43 hash records |
+
+  Put back together as an FSPX blob inside a one-part container, it goes through the normal compute path (`device::native_compute`, `VICTORY_NATIVE_COMPUTE=1`, off by default).
+- **Root constants:** 1,469 programs declare a constant buffer as root constants (root type 0); `fspx_program` refused them. Fixed: as many user SGPRs as the record's descriptor dwords.
+- **Offline: 542 of 2,680 translate** (`crates/victory-shader/examples/p4_fspx.rs` over the dump, natively on Linux, in seconds). The rest: 1,366 "an address with two computed terms", 226 "an address not from a root parameter", 166 "an image store of some channels", then small groups (`s_pack_*_b32_b16`, `s_bfm_b64`, unknown structured-buffer stride, the thread-group info SGPR, lane masks read as data). 1,529 programs are wave32, 1,151 wave64; the translator declares `WaveSize` where a program depends on the lane layout.
+- **In game, all of them made: the scene goes black or white** when the world starts (~4,000-6,000 draws a frame instead of ~9,000-11,000). A run with ~43 of them made looked "very sharp and correct" once loaded (the user).
+- **The cause, found by the hunt:** a program that does not translate still got a pipeline object. Its dispatches were then dropped, so **the title believed the pass ran and used what it never wrote**. Without a pipeline (E_NOTIMPL) the title goes its own way round, as before. The pass that blew the picture to white (`0f0039f000`, 16×16 groups, ~25 SRVs) does not translate at all. **Fix: a 0x218 program gets a pipeline only if it translates** (checked when the title asks for it).
+- **0x1c8 (graphics)**: word 0 a root signature, (1, 2) a 0x1d8 header, (3, 4) 0x50, then (code, metadata) pairs per stage at words 5-8, 9-12, 13-16. Not started.
+
+### 4. How to test this kind of thing (lessons)
+
+- **Judge a broken picture by draws a frame, not fps.** Broken runs ran at 29-42 fps (nothing drawn), good ones at ~17. `scripts/p4-bisect.sh` first went wrong on fps.
+- **The order of pipeline calls differs between runs** (they are made on several threads): bisect by call number gave contradictory answers (168 good in one run, 87 broken in another). **Code addresses are stable:** `VICTORY_NATIVE_COMPUTE_ONLY=<file>` and `scripts/p4-hunt.sh` halve the sorted list of addresses instead.
+- **fps while streaming says little:** one run at 2.3 fps was still loading the area.
+- Seven programs the hunt marked bad (`bench/p4-bad.txt`); six of them translate and need a second look now that untranslatable ones no longer get pipelines.
+- Unattended runs under GE-Proton: the game window's class is `victory.exe` (`steam_proton` under Proton Experimental); close the game by pid (`pkill -x victory.exe` misses it under Wine).
+
+### 5. Other trees read
+
+- **kroeeee** (this tree's upstream): see section 1; the author's next fixes (known_holes under Wine, PORT_DESCRIPTORS with port 1, COPY_COMPARE on BAR memory) to merge when published.
+- **Belobug/VIctory-Belobug-AMD**: the same base, plus texture uploads in the submission prelude "to fix frame-order & flickering" (a candidate for the flicker while streaming), a guard for AMD's compiler crashing (a list of pipelines left out), FSR 4.1.2. No 0x1c8/0x218.
+- **fxceless**: `VICTORY_NATIVE_PSO_DUMP` (dump only).
+- **victory-scarlett**: `SHOW_AFTER` (a slot shows a new texture only after its upload ran) in place of a wait for running submissions.
+
+---
+
 > **Linux / Proton fork.** This is avatarmanz/VIctory-7900XTX with the changes it
 > takes to run under Proton on AMD (RADV): ~16-17 fps in the open world on an
 > RX 7900 XT / Ryzen 5800X3D / 32 GB. **Start with [LINUX.md](LINUX.md).**
