@@ -5386,7 +5386,7 @@ impl Host {
                 #[cfg(feature = "diagnostics")]
                 blame_stale(&stale);
                 relay_wait(WHY_STALE, |_| stale.iter().all(|(shadow, from, to)| !shadow.writes_pending_in(*from, *to)));
-                crate::watch::ask_once(ranges);
+                crate::watch::ask_again(ranges);
                 stale = stale_under_flights(runs);
                 if stale.is_empty() {
                     return;
@@ -5396,7 +5396,7 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         blame_stale(&stale);
         self.settle(submitted, WHY_STALE);
-        crate::watch::ask_once(ranges);
+        crate::watch::ask_again(ranges);
     }
 
     /// [`Host::execute`], or with `late` the first half of
@@ -5408,6 +5408,8 @@ impl Host {
     /// ([`joins`]): those go to the queue in calls of their own, one after the
     /// other, as they would have.
     fn submit<'a>(&'a self, runs: &[&HostList], parts: &[usize], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
+        #[cfg(feature = "diagnostics")]
+        let _asker = crate::watch::asker(crate::watch::Asker::Submit);
         #[cfg(feature = "diagnostics")]
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -8640,7 +8642,9 @@ impl Meter {
         // Copies in the card's memory (`crate::shadow::cards`).
         let card = crate::shadow::card_stats();
         #[cfg(feature = "diagnostics")]
-        let slow = crate::watch::slow_asks();
+        let slow = crate::watch::slow_asks_line(frames);
+        #[cfg(feature = "diagnostics")]
+        let quiet = crate::watch::quiet_line(frames);
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
@@ -8758,12 +8762,12 @@ impl Meter {
                 );
             }
             #[cfg(feature = "diagnostics")]
-            tracing::info!(
-                "write-watch askings of a millisecond or more: {:.1} a frame, {:.1} ms a frame; the longest asking {:.1} ms",
-                slow[0] as f64 / frames,
-                slow[1] as f64 / 1e3 / frames,
-                slow[2] as f64 / 1e3
-            );
+            {
+                tracing::info!("{slow}");
+                if crate::watch::quiet_frames() > 0 {
+                    tracing::info!("{quiet}");
+                }
+            }
             if crate::shadow::cards() {
                 let per_frame = |i: usize| card[i] as f64 / frames;
                 tracing::info!(
