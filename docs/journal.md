@@ -4,6 +4,11 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**1.3 census, all of it: 40 MB a frame copied back, the title reads about one page of it**
+- `VICTORY_BACK_CENSUS=2` (read-write view memory guarded too), `bench/trials-20261126-054413-census-views`: **10,450-10,800 pages a frame written back and guarded (39.5-41 MB), none skipped; the title touched 0-1 page a frame before the next submission** (always a first read; pages `0x15fd93000`, `0x15fdc3000`). Frame 487-488 ms, as without the census.
+- Run 3 ended in an access violation in title code (`+0x4dbf69d`) **reading `0x15fdc3cd0`, in the very page the census had just seen the title read**. So the census caused it: a guard on the one page the title does read is not safe as it is (why the retried read faults is not known yet). Off by default; not to be run again until understood.
+- **What it means for 1.3:** within one submission, the copy-back is almost entirely bytes nobody reads. Unknowns before step 2: (a) reads through another view of the same pages (aliases are not guarded: a lower bound); (b) reads later than the next submission (the census lifts its guards there); (c) the one or two pages the title does read, which the step-2 design must keep eager (they look like results the title polls). Next for 1.3: a census that keeps a page guarded until it is read or the GPU writes it again, without guards on the pages already known to be read.
+
 **1.3 census, private memory: the title reads none of what is copied back there**
 - First runs (`bench/trials-…-census`): all three ended with an unhandled `0x80000001` (guard page) in title code. `lift()` took the pages out of its set before taking their guards off, so a title thread that met a guard in between found no page and its fault went on to the title. Fixed (`b4cfe43`): pages leave the set only after their guards are off.
 - Again (`bench/trials-20261126-053943-census2`): two runs in the world, 468-485 ms. **Per frame, 1,790-1,940 private pages written back and guarded (6.1-6.7 MB); the title touched 0-0.3 of them before the next submission** (one page, read). The third run ended in an access violation in title code during the load (`+0x4fd71ae`, reading a read-write page), with the census on; whether the census caused it is not known. The census stays off by default.
