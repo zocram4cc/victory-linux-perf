@@ -472,6 +472,13 @@ fn bind_zeros(
     }
 }
 
+/// `VICTORY_ALL_FRESH=1` (C.1): every table in dynamic slots. Off until
+/// measured; meant with `VICTORY_DYNAMIC_NO_WAIT=1`.
+fn all_fresh() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ALL_FRESH").is_some_and(|v| v == "1"))
+}
+
 /// `VICTORY_FRESH_COPY=1` (C.1): fresh tables copy the host descriptors of
 /// the title's own slots instead of making each view anew. Off until
 /// measured.
@@ -2079,10 +2086,17 @@ impl State {
     ) -> Vec<(u8, u32)> {
         let _timed = Timed::new(6);
         let tables = |u: &&UsedResource| u.root == RootType::Table;
+        // C.1 (`VICTORY_ALL_FRESH=1`): every table a draw reads is made in
+        // the list's dynamic slots, not only those holding constant buffers:
+        // the title's own slots are then not written while recording, and
+        // the recording threads do not wait for running submissions there
+        // (`slot_wait`; with `VICTORY_DYNAMIC_NO_WAIT` dynamic slots are not
+        // waited for).
+        let all = all_fresh();
         let mut fresh: Vec<u8> = used
             .iter()
             .filter(tables)
-            .filter(|u| u.kind == ResourceType::Cbv)
+            .filter(|u| all || u.kind == ResourceType::Cbv)
             .map(|u| u.slot)
             .collect();
         // Tables reaching past a host heap smaller than the title's (the
@@ -2260,7 +2274,7 @@ impl State {
                             && crate::descriptor::host::is_texture_view(&view)
                         {
                             host.texture_slot_tabled(title + k, kind.is_some());
-                            if kind.is_some() && !copied {
+                            if kind.is_some() && !copied && !all {
                                 host.mirror(title + k, table + u64::from(k) * 32, true);
                             }
                         }
