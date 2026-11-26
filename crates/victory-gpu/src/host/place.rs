@@ -109,22 +109,60 @@ pub(super) enum Waits {
     Yes,
 }
 
-/// Whether a step of `runs` reads one of `ranges` on the CPU.
-pub(super) fn read_by(runs: &[&HostList], mut ranges: Vec<(usize, usize)>) -> bool {
-    join_ranges(&mut ranges, []);
+/// Whether a step of `runs` reads on the CPU what one of their copies at its
+/// place, ahead of it, waits for its readers ([`Waits::ForReaders`]) with. (A
+/// reader ahead of the copy wants what was there before it, and the steps are
+/// done in this order: `VICTORY_PLACED_READERS=0` counts those as well, as
+/// before.)
+pub(super) fn read_by(runs: &[&HostList], written: &[(usize, usize)]) -> bool {
+    static ALL: OnceLock<bool> = OnceLock::new();
+    let all = *ALL.get_or_init(|| std::env::var_os("VICTORY_PLACED_READERS").is_some_and(|v| v == "0"));
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let waits = |p: &Placed| matches!(p.waits(written), Waits::ForReaders);
+    if all {
+        for list in runs {
+            let steps = &list.deferred().copies;
+            let placed = steps.iter().filter_map(|s| if let Step::Placed(p) = s { Some(p) } else { None });
+            let placed: Vec<_> = placed.filter(|p| waits(p)).map(|p| (p.dst, p.dst + p.len)).collect();
+            join_ranges(&mut ranges, placed);
+        }
+    }
     runs.iter().any(|list| {
-        list.deferred().copies.iter().any(|step| match step {
-            &Step::Copy(_, src, len) | &Step::Fill(_, src, len, _) => touches(&ranges, src, src + len),
-            Step::Texture(staging) => {
-                let (at, len) = staging.memory();
-                touches(&ranges, at, at + len)
+        list.deferred().copies.iter().any(|step| {
+            // What reads, by kind ([`READERS`]).
+            let (read, kind) = match step {
+                Step::Placed(p) => {
+                    let read = p.from.is_some() && touches(&ranges, p.src, p.src + p.len);
+                    if !all && waits(p) {
+                        join_ranges(&mut ranges, [(p.dst, p.dst + p.len)]);
+                    }
+                    (read, 0)
+                }
+                _ if ranges.is_empty() => (false, 0),
+                &Step::Copy(_, src, len) => (touches(&ranges, src, src + len), 1),
+                &Step::Fill(_, src, len, _) => (touches(&ranges, src, src + len), 2),
+                Step::Texture(staging) => {
+                    let (at, len) = staging.memory();
+                    (touches(&ranges, at, at + len), 3)
+                }
+                Step::Host(_, (from, to)) => (touches(&ranges, *from, *to), 4),
+                _ => (false, 0),
+            };
+            #[cfg(feature = "diagnostics")]
+            if read {
+                READERS[kind].fetch_add(1, Ordering::Relaxed);
             }
-            Step::Host(_, (from, to)) => touches(&ranges, *from, *to),
-            Step::Placed(p) => p.from.is_some() && touches(&ranges, p.src, p.src + p.len),
-            _ => false,
+            let _ = kind;
+            read
         })
     })
 }
+
+/// Diagnostics: the steps found reading what a copy at its place writes
+/// ([`read_by`]) since the last frame line: another such copy, a buffer copy,
+/// a fill, a texture, a step of ours.
+#[cfg(feature = "diagnostics")]
+pub(super) static READERS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// Everything recorded so far is done, and seen, before what follows.
 ///
