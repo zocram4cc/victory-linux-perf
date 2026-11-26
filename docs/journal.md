@@ -4,6 +4,11 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**M.1: `VICTORY_ONE_COPY=2` (small buffers take their cell's window): overlaps −82 %, the picture holds**
+- `bench/trials-20261126-065216-one-copy3*`: **overlapped ranges 44 a frame** (240-249 without, 130 with mode 1), 66-68 copies, 97 MB of overlap: what is left is big buffers that span more than one 4 MiB cell. Frame 464-507 ms (unchanged while the copy-back runs).
+- The user watched each run: "se ve muy bien", black only while things stream in; in one run Jason's head was black, in the next all was right. Jason's head black was also seen in two earlier runs **without** the switch (census runs, `…-063055-window-use`, `…-063417-lookup-miss`): an intermittent problem that predates M.1 (S.9 family), not caused by it.
+- Next: the ceiling with one copy (`VICTORY_BACK_CEILING=1 VICTORY_ONE_COPY=2`): if the picture mostly holds without the copy-back now, the path to the −22 % is open.
+
 **M.1: `VICTORY_ONE_COPY=1` decided per buffer holds the picture and halves the overlaps**
 - Why the per-ask version broke the picture: descriptor slots ask for the whole buffer (`descriptor::host::buffer_copy`, `view_extent`), which no window holds, and got the buffer copy; smaller asks got the window. One buffer was split between two copies in the same frame.
 - Per buffer (`bench/trials-20261126-064703-one-copy2*`): a buffer with no copy yet that a window holds whole takes the window as its copy for every ask. **The picture holds** (the user, live: "Jason se ve bien y la mayoría de cosas también", black only while streaming in). **Overlapped ranges 240-249 → 130 a frame**; all that is left is a buffer copy over a window (buffers whose copy came before the window). Frame 476-484 ms: unchanged, as expected while half the overlaps remain and the copy-back still runs.
