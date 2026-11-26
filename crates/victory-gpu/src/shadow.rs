@@ -2994,13 +2994,25 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     // reached the other only through the copy-back and title memory
     // (~245 written ranges a frame, 58-62 MB). An ask a window holds whole
     // takes the window, so both names share one copy.
-    if one_copy() {
+    //
+    // Decided per buffer, not per ask: answering only the asks a window
+    // held split one buffer between two copies (slots ask for the whole
+    // buffer, `view_extent`, and got the buffer copy; smaller asks got the
+    // window), and the picture broke (dark railings, Jason's head black,
+    // 26 Nov). Now a buffer with no copy yet that a window holds whole
+    // takes the window as its copy, for every ask from then on.
+    if one_copy() && map.get(&key).is_some_and(|e| e.shadow.is_none()) {
+        let buffer_end = map.get(&key).map_or(end, |e| e.end);
         drop(map);
-        if let Some(window) = window_holding(address, end) {
-            ONE_COPY.fetch_add(1, Ordering::Relaxed);
-            return Some(window);
-        }
+        let window = window_holding(key.0, buffer_end);
         map = buffers();
+        if let Some(window) = window
+            && let Some(entry) = map.get_mut(&key)
+            && entry.shadow.is_none()
+        {
+            ONE_COPY.fetch_add(1, Ordering::Relaxed);
+            entry.shadow = Some(window);
+        }
     }
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
