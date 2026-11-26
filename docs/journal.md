@@ -4,6 +4,26 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**Summary of 26 Nov (written at the user's request)**
+
+*Gains, on by default, picture right:*
+- **Pipeline library fixed** (`c436241`): world entry 9.5 s → 0.63 s; ~1,000 pipelines loaded from disk on later runs. The intro cutscenes play nearly whole and load in time for the first time (the user).
+- **Indirect draws no longer serialised** (I.1 `VICTORY_INDIRECT_BATCH`, I.2 `VICTORY_INDIRECT_WINDOW`): clamps inline 9,700 → ~830 a frame; **GPU 272 → 187 ms, frame ~500 → ~400 ms (2.0 → 2.5 fps)**. Gates: Jason 4 of 4, prologue 3 of 3.
+- S.1 (device loss) fixed overnight (texture pool, slot wait); S.7 guarded.
+
+*Measured and understood:*
+- **Where the frame goes** ([baseline.md](baseline.md)): the card ~190 ms, our thread ~200 ms (refreshes ~125 MB, copy-back ~45 MB, snapshots), one after the other.
+- **The copy-back cannot simply go** (1.3 closed): title memory is the byte merge between the title's page-tracked writes and the GPU's writes (~125 MB a frame of GPU bytes would come back stale). Ceiling without it: −22 %, black picture.
+- **The GPU is draw-bound, not pixel-bound** (1080p and Series S change ≤10 %); G.1 census by pipeline in release.
+- **Two other forks read** ([forks/neptune-vi.md](forks/neptune-vi.md), [forks/cool-fox.md](forks/cool-fox.md)): cool_fox on this machine runs ~2 fps (its wall here is before submission).
+
+*The direct path (M.2, memory shared as on the console):*
+- The hardware and driver allow it: ReBAR VRAM mapped at a chosen address and aliased through a dma-buf, CPU and GPU agree (`tools/rebar-bench/placed-alias.c`). CPU writes to VRAM are fast, **CPU reads are 250× slower** (IBS census: the title's code reads its GPU memory ~600,000 times a frame, mostly windows), so it must be by page: what the CPU reads stays in RAM.
+- vkd3d-proton is patched for it (`~/src/vkd3d-proton-vr`), but **Wine hides `VK_EXT_map_memory_placed`** from Windows programs: a Wine patch is needed.
+- **One copy per byte is the rule:** buffers in place under window copies break the picture (121 of 287, 47 MB of overlap): GPU writes into memory in place are not seen by write tracking, so any other copy goes stale. In place must cover whole window cells with their buffers.
+
+*Next, in order:* (1) windows and buffers in place together in RAM (`VICTORY_INPLACE=2` on today's base): picture, frame, stability; (2) the Wine patch so in-place memory can be VRAM; (3) per-page placement for what the title's CPU reads; then frames in flight (3.1).
+
 **Why in-place buffers break the picture: window copies over them miss the GPU's writes**
 - `VICTORY_INPLACE=3` with the new census (`bench/trials-…-inplace3-windows`): **287 title buffers in place, 121 of them under window copies, 47 MB of overlap**. A shader's write into a buffer in place lands in title memory directly, and Wine's write watch does not see writes the GPU makes; the window copy of the same bytes keeps its old bytes, and draws that read through the window see stale data. The user saw the same broken picture as before ("se ve igual"). This run also lost the device (as `INPLACE=2` did on 25 Nov): not yet understood.
 - **For M.2 this is the same rule as M.1: one copy per byte.** Memory shared in place (RAM now, VRAM later) works only where nothing else holds a copy of it. Windows (4 MiB cells of raw-address memory) are the other copies. So a buffer goes in place only with its whole window cell, or windows must answer from the in-place memory, or in-place memory is refreshed into any window over it every submission. `VICTORY_ONE_COPY=2` went the other way (small buffers take their window's copy), which is why it held the picture.
