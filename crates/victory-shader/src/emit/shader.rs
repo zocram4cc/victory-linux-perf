@@ -41,8 +41,16 @@ pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 /// Read by a program that takes the address out of a descriptor it picks
 /// at a computed index and walks the memory behind it.
 pub const VIEW_ADDRESSES: u32 = SLOT_STRIDES_COUNT * 4;
+/// Where in the [`SLOT_STRIDES`] buffer the record counts start, after the
+/// view addresses: dword `SLOT_COUNTS_AT + i` is the record count of the
+/// buffer view at heap slot `i` as the console's descriptor holds it
+/// (elements of a structured or typed view, bytes of a raw one; 0: none).
+/// Shaders read it instead of asking the host view's size: the AMD driver's
+/// compiler (RDNA 4) crashes on a size query of a raw buffer picked from the
+/// heap (after Belobug 1503444b).
+pub const SLOT_COUNTS_AT: u32 = (VIEW_ADDRESSES + SLOT_STRIDES_COUNT * 8) / 4;
 /// Bytes of the whole [`SLOT_STRIDES`] buffer.
-pub const SLOT_STRIDES_BYTES: u32 = VIEW_ADDRESSES + SLOT_STRIDES_COUNT * 8;
+pub const SLOT_STRIDES_BYTES: u32 = (SLOT_COUNTS_AT + SLOT_STRIDES_COUNT) * 4;
 
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,

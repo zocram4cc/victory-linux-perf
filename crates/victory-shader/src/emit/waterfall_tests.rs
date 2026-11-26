@@ -98,6 +98,37 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
 /// Runs `shader` with `views` at heap indices 0.. (the UAV last) on the
 /// hardware GPU and on WARP (each skipped without a device) and returns,
 /// per one that ran, the UAV's 32 dwords.
+thread_local! {
+    /// The record counts the title's views at heap slots 0.. hold, where
+    /// they differ from the host view's (a structured view the runtime makes
+    /// raw counts elements on the console, bytes on the host).
+    pub(super) static TITLE_COUNTS: std::cell::RefCell<Vec<u32>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The host's table by heap slot (`SLOT_STRIDES`) for `views`: the record
+/// counts from `SLOT_COUNTS_AT` on (the strides stay 0, as unbound).
+fn slot_table(views: &[View]) -> Vec<u32> {
+    use super::{SLOT_COUNTS_AT, SLOT_STRIDES_COUNT};
+    let mut table = vec![0u32; (SLOT_COUNTS_AT + SLOT_STRIDES_COUNT) as usize];
+    for (i, view) in views.iter().enumerate() {
+        if let View::Buffer { data, stride } = view {
+            let bytes = data.len() as u32 * 4;
+            table[SLOT_COUNTS_AT as usize + i] = match stride {
+                Stride::Raw => bytes,
+                Stride::Typed => bytes / 16,
+                Stride::Structured(b) | Stride::Format(_, b) => bytes / (*b).max(1),
+            };
+        }
+    }
+    TITLE_COUNTS.with(|c| {
+        for (i, &n) in c.borrow().iter().enumerate() {
+            table[SLOT_COUNTS_AT as usize + i] = n;
+        }
+    });
+    table
+}
+
 pub(super) fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
     let samplers = [D3D12_SAMPLER_DESC {
         Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
@@ -133,12 +164,36 @@ pub(super) fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec
             assert_eq!(u.root, RootType::Table, "{u:?}");
             ud[u.index as usize] = 0;
         }
+        let mut roots = vec![(0, Root::Constants(ud))];
+        // The table by heap slot, at the root parameter `Host` gives it
+        // (after the constants, root views by slot, then kind).
+        let mut root_views: Vec<(u8, u8)> = shader
+            .root_cbvs
+            .iter()
+            .map(|&r| (r, 0))
+            .chain(shader.root_srvs.iter().map(|&r| (r, 1)))
+            .chain(shader.root_uavs.iter().map(|&r| (r, 2)))
+            .collect();
+        root_views.sort_unstable();
+        root_views.dedup();
+        if let Some(at) = root_views
+            .iter()
+            .position(|&v| v == (super::SLOT_STRIDES, 1))
+        {
+            roots.push((
+                1 + at as u32,
+                Root::View {
+                    srv: true,
+                    data: slot_table(views),
+                },
+            ));
+        }
         let words = host
             .dispatch(
                 &root,
                 &pso,
                 &Dispatch {
-                    roots: vec![(0, Root::Constants(ud))],
+                    roots,
                     views,
                     samplers: &samplers,
                     groups: [1, 1, 1],

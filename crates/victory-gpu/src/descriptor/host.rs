@@ -1464,6 +1464,45 @@ fn view_kind(view: &View) -> u32 {
     }
 }
 
+/// A buffer view's record count as the console's descriptor holds it, for
+/// shaders that read it (`victory_shader::emit::SLOT_COUNTS_AT`): its
+/// elements, of a raw view its bytes (a raw view's elements are dwords);
+/// 0 for any other view.
+fn view_records(view: &View) -> u32 {
+    let Some((_, raw, _)) = view_elements(view) else {
+        return 0;
+    };
+    let elements = view_words(view).map_or(0, |(words, unordered)| {
+        // SAFETY: buffer views' union members.
+        unsafe {
+            if unordered {
+                uav_desc(words).Anonymous.Buffer.NumElements
+            } else {
+                srv_desc(words).Anonymous.Buffer.NumElements
+            }
+        }
+    });
+    if raw {
+        elements.saturating_mul(4)
+    } else {
+        elements
+    }
+}
+
+/// The title's description of the buffer view `view` and whether it is an
+/// unordered one; `None` if `view` is not a buffer view.
+fn view_words(view: &View) -> Option<(&[u32; 10], bool)> {
+    const BUFFER: u32 = 1;
+    match view {
+        View::Shader(_, Some(d)) if d[1] == BUFFER => Some((d, false)),
+        View::Unordered(_, _, Some(d)) if d[1] == BUFFER => Some((d, true)),
+        View::Placed(unordered, resource, d) if resource[0] == BUFFER => {
+            Some((d[..10].try_into().ok()?, *unordered))
+        }
+        _ => None,
+    }
+}
+
 /// A buffer view's structure stride, whether it is raw, and its format;
 /// `None` if `view` is not a buffer view.
 fn view_elements(view: &View) -> Option<(u32, bool, u32)> {
@@ -1873,8 +1912,8 @@ impl HostHeap {
         ));
         let strides = (!sampler)
             .then(|| {
-                // The strides, then the views' title addresses
-                // (`victory_shader::emit::VIEW_ADDRESSES`).
+                // The strides, the views' title addresses, then the record counts
+                // (`victory_shader::emit::VIEW_ADDRESSES`, `SLOT_COUNTS_AT`).
                 let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_BYTES);
                 let (buffer, data) = host.upload_buffer(bytes)?;
                 // SAFETY: the buffer's whole mapping; a live buffer.
@@ -2922,7 +2961,16 @@ impl HostHeap {
         {
             // SAFETY: inside the mapping; shaders read it while we write (a
             // dword, either value is one the slot had).
-            unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0) | kind) };
+            unsafe {
+                let table = *data as *mut u32;
+                table
+                    .add(index as usize)
+                    .write_volatile(stride.unwrap_or(0) | kind);
+                let counts = victory_shader::emit::SLOT_COUNTS_AT as usize;
+                table
+                    .add(counts + index as usize)
+                    .write_volatile(view.map_or(0, view_records));
+            }
             write_view_address(*data, index, view);
         }
         let was = if stride.is_some() {

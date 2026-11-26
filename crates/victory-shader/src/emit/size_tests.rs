@@ -179,6 +179,8 @@ fn sizes_of_a_volume_or_an_array_stay_untranslated() {
 /// it tests the record count of a view it never reads.
 #[test]
 fn the_record_count_of_a_structured_buffer_nothing_reads() {
+    // The console's view counts three elements of 16 bytes.
+    super::waterfall_tests::TITLE_COUNTS.with(|c| *c.borrow_mut() = vec![3]);
     let words = [TABLE, COUNT, STORE].concat();
     let shader = build(&words, (4, 16)).expect("translates");
     let (data, texel) = ([0u32; 12], [[0.0; 4]; 1]);
@@ -203,6 +205,7 @@ fn the_record_count_of_a_structured_buffer_nothing_reads() {
 /// program also reads by index.
 #[test]
 fn the_record_count_of_a_structured_buffer_read_by_index() {
+    super::waterfall_tests::TITLE_COUNTS.with(|c| *c.borrow_mut() = vec![3]);
     let load = [
         0x7E06_0280, // v_mov_b32 v3, 0
         0xE030_2000, // buffer_load_dword v5, v3, s[8:11], 0 idxen
