@@ -43,6 +43,11 @@ pub(crate) struct Pending {
     used: AtomicBool,
     /// A pass over the screen ([`GraphicsState::screen_pass`]).
     screen: bool,
+    /// A dispatch has waited for it outside the frame's budget
+    /// ([`compute_waits`]): later ones wait within the budget.
+    waited_long: AtomicBool,
+    /// That wait ended without it: later dispatches do not wait at all.
+    given_up: AtomicBool,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -68,6 +73,8 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            waited_long: AtomicBool::new(false),
+            given_up: AtomicBool::new(false),
         }
     }
 
@@ -166,9 +173,80 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        if !compute_waits(&p.shaders) {
+            wait(p, crate::frame::current());
+        } else if !p.waited_long.swap(true, Ordering::Relaxed) {
+            if !wait_long(p) {
+                give_up(p);
+            }
+        } else if !p.given_up.load(Ordering::Relaxed) {
+            wait(p, crate::frame::current());
+        }
     }
     p.made.get()?.as_ref()
+}
+
+/// The longest a dispatch waits for its pipeline outside the frame's
+/// budget ([`compute_waits`]): well inside the title's GPU watchdog (30 s
+/// a frame).
+const COMPUTE_WAIT_MOST: Duration = Duration::from_secs(20);
+
+/// Whether a dispatch with `shaders` waits for its pipeline outside the
+/// frame's budget, up to [`COMPUTE_WAIT_MOST`] (`VICTORY_COMPUTE_WAIT`; on
+/// under Wine). A dropped draw loses one frame's picture; a dropped
+/// dispatch the title issues once loses its output for the session. Under
+/// Proton the world's first frame asks for hundreds of pipelines no earlier
+/// run kept (vkd3d-proton keeps no pipeline library), and the one-off
+/// passes dropped there included the head blend-shape mapping
+/// (61e54e90adccaf6a): its maps stayed at the title's fill and every head
+/// was culled for the rest of the session (characters without heads; runs
+/// blend-1 to blend-6 on the owner's tree). The wait is on the recording
+/// thread before the dispatch is recorded, so it keeps its place. Once per
+/// pipeline: one that is never made would otherwise hold every frame that
+/// dispatches it for 20 s, and within the frame's budget it would take the
+/// whole budget of every such frame (six never made took 500 ms of every
+/// frame before loops got one latch): one not made in 20 s is given up,
+/// its later dispatches dropped without a wait.
+fn compute_waits(shaders: &[Arc<Shader>]) -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    shaders.first().is_some_and(|s| s.stage == "compute")
+        && *ON.get_or_init(|| crate::wine::on_under_wine("VICTORY_COMPUTE_WAIT"))
+}
+
+/// Waits for `p` until it is made or [`COMPUTE_WAIT_MOST`] passed; whether
+/// it was made.
+fn wait_long(p: &Pending) -> bool {
+    let started = Instant::now();
+    let (lock, done) = &DONE;
+    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while p.made.get().is_none() {
+        let rest = COMPUTE_WAIT_MOST.saturating_sub(started.elapsed());
+        if rest.is_zero() {
+            break;
+        }
+        held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
+    }
+    drop(held);
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(
+        crate::copystat::C::PipelineWaitUs,
+        started.elapsed().as_micros() as u64,
+    );
+    p.made.get().is_some()
+}
+
+/// Compute pipelines given up after [`COMPUTE_WAIT_MOST`].
+static GIVEN_UP: AtomicU64 = AtomicU64::new(0);
+
+/// Gives up waiting for `p` ([`compute_waits`]); a worker may still make it.
+fn give_up(p: &Pending) {
+    p.given_up.store(true, Ordering::Relaxed);
+    let count = GIVEN_UP.fetch_add(1, Ordering::Relaxed) + 1;
+    tracing::warn!(
+        shaders = %hashes(p),
+        count,
+        "a compute pipeline was not made in 20 s: its dispatches are dropped without waiting"
+    );
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
