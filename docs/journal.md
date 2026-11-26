@@ -4,6 +4,11 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**I.2 step 1: batch plus windows, inline clamps ~9,700 → ~830, GPU 187 ms, frame 407 ms (2.45 fps), picture held**
+- The batch now takes CPU-written records first, and `VICTORY_INDIRECT_WINDOW=1` takes what is left (records the list's shaders write: one clamp per window of up to 64). `bench/trials-20261126-075253-batch-window` (same scene, ~11,900 draws): **frame 407-408 ms, GPU 187 ms, clamps left inline 805-864 (6.5-6.8 ms)**; 4,900-5,400 records a frame clamped in preludes. Picture right (`shot-1.png`: railings, umbrella, Jason on the deck).
+- The day's GPU line: 272 ms (start) → 200 (I.1) → 187 (I.1 + windows). Frame 501 → 430 → 407 ms.
+- Next: the gates (5 Jason runs, 3 prologue runs) before both become the default.
+
 **2.1 census of the CPU's reads of GPU memory (AMD IBS): all-in-VRAM is not viable; a per-page hybrid is**
 - AMD IBS op sampling system-wide (`perf record -a -e ibs_op/cnt_ctl=1/ -c 200000 -d`; needs `kernel.perf_event_paranoid=-1`, set by the user with `pkexec` for this; reverts at reboot) during the open-world window (`bench/20261126-074822-cpu-reads`, 409 ms, 23 frames in 10 s), with the GPU memory map written by the layer (`VICTORY_REGIONS_FILE`: 1,096 MB of buffers, 3,590 MB of windows, 67 MB of textures the title fills). Classified by instruction: in the title image (`victory-image-b99f876b…`, mapped at `0x6ffff1be0000`, 176 MB) or not (our layer, Wine, other DLLs). Script: `scripts/cpu-reads.py` (the column order perf prints is pid, addr, data_src, ip).
 - **Title code's loads of GPU memory: 70 samples (0.37 % of its loads), ~600,000 a frame**: 63 in windows, 7 in buffers, on 54 sampled pages (none hot: 2-5 samples each). Through ReBAR each would be an uncached read (~0.5-1 µs, `tools/rebar-bench`): **300-500 ms a frame**. Title stores to GPU memory: ~900,000 a frame (write-combined in VRAM, fine).
