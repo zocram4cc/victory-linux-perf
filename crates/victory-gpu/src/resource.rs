@@ -258,16 +258,16 @@ pub(crate) fn pc_format(format: u32) -> u32 {
 /// (NVIDIA) refused the whole texture, so every pass that wrote it drew
 /// nothing. There 8-bit RGBA stands in: the same channels in the same
 /// order, every 4-bit level exact and every 5-bit level within 1/510.
-/// The title also renders to R9G9B9E5 (67), which no PC GPU does: 16-bit
-/// float RGBA stands in, with at least R9G9B9E5's precision and range.
+/// The title also renders to R9G9B9E5 (67), which no PC GPU does:
+/// R11G11B10_FLOAT stands in, or 16-bit float RGBA ([`e5_stand_in`]).
 /// The title's pipelines and views of such targets name the stand-in too
 /// ([`view_format`], the host view checks).
 /// shortcut: copies between such a target and a texture the title fills
 /// itself in the 16-bit format are skipped ([`stands_in`]); convert them
 /// if a pass turns out to need one.
 pub(crate) fn target_format(format: u32) -> u32 {
-    const STAND_INS: [(u32, u32); 3] = [(86, 28), (115, 28), (67, 10)];
-    let Some(i) = STAND_INS.iter().position(|&(f, _)| f == format) else {
+    let stand_ins: [(u32, u32); 3] = [(86, 28), (115, 28), (67, e5_stand_in())];
+    let Some(i) = stand_ins.iter().position(|&(f, _)| f == format) else {
         return format;
     };
     #[cfg(windows)]
@@ -275,7 +275,7 @@ pub(crate) fn target_format(format: u32) -> u32 {
         use windows::Win32::Graphics::Direct3D12::*;
         static REFUSED: std::sync::OnceLock<[bool; 3]> = std::sync::OnceLock::new();
         let refused = REFUSED.get_or_init(|| {
-            STAND_INS.map(|(f, to)| {
+            stand_ins.map(|(f, to)| {
                 let Some(host) = crate::host::host() else {
                     return false;
                 };
@@ -301,10 +301,43 @@ pub(crate) fn target_format(format: u32) -> u32 {
             })
         });
         if refused[i] {
-            return STAND_INS[i].1;
+            return stand_ins[i].1;
         }
     }
     format
+}
+
+/// The stand-in for R9G9B9E5 targets ([`target_format`]): R11G11B10_FLOAT
+/// (26; willy's build, after Neptune-VE), unsigned and without alpha as
+/// R9G9B9E5 is: 32 bits a texel as on the console, a negative value stored
+/// as 0, and a read of alpha gives 1 (the 16-bit stand-in gives back what a
+/// pass wrote there); with fewer bits of mantissa (6, 6 and 5 against
+/// R9G9B9E5's 9), each channel with an exponent of its own.
+/// `VICTORY_E5_TARGETS=r16g16b16a16`: R16G16B16A16_FLOAT (10), as before.
+/// R11G11B10 is the default as in willy's build: with it and the NaN guard
+/// (`victory-shader`'s `VICTORY_NAN_GUARD`), walls and skin were no longer
+/// blotched there (willy's run cf-col1).
+fn e5_stand_in() -> u32 {
+    static STAND_IN: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *STAND_IN.get_or_init(|| {
+        let value = std::env::var("VICTORY_E5_TARGETS").ok();
+        let stand_in = e5_stand_in_for(value.as_deref());
+        if let Some(value) = value
+            && stand_in == 26
+            && !value.eq_ignore_ascii_case("r11g11b10")
+        {
+            tracing::warn!(value = %value, "VICTORY_E5_TARGETS is neither r11g11b10 nor r16g16b16a16: R11G11B10_FLOAT stands in for R9G9B9E5 targets");
+        }
+        stand_in
+    })
+}
+
+/// [`e5_stand_in`] for a value of `VICTORY_E5_TARGETS`.
+fn e5_stand_in_for(value: Option<&str>) -> u32 {
+    match value {
+        Some(v) if v.eq_ignore_ascii_case("r16g16b16a16") => 10,
+        _ => 26,
+    }
 }
 
 /// Whether the host copy of the title texture `this` is in a stand-in
@@ -3301,6 +3334,20 @@ pub(crate) fn test_buffer(width: u64) -> This {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// `VICTORY_E5_TARGETS`: R16G16B16A16_FLOAT stands in for R9G9B9E5
+    /// targets only when the switch names it; R11G11B10_FLOAT does
+    /// otherwise, whatever else it says.
+    #[test]
+    fn r9g9b9e5_targets_stand_in_as_the_switch_says() {
+        assert_eq!(e5_stand_in_for(None), 26);
+        assert_eq!(e5_stand_in_for(Some("r11g11b10")), 26);
+        assert_eq!(e5_stand_in_for(Some("r16g16b16a16")), 10);
+        assert_eq!(e5_stand_in_for(Some("R16G16B16A16")), 10);
+        for other in ["", "0", "1", "r11g11b10 ", " r16g16b16a16"] {
+            assert_eq!(e5_stand_in_for(Some(other)), 26, "{other:?}");
+        }
+    }
 
     #[test]
     fn a8_unorm_is_not_in_the_r8_typeless_family() {
