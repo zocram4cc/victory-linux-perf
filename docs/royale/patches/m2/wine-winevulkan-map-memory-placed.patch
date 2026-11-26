@@ -1,0 +1,14 @@
+--- a/dlls/winevulkan/loader.c	2026-11-26 10:41:52.996709178 +0100
++++ b/dlls/winevulkan/loader.c	2026-11-26 10:41:53.004310251 +0100
+@@ -369,6 +369,11 @@
+ #define USE_VK_EXT(x) if (!strcmp(extension, #x)) return (extensions->has_ ## x = physical_device->extensions.has_ ## x);
+     ALL_VK_CLIENT_DEVICE_EXTS
+ #undef USE_VK_EXT
++    /* victory-royale (M.2): VRAM mapped at a title address. Wine keeps this
++     * extension for WoW64 and does not list it; a 64-bit client's placed
++     * maps pass through win32u to the host driver. */
++    if (!strcmp(extension, "VK_EXT_map_memory_placed"))
++        return TRUE;
+     WARN("Extension %s is not supported.\n", debugstr_a(extension));
+     return FALSE;
+ }
