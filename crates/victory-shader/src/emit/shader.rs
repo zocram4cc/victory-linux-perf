@@ -563,26 +563,12 @@ impl Shader {
 
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
+        // The interpolated signature: a pixel program's inputs, another
+        // graphics program's outputs.
         if self.pixel {
-            // Reading a per-vertex value with attributeAtVertex needs a
-            // constant input, even when the source declaration was smooth.
-            // D3D requires all components packed into the same register to
-            // share a mode, including the ones the shader never reads.
-            for index in 0..self.inputs.len() {
-                let unused = &self.inputs[index];
-                if unused.kind != 0 || unused.usage != 0 || unused.row.is_none() {
-                    continue;
-                }
-                let mut modes = self.inputs.iter()
-                    .filter(|e| e.row == unused.row && e.usage != 0)
-                    .map(|e| e.interp);
-                if let Some(mode) = modes.next()
-                    && (mode == 1 || unused.comp == 9)
-                    && modes.all(|other| other == mode)
-                {
-                    self.inputs[index].interp = mode;
-                }
-            }
+            reconcile_row_interp(&mut self.inputs);
+        } else if self.threads.is_none() || self.mesh.is_some() {
+            reconcile_row_interp(&mut self.outputs);
         }
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
@@ -1048,5 +1034,116 @@ impl Shader {
             list.push(Some(self.m.md_node(ops)));
         }
         Some(self.m.md_node(list))
+    }
+}
+
+/// Gives the elements packed into one signature row one interpolation mode,
+/// as D3D requires of all of a register's components, the ones the program
+/// never reads included. `emit_program` declares each element a default by
+/// its kind and type and a read sets the mode it uses (`lower`), so a row can
+/// end up with two: an unread float beside an integer, say, or a float the
+/// program reads per vertex (`attributeAtVertex` needs a constant input)
+/// beside one declared smooth.
+///
+/// An integer or `SV_IsFrontFace` element can only be constant, so it makes
+/// its row constant. Otherwise the unread elements of a row take the mode its
+/// read elements agree on (an unread integer only a constant one). Elements
+/// without a register or a mode are left alone. Read elements that disagree
+/// are left too: no one mode serves both reads.
+/// (meeyao/victory-8gb-linux, patch 7.)
+fn reconcile_row_interp(elems: &mut [SigElement]) {
+    use std::collections::HashMap;
+    let mut constant = HashMap::<u32, bool>::new();
+    let mut read = HashMap::<u32, Option<u8>>::new();
+    for e in elems.iter() {
+        let Some(row) = e.row.filter(|_| e.interp != 0) else { continue };
+        *constant.entry(row).or_default() |= e.kind == 13 || e.comp != 9;
+        if e.usage != 0 {
+            // `None` once two reads disagree.
+            read.entry(row)
+                .and_modify(|m| *m = m.filter(|&m| m == e.interp))
+                .or_insert(Some(e.interp));
+        }
+    }
+    for e in elems.iter_mut() {
+        let Some(row) = e.row.filter(|_| e.interp != 0) else { continue };
+        if constant.get(&row) == Some(&true) {
+            e.interp = 1;
+        } else if e.usage == 0
+            && let Some(&Some(mode)) = read.get(&row)
+            && (mode == 1 || e.comp == 9)
+        {
+            e.interp = mode;
+        }
+    }
+}
+
+#[cfg(test)]
+mod row_interp_tests {
+    use super::*;
+
+    fn elem(kind: u8, comp: u8, interp: u8, row: u32, col: u8, usage: u8) -> SigElement {
+        SigElement {
+            name: "TEXCOORD".into(),
+            index: 0,
+            kind,
+            comp,
+            interp,
+            row: Some(row),
+            col,
+            cols: 1,
+            usage,
+            half: false,
+        }
+    }
+
+    fn modes(elems: &[SigElement]) -> Vec<u8> {
+        elems.iter().map(|e| e.interp).collect()
+    }
+
+    /// An integer or front-face element makes its row constant, read or not.
+    #[test]
+    fn an_integer_or_front_face_makes_its_row_constant() {
+        // Row 7: an unread float beside a read front face. Row 8: an unread
+        // integer beside an unread float, nothing read to say a mode.
+        let mut elems = vec![
+            elem(0, 9, 2, 7, 0, 0),
+            elem(13, 5, 1, 7, 1, 1),
+            elem(0, 5, 1, 8, 0, 0),
+            elem(0, 9, 2, 8, 1, 0),
+        ];
+        reconcile_row_interp(&mut elems);
+        assert_eq!(modes(&elems), [1, 1, 1, 1]);
+    }
+
+    /// Unread floats take the mode the read elements agree on; elements of
+    /// other rows, without a register or without a mode are left alone.
+    #[test]
+    fn unread_elements_take_the_mode_their_row_is_read_with() {
+        let mut elems = vec![
+            elem(0, 9, 2, 8, 0, 0),
+            elem(0, 9, 3, 8, 1, 1),
+            elem(0, 9, 3, 8, 2, 1),
+            // Its own row.
+            elem(0, 9, 2, 9, 0, 0),
+            // A position: its mode is its own.
+            elem(3, 9, 4, 10, 0, 1),
+            elem(12, 5, 0, 8, 3, 0),
+            SigElement { row: None, ..elem(28, 9, 6, 0, 0, 1) },
+        ];
+        reconcile_row_interp(&mut elems);
+        assert_eq!(modes(&elems), [3, 3, 3, 2, 4, 0, 6]);
+    }
+
+    /// Reads that disagree leave the row as it is.
+    #[test]
+    fn reads_that_disagree_leave_the_row() {
+        let mut elems = vec![
+            elem(0, 9, 2, 4, 0, 0),
+            elem(0, 9, 2, 4, 1, 1),
+            elem(0, 9, 4, 4, 2, 1),
+        ];
+        reconcile_row_interp(&mut elems);
+        assert_eq!(modes(&elems), [2, 2, 4]);
     }
 }
