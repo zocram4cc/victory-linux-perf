@@ -29,6 +29,17 @@ RUNS = Path(os.environ.get("VICTORY_RUNS_DIR", Path.home() / ".local/share/victo
 # ----------------------------------------------------------------- run.json
 
 
+
+def proton_name(path):
+    """The Proton build at `path`: its version, and the folder's name when that
+    is not the version or the default "Proton-GE Latest" (a patched copy)."""
+    folder = Path(path).name
+    version_file = Path(path) / "version"
+    if not version_file.exists():
+        return folder
+    version = version_file.read_text().split()[-1]
+    return version if folder in (version, "Proton-GE Latest") else f"{version} ({folder})"
+
 def sh(*cmd: str) -> str:
     try:
         return subprocess.run(cmd, capture_output=True, text=True, timeout=10).stdout.strip()
@@ -45,7 +56,6 @@ def write_run_json(args: argparse.Namespace) -> None:
         meminfo = Path("/proc/meminfo").read_text()
         total_kb = int(re.search(r"MemTotal:\s+(\d+)", meminfo).group(1))
         proton = os.environ.get("PROTONPATH", "")
-        version_file = Path(proton) / "version"
         info.update(
             started=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             started_epoch=time.time(),
@@ -54,7 +64,7 @@ def write_run_json(args: argparse.Namespace) -> None:
             exe=args.exe,
             git_rev=sh("git", "-C", repo, "rev-parse", "--short", "HEAD"),
             git_dirty=bool(sh("git", "-C", repo, "status", "--porcelain", "--untracked-files=no")),
-            proton=version_file.read_text().split()[-1] if version_file.exists() else Path(proton).name,
+            proton=proton_name(proton),
             umu=sh("umu-run", "--version").splitlines()[0] if sh("umu-run", "--version") else "",
             gpu=sh("nvidia-smi", "--query-gpu=name,driver_version,memory.total", "--format=csv,noheader"),
             cpu=next((l.split(":", 1)[1].strip() for l in Path("/proc/cpuinfo").read_text().splitlines()

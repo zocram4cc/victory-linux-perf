@@ -20,6 +20,8 @@
 #   --texture-waits wait longer for textures in the first frames and the first
 #                   cutscene (VICTORY_EARLY_TEXTURES_MS=40, VICTORY_BAKE_TEXTURES_MS=10000,
 #                   the willy build's; against faces of noise)
+#   --view-tree     GE-Proton11-14 with GE PR #1016's wineserver (memory views kept in a
+#                   tree), from ~/.local/share/victory/proton/GE-Proton11-14-viewtree
 #   --mangohud      also MangoHud's frame log (off by default: its NVIDIA thread
 #                   aborted the title under umu, `free(): invalid pointer`)
 #
@@ -57,6 +59,7 @@ while (( $# )); do
       export VICTORY_EARLY_TEXTURES_MS="${VICTORY_EARLY_TEXTURES_MS:-40}"
       export VICTORY_BAKE_TEXTURES_MS="${VICTORY_BAKE_TEXTURES_MS:-10000}" ;;
     --skip-intro) export VICTORY_KEYS="${VICTORY_KEYS-12:Enter,16:Enter,20:A,25:Enter,30:A,35:Enter,40:A,50:Enter}" ;;
+    --view-tree) export PROTONPATH="${PROTONPATH:-$HOME/.local/share/victory/proton/GE-Proton11-14-viewtree}" ;;
     --mangohud) mangohud=1 ;;
     --no-mangohud) mangohud=0 ;;
     -h|--help) sed -n '2,/^set -euo/p' "$0" | sed '$d'; exit 0 ;;
