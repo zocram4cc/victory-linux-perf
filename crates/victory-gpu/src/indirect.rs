@@ -368,6 +368,11 @@ pub(crate) fn bound_later(
     Some((dst, dst_offset))
 }
 
+/// I.1: records looked at for batching since the last frame line, by
+/// outcome: batched, split dispatch, windowed, several records or a count,
+/// arguments in the card's memory, arguments the list's shaders wrote.
+pub(crate) static BATCH_WHY: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
 /// Records clamped in preludes since the last frame line.
 pub(crate) static BATCHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 

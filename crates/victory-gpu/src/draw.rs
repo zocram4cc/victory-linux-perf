@@ -2559,14 +2559,24 @@ impl State {
         // I.1 (`VICTORY_INDIRECT_BATCH`): a single record no shader of the
         // list wrote before it is clamped in the list's prelude, into a slot
         // of its own: no pass of ours and no wait here.
-        let batched = hit.is_none()
-            && crate::indirect::batch_on()
-            && parts.is_none()
-            && !windowed
-            && max == 1
-            && count.is_none()
-            && !args.carded()
-            && !list.gpu_writes(arguments as usize, len as usize);
+        let batched = hit.is_none() && crate::indirect::batch_on() && {
+            // Why a record is not batched, counted for the frame line.
+            let why = if parts.is_some() {
+                1
+            } else if windowed {
+                2
+            } else if max != 1 || count.is_some() {
+                3
+            } else if args.carded() {
+                4
+            } else if list.gpu_writes(arguments as usize, len as usize) {
+                5
+            } else {
+                0
+            };
+            crate::indirect::BATCH_WHY[why].fetch_add(1, Ordering::Relaxed);
+            why == 0
+        };
         let later = if batched {
             args.refresh(list, arguments, len);
             crate::indirect::bound_later(list, (&args.buffer, offset), (kind, stride, 1))

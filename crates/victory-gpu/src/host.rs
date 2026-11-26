@@ -6181,6 +6181,13 @@ impl Meter {
         crate::pool::pool_line(frames);
         crate::census::census_line(frames);
         gpu_census_line(frames);
+        if crate::indirect::batch_on() {
+            let w = [0, 1, 2, 3, 4, 5].map(|i| crate::indirect::BATCH_WHY[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            tracing::info!(
+                "indirect records per frame (I.1 batch): {:.0} clamped in preludes; not batched: {:.0} split dispatches, {:.0} windowed, {:.0} several or counted, {:.0} in card copies, {:.0} written by the list's shaders",
+                w[0], w[1], w[2], w[3], w[4], w[5]
+            );
+        }
         let shared = crate::shadow::ONE_COPY.swap(0, Ordering::Relaxed);
         if shared > 0 {
             tracing::info!("buffer asks that took a window's copy per frame (M.1, VICTORY_ONE_COPY): {:.0}", shared as f64 / frames);
