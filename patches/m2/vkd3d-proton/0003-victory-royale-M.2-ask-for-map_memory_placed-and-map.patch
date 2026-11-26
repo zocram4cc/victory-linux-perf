@@ -1,0 +1,50 @@
+From 9b0a6c6aa8d0fde14e6b05d84e487b2db9678e4b Mon Sep 17 00:00:00 2001
+From: datingesp-hash <228639058+datingesp-hash@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 10:38:55 +0100
+Subject: [PATCH 3/3] victory-royale M.2: ask for map_memory_placed and
+ map_memory2 though Wine does not list them
+
+---
+ libs/vkd3d/device.c   | 21 +++++++++++++++++++++
+ subprojects/.wraplock |  0
+ 2 files changed, 21 insertions(+)
+ create mode 100644 subprojects/.wraplock
+
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 26b091a8..dc5f2d71 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -2336,6 +2336,27 @@ static HRESULT vkd3d_init_device_extensions(struct d3d12_device *device,
+             create_info->optional_device_extension_count,
+             user_extension_supported, vulkan_info, "device");
+ 
++    /* victory-royale (M.2): Wine does not list VK_EXT_map_memory_placed to
++     * Windows programs (it keeps it for WoW64), but it knows it: asked for,
++     * a 64-bit client's placed maps pass through to the host driver. */
++    {
++        char value[8];
++        if (vkd3d_get_env_var("VKD3D_VRAM_AT_ADDRESS", value, sizeof(value)) && value[0] == '1')
++        {
++            if (!vulkan_info->EXT_map_memory_placed)
++            {
++                vulkan_info->EXT_map_memory_placed = true;
++                ++*device_extension_count;
++            }
++            if (!vulkan_info->KHR_map_memory2)
++            {
++                vulkan_info->KHR_map_memory2 = true;
++                ++*device_extension_count;
++            }
++            WARN("victory-royale: VK_EXT_map_memory_placed and VK_KHR_map_memory2 asked for though not listed.\n");
++        }
++    }
++
+     if (get_spec_version(vk_extensions, count, VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME) < 3)
+         vulkan_info->EXT_vertex_attribute_divisor = false;
+ 
+diff --git a/subprojects/.wraplock b/subprojects/.wraplock
+new file mode 100644
+index 00000000..e69de29b
+-- 
+2.56.1
+

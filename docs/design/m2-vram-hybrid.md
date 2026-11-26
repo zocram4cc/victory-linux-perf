@@ -50,3 +50,35 @@ So the GPU wants VRAM (9× faster), and the CPU can write it, but every read the
 - **The title reading a VRAM page in a hot loop**: 0.5-1 µs a load. The census must find those before a kind moves wholesale, and a page that turns hot must be movable.
 - **Device loss and reset**: VRAM content is lost if the GPU resets, and the title's memory with it. Today a loss ends the run anyway.
 - **Size**: 1.1 GB of buffers + 3.6 GB of windows fit the 20 GB card with textures, but VRAM is also our host textures (9 GB live in the pool).
+
+## Status (26 Nov 2026, parked): what works, what does not, how to resume
+
+**Parked with every switch off.** Nothing of M.2 is on by default; the game runs as before (~400 ms, picture right).
+
+### What works
+
+- **The mechanism, end to end on this machine:** title buffers in ReBAR VRAM mapped at their own addresses, under Wine, the CPU and the GPU on the same bytes (`bench/trials-…-vram-wine`: 286 placements). Linux side proven alone first (`tools/rebar-bench/placed-alias.c`: placed map, dma-buf aliases, CPU and GPU agree).
+- **Windows alone in place** (system memory, `VICTORY_INPLACE=1`): the picture is right; the GPU is 2× slower (379 ms) reading them over PCIe.
+- **Buffers ≥ 1 MiB alone in place** (`VICTORY_INPLACE=3 VICTORY_INPLACE_BUFFER_KB=1024,10000000`): right; no gain (read-only, cheap to copy).
+
+### What does not, and what is ruled out
+
+- **Small and mid buffers in place together break the picture** (the house dark, the dock and the water cut and bent, debris on the water), in system memory and in VRAM alike, and in-place runs lose the device now and then.
+- Ruled out: shader writes under copies (0 declared on buffers in place); the title's buffer copies (0 touch in-place memory; they are now recorded on the card when both sides are in place); host-import failures (none with `VKD3D_DEBUG=warn`); the address directory's offset (a real bug, fixed in `memory.rs`, not the whole cause).
+- **Hypothesis left:** per-frame data the title's threads rewrite while the card still draws. Copies give the card a snapshot taken at submission; in place it reads the bytes as they change. To test: time the title's CPU writes to those buffers against the submission that reads them (write watch per submission, or IBS stores by address), and compare with when the title's fences say the card is done.
+
+### The next design step
+
+Share only memory the title does not rewrite while the card reads it (static data, streamed geometry, the big buffers), keep copies for dynamic data, and learn the split per buffer from that census. Then the Wine/VRAM path for what is shared, and per-page placement for windows (the title's CPU reads them: 63 of 70 IBS samples).
+
+### How to resume (all pieces are kept)
+
+| Piece | Where | How |
+|---|---|---|
+| vkd3d-proton patch (`VKD3D_VRAM_AT_ADDRESS=1`: heaps opened on host memory become ReBAR VRAM placed at the same address; asks for `VK_EXT_map_memory_placed` though Wine does not list it) | `patches/m2/vkd3d-proton/` (on GE-Proton11-14's vkd3d commit `cae8353e` plus GE's four patches); worktree `~/src/vkd3d-proton-vr`, branch `victory-vram` | `meson setup --cross-file build-win64.txt --buildtype release build-vr-win64 && ninja -C build-vr-win64` (needs `mingw-w64-gcc`, `meson`: installed) |
+| Wine patch (`winevulkan`'s loader lets `VK_EXT_map_memory_placed` through) | `patches/m2/wine-winevulkan-map-memory-placed.patch` | On GE's prepared source (`victory-data/wineserver/build-GE-Proton11-14/ge/wine`): regenerate `include/wine/vulkan.h` (`dlls/winevulkan/make_vulkan -x vk.xml -X video.xml`; GE's prep left it empty), configure a separate tree `--with-vulkan` (`build-vk`), `make dlls/winevulkan/x86_64-windows/winevulkan.dll` |
+| Proton copy with the patched `winevulkan.dll` | `~/Games/victory-data/proton-vr/GE-Proton11-14-vr` (reflinked copy; the original DLL as `winevulkan.dll.ge`) | `VP_PROTON=<that folder>` |
+| Exe copy beside the patched `d3d12.dll`/`d3d12core.dll` | `~/src/victory-royale-wt/vram/release/` (the folder must be named `release` or `diag`: `bench.sh` finds the game by that) | `VP_EXE=<that>/victory.exe`, copy a fresh `victory.exe` there after each build |
+| Layer switches | `VICTORY_INPLACE` (1 windows, 2 windows and buffers, 3 buffers only for VRAM: no shared 64 KiB pages, heaps kept), `VICTORY_INPLACE_BUFFER_KB=min,max` (bisection by size), `VICTORY_BACK_OVERLAP=1` (censuses on the frame line) | e.g. `VP_PROTON=… VP_EXE=… scripts/trials.sh -n 1 -l x VICTORY_INPLACE=3 VKD3D_VRAM_AT_ADDRESS=1 VKD3D_DEBUG=warn` |
+
+Journal entries of 26 Nov hold every run and its numbers.

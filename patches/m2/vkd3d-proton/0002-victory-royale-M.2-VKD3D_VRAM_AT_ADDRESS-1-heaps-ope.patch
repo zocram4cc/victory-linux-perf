@@ -1,0 +1,173 @@
+From 1552e9fe67650306f5dcfa99441b1f72f7a94d5e Mon Sep 17 00:00:00 2001
+From: datingesp-hash <228639058+datingesp-hash@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 10:03:02 +0100
+Subject: [PATCH 2/3] victory-royale M.2: VKD3D_VRAM_AT_ADDRESS=1, heaps opened
+ on host memory become ReBAR VRAM placed at the same address
+
+---
+ libs/vkd3d/device.c        | 10 +++++
+ libs/vkd3d/memory.c        | 76 +++++++++++++++++++++++++++++++++++++-
+ libs/vkd3d/vkd3d_private.h |  3 ++
+ libs/vkd3d/vulkan_procs.h  |  3 ++
+ 4 files changed, 91 insertions(+), 1 deletion(-)
+
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 6aa9234c..26b091a8 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -121,6 +121,8 @@ static const struct vkd3d_optional_extension_info optional_device_extensions[] =
+     VK_EXTENSION(EXT_EXTENDED_DYNAMIC_STATE_2, EXT_extended_dynamic_state2),
+     VK_EXTENSION(EXT_EXTENDED_DYNAMIC_STATE_3, EXT_extended_dynamic_state3),
+     VK_EXTENSION(EXT_EXTERNAL_MEMORY_HOST, EXT_external_memory_host),
++    VK_EXTENSION(EXT_MAP_MEMORY_PLACED, EXT_map_memory_placed),
++    VK_EXTENSION(KHR_MAP_MEMORY_2, KHR_map_memory2),
+     VK_EXTENSION(EXT_SHADER_IMAGE_ATOMIC_INT64, EXT_shader_image_atomic_int64),
+     VK_EXTENSION(EXT_MESH_SHADER, EXT_mesh_shader),
+     VK_EXTENSION(EXT_MUTABLE_DESCRIPTOR_TYPE, EXT_mutable_descriptor_type),
+@@ -1333,6 +1335,14 @@ static void vkd3d_physical_device_info_init(struct vkd3d_physical_device_info *i
+         vk_prepend_struct(&info->properties2, &info->external_memory_host_properties);
+     }
+ 
++    /* victory-royale (M.2): VRAM mapped at the address a host-memory heap
++     * was opened at (VKD3D_VRAM_AT_ADDRESS=1). */
++    if (vulkan_info->EXT_map_memory_placed)
++    {
++        info->map_memory_placed_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT;
++        vk_prepend_struct(&info->features2, &info->map_memory_placed_features);
++    }
++
+     if (vulkan_info->AMD_shader_core_properties)
+     {
+         info->shader_core_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CORE_PROPERTIES_AMD;
+diff --git a/libs/vkd3d/memory.c b/libs/vkd3d/memory.c
+index 45300738..9f6d8d44 100644
+--- a/libs/vkd3d/memory.c
++++ b/libs/vkd3d/memory.c
+@@ -1223,6 +1223,73 @@ HRESULT vkd3d_allocate_device_memory(struct d3d12_device *device,
+     return hr;
+ }
+ 
++/* victory-royale (M.2): with VKD3D_VRAM_AT_ADDRESS=1, a heap opened on host
++ * memory (OpenExistingHeapFromAddress[1]) is not an import of that memory:
++ * it is device-local, host-visible memory (VRAM through ReBAR) mapped for the
++ * CPU *at the same address* (VK_EXT_map_memory_placed), its first bytes copied
++ * from what was there. The CPU and the GPU then share one memory, as on a
++ * console: no copies, the GPU at VRAM speed. CPU reads of it are slow
++ * (uncached), so the caller only opens memory the CPU writes and the GPU reads.
++ * Not safe against writes to the range while it is being moved. */
++static HRESULT vkd3d_place_vram_at_address(struct d3d12_device *device, void *host_address,
++        VkDeviceSize size, uint32_t type_mask, void *pNext, struct vkd3d_device_memory_allocation *allocation)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
++    VkMemoryMapPlacedInfoEXT placed_info;
++    VkMemoryMapInfoKHR map_info;
++    static int enabled = -1;
++    void *staging, *mapped;
++    char value[8];
++    VkResult vr;
++    HRESULT hr;
++
++    if (enabled < 0)
++        enabled = vkd3d_get_env_var("VKD3D_VRAM_AT_ADDRESS", value, sizeof(value)) && value[0] == '1';
++    if (!enabled || !device->vk_info.KHR_map_memory2 ||
++            !device->device_info.map_memory_placed_features.memoryMapPlaced)
++        return E_NOTIMPL;
++
++    if (FAILED(hr = vkd3d_try_allocate_device_memory(device, size,
++            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
++            type_mask, pNext, true, allocation)))
++    {
++        WARN("No ReBAR memory for %p, %"PRIu64" bytes, hr %#x.\n", host_address, size, (int)hr);
++        return hr;
++    }
++
++    if ((vr = VK_CALL(vkMapMemory(device->vk_device, allocation->vk_memory, 0, VK_WHOLE_SIZE, 0, &staging))))
++    {
++        ERR("Failed to map ReBAR memory, vr %d.\n", vr);
++        vkd3d_free_device_memory(device, allocation);
++        return E_FAIL;
++    }
++    memcpy(staging, host_address, size);
++    VK_CALL(vkUnmapMemory(device->vk_device, allocation->vk_memory));
++
++    placed_info.sType = VK_STRUCTURE_TYPE_MEMORY_MAP_PLACED_INFO_EXT;
++    placed_info.pNext = NULL;
++    placed_info.pPlacedAddress = host_address;
++    map_info.sType = VK_STRUCTURE_TYPE_MEMORY_MAP_INFO_KHR;
++    map_info.pNext = &placed_info;
++    map_info.flags = VK_MEMORY_MAP_PLACED_BIT_EXT;
++    map_info.memory = allocation->vk_memory;
++    map_info.offset = 0;
++    map_info.size = VK_WHOLE_SIZE;
++    mapped = NULL;
++    vr = VK_CALL(vkMapMemory2KHR(device->vk_device, &map_info, &mapped));
++    if (vr || mapped != host_address)
++    {
++        ERR("Placed map of ReBAR memory at %p failed, vr %d, got %p.\n", host_address, vr, mapped);
++        if (!vr)
++            VK_CALL(vkUnmapMemory(device->vk_device, allocation->vk_memory));
++        vkd3d_free_device_memory(device, allocation);
++        return E_FAIL;
++    }
++
++    WARN("victory-royale: %"PRIu64" bytes at %p are VRAM now (ReBAR, placed).\n", size, host_address);
++    return S_OK;
++}
++
+ static HRESULT vkd3d_import_host_memory(struct d3d12_device *device, void *host_address,
+         VkDeviceSize size, VkMemoryPropertyFlags type_flags, uint32_t type_mask,
+         void *pNext, struct vkd3d_device_memory_allocation *allocation)
+@@ -1596,7 +1663,14 @@ static HRESULT vkd3d_memory_allocation_init(struct vkd3d_memory_allocation *allo
+         vk_prepend_struct(&flags_info, &priority_info);
+     }
+ 
+-    if (host_ptr)
++    if (host_ptr && !(info->heap_flags & D3D12_HEAP_FLAG_ALLOW_WRITE_WATCH) &&
++            SUCCEEDED(vkd3d_place_vram_at_address(device, host_ptr, memory_requirements.size,
++                    memory_requirements.memoryTypeBits, &flags_info, &allocation->device_allocation)))
++    {
++        /* The memory is at host_ptr now; handled as an import below. */
++        hr = S_OK;
++    }
++    else if (host_ptr)
+     {
+         hr = vkd3d_import_host_memory(device, host_ptr, memory_requirements.size,
+                 type_flags, type_mask, &flags_info, &allocation->device_allocation);
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index e63dc7b7..e7db71b7 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -178,6 +178,8 @@ struct vkd3d_vulkan_info
+     bool EXT_extended_dynamic_state2;
+     bool EXT_extended_dynamic_state3;
+     bool EXT_external_memory_host;
++    bool EXT_map_memory_placed;
++    bool KHR_map_memory2;
+     bool EXT_shader_image_atomic_int64;
+     bool EXT_mesh_shader;
+     bool EXT_mutable_descriptor_type; /* EXT promotion of VALVE one. */
+@@ -5416,6 +5418,7 @@ struct vkd3d_physical_device_info
+     VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT graphics_pipeline_library_features;
+     VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT fragment_shader_interlock_features;
+     VkPhysicalDeviceMemoryPriorityFeaturesEXT memory_priority_features;
++    VkPhysicalDeviceMapMemoryPlacedFeaturesEXT map_memory_placed_features;
+     VkPhysicalDevicePageableDeviceLocalMemoryFeaturesEXT pageable_device_memory_features;
+     VkPhysicalDeviceDynamicRenderingUnusedAttachmentsFeaturesEXT dynamic_rendering_unused_attachments_features;
+     VkPhysicalDeviceMemoryDecompressionFeaturesNV memory_decompression_features;
+diff --git a/libs/vkd3d/vulkan_procs.h b/libs/vkd3d/vulkan_procs.h
+index 6b82391b..0a773dbe 100644
+--- a/libs/vkd3d/vulkan_procs.h
++++ b/libs/vkd3d/vulkan_procs.h
+@@ -295,6 +295,9 @@ VK_DEVICE_EXT_PFN(vkCmdSetRasterizationSamplesEXT)
+ /* VK_EXT_external_memory_host */
+ VK_DEVICE_EXT_PFN(vkGetMemoryHostPointerPropertiesEXT)
+ 
++/* VK_KHR_map_memory2 (victory-royale, M.2) */
++VK_DEVICE_EXT_PFN(vkMapMemory2KHR)
++
+ /* VK_EXT_mesh_shader */
+ VK_DEVICE_EXT_PFN(vkCmdDrawMeshTasksEXT)
+ VK_DEVICE_EXT_PFN(vkCmdDrawMeshTasksIndirectEXT)
+-- 
+2.56.1
+
