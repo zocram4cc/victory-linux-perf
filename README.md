@@ -406,7 +406,7 @@ In roadmap order. Piece letters refer to [the target](#the-target-pieces-that-fi
 | P.4 Two pipeline creation methods not implemented ([notes](docs/design/p4-pipeline-methods.md); device `0x1c8`, `0x218`, `device.rs` `unknown_pipeline`): the title goes without those pipelines (16 + 13 logged calls, up to thousands; no fork implements them, upstream included). In play: ~320 draws and ~980 indirect draws a frame dropped for want of a host pipeline, minutes in (26 Nov play log); a candidate for S.9 and missing objects | P | *open* | | to decode: the descriptions are (pointer, size) pairs into the title image |
 | A.1 Upload census: time and bytes of texture and buffer uploads on the submitting thread, during the load and in play | A | *open* | | with P.1 |
 | A.2 Uploads on a copy queue of their own, fed by workers | A | *open* | | after A.1 |
-| S.7 Prologue null fault (SQC, address 0): 1 of 6 prologue runs with the wait | L | maintainer | | cause likely found (root view left at 0, `draw.rs`); guarded with zeros, to verify |
+| S.7 Prologue null fault (SQC, address 0): 1 of 6 prologue runs with the wait | L | maintainer | | a likely cause (root view left at 0, `draw.rs`) guarded with zeros; 6 of 6 held since, the guard never fired: 1 in 12; watched |
 | S.5 Evaluate fxceless `a26859f` (descriptor mirroring) | D | maintainer | `s5-heap-sync` | **done**: ported (`VICTORY_HEAP_SYNC=1`, off); not the cause; the title copies ~225,000 records a frame as bytes |
 | S.4 Open-world baseline (Jason, outside the house) | G | maintainer | `s5-heap-sync` | **done**: 497 ms (2.0 fps), GPU-bound, a serial chain ([baseline.md](docs/baseline.md)) |
 | S.2 Exact lifetimes for host copies | L | *open* | | after S.1 |

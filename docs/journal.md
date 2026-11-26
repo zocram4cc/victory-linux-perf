@@ -4,6 +4,9 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**S.7 guard: 6 of 6 prologue runs held, the guard never fired**
+- `bench/trials-20261126-051802-s7-zeros` (prologue, pool and wait on): **world 6 of 6**, 354-376 ms (windows `invalid`: the intro cutscene). No run logged a root view bound to zeros. So the guard did no work here, and the cause is not confirmed: S.7 stands at 1 crash in 12 prologue runs with the wait. Watched; the guard stays (it costs nothing when unused) and its log line will name the address if it fires.
+
 **P.1 begun: the pipeline library was never made; draws dropped for good**
 - `pipeline/library.rs` asked vkd3d-proton for an empty library with an empty slice, whose pointer is not null. vkd3d refuses a pointer with a length of 0 (`if (!blob_length && blob) return E_INVALIDARG`, `libs/vkd3d/cache.c` `d3d12_pipeline_library_init`). So **every run went without a library** (*"no host pipeline library: pipelines are not kept"*), the early list of title pipelines stayed at 0, and each run made all its pipelines again: ~3,000 entering the open world. Fixed in `c436241` (a null blob); with it, the 0.5 s/frame budget and the early start (decision 0007) can work as designed. To measure: two runs in a row, the second should load from the library.
 - New counters on the "host pipelines all made" line: ms in the host's make and load calls, the workers' total, title threads' wait, draws dropped after waiting.
