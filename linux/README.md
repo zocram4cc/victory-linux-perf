@@ -14,7 +14,7 @@ by way of vkd3d-proton (3.2.0 or newer: see `run.sh`).
 Machine settings go into `linux/local.env` (git-ignored): `GAME_DIR`,
 `PROTONPATH`, `STATE_DIR`, `D3DCOMPILER` as `run.sh` describes them, and any
 `VICTORY_*` switches. (An example file with the switches measured on an
-RX 7900 XTX is not in the repository yet: the policy check does not allow
+RX 9070 XT is not in the repository yet: the policy check does not allow
 its file type.)
 
 Measuring a switch: runs from the same save land in scenes of 1,500 to 7,000

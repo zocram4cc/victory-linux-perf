@@ -10,7 +10,7 @@ file types, and `.patch` and `.c` are not among them. Whether to allow them
 is the owner's decision.
 
 Measured on Proton Hotfix `hotfix-20261110` (wine-11.0), kernel 7.3, RADV, an
-RX 7900 XTX.
+RX 9070 XT.
 
 ## 1. `views-tree.patch`: the server finds a process's views through a tree
 

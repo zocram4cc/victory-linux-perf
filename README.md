@@ -1,9 +1,9 @@
-# VIctory on an RX 7900 XTX, under Linux
+# VIctory under Linux, on an RX 9070 XT
 
 A fork of [avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX),
 itself a fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility
 layer that runs an Xbox Series title natively on Windows from files the user
-supplies. This one is about **running it on Linux through Proton, on AMD RDNA 3
+supplies. This one is about **running it on Linux through Proton, on AMD RDNA 4
 with Mesa's RADV**, and about speed there: the world at 30 frames a second,
 which is also the most the title asks for (it paces itself to 33.3 ms a frame).
 It is not there yet.
@@ -15,7 +15,7 @@ or publisher.
 ## Where it stands (2026-11-25)
 
 Tested on one machine only: Linux 7.3 (CachyOS), Ryzen 9 9950X3D, 64 GB RAM,
-Radeon RX 7900 XTX with RADV, Proton Hotfix `hotfix-20261110` (vkd3d-proton
+Radeon RX 9070 XT (16 GB) with RADV, Proton Hotfix `hotfix-20261110` (vkd3d-proton
 3.2.0), the Series X profile at 1440p. Frame times are medians of five-second
 stretches of one play session on the release build, by how much there is to
 draw.
