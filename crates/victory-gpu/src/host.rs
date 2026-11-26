@@ -1065,6 +1065,13 @@ fn create() -> windows::core::Result<Host> {
             let amd = crate::indirect::amd(&device);
             victory_shader::emit::set_host_rdna(amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64);
         }
+        // Fixes for what vkd3d-proton and its drivers do are on by default
+        // only under Wine.
+        tracing::info!(
+            wine = crate::wine::on_wine(),
+            raw_typed_loads = victory_shader::emit::raw_typed_loads(),
+            "Wine-only fixes"
+        );
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
