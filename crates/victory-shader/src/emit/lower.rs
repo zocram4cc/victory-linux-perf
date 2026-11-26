@@ -314,6 +314,9 @@ struct Lower<'a> {
     tail: Vec<Option<usize>>,
     /// The program writes UAVs: barriers fence them too.
     writes_uavs: bool,
+    /// 16-bit integer typed UAV loads read through the slot's raw view
+    /// ([`raw_typed_loads_on`]).
+    raw_typed_loads: bool,
     /// src0 of the current instruction as DPP fetched it.
     src0: Option<V>,
     /// Compute code that reads other lanes: thread ids follow the host
@@ -1115,7 +1118,7 @@ fn own_bits_on() -> bool {
 /// what it writes for the console's own hardware, and the switches whose
 /// default is the host's (under Wine or not).
 pub fn host_settings() -> [u32; 5] {
-    let wine = u32::from(table_slot_words());
+    let wine = u32::from(table_slot_words()) | u32::from(raw_typed_loads_on()) << 1;
     [host_max_wave(), super::shader::view_heap_limit(), super::shader::raw_views(), host_rdna(), wine]
 }
 
@@ -1153,10 +1156,41 @@ pub fn table_slot_words() -> bool {
     wine_switch("VICTORY_TABLE_SLOT_WORDS", &ENV)
 }
 
+/// Whether a compute program that stores to UAVs and synchronises its group
+/// with `s_barrier` reads 16-bit integer typed buffer views (`_d16` loads of
+/// 1, 2 or 4 channels, the view's kind from the host's table by heap slot)
+/// through the slot's raw view instead (`VICTORY_RAW_TYPED_LOADS`: on under
+/// Wine, `0` off, `1` on; untested on Windows). On RADV through
+/// vkd3d-proton a typed (texel buffer) load after the group barrier could
+/// return what the buffer held before another wave's store that preceded
+/// the barrier; raw loads see it. The face network's Formula program
+/// (0aa7934094794dbf, an interpreter whose 1,024 threads keep a register
+/// file in an R16_UINT view, a barrier between its 12 stages), replayed
+/// from the title's buffers in the owner's tree: typed, its registers left
+/// a CPU model of its console code from stage 2 (1 register, 119 by stage
+/// 12) whatever the barrier's fence bits, globally coherent views or RADV's
+/// LLVM backend; one dispatch a stage, or raw loads, matched the model
+/// after every stage. Torn faces (mouths agape) before, whole ones after.
+fn raw_typed_loads_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_RAW_TYPED_LOADS.get() {
+        return on;
+    }
+    static ENV: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    wine_switch("VICTORY_RAW_TYPED_LOADS", &ENV)
+}
+
+/// See [`raw_typed_loads_on`], for the host's log.
+pub fn raw_typed_loads() -> bool {
+    raw_typed_loads_on()
+}
+
 #[cfg(test)]
 thread_local! {
     /// A test's choice for [`table_slot_words`], for its thread only.
     pub(super) static TEST_TABLE_SLOT_WORDS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// A test's choice for [`raw_typed_loads_on`], for its thread only.
+    pub(super) static TEST_RAW_TYPED_LOADS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 static HOST_RDNA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1428,6 +1462,11 @@ impl<'a> Lower<'a> {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
+        let raw_typed_loads = raw_typed_loads_on()
+            && x.native.stage == HwStage::Cs
+            && writes_uavs
+            && insts().any(|i| i.name() == "s_barrier")
+            && insts().any(|i| matches!(i.fields, Fields::Buffer { .. }) && i.name().contains("load_format"));
         let mut console_lanes = false;
         // LDS accesses get a group barrier each (a console wave split in two host waves)
         let mut split_lds = false;
@@ -1712,6 +1751,7 @@ impl<'a> Lower<'a> {
             rpo: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
             writes_uavs,
+            raw_typed_loads,
             src0: None,
             console_lanes,
             split_lds,
@@ -12003,9 +12043,50 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
+        // The same element through the slot's raw view (its raw twin, or the
+        // slot itself where the host keeps none), where the view is a 16-bit
+        // integer one ([`raw_typed_loads_on`]): (taken, dwords).
+        let mut raw: Option<(V, Vec<V>)> = None;
         let r = if typed {
             if *offen || matches!(off, V::Inst(_)) || *offset != 0 {
                 return Err("a typed buffer load at an offset");
+            }
+            if uav
+                && d16
+                && matches!(count, 1 | 2 | 4)
+                && self.raw_typed_loads
+                && let Some(index) = index
+                && let Some(word) = self.slot_word(src, table_slot_words())?
+            {
+                let c = self.cur;
+                // Only views of 16-bit integer channels as many as loaded:
+                // their element is the loaded bytes.
+                let size = 2 * count;
+                let bits = self.s.m.i32(super::shader::VIEW_INTEGER | super::shader::VIEW_STRIDE_BITS);
+                let want = self.s.m.i32(super::shader::VIEW_INTEGER | size);
+                let kind = self.s.m.bin(c, Bin::And, word, bits);
+                let taken = self.s.m.cmp(c, pred::EQ, kind, want);
+                let h = self.handle(site, src, false, (11 | u, 0))?;
+                let k = self.s.m.i32(size);
+                let byte = self.s.m.bin(c, Bin::Mul, index, k);
+                let k3 = self.s.m.i32(3);
+                let within = self.s.m.bin(c, Bin::And, byte, k3);
+                let aligned = self.s.m.bin(c, Bin::Sub, byte, within);
+                let dwords = count.div_ceil(2);
+                let (mask, align) = (self.s.m.i8((1u8 << dwords) - 1), self.s.m.i32(4));
+                let l = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &[h, aligned, iu, mask, align]);
+                let mut ws = Vec::new();
+                for d in 0..dwords {
+                    let f = self.s.m.extract(c, l, d);
+                    ws.push(self.as_int(f));
+                }
+                if count == 1 {
+                    let sh = self.s.m.bin(c, Bin::Shl, within, k3);
+                    let x = self.s.m.bin(c, Bin::LShr, ws[0], sh);
+                    let low = self.s.m.i32(0xFFFF);
+                    ws[0] = self.s.m.bin(c, Bin::And, x, low);
+                }
+                raw = Some((taken, ws));
             }
             if uav {
                 self.s.flags |= flags::TYPED_UAV_LOADS;
@@ -12095,7 +12176,11 @@ impl<'a> Lower<'a> {
                         None => h,
                     });
                 }
-                self.write(inst, Reg::V(reg + k as u8), x.expect("a channel"), guard);
+                let mut x = x.expect("a channel");
+                if let Some((taken, ws)) = &raw {
+                    x = self.s.m.select(c, *taken, ws[k as usize], x);
+                }
+                self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());
         }

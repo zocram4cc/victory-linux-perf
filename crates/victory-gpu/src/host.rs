@@ -957,6 +957,7 @@ fn create() -> windows::core::Result<Host> {
         tracing::info!(
             wine = crate::wine::on_wine(),
             table_slot_words = victory_shader::emit::table_slot_words(),
+            raw_typed_loads = victory_shader::emit::raw_typed_loads(),
             "Wine-only fixes"
         );
         let messages = debug
