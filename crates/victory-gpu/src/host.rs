@@ -6204,7 +6204,7 @@ impl Meter {
         regions_dump();
         if crate::inplace::level() >= 2 {
             let (placed, covered, bytes) = crate::inplace::windows_over_placed();
-            tracing::info!("title buffers in place: {placed}, of them {covered} under window copies ({:.1} MB of overlap): GPU writes there are not seen by those copies", bytes as f64 / 1e6);
+            tracing::info!("title memory in place: {placed} ranges, of them {covered} under host copies, windows or buffer copies ({:.1} MB of overlap): GPU writes there are not seen by those copies", bytes as f64 / 1e6);
         }
         if crate::indirect::batch_on() {
             let w = [0, 1, 2, 3, 4, 5].map(|i| crate::indirect::BATCH_WHY[i].swap(0, Ordering::Relaxed) as f64 / frames);

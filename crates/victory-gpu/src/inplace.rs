@@ -201,7 +201,7 @@ pub(crate) fn windows_over_placed() -> (u64, u64, u64) {
     let ranges = PLACED_RANGES.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let (mut buffers, mut bytes) = (0, 0);
     for &(a, e) in &ranges {
-        let over = crate::shadow::windows_over(a, e);
+        let over = crate::shadow::copies_over(a, e);
         if over > 0 {
             buffers += 1;
             bytes += over;

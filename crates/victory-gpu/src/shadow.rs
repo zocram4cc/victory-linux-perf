@@ -2882,6 +2882,22 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     n
 }
 
+/// Bytes of host copies, windows and buffer copies (not in place), over
+/// `[at, end)`.
+pub(crate) fn copies_over(at: u64, end: u64) -> u64 {
+    let mut bytes = windows_over(at, end);
+    let map = buffers();
+    for (key, entry) in map.range(..(end, 0)).rev().take(256) {
+        if entry.end > at
+            && let Some(shadow) = &entry.shadow
+            && !shadow.in_place()
+        {
+            bytes += entry.end.min(end) - key.0.max(at);
+        }
+    }
+    bytes
+}
+
 /// Bytes of windows (copies) over `[at, end)`.
 pub(crate) fn windows_over(at: u64, end: u64) -> u64 {
     let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
