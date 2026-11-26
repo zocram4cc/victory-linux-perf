@@ -146,6 +146,13 @@ export VKD3D_CONFIG="${VKD3D_CONFIG-descriptor_heap}"
 export VKD3D_DISABLE_EXTENSIONS="${VKD3D_DISABLE_EXTENSIONS-VK_NV_raw_access_chains}"
 export VKD3D_SHADER_CACHE_PATH="${VKD3D_SHADER_CACHE_PATH:-$HOME/.cache/victory/vkd3d}"
 mkdir -p "$VKD3D_SHADER_CACHE_PATH"
+# NVIDIA's own shader disk cache holds 1 GB unless told otherwise: the
+# title's pipelines filled it, the driver trimmed what warm had made, and
+# the first 20-30 s of the world compiled 1,100-1,300 pipelines again with
+# 700-800 draws a frame left out (runs 20261126-232301 and -232829). The
+# same two settings as WASDeKeys' launcher; warm and shaders get them too.
+export __GL_SHADER_DISK_CACHE_SIZE="${__GL_SHADER_DISK_CACHE_SIZE:-12884901888}"
+export __GL_SHADER_DISK_CACHE_SKIP_CLEANUP="${__GL_SHADER_DISK_CACHE_SKIP_CLEANUP:-1}"
 
 cd "$repo"   # victory.toml is looked for in the working directory
 
@@ -188,10 +195,10 @@ d VICTORY_SHOW_AFTER 1
 # (Jason under a street lamp, the car scene) at no cost a frame (runs
 # 20261126-232301 and -232829 against -231332).
 d VICTORY_AMBIENT 1.2
-# NVIDIA caps the shader-visible view heap at 1,000,000 views; more of it
-# for tables made per draw (trustno1's value): dropped draws about 340 a
-# frame before, about 150 after.
-d VICTORY_DYNAMIC_SLOTS 524288
+# Not VICTORY_DYNAMIC_SLOTS=524288 (trustno1's) by default: on NVIDIA's
+# capped view heap it leaves 500,000 of the title's slots in place, and the
+# title uses slots up to about 720,000; a view read past them would meet
+# another draw's table. Unset, 2^18 dynamic slots keep 737,855 in place.
 if (( safe )); then
   # scripts/play.ps1 -Safe: without the newer, faster ways.
   d VICTORY_UNDER_WIDE 0
