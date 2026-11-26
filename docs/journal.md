@@ -4,6 +4,19 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**Buffers in place, split by size: what breaks is the ≥ 1 MiB ones, and they are nearly all the bytes**
+- `VICTORY_INPLACE_BUFFER_KB=min,max` (new, bisection) with `VICTORY_INPLACE=3`, the user watching each run:
+
+| Buffers in place | Count / MB | Picture | Frame / GPU |
+|---|---|---|---|
+| < 64 KiB (`…-inplace-small`) | 214 / 1 MB | right | 351 ms / 129 ms; **lost the device** at the end |
+| 64 KiB-1 MiB (`…-inplace-mid`) | 70 / 15 MB | right ("lo que ha cargado no se vuelve negro y Jason se ve bien") | 427 ms / 194 ms |
+| ≥ 64 KiB (`…-inplace-big`) | 100 / 130 MB | **broken** | 434 ms / 220 ms |
+
+- So the buffers ≥ 1 MiB (~30, ~115 MB) are what breaks the picture, and they are the bytes that matter; what holds in place is too little to gain from.
+- **Hypothesis to test:** buffers in place are host-pointer imports (`VK_EXT_external_memory_host`: amdgpu userptr). The title's memory is write-watched; Wine's write watch resets protections at each submission (`mprotect`), and every protection change on a userptr range triggers an MMU notifier that invalidates the import. Big buffers the title rewrites often would be invalidated again and again: stale reads, and now and then a lost device. Windows in place held because what lies in them is written seldom (to check). **VRAM placed at the address is device memory, not an import**: it would not have this problem. That is the next step, and it needs the Wine patch.
+- The user asked whether the biggest could be compressed: not for these (the GPU reads them raw, every frame, and the cost is keeping them in step, not their size); textures already travel compressed (BCn) and the card compresses its targets itself.
+
 **Windows alone in place: the picture is right; buffers in place are what breaks it. Windows over PCIe cost the GPU 2×**
 - `VICTORY_INPLACE=1` (`bench/trials-20261126-102825-inplace1`): 78 windows, 360 MB in place, no buffers. **The picture is right** (`shot-1.png`: the house in colour, the dock and the water whole, Jason on the deck), better than with copies. But **GPU 379 ms** (187 with copies) and 582 ms a frame: the windows' 360 MB read over PCIe, as on 25 Nov.
 - So **buffers in place break the picture, not memory in place as such**, and not copies over them (none left under `=2`). Something about how a title buffer is opened in place (`inplace::place_part`: the 64 KiB-aligned heap around it, the bias, its length, or its retirement when the title releases the buffer object while its memory lives on) is wrong. That is the next thing to find, by halves (by size, by kind of use).
