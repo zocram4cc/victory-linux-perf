@@ -5065,22 +5065,51 @@ struct Entry {
 /// written when a buffer comes, goes or gets its copy: readers share it.
 static BUFFERS: std::sync::RwLock<BTreeMap<(u64, usize), Entry>> = std::sync::RwLock::new(BTreeMap::new());
 
+/// [`BUFFERS`] for writing. Each change made through it is announced first,
+/// with [`touch`].
 fn buffers() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entry>> {
-    let map = BUFFERS.write().unwrap_or_else(|e| e.into_inner());
-    // What threads remember of it ([`FOUND`]) is of before.
-    BUFFERS_CHANGED.fetch_add(1, Ordering::SeqCst);
-    map
+    BUFFERS.write().unwrap_or_else(|e| e.into_inner())
 }
 
-/// How often [`BUFFERS`] was taken to be changed.
+/// How many changes were made to [`BUFFERS`] ([`touch`]): the number of the last.
 static BUFFERS_CHANGED: AtomicU64 = AtomicU64::new(1);
+
+/// Title memory is counted in grains of `1 << GRAIN_SHIFT` bytes (64 KiB) for
+/// [`FOUND`]: see [`touch`].
+const GRAIN_SHIFT: u32 = 16;
+
+/// The longest span (grains, from an answer's buffer's first grain to the
+/// ask's) an answer is kept for: a hit checks each grain of it.
+const SPAN_MOST: u64 = 256;
+
+/// The grain slots: the last change to a grain is kept in the slot of the
+/// grain's number modulo this. Grains 1 GiB apart share a slot, which only
+/// ever makes a change count for more asks than it touches.
+const GRAIN_SLOTS: usize = 1 << 14;
+
+/// Per grain slot, the number of the last change that touched it ([`touch`]).
+static GRAIN_CHANGED: [AtomicU64; GRAIN_SLOTS] = [const { AtomicU64::new(0) }; GRAIN_SLOTS];
+
+/// Announces a change to the bytes `[start, end)` of [`BUFFERS`] (of a buffer,
+/// or of the one it replaces). An answer whose span holds none of their grains
+/// nor `start`'s is not altered by it: see [`unchanged_since`]. Called under the
+/// map's write lock, before the change is made (so is the copy `lookup` makes
+/// for an entry, which changes the entry too).
+fn touch(start: u64, end: u64) {
+    let number = BUFFERS_CHANGED.fetch_add(1, Ordering::SeqCst) + 1;
+    let first = start >> GRAIN_SHIFT;
+    let last = end.saturating_sub(1).max(start) >> GRAIN_SHIFT;
+    for grain in first..=last.min(first + GRAIN_SLOTS as u64 - 1) {
+        GRAIN_CHANGED[grain as usize % GRAIN_SLOTS].store(number, Ordering::SeqCst);
+    }
+}
 
 /// Answers a thread remembers.
 const FOUND_MOST: usize = 1024;
 
-/// An ask (address, bytes), the count of changes it was answered at, and the
-/// answer.
-type Found = (u64, u64, u64, std::sync::Weak<Shadow>);
+/// An ask (address, bytes), the first grain of the buffer that answers it,
+/// the count of changes it was answered at, and the answer.
+type Found = (u64, u64, u64, u64, std::sync::Weak<Shadow>);
 
 thread_local! {
     /// The last answers of [`lookup`] out of [`BUFFERS`], by a hash of the
@@ -5095,33 +5124,66 @@ fn quick_find() -> bool {
     crate::toggled!("VICTORY_QUICK_FIND")
 }
 
+/// Whether [`FOUND`] tells its answers apart by grain (see
+/// [`unchanged_since`]); `VICTORY_FIND_BUCKETS=0`: by the count of all changes.
+fn find_buckets() -> bool {
+    crate::toggled!("VICTORY_FIND_BUCKETS")
+}
+
+/// The asks answered from [`FOUND`] (the microbenchmark reads it).
+#[cfg(test)]
+static HITS: AtomicU64 = AtomicU64::new(0);
+
 fn found_at(address: u64, len: u64) -> usize {
     let h = (address ^ len.rotate_left(32)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     (h >> 54) as usize % FOUND_MOST
 }
 
-/// What this thread remembers of an ask, if nothing changed since.
-fn found(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    let changed = BUFFERS_CHANGED.load(Ordering::SeqCst);
-    let shadow = FOUND.with(|f| {
+/// What this thread remembers of an ask, if the answer still stands.
+fn found(address: u64, len: u64, buckets: bool) -> Option<Arc<Shadow>> {
+    let last = address >> GRAIN_SHIFT;
+    let (shadow, first, changed) = FOUND.with(|f| {
         let f = f.borrow();
-        let (a, n, at, shadow) = f.get(found_at(address, len))?;
-        ((*a, *n, *at) == (address, len, changed)).then(|| shadow.upgrade()).flatten()
+        let (a, n, first, changed, shadow) = f.get(found_at(address, len))?;
+        if (*a, *n) != (address, len) || !unchanged_since(buckets, *first, last, *changed) {
+            return None;
+        }
+        Some((shadow.upgrade()?, *first, *changed))
     })?;
     // Whoever takes the map to let a copy go that nobody holds finds it held
     // now, or had counted before: then it is not handed out.
     std::sync::atomic::fence(Ordering::SeqCst);
-    (BUFFERS_CHANGED.load(Ordering::SeqCst) == changed).then_some(shadow)
+    unchanged_since(buckets, first, last, changed).then_some(shadow)
 }
 
-/// Remembers an answer given while `changed` was the count.
-fn remember(address: u64, len: u64, changed: u64, shadow: &Arc<Shadow>) {
+/// Whether the answer given at change number `changed`, to an ask whose span
+/// is grains `first..=last` (from the first grain of its buffer to the ask's),
+/// still stands. Without `buckets`, no change may have been made since. With
+/// them, no change since may have touched a grain of the span. That is exact:
+/// an answer depends only on the buffers covering the ask and on the keys
+/// nearest below it (see `lookup_with`). A change to a grain outside the span
+/// cannot cover the ask (that would touch the ask's grain), nor start between
+/// the answer's buffer and the ask (that start would lie in the span).
+fn unchanged_since(buckets: bool, first: u64, last: u64, changed: u64) -> bool {
+    if !buckets {
+        return BUFFERS_CHANGED.load(Ordering::SeqCst) == changed;
+    }
+    // Nothing changed at all, so nothing in the span: no grain is read.
+    if BUFFERS_CHANGED.load(Ordering::SeqCst) == changed {
+        return true;
+    }
+    last - first < SPAN_MOST && (first..=last).all(|grain| GRAIN_CHANGED[grain as usize % GRAIN_SLOTS].load(Ordering::SeqCst) <= changed)
+}
+
+/// Remembers an answer given at change number `changed`, for an ask whose
+/// buffer starts in grain `first`.
+fn remember(address: u64, len: u64, first: u64, changed: u64, shadow: &Arc<Shadow>) {
     FOUND.with(|f| {
         let mut f = f.borrow_mut();
         if f.is_empty() {
-            f.resize_with(FOUND_MOST, || (0, 0, 0, std::sync::Weak::new()));
+            f.resize_with(FOUND_MOST, || (0, 0, 0, 0, std::sync::Weak::new()));
         }
-        f[found_at(address, len)] = (address, len, changed, Arc::downgrade(shadow));
+        f[found_at(address, len)] = (address, len, first, changed, Arc::downgrade(shadow));
     });
 }
 
@@ -5131,18 +5193,21 @@ fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), 
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    buffers().insert(
-        (start, resource),
-        Entry {
-            end: start + len,
-            shadow: None,
-        },
-    );
+    let mut map = buffers();
+    let end = start + len;
+    // A replaced entry changes the memory its old end covered too.
+    let old_end = map.get(&(start, resource)).map_or(start, |entry| entry.end);
+    touch(start, end.max(old_end));
+    map.insert((start, resource), Entry { end, shadow: None });
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers().remove(&(start, resource));
+    let mut map = buffers();
+    if let Some(end) = map.get(&(start, resource)).map(|entry| entry.end) {
+        touch(start, end);
+        map.remove(&(start, resource));
+    }
 }
 
 /// The title buffer holding `address`, as (start, length), without making
@@ -5176,17 +5241,27 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     {
         // As `lookup` finds a buffer: among the 256 that start below.
         let mut map = buffers();
-        for (_, entry) in map.range_mut(..(end, 0)).rev().take(256) {
-            if entry.end > at && entry.shadow.as_ref().is_some_and(|s| s.place.is_some()) {
-                gone.extend(entry.shadow.take());
-            }
-        }
+        gone.extend(take_copies(&mut map, at, end, |s| s.place.is_some()));
     }
     let n = gone.len() as u64;
     for shadow in gone {
         crate::host::retire(shadow);
     }
     n
+}
+
+/// The copies `in_place_let_go` takes out of the map: those of the title
+/// buffers overlapping `[at, end)` that `wanted` says, among the 256 nearest
+/// below `end` (as `lookup` finds a buffer).
+fn take_copies(map: &mut BTreeMap<(u64, usize), Entry>, at: u64, end: u64, wanted: impl Fn(&Shadow) -> bool) -> Vec<Arc<Shadow>> {
+    let mut gone = Vec::new();
+    for (key, entry) in map.range_mut(..(end, 0)).rev().take(256) {
+        if entry.end > at && entry.shadow.as_deref().is_some_and(&wanted) {
+            touch(key.0, entry.end);
+            gone.extend(entry.shadow.take());
+        }
+    }
+    gone
 }
 
 /// For the in-place census (`crate::inplace`): the title buffers (start,
@@ -5238,8 +5313,16 @@ pub(crate) fn peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
 }
 
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
-    let quick = quick_find();
-    if quick && let Some(shadow) = found(address, len) {
+    lookup_with(address, len, any, quick_find(), find_buckets())
+}
+
+/// [`lookup`] with its switches given: `quick` answers from, and keeps, what
+/// this thread remembers; `buckets` tells the remembered apart by grain. With
+/// `quick` off, the answer is the uncached one.
+fn lookup_with(address: u64, len: u64, any: bool, quick: bool, buckets: bool) -> Option<Arc<Shadow>> {
+    if quick && let Some(shadow) = found(address, len, buckets) {
+        #[cfg(test)]
+        let _ = HITS.fetch_add(1, Ordering::Relaxed);
         return Some(shadow);
     }
     let end = address.checked_add(len.max(1))?;
@@ -5247,10 +5330,12 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         let map = buffers_read();
         match map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end) {
             // The copy is made already (nearly always).
-            Some((_, Entry { shadow: Some(shadow), .. })) => {
-                if quick {
-                    // (Nobody changes the map while this lock is held.)
-                    remember(address, len, BUFFERS_CHANGED.load(Ordering::SeqCst), shadow);
+            Some((key, Entry { shadow: Some(shadow), .. })) => {
+                let first = key.0 >> GRAIN_SHIFT;
+                // (Nobody changes the map while this lock is held.) A span too
+                // long to check on each hit is not kept.
+                if quick && (!buckets || (address >> GRAIN_SHIFT) - first < SPAN_MOST) {
+                    remember(address, len, first, BUFFERS_CHANGED.load(Ordering::SeqCst), shadow);
                 }
                 return Some(shadow.clone());
             }
@@ -5274,6 +5359,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     };
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
+        touch(key.0, entry.end);
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
         // Shaders write some buffers (unordered access), so not upload memory.
@@ -5335,6 +5421,271 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         entry.shadow = Some(shadow);
     }
     entry.shadow.clone()
+}
+
+#[cfg(test)]
+mod find_tests {
+    use super::*;
+
+    /// Synthetic title addresses. Nothing reads title memory here (copies
+    /// are made, never filled), and each test keeps to a range of its own.
+    const BASE: u64 = 0xD000_0000_0000_0000;
+    const KIB: u64 = 1 << 10;
+    const MIB: u64 = 1 << 20;
+
+    fn same(a: &Option<Arc<Shadow>>, b: &Option<Arc<Shadow>>) -> bool {
+        match (a, b) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    fn id(a: &Option<Arc<Shadow>>) -> Option<u64> {
+        a.as_ref().map(|s| s.id)
+    }
+
+    /// The host GPU, made here: `lookup` first asks for it under the map's
+    /// write lock (`card_limits`), so a test that met it there first would
+    /// wait on that lock. Without a GPU the tests fail rather than pass.
+    fn gpu() {
+        assert!(crate::host::host().is_some(), "these tests need the host GPU");
+    }
+
+    /// Asks the cache twice (the second may be a hit) and the uncached lookup
+    /// once. Both cached answers must be the uncached one, which is returned.
+    fn ask(address: u64, len: u64, any: bool, buckets: bool, at: &str) -> Option<Arc<Shadow>> {
+        gpu();
+        let first = lookup_with(address, len, any, true, buckets);
+        let again = lookup_with(address, len, any, true, buckets);
+        let want = lookup_with(address, len, any, false, buckets);
+        let what = format!("{at}: {address:#x}+{len} any={any} buckets={buckets}");
+        assert!(same(&first, &want), "{what}: cached {:?}, uncached {:?}", id(&first), id(&want));
+        assert!(same(&again, &want), "{what}, asked again: cached {:?}, uncached {:?}", id(&again), id(&want));
+        want
+    }
+
+    /// A xorshift generator: the same sequence in every run.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// Random registrations, removals, takes of copies and asks over buffers
+    /// that overlap, nest and share starts: every cached answer is the
+    /// uncached one, under both settings of `buckets`, for `find` and
+    /// `find_any` alike.
+    #[test]
+    fn cached_answers_match_uncached_ones_through_random_changes() {
+        const SPAN: u64 = 8 * MIB;
+        const LENS: [u64; 6] = [4 * KIB, 16 * KIB, 64 * KIB, 256 * KIB, MIB, 2 * MIB];
+        const ASKS: [u64; 6] = [0, 1, 4, 64, 4 * KIB, 64 * KIB];
+        const SEEDS: [u64; 3] = [0x2545_F491_4F6C_DD1D, 0x9E37_79B9_7F4A_7C15, 0xC0FF_EE00_D15E_A5E5];
+        for (seed, buckets) in SEEDS.iter().flat_map(|&seed| [(seed, false), (seed, true)]) {
+            let mut rng = Rng(seed ^ u64::from(buckets));
+            // (resource, start) -> length, as the map should hold them.
+            let mut live: BTreeMap<(usize, u64), u64> = BTreeMap::new();
+            let mut pool: Vec<(u64, u64, bool)> = Vec::new();
+            for step in 0..4000 {
+                let at = format!("buckets={buckets} step {step}");
+                let roll = rng.below(100);
+                if roll < 25 && live.len() < 40 {
+                    let resource = 1 + rng.below(4) as usize;
+                    let start = BASE + (rng.below(SPAN >> 12) << 12);
+                    let len = LENS[rng.below(LENS.len() as u64) as usize];
+                    register(resource, start, len);
+                    live.insert((resource, start), len);
+                } else if roll < 35 {
+                    let pick = rng.below(live.len().max(1) as u64) as usize;
+                    if let Some((&(resource, start), _)) = live.iter().nth(pick) {
+                        unregister(resource, start);
+                        live.remove(&(resource, start));
+                    }
+                } else if roll < 42 {
+                    let start = BASE + (rng.below(SPAN >> 12) << 12);
+                    let len = LENS[rng.below(LENS.len() as u64) as usize];
+                    drop(take_copies(&mut buffers(), start, start + len, |_| true));
+                } else {
+                    // Half the asks repeat one of the last 32, so that a cached
+                    // answer is checked after the changes made since it was given.
+                    let (address, len, any) = if !pool.is_empty() && rng.below(2) == 0 {
+                        pool[rng.below(pool.len() as u64) as usize]
+                    } else {
+                        let pick = rng.below(live.len().max(1) as u64) as usize;
+                        let inside = rng.below(3) > 0;
+                        let address = match live.iter().nth(pick) {
+                            Some((&(_, start), &len)) if inside => {
+                                if rng.below(2) == 0 { start } else { start + len - 1 }
+                            }
+                            _ => BASE + rng.below(SPAN),
+                        };
+                        let len = ASKS[rng.below(ASKS.len() as u64) as usize];
+                        let any = rng.below(2) == 0;
+                        if pool.len() == 32 {
+                            pool.remove(0);
+                        }
+                        pool.push((address, len, any));
+                        (address, len, any)
+                    };
+                    ask(address, len, any, buckets, &at);
+                }
+            }
+        }
+    }
+
+    /// A change far from an answer's grains leaves the answer in place, as a
+    /// hit. A change covering the ask (the same start, a later resource) takes
+    /// the answer over, and the cache lets the old one go.
+    #[test]
+    fn a_far_change_keeps_the_answer_and_a_covering_one_replaces_it() {
+        let start = BASE + 0x1000_0000;
+        register(1, start, 64 * KIB);
+        let at = start + 0x100;
+        let answer = ask(at, 1, false, true, "buffer 1");
+        assert!(answer.is_some(), "buffer 1 has its copy");
+        register(2, BASE + 0x800_0000, 64 * KIB);
+        let kept = found(at, 1, true);
+        assert!(same(&kept, &answer), "a change 128 MiB away dropped the answer: found {:?}, answered {:?}", id(&kept), id(&answer));
+        register(3, start, 64 * KIB);
+        assert!(found(at, 1, true).is_none(), "a buffer covering the ask left its old answer in the cache");
+        let taken_over = ask(at, 1, false, true, "buffer 3 covers");
+        assert!(taken_over.is_some() && !same(&taken_over, &answer), "a covering buffer did not take over: {:?}", id(&taken_over));
+    }
+
+    /// An answer is looked for among the 64 keys nearest below the ask. With
+    /// 63 keys starting between the answer's buffer and the ask, the buffer is
+    /// still found; the 64th such key puts it out of reach, and the cache must
+    /// stop answering with it.
+    #[test]
+    fn the_64th_key_between_an_answer_and_its_ask_puts_it_out_of_reach() {
+        let arena = BASE + 0x4000_0000;
+        register(10, arena, 4 * MIB);
+        let at = arena + 0x4_0800;
+        let arena_copy = ask(arena, 1, false, true, "arena");
+        assert!(arena_copy.is_some(), "the arena has its copy");
+        assert!(same(&ask(at, 1, false, true, "alone"), &arena_copy), "the arena answers alone");
+        for i in 1..=63 {
+            register(11, arena + i * 0x1000, 0x100);
+        }
+        let with_63 = ask(at, 1, false, true, "63 keys between");
+        assert!(same(&with_63, &arena_copy), "63 keys between: {:?}, not the arena's {:?}", id(&with_63), id(&arena_copy));
+        register(11, arena + 64 * 0x1000, 0x100);
+        let with_64 = ask(at, 1, false, true, "64 keys between");
+        assert!(!same(&with_64, &arena_copy), "64 keys between: the arena still answers ({:?})", id(&with_64));
+    }
+
+    /// A copy taken out of the map is not handed out again by the cache, though
+    /// a list still holds it: the next ask makes a new copy.
+    #[test]
+    fn a_taken_copy_is_not_handed_out_again() {
+        let start = BASE + 0x8000_0000;
+        register(20, start, 256 * KIB);
+        let held = ask(start + 0x40, 16, false, true, "before the take");
+        assert!(held.is_some(), "the buffer has its copy");
+        let gone = take_copies(&mut buffers(), start, start + 256 * KIB, |_| true);
+        assert_eq!(gone.len(), 1, "the take gave up the buffer's copy");
+        let after = ask(start + 0x40, 16, false, true, "after the take");
+        assert!(after.is_some() && !same(&after, &held), "a taken copy was handed out again: {:?}", id(&after));
+    }
+
+    /// Lookup cost with a change every `every` asks (0: none), over 512 title
+    /// buffers of 64 KiB and a 16 MiB arena with 64 buffers in it. Changes
+    /// alternate between a buffer's own grain (a buffer inside it, below the
+    /// asks) and an empty grain. Asks are drawn from the first `working` of
+    /// 4,096 different ones, 42,500 a frame, four frames. Prints the median
+    /// ns per ask of three runs and the cache's hit rate, for the uncached
+    /// lookup, for the cache with one global count (`old`) and for the cache
+    /// with grains (`grain`). Run by hand, in a release build:
+    /// `-- --ignored --nocapture bench_find_under_changes`.
+    #[test]
+    #[ignore = "microbenchmark: run by hand, in a release build"]
+    fn bench_find_under_changes() {
+        const FRAME: usize = 42_500;
+        const FRAMES: usize = 4;
+        gpu();
+        let base = BASE + 0x2000_0000;
+        for i in 0..512 {
+            register(1, base + i * 0x2_0000, 64 * KIB);
+        }
+        let arena = BASE + 0x6000_0000;
+        register(2, arena, 16 * MIB);
+        for j in 0..64 {
+            register(3, arena + j * 0x4_0000 + 0x1000, 64 * KIB);
+        }
+        // The change pair `pair` registers, then removes: (start, bytes).
+        let transient = |pair: usize| -> (u64, u64) {
+            let at = base + (pair / 2 % 256) as u64 * 0x2_0000;
+            if pair % 2 == 0 { (at + 0x1_0000, 64 * KIB) } else { (at + 0x100, 0x80) }
+        };
+        let mut rng = Rng(0xB3C0_FFEE_D00D_5EED);
+        let asks: Vec<(u64, u64)> = (0..4096)
+            .map(|_| {
+                let address = if rng.below(8) == 0 {
+                    arena + rng.below(16 * MIB - 256)
+                } else {
+                    base + rng.below(512) * 0x2_0000 + 0x200 + rng.below(64 * KIB - 0x200 - 256)
+                };
+                (address, 1 + rng.below(255))
+            })
+            .collect();
+        for &(address, len) in &asks {
+            lookup_with(address, len, false, false, false);
+        }
+        for working in [256usize, 1024, 4096] {
+            let order: Vec<usize> = (0..FRAME * FRAMES).map(|_| rng.below(working as u64) as usize).collect();
+            for every in [0usize, 1000, 100, 10] {
+                for (mode, quick, buckets) in [("uncached", false, false), ("old", true, false), ("grain", true, true)] {
+                    let mut ns = Vec::new();
+                    let mut hits = 0.0;
+                    let mut sum = 0u64;
+                    let mut changes = 0usize;
+                    for _ in 0..3 {
+                        changes = 0;
+                        HITS.store(0, Ordering::Relaxed);
+                        let started = std::time::Instant::now();
+                        for (n, &k) in order.iter().enumerate() {
+                            if every > 0 && n % every == 0 {
+                                let (at, len) = transient(changes / 2);
+                                if changes % 2 == 0 {
+                                    register(7, at, len);
+                                } else {
+                                    unregister(7, at);
+                                }
+                                changes += 1;
+                            }
+                            let (address, len) = asks[k];
+                            if let Some(shadow) = lookup_with(address, len, false, quick, buckets) {
+                                sum = sum.wrapping_add(shadow.id);
+                            }
+                        }
+                        ns.push(started.elapsed().as_nanos() as f64 / order.len() as f64);
+                        hits = HITS.load(Ordering::Relaxed) as f64 / order.len() as f64;
+                        if changes % 2 == 1 {
+                            unregister(7, transient(changes / 2).0);
+                        }
+                    }
+                    ns.sort_by(f64::total_cmp);
+                    println!(
+                        "BENCH working={working:<5} every={every:<5} mode={mode:<8} ns_per_ask={:>6.1} (min {:.1}) hits={:>5.1}% changes={changes} check={}",
+                        ns[1],
+                        ns[0],
+                        100.0 * hits,
+                        std::hint::black_box(sum) % 1000
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (
