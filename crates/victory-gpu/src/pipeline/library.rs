@@ -570,11 +570,16 @@ pub(crate) fn pipeline(
 }
 
 /// Writes the library and the early list if pipelines were added since the
-/// last save and `SAVE_EVERY` has passed (or `now`).
+/// last save and `SAVE_EVERY` has passed (or `now`); without a library,
+/// the early list alone ([`early_without_library`]).
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
-    let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
+    let Some(dir) = DIR.get() else { return };
+    let library = library();
+    if library.is_none() && !early_without_library() {
+        return;
+    }
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
         if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
@@ -582,6 +587,10 @@ pub(crate) fn save(now: bool) {
         }
         *last = Some(std::time::Instant::now());
     }
+    let Some(library) = library else {
+        save_early_list(dir);
+        return;
+    };
     if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
@@ -647,6 +656,42 @@ pub(crate) fn save(now: bool) {
             "host pipeline library saved"
         ),
         Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
+    }
+}
+
+/// Whether the early list is kept when the host has no pipeline library
+/// (`VICTORY_EARLY_LIST`; on under Wine). vkd3d-proton refuses the library
+/// ("no host pipeline library: pipelines are not kept" in every run under
+/// Proton), and the list was only written beside it: every session there
+/// started with "title pipelines to start early pipelines=0", made each
+/// pipeline at its first draw, and `victory warm --used` had no list to
+/// read. A Windows driver keeps a library, so this is never reached there
+/// unless asked for.
+fn early_without_library() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::wine::on_under_wine("VICTORY_EARLY_LIST"))
+}
+
+/// Writes the early list and the slow list alone (no library to save beside
+/// them), if they changed.
+fn save_early_list(dir: &std::path::Path) {
+    if !USED_CHANGED.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    // Through `used`, as beside the library.
+    let used: Vec<String> = used().iter().flatten().cloned().collect();
+    let slow: Vec<String> = slow_ones().iter().flatten().map(|(key, ms)| format!("{key} {ms}")).collect();
+    let written = std::fs::create_dir_all(dir)
+        .and_then(|()| write_atomically(&dir.join(SLOW_FILE), slow.join("\n").as_bytes()))
+        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
+    match written {
+        Ok(()) => tracing::info!(
+            early = used.len(),
+            made = MADE.load(Ordering::Relaxed),
+            started_early = EARLY.load(Ordering::Relaxed),
+            "early pipeline list saved (no host pipeline library)"
+        ),
+        Err(e) => tracing::warn!(error = %e, "early pipeline list not saved"),
     }
 }
 
