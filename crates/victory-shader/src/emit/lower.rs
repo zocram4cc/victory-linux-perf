@@ -1111,10 +1111,52 @@ fn own_bits_on() -> bool {
 }
 
 /// What the translator was told of the host, for a cache's key: the widest
-/// wave, the view heap's limit, where the raw twins of its views start, and
-/// what it writes for the console's own hardware.
-pub fn host_settings() -> [u32; 4] {
-    [host_max_wave(), super::shader::view_heap_limit(), super::shader::raw_views(), host_rdna()]
+/// wave, the view heap's limit, where the raw twins of its views start,
+/// what it writes for the console's own hardware, and the switches whose
+/// default is the host's (under Wine or not).
+pub fn host_settings() -> [u32; 5] {
+    let wine = u32::from(table_slot_words());
+    [host_max_wave(), super::shader::view_heap_limit(), super::shader::raw_views(), host_rdna(), wine]
+}
+
+static HOST_WINE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Tells the translator that the host runs under Wine (vkd3d-proton): the
+/// default of the switches that read [`wine_switch`].
+pub fn set_host_wine(on: bool) {
+    HOST_WINE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A switch on under Wine ([`set_host_wine`]) unless its variable `name`
+/// says otherwise: `0` off, any other value on.
+fn wine_switch(name: &str, env: &std::sync::OnceLock<Option<bool>>) -> bool {
+    env.get_or_init(|| std::env::var_os(name).map(|v| v != "0"))
+        .unwrap_or_else(|| HOST_WINE.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Whether descriptors a program reads through a descriptor table take the
+/// format kind of their view from the host's table by heap slot, as those
+/// it picks from the heap do, and the host enters the words of the slots
+/// it copies tables into (`VICTORY_TABLE_SLOT_WORDS`: on under Wine, `0`
+/// off, `1` on; untested on Windows). The face network (the 65
+/// `compute_graph_ops` programs, all bound through tables, their tensors in
+/// R16_UINT and R16G16B16A16_UINT views) otherwise reads its 16-bit
+/// integers as halves, then 0: its output, the R16_UINT buffer the head
+/// extract 970c4fbb3b017c0e reads, stays zero, faces do not move and eyes
+/// glow (the rig drives the eye meshes too).
+pub fn table_slot_words() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_TABLE_SLOT_WORDS.get() {
+        return on;
+    }
+    static ENV: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    wine_switch("VICTORY_TABLE_SLOT_WORDS", &ENV)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`table_slot_words`], for its thread only.
+    pub(super) static TEST_TABLE_SLOT_WORDS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 static HOST_RDNA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -7474,7 +7516,7 @@ impl<'a> Lower<'a> {
     /// `ResourceHeap`): read from the host's table by heap slot in the
     /// current block.
     fn slot_stride(&mut self, src: &Source) -> Result<Option<V>, Why> {
-        let word = self.slot_word(src)?;
+        let word = self.slot_word(src, false)?;
         Ok(word.map(|word| {
             let bits = self.s.m.i32(super::shader::VIEW_STRIDE_BITS);
             self.s.m.bin(self.cur, Bin::And, word, bits)
@@ -7482,10 +7524,11 @@ impl<'a> Lower<'a> {
     }
 
     /// Whether the typed buffer view `src` names is one of an integer format,
-    /// and whether a signed one, as [`Self::slot_stride`] (`None`: a view the
-    /// program does not pick from the heap).
+    /// and whether a signed one, as [`Self::slot_stride`], and of a view read
+    /// through a table too with [`table_slot_words`] (`None`: a view the
+    /// host's table by heap slot does not describe).
     fn integer_view(&mut self, src: &Source) -> Result<Option<(V, V)>, Why> {
-        let Some(word) = self.slot_word(src)? else {
+        let Some(word) = self.slot_word(src, table_slot_words())? else {
             return Ok(None);
         };
         let c = self.cur;
@@ -7499,8 +7542,10 @@ impl<'a> Lower<'a> {
     }
 
     /// The host's word for the buffer view `src` names: its stride and
-    /// format kind ([`super::shader::SLOT_STRIDES`]).
-    fn slot_word(&mut self, src: &Source) -> Result<Option<V>, Why> {
+    /// format kind ([`super::shader::SLOT_STRIDES`]); of a view picked from
+    /// the heap, and with `tables` of one read through a table too (the host
+    /// enters the words of the slots it copies tables into).
+    fn slot_word(&mut self, src: &Source, tables: bool) -> Result<Option<V>, Why> {
         let Source::Loaded { load, first } = src else {
             return Ok(None);
         };
@@ -7508,7 +7553,7 @@ impl<'a> Lower<'a> {
             .scalar
             .get(load)
             .and_then(|a| self.x.native.layout.get(a.param))
-            .is_some_and(|p| p.root == RootType::ResourceHeap);
+            .is_some_and(|p| p.root == RootType::ResourceHeap || (tables && p.root == RootType::Table));
         if !heap {
             return Ok(None);
         }
@@ -13370,5 +13415,52 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    /// A d16 typed buffer load through a table asks the host's table by heap
+    /// slot for its view's format kind with `VICTORY_TABLE_SLOT_WORDS` (the
+    /// face network's compute_graph_ops programs, e.g. 0aa7934094794dbf,
+    /// load R16G16B16A16_UINT data this way and compute with it as
+    /// integers); without it, and for a 32-bit load, the program is as
+    /// before.
+    #[test]
+    fn a_d16_typed_buffer_load_through_a_table_reads_its_views_format_kind() {
+        let layout = vec![root(RootType::Table, 0, 0)];
+        let used = vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 4,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        let words = |d16: bool| {
+            // buffer_load_format(_d16)_xyzw v[1:..], v0, s[8:11], 0 idxen
+            let op: u32 = if d16 { 0x83 } else { 0x03 };
+            [
+                0xBE84_0300, // s_mov_b32 s4, s0
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0x38 << 26 | op << 18 | 1 << 13,
+                0x8002_0100,
+                0xBF8C_3F70, // s_waitcnt vmcnt(0)
+                0xD834_0000,
+                0x0000_0100, // ds_write_b32 v0, v1
+                S_ENDPGM,
+            ]
+        };
+        let table = |d16, on| {
+            let was = super::TEST_TABLE_SLOT_WORDS.replace(Some(on));
+            let l = lower_with(&words(d16), layout.clone(), used.clone());
+            super::TEST_TABLE_SLOT_WORDS.set(was);
+            l.unwrap().root_srvs.contains(&super::super::shader::SLOT_STRIDES)
+        };
+        assert!(table(true, true), "d16");
+        assert!(!table(false, true), "32-bit");
+        assert!(!table(true, false), "d16, switch off");
     }
 }
