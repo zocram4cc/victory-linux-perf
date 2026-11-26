@@ -51,7 +51,10 @@ tempfile.workspace = true
 
 [features]
 # Debugging switches (scripted keys and the like).
-diagnostics = ["victory-gpu/diagnostics", "victory-loader/diagnostics", "dep:windows", "dep:windows-core"]
+diagnostics = ["scripted", "victory-gpu/diagnostics", "victory-loader/diagnostics", "dep:windows", "dep:windows-core"]
+# Only the scripted key presses (`VICTORY_KEYS`), for a build without the rest
+# of `diagnostics`.
+scripted = []
 
 [lints]
 workspace = true

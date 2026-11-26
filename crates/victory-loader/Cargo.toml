@@ -33,7 +33,9 @@ tempfile.workspace = true
 
 [features]
 # Debugging switches (scheduled stack dumps and the like).
-diagnostics = []
+diagnostics = ["scripted"]
+# Only `VICTORY_STEP_OVER`, for a build without the rest of `diagnostics`.
+scripted = []
 
 [lints]
 workspace = true

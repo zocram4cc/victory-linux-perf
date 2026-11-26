@@ -29,6 +29,9 @@ diagnostics = [
     "victory-loader/diagnostics",
     "victory-shader/diagnostics",
 ]
+# Only what a scripted run needs (`VICTORY_KEYS`, `VICTORY_STEP_OVER`), none of
+# the rest of `diagnostics`.
+scripted = ["victory-hle/scripted", "victory-loader/scripted"]
 
 [lints]
 workspace = true

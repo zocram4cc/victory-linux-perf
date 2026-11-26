@@ -304,6 +304,15 @@ A release build has no debugging aids. Build them in with
 cargo build --profile diag -p victory --features diagnostics   # target\diag\victory.exe
 ```
 
+For scripted runs of a build without the rest of the aids, `--features scripted`
+builds in only `VICTORY_KEYS` and `VICTORY_STEP_OVER=<hex offset>,...` (title
+breakpoints stepped over, such as the pool traps of Grand Theft Auto VI
+1.0.2.1 at `+0x5149aec` and `+0x63966f`); `diagnostics` includes both:
+
+```powershell
+cargo build --profile release -p victory --features scripted   # target\release\victory.exe
+```
+
 The on/off switches below (`...=1`) are off when unset or set to `0`.
 
 | Variable | Effect |
