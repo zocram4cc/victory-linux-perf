@@ -644,6 +644,18 @@ pub(crate) extern "system" fn create_compute(
     )
 }
 
+/// P.4: a compute pipeline from a container we built (device method 0x218's
+/// pieces put back together as an `FSPX` program, `device::native_compute`).
+pub(crate) fn create_compute_from(container: &[u8], iid: *const Iid, out: *mut This) -> HRESULT {
+    hand_out(
+        vec![shader("compute", container)],
+        #[cfg(windows)]
+        None,
+        iid,
+        out,
+    )
+}
+
 /// Device method 0x1f0: the plain compute description plus console
 /// extensions `(desc, extension count, extensions, iid, out)`.
 /// shortcut: the extensions (console shader settings) are ignored, as is
