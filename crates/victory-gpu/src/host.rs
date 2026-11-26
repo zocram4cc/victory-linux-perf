@@ -6201,6 +6201,10 @@ impl Meter {
         crate::pool::pool_line(frames);
         crate::census::census_line(frames);
         gpu_census_line(frames);
+        let born = [0, 1].map(|i| crate::descriptor::host::BORN_WAITS[i].swap(0, Ordering::Relaxed));
+        if born[0] + born[1] > 0 {
+            tracing::info!("slot writes of textures per frame (VICTORY_SLOT_WAIT=2): {:.0} waited for older submissions, {:.0} did not need to", born[0] as f64 / frames, born[1] as f64 / frames);
+        }
         let refused = crate::descriptor::host::DYNAMIC_REFUSED.swap(0, Ordering::Relaxed);
         if refused > 0 {
             tracing::info!("dynamic descriptor tables refused for want of slots per frame: {:.0} (their draws are dropped)", refused as f64 / frames);

@@ -1127,6 +1127,9 @@ pub(crate) struct HostTexture {
     /// Whether its contents come from title memory ([`fills`]): counted in
     /// [`KINDS`] while it lives.
     filled: bool,
+    /// Submissions started when it was made: those may run without its
+    /// page-table update (`VICTORY_SLOT_WAIT=2`).
+    pub(crate) born: u64,
 }
 
 /// What a title texture has on the host: its host copy and, for a depth
@@ -1566,6 +1569,7 @@ impl HostTexture {
             state: std::sync::atomic::AtomicU32::new(state),
             bytes,
             filled: false,
+            born: crate::host::submissions().1,
         }
     }
 }
@@ -1606,6 +1610,16 @@ pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u
 /// this is the texture's first use ([`Hosted`]). Asking is a use; what must
 /// not count as one asks `host_made`.
 #[cfg(windows)]
+/// The submissions started when the host copy of texture `this` was made
+/// (made now if it has none yet); `None` if it has none.
+pub(crate) fn host_born(this: This) -> Option<u64> {
+    if this.is_null() {
+        return None;
+    }
+    let (host, _) = hosted(this, true)?;
+    Some(host.born)
+}
+
 pub(crate) fn host_resource<'a>(
     this: This,
 ) -> Option<&'a windows::Win32::Graphics::Direct3D12::ID3D12Resource> {

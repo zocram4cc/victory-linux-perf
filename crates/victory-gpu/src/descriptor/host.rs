@@ -2336,6 +2336,52 @@ fn dynamic_no_wait() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_DYNAMIC_NO_WAIT").is_some_and(|v| v == "1"))
 }
 
+/// `VICTORY_SLOT_WAIT`: 1 (default) every write waits until no submission
+/// runs; 0 none waits; 2 a write waits only for the submissions that had
+/// started when the host copy of the texture its view shows was made
+/// (victory-scarlett's `SHOW_AFTER` answers the same race; C.1, 26 Nov).
+fn slot_wait_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_SLOT_WAIT").as_deref() {
+        Ok("0") => 0,
+        Ok("2") => 2,
+        _ => 1,
+    })
+}
+
+/// Writes by [`slot_wait_born`]: those that waited, and those that did not
+/// need to (frame line).
+pub(crate) static BORN_WAITS: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// `VICTORY_SLOT_WAIT=2`: waits until every submission started before the
+/// host copy of the view's texture was made has finished.
+fn slot_wait_born(view: &View) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if NO_WAIT.with(|w| w.get()) {
+        return;
+    }
+    let resource = match view {
+        View::Shader(r, _) | View::Unordered(r, _, _) => *r,
+        _ => return,
+    };
+    let Some(born) = crate::resource::host_born(resource as crate::object::This) else {
+        return;
+    };
+    if crate::host::submissions().0 >= born {
+        BORN_WAITS[1].fetch_add(1, Relaxed);
+        return;
+    }
+    BORN_WAITS[0].fetch_add(1, Relaxed);
+    let started = std::time::Instant::now();
+    while crate::host::submissions().0 < born {
+        if started.elapsed() > std::time::Duration::from_secs(2) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_micros(100));
+    }
+}
+
 fn slot_wait() {
     use std::sync::atomic::Ordering::Relaxed;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -2381,7 +2427,11 @@ pub(crate) fn slot_line(frames: f64) {
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
-    slot_wait();
+    if slot_wait_mode() == 2 {
+        slot_wait_born(view);
+    } else {
+        slot_wait();
+    }
     let host = host()?;
     let device = &host.device;
     match view {
