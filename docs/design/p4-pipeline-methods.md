@@ -33,6 +33,8 @@ The pairs alternate between the title image's data (`0x14…`, lengths 0xbc-0x2f
 ```
 These are shader containers by (pointer, length), like the PC description's `D3D12_SHADER_BYTECODE`, with an index and a tag. Lengths seen: 0x70, 0x530, 0x1e04.
 
+**Checked offline, 26 Nov:** in the cached image the `0x14…` addresses of the pairs fall in code (x86 bytes). So either they are not image data, or the image's data there differs at run time. The blocks must be dumped from the running process (step 2), not read from the file.
+
 ## Steps
 
 1. **Census:** count the calls of each method per run, and the draws and indirect draws dropped for want of a pipeline. Is it these pipelines, or other ones (untranslated shaders, slow compiles)? Log `missing()` reasons for the top dropped pipelines in a diagnostics build.
