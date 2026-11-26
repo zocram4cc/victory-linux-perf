@@ -64,6 +64,22 @@ export GAMEID="${GAMEID:-umu-0}"
 [[ -d "$PROTONPATH" ]] || { echo "No Proton at $PROTONPATH; set PROTONPATH" >&2; exit 2; }
 mkdir -p "$WINEPREFIX"
 
+# vkd3d-proton older than v3.1-83 (GE-Proton11-12 and before) converts DXIL
+# with dxil-spirv's legacy structurizer, which turned ~6% of the title's
+# pipelines into invalid SPIR-V that NVIDIA's compiler crashed on (the title
+# died as it loaded). GE-Proton11-13 and later have the rewritten one.
+d3d12core="$PROTONPATH/files/lib/wine/vkd3d-proton/x86_64-windows/d3d12core.dll"
+if command -v strings >/dev/null && [[ -f "$d3d12core" ]]; then
+  vkd3d_version=$(strings "$d3d12core" | grep -m1 -oE '^v[0-9]+\.[0-9]+(\.[0-9]+)?(-[0-9]+)?-g[0-9a-f]+' || true)
+  if [[ "$vkd3d_version" =~ ^v([0-9]+)\.([0-9]+)(\.[0-9]+)?(-([0-9]+))? ]]; then
+    major=${BASH_REMATCH[1]} minor=${BASH_REMATCH[2]} since=${BASH_REMATCH[5]:-0}
+    if (( major < 3 || (major == 3 && minor < 1) || (major == 3 && minor == 1 && since < 83) )); then
+      echo "warning: $PROTONPATH has vkd3d-proton $vkd3d_version, older than v3.1-83: its legacy" \
+        "DXIL structurizer crashes NVIDIA's shader compiler on this title. Use GE-Proton11-13 or later." >&2
+    fi
+  fi
+fi
+
 exe="${VICTORY_EXE:-}"
 if [[ -z "$exe" ]]; then
   for c in "$target/$profile/victory.exe" \

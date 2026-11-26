@@ -19,7 +19,7 @@ To build from this checkout, install the pinned Rust toolchain and the MSVC C++ 
 
 The Windows build runs under Proton-GE through [umu-launcher](https://github.com/Open-Wine-Components/umu-launcher), with vkd3d-proton turning Direct3D 12 into Vulkan. Tested so far on Fedora 45 with an RTX 5080: it builds, starts under Proton, and passes the unit tests there; a full game run is still to come.
 
-You need rustup, clang, lld and llvm (`sudo dnf install rustup clang lld llvm` on Fedora), `umu-run` on your PATH (on Fedora 45 use the release's zipapp, the RPMs are built for older Python), and Proton-GE in `~/.local/share/Steam/compatibilitytools.d/Proton-GE Latest` (or set `PROTONPATH`).
+You need rustup, clang, lld and llvm (`sudo dnf install rustup clang lld llvm` on Fedora), `umu-run` on your PATH (on Fedora 45 use the release's zipapp, the RPMs are built for older Python), and **GE-Proton11-13 or later** in `~/.local/share/Steam/compatibilitytools.d/Proton-GE Latest` (or set `PROTONPATH`). Older vkd3d-proton (before v3.1-83, so GE-Proton11-12 and earlier) converts DXIL with dxil-spirv's legacy structurizer, which turns about 6% of the title's pipelines into invalid SPIR-V that NVIDIA's shader compiler crashes on, and the title dies as it loads; the launcher warns when it can tell.
 
 Cross-compile with [cargo-xwin](https://github.com/rust-cross/cargo-xwin); it downloads Microsoft's CRT and Windows SDK, whose licence you accept with `XWIN_ACCEPT_LICENSE=1`:
 
