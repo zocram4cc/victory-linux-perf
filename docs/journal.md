@@ -4,6 +4,11 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**Gates passed: `VICTORY_INDIRECT_BATCH` and `VICTORY_INDIRECT_WINDOW` on by default**
+- Jason (`bench/trials-20261126-075607-gate-batch-jason` plus `…-batch-window`): **world 4 of 4, 395-408 ms**. A fifth run stayed on the start screen for 6 minutes (30 fps, 3 draws a frame, **no indirect draw at all**, 6 DirectStorage "request ran before its page array was filled" warnings): it never reached anything the switches touch; noted as a start-screen hang to watch.
+- Prologue (`…-gate-batch-prologue`): **world 3 of 3, 351-371 ms** (windows invalid as always: the intro cutscene).
+- Both switches are now on by default (`=0` turns each off).
+
 **I.2 step 1: batch plus windows, inline clamps ~9,700 → ~830, GPU 187 ms, frame 407 ms (2.45 fps), picture held**
 - The batch now takes CPU-written records first, and `VICTORY_INDIRECT_WINDOW=1` takes what is left (records the list's shaders write: one clamp per window of up to 64). `bench/trials-20261126-075253-batch-window` (same scene, ~11,900 draws): **frame 407-408 ms, GPU 187 ms, clamps left inline 805-864 (6.5-6.8 ms)**; 4,900-5,400 records a frame clamped in preludes. Picture right (`shot-1.png`: railings, umbrella, Jason on the deck).
 - The day's GPU line: 272 ms (start) → 200 (I.1) → 187 (I.1 + windows). Frame 501 → 430 → 407 ms.

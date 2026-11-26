@@ -329,11 +329,12 @@ pub(crate) fn bound_split(list: &HostList, src: (&ID3D12Resource, u64)) -> Optio
 /// pass of ours between them. Without it, every record was clamped right
 /// before its draw into the one scratch buffer the list has, between two
 /// waits for every shader write (~9,700 a frame in the open world, the
-/// draws never overlapping: G.1, 26 Nov). Off until measured.
+/// draws never overlapping: G.1, 26 Nov). On by default (`=0` off).
 pub(crate) fn batch_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var_os("VICTORY_INDIRECT_BATCH").is_some_and(|v| v == "1");
+        // On by default since 26 Nov (GPU −26 %, the gates held); `=0` off.
+        let on = std::env::var_os("VICTORY_INDIRECT_BATCH").is_none_or(|v| v != "0");
         if on {
             tracing::info!("VICTORY_INDIRECT_BATCH=1: indirect records clamped in the list's prelude, in one run");
         }
