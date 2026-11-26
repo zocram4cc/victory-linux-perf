@@ -775,13 +775,14 @@ static NULL_ROOT_SEEN: std::sync::Mutex<Option<std::collections::HashSet<(String
 /// A root constant (`srv` false) or shader view `param` of pipeline
 /// `pipeline` that would read nothing of ours (`why`) reads zeros instead
 /// of whatever the list held ([`null_roots_on`]). Each pipeline, parameter,
-/// side and cause is logged once, with the count so far.
-fn bind_null_root(l: &ID3D12GraphicsCommandList, param: u32, compute: bool, srv: bool, pipeline: &str, why: NullRoot) {
+/// side and cause is logged once, with the count so far. Whether it was
+/// bound (not with the switch off or without the zeros).
+fn bind_null_root(l: &ID3D12GraphicsCommandList, param: u32, compute: bool, srv: bool, pipeline: &str, why: NullRoot) -> bool {
     if !null_roots_on() {
-        return;
+        return false;
     }
     let Some(gpu) = crate::descriptor::host::zero_buffer_gpu() else {
-        return;
+        return false;
     };
     let n = NULL_ROOTS.fetch_add(1, Ordering::Relaxed) + 1;
     {
@@ -800,6 +801,7 @@ fn bind_null_root(l: &ID3D12GraphicsCommandList, param: u32, compute: bool, srv:
             (true, true) => l.SetComputeRootShaderResourceView(param, gpu),
         }
     }
+    true
 }
 
 /// Whether a draw or dispatch whose program reads descriptor tables is
@@ -1752,8 +1754,8 @@ impl State {
                             None,
                         ));
                     }
-                    if null_roots_on() && !root_address_ok(gpu) {
-                        bind_null_root(l, param, compute, srv, &p.name, NullRoot::NearZero);
+                    // (Bound as before if the zeros are not there.)
+                    if !root_address_ok(gpu) && bind_null_root(l, param, compute, srv, &p.name, NullRoot::NearZero) {
                         continue;
                     }
                     // SAFETY: an open list; the address is in live memory.
