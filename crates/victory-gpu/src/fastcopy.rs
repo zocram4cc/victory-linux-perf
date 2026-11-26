@@ -98,6 +98,12 @@ fn restore_guard(at: usize) {
     }
 }
 
+/// Whether `rip` is our copy instruction (for the census's handler).
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub(crate) fn at_copy(rip: usize) -> bool {
+    rip == &raw const victory_fast_copy_at as usize
+}
+
 #[cfg(all(windows, target_arch = "x86_64"))]
 fn install() {
     use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
@@ -113,6 +119,15 @@ fn install() {
                 return EXCEPTION_CONTINUE_SEARCH;
             }
             let code = record.ExceptionCode;
+            if code == STATUS_GUARD_PAGE_VIOLATION
+                && record.NumberParameters >= 2
+                && crate::census::ours(record.ExceptionInformation[1])
+            {
+                // A guard of the read census (1.3), not the title's: the
+                // fault took it away, and the copy goes on from where it
+                // stopped (`rep movsb` keeps its place in its registers).
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
             if code == STATUS_GUARD_PAGE_VIOLATION && record.NumberParameters >= 2 {
                 // A guard page (a thread's stack end, or the title's own):
                 // the fault took its guard away. It is put back, so the

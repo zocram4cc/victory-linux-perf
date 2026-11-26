@@ -36,6 +36,8 @@ mod indirect;
 mod inplace;
 #[cfg(windows)]
 mod pool;
+#[cfg(windows)]
+mod census;
 mod fastcopy;
 pub mod medir;
 pub mod list;

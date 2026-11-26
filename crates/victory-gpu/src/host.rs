@@ -3964,6 +3964,8 @@ impl Host {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        // The read census's guards come off before we read title memory.
+        crate::census::lift();
         let was_working = working(true);
         submitting(1, runs.len());
         // Flights in the air ([`late`]): a submission that is waited for
@@ -4245,6 +4247,8 @@ impl Host {
                 what.write(at as *mut u8, bytes);
             }
         }
+        // What went back, guarded until the next submission (1.3 census).
+        crate::census::arm();
         self.log_messages();
         submitting(0, 0);
         #[cfg(feature = "diagnostics")]
@@ -5612,6 +5616,8 @@ fn direct_writes() -> bool {
 /// Copies host memory into title memory after a submission (what shaders
 /// wrote), leaving pages that are not mapped alone.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
+    // Every caller is a copy-back: the read census guards what it writes.
+    crate::census::note(dst as usize, len);
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     // Without a system call where every page takes it (`crate::fastcopy`);
@@ -5850,6 +5856,7 @@ impl Meter {
         crate::descriptor::host::slot_line(frames);
         crate::resource::textures_made_line(frames);
         crate::pool::pool_line(frames);
+        crate::census::census_line(frames);
         let zeros = crate::draw::ZERO_ROOTS.load(Ordering::Relaxed);
         if zeros > 0 {
             tracing::info!("root views bound to zeros so far (no host copy at their address; S.7 guard): {zeros}");
