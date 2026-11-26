@@ -648,6 +648,54 @@ fn v_med3_f32_matches_rdna2_with_nan() {
     });
 }
 
+/// `v_div_fixup_f32 q, den, num` gives the special cases in the ISA's order.
+/// A NaN quotient is what `v_div_scale_f32` leaves for 0/x and x/Inf, so it
+/// ranks below signed zero there and is a signed Inf (an overflow) only when
+/// no special case applies.
+#[test]
+fn v_div_fixup_f32_ranks_a_nan_quotient_below_signed_zero() {
+    // v_div_fixup_f32 v0, v1, v2, v3 (VOP3 opcode 0x15F): v1 the quotient,
+    // v2 the denominator, v3 the numerator.
+    let shader = build_valu_cs(&vop3(0x15F, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let f = f32::to_bits;
+    let (qnan, inf, ninf) = (0x7FC0_0000, f(f32::INFINITY), f(f32::NEG_INFINITY));
+    // (quotient, denominator, numerator) -> result bits; `None` for a NaN.
+    let cases: &[([u32; 3], Option<u32>)] = &[
+        // 0/x and x/Inf with a NaN quotient: signed zero (was signed Inf).
+        ([qnan, f(2.0), f(0.0)], Some(f(0.0))),
+        ([qnan, f(-2.0), f(0.0)], Some(f(-0.0))),
+        ([qnan, ninf, f(1.0)], Some(f(-0.0))),
+        ([qnan, inf, f(-3.0)], Some(f(-0.0))),
+        // A NaN quotient and no special case: signed Inf.
+        ([qnan, f(2.0), f(3.0)], Some(inf)),
+        ([qnan, f(-2.0), f(3.0)], Some(ninf)),
+        // x/0 and Inf/x: signed Inf, above signed zero.
+        ([f(0.0), f(0.0), f(1.0)], Some(inf)),
+        ([f(0.0), f(-2.0), inf], Some(ninf)),
+        // 0/0 and Inf/Inf: the negative quiet NaN.
+        ([f(0.0), f(0.0), f(0.0)], Some(0xFFC0_0000)),
+        ([f(1.0), ninf, inf], Some(0xFFC0_0000)),
+        // NaN operands: NaN.
+        ([f(1.0), f(2.0), qnan], None),
+        ([f(1.0), qnan, f(2.0)], None),
+        // No special case: the quotient with the operands' sign.
+        ([f(1.5), f(-2.0), f(3.0)], Some(f(-1.5))),
+        ([f(-1.5), f(2.0), f(3.0)], Some(f(1.5))),
+    ];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|&([q, d, n], _)| [q, d, n, 0]).collect();
+    run_cases(&shader, &inputs, |backend, i, inp, got| match cases[i].1 {
+        Some(want) => assert_eq!(
+            got, want,
+            "{backend}: v_div_fixup_f32 q={:#010x} den={:#010x} num={:#010x} = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1], inp[2],
+        ),
+        None => assert!(
+            f32::from_bits(got).is_nan(),
+            "{backend}: v_div_fixup_f32 {inp:x?} = {got:#010x}, want NaN",
+        ),
+    });
+}
+
 /// RDNA2 orders -0 below +0 in its maximums and minimums; DXIL's FMax and
 /// FMin compare and select, which can give either zero.
 #[test]
