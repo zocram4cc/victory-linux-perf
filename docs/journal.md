@@ -4,6 +4,12 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**G.1: the GPU's time is spread over ~1,400 pipelines; the costliest are all mesh shaders. The title renders for 4K**
+- `VICTORY_GPU_CENSUS=1` (`bench/trials-20261126-070908-gpu-census`, 481-509 ms, GPU 260 ms on the frame line): **209-212 ms timed** across 1,394-1,402 title pipelines a frame. **No single culprit**: the costliest is 12 ms (353 draws), the top 20 sum to ~115 ms.
+- **The top 8 are all mesh pipelines** (shaders `adc5c689…` 22.9 KB, `0a2ea81c…` twice, `b7a81f5b…`, `903776ba…` 21.7 KB, `cf43bdbf…`, `8f690b0f…`, `db875f50…`): the console's geometry, translated. The interval between two marks counts the draw's whole work, pixels included.
+- **The title renders for a 4K display:** the layer reports 3840×2160 (`dxgi.rs` `display_size`, *"display mode reported to the title width=3840 height=2160"*), the swap chain is 3840×2160, and the window is fitted to 1920×1080. A user suggested native 1080p without FSR; `VICTORY_DISPLAY_MODE=1920x1080` already exists (like a Series X on a 1080p set). Run with the census next.
+- Jason's head black again, in a run with only the census (pre-existing, S.9).
+
 **1.3 line closed: the copy-back is the merge, and stays until phase 2. The GPU's 265 ms is the next target (G.1)**
 - `bench/trials-…-refresh-over-gpu`: **~860 refreshes a frame take ~125 MB of bytes the GPU wrote in the last submission back from title memory** (pages the title's CPU dirtied hold GPU-written bytes too). With the copy-back those bytes are the GPU's; without it they are stale and undo the GPU's work in our own copy. That is why every ceiling, even with one copy and no overlaps, lost the picture. Write tracking by page (Wine's write watch) cannot tell the title's bytes from the GPU's in a page; only the copy-back's byte merge does.
 - So 1.3 step 2 as designed is not possible on this tracking. What removes the copy-back is phase 2 (memory the GPU reads in place, ReBAR) or byte-exact tracking. Its ceiling is −22 % in any case. `VICTORY_ONE_COPY=2` stays as a measured option (overlaps −82 %, picture held) for phase 2.
