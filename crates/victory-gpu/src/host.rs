@@ -5913,6 +5913,10 @@ impl Meter {
                     crate::shadow::WINDOW_USE[0].swap(0, Ordering::Relaxed) as f64 / frames,
                     crate::shadow::WINDOW_USE[1].swap(0, Ordering::Relaxed) as f64 / frames,
                 );
+                let [missed, past, none] = [0, 1, 2].map(|i| crate::shadow::LOOKUP_MISS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+                tracing::info!(
+                    "asks that took a window per frame (M.1): {missed:.0} a buffer held whole but the search missed, {past:.0} past a buffer's end, {none:.0} in no buffer"
+                );
             }
         }
         let zeros = crate::draw::ZERO_ROOTS.load(Ordering::Relaxed);

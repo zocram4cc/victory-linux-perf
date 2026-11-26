@@ -2857,6 +2857,16 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     n
 }
 
+/// M.1: asks that went to a window: a buffer held them whole but the
+/// search for it (64 starts below) missed it; a buffer holds the address
+/// but the ask runs past its end; no buffer holds the address.
+pub(crate) static LOOKUP_MISS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+pub(crate) fn overlap_census() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BACK_OVERLAP").is_some_and(|v| v == "1"))
+}
+
 /// M.1: of the windows under written buffer copies, those used in the
 /// last two frames, and those whose asks reached the overlapping bytes.
 pub(crate) static WINDOW_USE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
@@ -2959,6 +2969,22 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         .find(|(_, e)| e.end >= end)
         .map(|(k, _)| *k);
     let Some(key) = key else {
+        // M.1 census: an ask that takes a window though a buffer holds its
+        // address. Missed by the 64-start search, or past the buffer's end.
+        if overlap_census() {
+            let holders: Vec<u64> = map
+                .range(..=(address, usize::MAX))
+                .rev()
+                .filter(|(_, e)| e.end > address)
+                .map(|(_, e)| e.end)
+                .take(4)
+                .collect();
+            if let Some(&far) = holders.iter().max() {
+                LOOKUP_MISS[if far >= end { 0 } else { 1 }].fetch_add(1, Ordering::Relaxed);
+            } else {
+                LOOKUP_MISS[2].fetch_add(1, Ordering::Relaxed);
+            }
+        }
         drop(map);
         return loose(address, end, len <= 1, any);
     };
