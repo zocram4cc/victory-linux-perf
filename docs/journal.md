@@ -4,6 +4,10 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**`VICTORY_SLOT_WAIT=0` (with the texture pool) breaks the picture: the wait is still needed**
+- `descriptor::host::make` begins with `slot_wait()` (S.1: a host slot is not written while a submission runs). With the texture pool (S.6) the device loss it fixed no longer needs it, so it was tried off to see what it costs `make`. **The picture breaks** (the user: "se ve rara"; screenshot in the session: the sky black, white specks over the trees and edges, a blue cast). So a host slot rewritten while a submission runs corrupts what the card reads through it, a second effect of the same race: the pool removed the fault, the wait still keeps descriptors whole. **On, as it is.**
+- So part of `make`'s 8-9 µs may be that wait. Making descriptors cheaper on the recording threads must keep slots that a running submission can read untouched: e.g. write fresh tables' views into slots no running submission names (the dynamic slots are per list; they are given back when the list has run), and wait only for title slots.
+
 **C.1 step 1, `VICTORY_FRESH_COPY=1`: no gain (copying through the title slot costs more than making the view)**
 - `bench/trials-20261126-150217-fresh-copy`: `make_at` is gone from fresh tables, but **"mirror + copy" takes 12.5-13.5 µs per descriptor** (106,000-112,000 a frame, 1.33-1.51 s across threads) against 8-9 µs for `make_at`; frame 540-597 ms against ~400-430. The picture held (the user: all right but Jason's face black, the known intermittent S.9 symptom). **Off.**
 - Reading: `mirror` of the title slot remakes it nearly every time, so the title's descriptor records change from draw to draw or frame to frame (new generations), and a cache keyed by slot misses. The cost is in making a view (`descriptor::host::make`: lookups of the host resource or copy, then the host's `Create*View`), not in where it is written.
