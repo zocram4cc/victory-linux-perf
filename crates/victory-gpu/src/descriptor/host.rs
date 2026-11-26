@@ -5970,7 +5970,9 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert_eq!(table[at + 14..at + 18], [0x1234_5600, 0x42, 0, 0]);
         assert_eq!(table[at + 12..at + 14], [0xdead_beef; 2], "slot 6 untouched");
         let last = at + 2 * (SLOT_STRIDES_COUNT as usize - 1);
-        assert_eq!(table[last..], [0x1234_5600, 0x42]);
+        // (The record counts follow the addresses: `SLOT_COUNTS_AT`.)
+        assert_eq!(table[last..last + 2], [0x1234_5600, 0x42]);
+        assert_eq!(last + 2, victory_shader::emit::SLOT_COUNTS_AT as usize, "the counts begin after the last address");
         assert_eq!(table[..at].iter().filter(|&&w| w != 0xdead_beef).count(), 0, "the strides untouched");
     }
 
