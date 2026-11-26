@@ -1,12 +1,12 @@
 # Shared by the hooks in this folder: every commit of this repository is
-# made as `local <local@localhost>`, unsigned, and nothing that names a
+# made as `developer <developer@localhost>`, unsigned, and nothing that names a
 # contributor goes in. Sourced, not run.
 #
 # The terms that must not appear (names, addresses, hosts) are kept outside
 # the repository, one per line, in .git/info/identity-denylist; lines starting
 # with # are ignored. Without that file only the identity itself is checked.
 
-EXPECTED_IDENT="local <local@localhost>"
+EXPECTED_IDENT="developer <developer@localhost>"
 
 identity_denylist() {
     f="$(git rev-parse --git-path info/identity-denylist)"
@@ -34,7 +34,7 @@ identity_config_ok() {
     committer="$(git var GIT_COMMITTER_IDENT | identity_strip_date)"
     if [ "$author" != "$EXPECTED_IDENT" ] || [ "$committer" != "$EXPECTED_IDENT" ]; then
         echo "identity: commits here are made as '$EXPECTED_IDENT' (author is '$author', committer '$committer')" >&2
-        echo "identity: git config --local user.name local && git config --local user.email local@localhost" >&2
+        echo "identity: git config --local user.name developer && git config --local user.email developer@localhost" >&2
         ok=1
     fi
     if [ "$(git config --bool commit.gpgsign)" = "true" ]; then

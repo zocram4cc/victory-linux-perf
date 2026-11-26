@@ -1,6 +1,6 @@
 #!/bin/sh
 # The last gate (identity.sh): every commit not yet on any remote is made as
-# local@localhost and unsigned, and nothing pushed to this remote, its whole
+# developer@localhost and unsigned, and nothing pushed to this remote, its whole
 # history on a first push, names a contributor.
 . "$(dirname "$0")/identity.sh"
 remote="$1"
@@ -22,7 +22,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     done
 done
 if [ $fail -ne 0 ]; then
-    echo "identity: push refused; commits here are local <local@localhost>, unsigned, naming no one" >&2
+    echo "identity: push refused; commits here are developer <developer@localhost>, unsigned, naming no one" >&2
     exit 1
 fi
 exit 0

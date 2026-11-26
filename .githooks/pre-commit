@@ -1,5 +1,5 @@
 #!/bin/sh
-# Every commit: made as local@localhost and unsigned, no staged line naming a
+# Every commit: made as developer@localhost and unsigned, no staged line naming a
 # contributor (identity.sh), then the asset policy.
 # Install with: cargo xtask install-hooks
 . "$(dirname "$0")/identity.sh"
