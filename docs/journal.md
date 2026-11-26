@@ -4,6 +4,11 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**D.1: spreading the full rescan is no gain; the heap pass is not on the frame's critical path now**
+- `VICTORY_HEAP_ROLL=1` (`bench/trials-20261126-055355-heap-roll`): 477-486 ms against 478-486 without (`…-d1-parts`). Each pass now looks at ~18,800 slots, ~130 ms a frame of the slot loop (against ~30 ms on average plus the 231 ms spike every 16 passes); p95 505-511 against 508-529. **Off.**
+- The frame does not move with the pass's cost either way, so the heap pass is not what the frame waits for at present (the serial chain is). D.1 drops in priority; its texture side goes with A.
+- Next: the ceiling of 1.3, `VICTORY_BACK_CEILING=1` (no snapshots, no copy-back; measurement only, the picture may break).
+
 **D.1 split: one full rescan every 16 passes, and streaming textures on the recording thread**
 - New frame line (`bench/trials-20261126-055025-d1-parts`, 478-486 ms): **heap pass per frame: 4-60 ms over ~3,800 changed slots; 231 ms when it looks at all 119,048 slots (every 16th pass); 2-5 ms queueing span refreshes (2.4 GB of spans, refreshed at submission); 6-115 ms in `heap_textures`**.
 - The full rescan is a spike of ~230 ms every 16 frames. `VICTORY_HEAP_ROLL=1` spreads it, a sixteenth of the slots per pass (each slot still looked at every 16 passes). To measure.
