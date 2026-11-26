@@ -6203,6 +6203,13 @@ impl Meter {
         gpu_census_line(frames);
         regions_dump();
         if crate::inplace::level() >= 2 {
+            let [n, mixed, bytes_n, bytes_mixed] =
+                [0, 1, 2, 3].map(|i| crate::list::INPLACE_COPIES[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            tracing::info!(
+                "title buffer copies per frame between memory in place, made on the card in list order: {n:.0} ({:.1} MB); with one side in place, still made by the CPU: {mixed:.0} ({:.1} MB)",
+                bytes_n / 1e6,
+                bytes_mixed / 1e6
+            );
             let (placed, covered, bytes) = crate::inplace::windows_over_placed();
             tracing::info!("title memory in place: {placed} ranges, of them {covered} under host copies, windows or buffer copies ({:.1} MB of overlap): GPU writes there are not seen by those copies", bytes as f64 / 1e6);
         }

@@ -825,10 +825,67 @@ extern "system" fn copy_buffer_region(
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
     {
+        if in_place_copy(list, to as u64, from as u64, len) {
+            return;
+        }
         list.defer_copy(to, from, len as usize);
     }
     #[cfg(not(windows))]
     let _ = (this, dst, dst_offset, src, src_offset, len);
+}
+
+/// M.2: title buffer copies whose both sides are title memory in place,
+/// recorded on the card in their place in the list, as the console runs
+/// them; copies with one side in place, and the bytes of both kinds.
+#[cfg(windows)]
+pub(crate) static INPLACE_COPIES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// A title buffer copy between title memory in place (`VICTORY_INPLACE` 2
+/// or 3) is recorded as a copy on the card, between two waits for shader
+/// writes, in the list's order. Otherwise every title buffer copy is made
+/// by the CPU in title memory when the list is submitted (`defer_copy`),
+/// before anything of the list has run: with copies the refreshes and the
+/// copy-back hid that, but in place the card then read the copy's result
+/// out of order (draws before it saw it; a pass that wrote its source
+/// before it was not seen). True if recorded here.
+#[cfg(windows)]
+fn in_place_copy(list: &crate::host::HostList, to: u64, from: u64, len: u64) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    use windows::Win32::Graphics::Direct3D12::*;
+    if crate::inplace::level() < 2 || len == 0 {
+        return false;
+    }
+    let (Some(d), Some(s)) = (crate::shadow::find(to, len), crate::shadow::find(from, len)) else {
+        return false;
+    };
+    match (d.in_place(), s.in_place()) {
+        (true, true) => {}
+        (false, false) => return false,
+        _ => {
+            INPLACE_COPIES[1].fetch_add(1, Relaxed);
+            INPLACE_COPIES[3].fetch_add(len, Relaxed);
+            return false;
+        }
+    }
+    INPLACE_COPIES[0].fetch_add(1, Relaxed);
+    INPLACE_COPIES[2].fetch_add(len, Relaxed);
+    list.keep(&d.buffer);
+    list.keep(&s.buffer);
+    let wait = D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }),
+        },
+    };
+    // SAFETY: an open list; both buffers live (kept by the list), the
+    // ranges inside them.
+    unsafe {
+        list.list.ResourceBarrier(std::slice::from_ref(&wait));
+        list.list.CopyBufferRegion(&d.buffer, d.offset(to), &s.buffer, s.offset(from), len);
+        list.list.ResourceBarrier(std::slice::from_ref(&wait));
+    }
+    true
 }
 
 /// Whether one of two resources is a target in a stand-in format and the
