@@ -5963,6 +5963,11 @@ impl Meter {
                     "copy-back ranges in copies of memory not write-watched per frame (refreshed whole each time): {unwatched:.0} of {ranges:.0}, {:.1} MB",
                     unwatched_bytes / 1e6
                 );
+                let [refreshes, refreshed] = [0, 1].map(|i| crate::shadow::REFRESH_OVER_GPU[i].swap(0, Ordering::Relaxed) as f64 / frames);
+                tracing::info!(
+                    "refreshes per frame that take from title memory bytes the GPU wrote in the last submission (1.3): {refreshes:.0}, {:.1} MB",
+                    refreshed / 1e6
+                );
                 let [ranges_t, textures_t, bytes_t] = [9, 10, 11].map(|i| BACK_OVERLAP[i].swap(0, Ordering::Relaxed) as f64 / frames);
                 tracing::info!(
                     "copy-back ranges over textures the title fills per frame (1.3): {ranges_t:.0} ranges, {textures_t:.0} textures, {:.1} MB",

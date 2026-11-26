@@ -63,6 +63,9 @@ pub(crate) struct Shadow {
     /// Asks for the copy that gave no length (root views: they read from
     /// their address to the copy's end, whatever lies there).
     unsized_asks: AtomicU64,
+    /// 1.3 census (`VICTORY_BACK_OVERLAP=1`): the ranges shaders wrote in
+    /// the last submission that declared any (title addresses).
+    gpu_wrote: Mutex<Vec<(usize, usize)>>,
     /// A number no other copy has had. Its address is no name for a copy:
     /// one let go and another made may share it.
     id: u64,
@@ -1767,6 +1770,7 @@ impl Shadow {
             used: AtomicU64::new(crate::host::moment()),
             asked: [AtomicU64::new(u64::MAX), AtomicU64::new(0)],
             unsized_asks: AtomicU64::new(0),
+            gpu_wrote: Mutex::new(Vec::new()),
             id: {
                 static NEXT: AtomicU64 = AtomicU64::new(1);
                 NEXT.fetch_add(1, Ordering::Relaxed)
@@ -2173,6 +2177,9 @@ impl Shadow {
         if self.place.is_some() {
             return;
         }
+        if overlap_census() && !ranges.is_empty() {
+            *self.gpu_wrote.lock().unwrap_or_else(|e| e.into_inner()) = ranges.to_vec();
+        }
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         if relay() {
             let free = self.flights.lock().unwrap_or_else(|e| e.into_inner()).done(ranges);
@@ -2529,6 +2536,17 @@ impl Shadow {
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
+        if overlap_census() && from < to {
+            // Bytes this refresh takes from title memory where the GPU
+            // wrote in the last submission: the copy-back must have put
+            // the GPU's bytes there first, or they are undone here.
+            let wrote = self.gpu_wrote.lock().unwrap_or_else(|e| e.into_inner());
+            let over: usize = wrote.iter().map(|&(a, e)| e.min(to).saturating_sub(a.max(from))).sum();
+            if over > 0 {
+                REFRESH_OVER_GPU[0].fetch_add(1, Ordering::Relaxed);
+                REFRESH_OVER_GPU[1].fetch_add(over as u64, Ordering::Relaxed);
+            }
+        }
         if f1_own() && from < to {
             let pages: Vec<usize> = {
                 let mut own = self.own.lock().unwrap_or_else(|e| e.into_inner());
@@ -2868,6 +2886,10 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
 /// search for it (64 starts below) missed it; a buffer holds the address
 /// but the ask runs past its end; no buffer holds the address.
 pub(crate) static LOOKUP_MISS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// 1.3 census: refresh copies that take bytes the GPU wrote in the last
+/// submission from title memory, and those bytes.
+pub(crate) static REFRESH_OVER_GPU: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 pub(crate) fn overlap_census() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
