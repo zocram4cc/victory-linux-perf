@@ -4,6 +4,11 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**Playing it: the load is slow and black, and two pieces were missing (P, A)**
+- The user played the Jason save (our build, pool and S.7 guard not yet built). Seen: the world comes in black (Jason's house included) with many textures missing for a long time, and ~3 fps. Screenshot in play (`bench/user-play-20261126/shot-now.png`): S.9 again, a dark interior, Jason as a black silhouette, white frost-like speckles on the floor and table, windows blown out.
+- Play log (`royale-save/logs/20261126-050658-run.log`): ~3,000 pipelines first bound in the first 2-3 minutes of the world (1,795 in the first minute), **one frame of 9,953 ms** at 04:10:19, then 2.1-3.0 fps. The shader translation hits its disk cache; the pipelines are created on first bind, on the submitting thread.
+- **Two pieces added to the target (README §4):** **P** pipelines (a journal of what each run creates, replayed on spare cores at the loading screen; a pipeline still missing built on a worker), modelled on KytyPS5's shader journal, pipeline journal and driver-cache saver; **A** asynchronous uploads (a copy queue of its own, fed by workers). Neither is in the 1.3 → 3.1 chain, so they do not wait for it; the steady ~2-3 fps is the serial chain, which only B, D.1 and Q fix.
+
 **S.7 traced: a root view left at address 0; the 1.3 read census built**
 - The only SQC fault on record (kernel log, 25 Nov 23:30:38; prologue run `royale/logs/20261125-232915-run.log`): *SQC (data) reading address 0x0*, `PERMISSION_FAULTS 0x3`. The SQC is the scalar cache: constant buffer loads. 100 ms before, the sweep had let go of 252 texture copies and a texture staging buffer.
 - `draw.rs`: a root CBV or SRV whose title address does not resolve to a host copy (`root_view` returns `None`, or the title never set the root) was **skipped with `continue`**. vkd3d then leaves the root descriptor at 0, and the shader's constant loads read address 0: that fault exactly.
