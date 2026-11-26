@@ -1404,7 +1404,23 @@ impl State {
             .entry(std::ptr::from_ref(host) as usize)
             .or_insert_with(|| (0, Ranges::new()));
         let changed = host.buffer_changes();
-        let slots = if *passes % 16 == 0 {
+        // `VICTORY_HEAP_ROLL=1` (D.1): the look at every slot is spread
+        // over the 16 passes, a sixteenth each (by slot number), instead of
+        // all 119,000 slots in one pass every 16 (231 ms in that frame,
+        // 26 Nov). Each slot is still looked at every 16 passes.
+        static ROLL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let roll = *ROLL.get_or_init(|| std::env::var_os("VICTORY_HEAP_ROLL").is_some_and(|v| v == "1"));
+        let slots = if roll {
+            let turn = (*passes % 16) as u32;
+            let mut slots = changed;
+            let seen: std::collections::HashSet<u32> = slots.iter().copied().collect();
+            slots.extend(host.buffer_slots().into_iter().filter(|i| i % 16 == turn && !seen.contains(i)));
+            // A slot that is no buffer view any more and was not reported
+            // as gone is dropped on its turn.
+            let all: std::collections::HashSet<u32> = host.buffer_slots().into_iter().collect();
+            ranges.retain(|i, _| i % 16 != turn || all.contains(i));
+            slots
+        } else if *passes % 16 == 0 {
             ranges.clear();
             host.buffer_slots()
         } else {
