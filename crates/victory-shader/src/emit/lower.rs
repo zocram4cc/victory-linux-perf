@@ -4786,7 +4786,7 @@ impl<'a> Lower<'a> {
     /// wave reads leave those out (AMD gives 0 from them), quad reads are
     /// what reaches them.
     fn helpers_read(&self, quad: bool) -> bool {
-        quad && self.s.pixel
+        quad && self.s.pixel && super::pixel_quad_reads()
     }
 
     /// `x` of the lane of this lane's quad that `lanes` names for each of
@@ -12495,8 +12495,14 @@ impl<'a> Lower<'a> {
         let term = match self.x.st.exits[b] {
             LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
                 let ok = self.count_iteration(t, pred::IULT);
-                let abort = self.abort_block();
-                Term::CondBr(ok, self.block[t].expect("reachable"), abort)
+                if super::loop_abort() {
+                    let abort = self.abort_block();
+                    Term::CondBr(ok, self.block[t].expect("reachable"), abort)
+                } else {
+                    // (Counted, so the header's phi has its value, but with no
+                    // exit to the abort block.)
+                    Term::Br(self.block[t].expect("reachable"))
+                }
             }
             LaneExit::Jump(t) => {
                 self.enter_loop(b, t, self.cur);
