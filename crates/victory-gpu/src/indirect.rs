@@ -2618,9 +2618,11 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
     }
 
     /// The list's budget starts empty at each submission, wherever it
-    /// lives (the card's copy is zeroed in the list): a recording whose
-    /// clamps spend all of it is followed, after the reset, by one whose
-    /// small record still runs.
+    /// lives (the card's copy is zeroed in the list): two big records spend
+    /// all but 2,048 of it and a third does not fit; a record of exactly
+    /// 2,048 after them runs only on a budget that started empty (with
+    /// `VICTORY_INDIRECT_REST=1` the third takes the rest and it runs
+    /// empty), the same in every round, and alone it always runs.
     #[test]
     fn host_list_budget_starts_empty_at_each_submission() {
         let Some(host) = super::host() else {
@@ -2653,7 +2655,12 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
             }
             sig.unwrap()
         };
-        // Three records of 65,535 x 16 groups: about half the budget each.
+        // Three records of 65,535 x 16 groups (64 a group): two spend all
+        // of the budget (2^27) but 2,048, the third does not fit. The last
+        // record's 32 groups cost those 2,048 exactly: it fits only where
+        // the budget started empty. The worker counts one hit a group.
+        const LAST_GROUPS: u32 = 32;
+        let fits_after = if rest() == 1 { 0 } else { LAST_GROUPS };
         let Some((big, big_ptr)) = host.shared_buffer(3 * u64::from(STRIDE)) else {
             return;
         };
@@ -2673,9 +2680,15 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
                     12,
                 );
             }
-            std::ptr::copy_nonoverlapping([1u32, 1, 1].as_ptr().cast::<u8>(), small_ptr, 12);
+            std::ptr::copy_nonoverlapping([LAST_GROUPS, 1, 1].as_ptr().cast::<u8>(), small_ptr, 12);
             std::ptr::write_bytes(hits_ptr, 0, 256);
         }
+        // SAFETY: a mapped buffer no list is using between submissions.
+        let take_hits = || unsafe {
+            let hits = (hits_ptr as *const u32).read_volatile();
+            (hits_ptr as *mut u32).write_volatile(0);
+            hits
+        };
         // SAFETY: a live buffer.
         let hits_gpu = unsafe { hits_buf.GetGPUVirtualAddress() };
         for round in 0..2 {
@@ -2694,13 +2707,13 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
             assert_eq!(host.log_messages(), None, "the debug layer found an error");
             host.execute(&[&list]);
             list.reset();
-            // SAFETY: the list has run; a mapped buffer.
-            let hits = unsafe { (hits_ptr as *const u32).read_volatile() };
-            // The small record comes after the big ones spent the budget:
-            // it runs empty, in every round alike (none carries over).
-            assert_eq!(hits, 0, "round {round}: the spent budget empties the record after it");
+            // The last record comes after the big ones: it runs where the
+            // round's budget started empty (empty with REST), in every round
+            // alike. Had round 0's spending carried over, round 1's would not
+            // fit.
+            assert_eq!(take_hits(), fits_after, "round {round}: the last record after the spent budget");
         }
-        // A recording with only the small record: the budget is empty
+        // A recording with only the last record: the budget is empty
         // again, so it runs.
         let scratch = bound(&list, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1)).unwrap();
         // SAFETY: as above.
@@ -2714,9 +2727,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         assert_eq!(host.log_messages(), None, "the debug layer found an error");
         host.execute(&[&list]);
         list.reset();
-        // SAFETY: the list has run; a mapped buffer.
-        let hits = unsafe { (hits_ptr as *const u32).read_volatile() };
-        assert_eq!(hits, 1, "the budget starts empty at the next submission");
+        assert_eq!(take_hits(), LAST_GROUPS, "the budget starts empty at the next submission");
     }
 
     /// Records the dispatch records `groups` (three words each, `step`
