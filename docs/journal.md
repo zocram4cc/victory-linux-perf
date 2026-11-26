@@ -4,6 +4,11 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**C.1 closed: the recording threads' waits are off the frame's critical path**
+- With the dynamic ring at 1 << 20 (`…-ring-1m`, `VICTORY_ALL_FRESH=1 VICTORY_DYNAMIC_NO_WAIT=1`): **no table refused**, picture better (the user), bind 340-410 ms a frame (was ~1,300-1,550 with the full wait), **but frame 365-386 ms against ~395**: −2 to −7 %.
+- So ~1 s a frame of the title's recording threads was mostly parallel slack: the frame is set by the serial chain **prepare (~115-140 ms) → GPU (~165-180 ms) → copy-back (~55-65 ms)**, with ~2 of 12 cores and the card ~41 % busy. C.1 is parked (`ALL_FRESH`, `DYNAMIC_NO_WAIT`, the 1 << 20 ring: not default; ring back at 1 << 18).
+- Next, the two Linux-side suspects (the same cool_fox code ran ~2 fps here and 10-20 on Windows): **G.2** the GPU's ~12 µs per draw (165 ms for ~13,000 draws on a 7900 XT; a RADV thread trace to see what lies between draws: barriers, state, descriptor or query work); **W.1** the cost of Wine's write-watch (page protection and faults) per frame.
+
 **`VICTORY_SLOT_WAIT=2` (wait only for submissions older than the texture's host copy): −6 to −9 %, picture wrong**
 - `…-slot-wait-born`: frame 359-372 ms (control ~395), bind 420-710 ms (~1,300-1,550 with the full wait); 1-6 texture slot writes a frame wait, ~12,000-14,000 do not need to.
 - The picture (the user, screenshot in the session): a different colour over the screen while loading, a black flash of the sky, and **when the camera moves everything smears and blurs**; the satellite dish black, a black strip at the left edge.
