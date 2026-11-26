@@ -15,6 +15,8 @@
 #   --skip-intro    press through the boot screens and logos (meeyao's timings, same
 #                   game build): Enter/A at 12-50 s, so the run reaches the load sooner
 #   --proton-log    Wine's own log into the run folder (large)
+#   --new-game      start at the opening scene: the story save and player record are
+#                   moved to ~/.local/share/victory/save-backups/<time> first (settings stay)
 #   --levels-on-demand  texture mip levels as draws need them
 #                   (VICTORY_LEVELS_ON_DEMAND=1; off by default since it used more memory)
 #   --no-texture-waits  the title's shorter waits for textures in the first frames and
@@ -47,7 +49,7 @@ winpath() { local p; p="$(realpath -m -- "$1")"; printf 'Z:%s' "${p//\//\\}"; }
 usage() { sed -n '2,8p' "$0" >&2; exit 2; }
 
 # Options that apply to every command, taken out first.
-profile=release safe=0 bench="" proton_log=0 mangohud=0 stock_wineserver=0 args=()
+profile=release safe=0 bench="" proton_log=0 mangohud=0 stock_wineserver=0 new_game=0 args=()
 while (( $# )); do
   case "$1" in
     --diag) profile=diag ;;
@@ -55,6 +57,7 @@ while (( $# )); do
     --ray-tracing) export VICTORY_BVH_BUILDER="${VICTORY_BVH_BUILDER:-1}" ;;
     --bench) shift; bench="${1:?--bench needs a route name}" ;;
     --proton-log) proton_log=1 ;;
+    --new-game) new_game=1 ;;
     --levels-on-demand) export VICTORY_LEVELS_ON_DEMAND="${VICTORY_LEVELS_ON_DEMAND:-1}" ;;
     --no-texture-waits)
       export VICTORY_EARLY_TEXTURES_MS="${VICTORY_EARLY_TEXTURES_MS:-12}"
@@ -256,6 +259,20 @@ if [[ "${VICTORY_PREBUILD:-1}" != 0 ]]; then
       echo "warning: translating the shaders failed (see $log); the run translates them as it goes" >&2
     fi
   fi
+fi
+
+# --new-game: the title's story saves (SARC*) and player records (Player~*)
+# moved aside, never deleted, so every run starts at the opening scene and
+# runs can be compared frame for frame. Settings stay.
+if (( new_game )); then
+  backup="$HOME/.local/share/victory/save-backups/$(date +%Y%m%d-%H%M%S)"
+  moved=0
+  while IFS= read -r -d '' save; do
+    rel="${save#"$data"/}"
+    mkdir -p "$backup/$(dirname "$rel")"
+    mv "$save" "$backup/$rel" && moved=$((moved + 1))
+  done < <(find "$data" -mindepth 5 -maxdepth 5 -path '*/saves/*' \( -name 'SARC*' -o -name 'Player~*' \) -print0)
+  (( moved )) && echo "new game: $moved saves moved to $backup" >&2 || echo "new game: no saves to move" >&2
 fi
 
 # The run's folder.
