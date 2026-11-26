@@ -4,6 +4,14 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**P.1: with the library made, the world-entry freeze is gone (9.5 s → 0.63 s)**
+- `bench/trials-20261126-053012-pipelib`, Jason save, two runs in a row after `c436241`:
+  - run 1 (empty library): the frame the world appears in takes **9,487 ms** (1,378 pipelines made in those 5 s), then ~460-480 ms;
+  - run 2: *"host pipeline library loaded bytes=265016"*, *"title pipelines to start early pipelines=1466"*; **993 pipelines made in the first 5 s of the process**, 482 more by 30 s, all during the loading screen. The world's first frame takes **629 ms**, and no frame is over 2 s.
+- The loading screen lasted longer in run 2 (world at 69 s against 42 s), with no pipeline work in that gap (1 pipeline from 50 to 60 s): variation in the title's own load or the auto keys, not pipelines. More runs will tell.
+- The library is small (265 KB): with vkd3d-proton's own disk cache, the application library keeps only metadata, and vkd3d's cache holds the compiled pipelines.
+- Unchanged: **~300 draws and 800-860 indirect draws a frame still dropped for want of a pipeline**, from the very first world frame (P.4).
+
 **S.7 guard: 6 of 6 prologue runs held, the guard never fired**
 - `bench/trials-20261126-051802-s7-zeros` (prologue, pool and wait on): **world 6 of 6**, 354-376 ms (windows `invalid`: the intro cutscene). No run logged a root view bound to zeros. So the guard did no work here, and the cause is not confirmed: S.7 stands at 1 crash in 12 prologue runs with the wait. Watched; the guard stays (it costs nothing when unused) and its log line will name the address if it fires.
 
