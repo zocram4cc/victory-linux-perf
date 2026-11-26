@@ -4,6 +4,20 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**Phase 2, the direct path: title GPU memory in VRAM through ReBAR (the console model). The platform allows it; the CPU's reads decide it**
+- The user asked why the GPU cannot read all of title memory, and for the most direct path. Two obstacles, apart: (1) technical, the page pool (72 % of the bytes) is sections and views, which vkd3d's `OpenExistingHeapFromAddress` (a host-pointer import on Linux) does not see; (2) physical, system memory over PCIe is ~25 GB/s for the GPU against VRAM's hundreds.
+- **The direct path:** the title's GPU memory in **VRAM**, mapped for the CPU at the title's own addresses through ReBAR. The GPU reads at full speed; there are no copies, refreshes or copy-back. **This machine has the pieces** (`vulkaninfo`): RADV exposes `VK_EXT_map_memory_placed` (VRAM mapped at a chosen address, made for Wine), `VK_EXT_external_memory_dma_buf` and `VK_KHR_external_memory_fd` (one VRAM object mapped several times: the page pool's aliases), and a memory type that is VRAM, host-visible and coherent on the 20 GB heap (ReBAR). vkd3d-proton would need a heap made from such memory (a patch of ours).
+- **Microbenchmark 2.1** (`tools/rebar-bench/rebar-bench.c`, native Vulkan, 256 MB):
+
+| Memory | CPU write (memset / 32 B streaming) | CPU read | Scattered 64 B read-modify-write | GPU copy out of it |
+|---|---|---|---|---|
+| VRAM through ReBAR (coherent) | 11.7 / 22.6 GB/s | **0.082 GB/s** | 0.94 M/s | **262 GB/s** |
+| system RAM, coherent uncached | 15.1 / 30.5 GB/s | 0.64 GB/s | 5.6 M/s | 28.4 GB/s |
+| system RAM, cached | 13.3 / 30.6 GB/s | 21.2 GB/s | 87 M/s | 28.6 GB/s |
+
+- **What it decides:** the GPU reads VRAM 9× faster than RAM, and the CPU writes VRAM fast enough, but **reads it 250× slower than cached RAM** (1 MB of CPU reads a frame = 12 ms). The direct path holds only if the title's CPU seldom reads its GPU memory, including the data it writes itself and reads again (command buffers, structures updated in place), not only what the GPU writes (that census said ~1 page a frame).
+- **Next measurement:** the title CPU's reads of its GPU memory by page and per frame (a sampled census; the earlier guard census faulted on a page the title reads, so this needs a safer form).
+
 **I.1 `VICTORY_INDIRECT_BATCH=1`: GPU 272 → 200 ms (−26 %), frame 501 → 422-441 ms (−14 %), picture held**
 - Every indirect record was clamped right before its draw into **the list's one scratch buffer** (`indirect_scratch`: every clamp writes offset 0), so two global UAV barriers per draw were needed by construction, and no two draws ever overlapped.
 - **I.1:** a single record that no shader of the list wrote before it gets a slot of its own in a per-list buffer (`HostList::batch_slot`). Its clamp is left for the list's **prelude** (`indirect::record_batch`: one wait, all the clamps back to back, one wait and the move to `INDIRECT_ARGUMENT`), and the draw reads its slot with no pass of ours.
