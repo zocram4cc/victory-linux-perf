@@ -72,6 +72,10 @@ describe which lighting paths run and the remaining rendering issues.
 | `VICTORY_AMBIENT_SETTLE` | How fast light settles after walking indoors (on by default, `250,3`; `0` turns it off) |
 | `VICTORY_TEXTURE_STORE=1` | Converted textures kept between runs (about 8 ms a frame for now: off) |
 | `VICTORY_KBM_GTA=1` | Optional GTA V PC-style keyboard and mouse mapping on the stand-in pad: `F2` or `` ` `` (`~`) toggles mouse-look and auto-hides the cursor while locked (`Esc`/`P`/focus loss unlocks and restores it), LMB/RMB = RT/LT, MMB/`C` = R3, `Shift` = A, `Space` = X, `R` = B, `F` = Y, `Tab` = LB, `Q` = RB, `Ctrl` = L3, `E` = D-pad Right, `V` = View. Tune with `VICTORY_MOUSE_SENS` (default `1.0`) and `VICTORY_MOUSE_INVERT_Y=1` (or pass via `scripts\play.ps1 -More @{VICTORY_KBM_GTA='1'}`) |
+| `VICTORY_NO_WATCHDOG=1` | The title's watchdog does not end the process when its main thread stalls for ~30 s (a recorded frame, a debugger, a long load); byte-checked, 1.0.2.1 only |
+| `VICTORY_NO_POOL_TRAP=1` | The instance-list allocator returns NULL instead of stopping on its `int3` when its pool is full (upstream issue #698); a way past the stop, not its cause |
+| `VICTORY_RT_FALLBACK=1` | The title's own non-ray-traced lighting: its "is the top-level structure there?" check says no, and its lighting takes its fallback branch (the structures are still built) |
+| `VICTORY_RT_FALLBACK_NO_BVH=1` | The same, and the title's acceleration-structure builds, rehydrations and copies are skipped too |
 
 What is known to be wrong:
 
@@ -81,7 +85,8 @@ What is known to be wrong:
 - Textures of what just came into view appear late while the title streams.
 - The first run of a new build stutters while the driver makes pipelines
   (`victory warm` makes them ahead).
-- Recording a frame in the world makes the title's own watchdog end it.
+- Recording a frame in the world makes the title's own watchdog end it
+  (`VICTORY_NO_WATCHDOG=1` keeps it from doing so).
 
 ## How to run it
 
