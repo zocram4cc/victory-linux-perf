@@ -6210,6 +6210,11 @@ impl Meter {
                 bytes_n / 1e6,
                 bytes_mixed / 1e6
             );
+            let mut big = crate::shadow::big_in_place();
+            big.sort_by_key(|b| std::cmp::Reverse(b.1));
+            let written = big.iter().filter(|b| b.2 > 0).count();
+            let list: Vec<String> = big.iter().take(12).map(|(a, l, w)| format!("{a:#x}+{}K w{w}", l >> 10)).collect();
+            tracing::info!("title buffers of 1 MiB or more in place: {}, {written} of them written by shaders; the biggest (start+size, writes so far): {}", big.len(), list.join(", "));
             let (placed, covered, bytes) = crate::inplace::windows_over_placed();
             tracing::info!("title memory in place: {placed} ranges, of them {covered} under host copies, windows or buffer copies ({:.1} MB of overlap): GPU writes there are not seen by those copies", bytes as f64 / 1e6);
         }

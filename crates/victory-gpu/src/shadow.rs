@@ -1826,6 +1826,10 @@ impl Shadow {
 
     pub(crate) fn writing(&self, address: usize, len: usize) {
         if self.place.is_some() {
+            // M.2 census: shader writes declared on memory in place.
+            if self.len >= 1 << 20 {
+                self.unsized_asks.fetch_add(1 << 32, Ordering::Relaxed);
+            }
             return;
         }
         let range = (address, address + len);
@@ -2880,6 +2884,18 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
         crate::host::retire(shadow);
     }
     n
+}
+
+/// M.2: the title buffers of 1 MiB or more in place, with the shader
+/// writes declared on them since the start: (start, bytes, writes).
+pub(crate) fn big_in_place() -> Vec<(u64, u64, u64)> {
+    let map = buffers();
+    map.iter()
+        .filter_map(|(key, entry)| {
+            let s = entry.shadow.as_ref()?;
+            (s.in_place() && s.len >= 1 << 20).then(|| (key.0, s.len, s.unsized_asks.load(Ordering::Relaxed) >> 32))
+        })
+        .collect()
 }
 
 /// Bytes of host copies, windows and buffer copies (not in place), over

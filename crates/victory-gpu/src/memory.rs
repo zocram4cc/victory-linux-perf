@@ -169,7 +169,7 @@ impl Memory {
                     // SAFETY: as above; the offset first, as below.
                     unsafe {
                         if other.read() == 0 {
-                            other.add(1).write_volatile((at - first) as u32);
+                            other.add(1).write_volatile(shadow.offset(at) as u32);
                             other.write_volatile(n as u32 + 1);
                         }
                     }
@@ -185,7 +185,9 @@ impl Memory {
                 return;
             }
         };
-        let offset = shadow.offset_in(start).unwrap_or(0);
+        // In the copy's resource: for memory in place the buffer begins at
+        // the 64 KiB line below the title memory (`Shadow::offset` adds that).
+        let offset = shadow.offset_in(start).map_or(0, |_| shadow.offset(start));
         // The offset first: a shader that sees the number sees it too.
         // SAFETY: inside the directory's mapping.
         unsafe {
