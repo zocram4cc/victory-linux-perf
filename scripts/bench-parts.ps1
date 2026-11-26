@@ -63,6 +63,7 @@ $patterns = [ordered]@{
     record_calls     = 'recording per frame \(\d+ frames\): (\d+) list calls'
     thin_calls_ms    = 'VICTORY_THIN\): \d+ in ([\d.]+) ms'
     pipeline_wait    = 'threads\); ([\d.]+) ms waiting for pipelines'
+    unmapped_mb      = 'ms, moves [\d.]+ ms, ([\d.]+) MB unmapped'
     card_idle_behind = 'ms \(the card about \d+% busy by this count\), ([\d.]+) ms of that while the submitting thread'
 }
 $all = @()
@@ -84,5 +85,6 @@ foreach ($k in $patterns.Keys) {
     $xs = @($all | Where-Object { $_.ContainsKey($k) } | ForEach-Object { $_[$k] })
     if ($xs.Count) { '{0,-18} {1,9:N2}  (n {2})' -f $k, (($xs | Measure-Object -Average).Average), $xs.Count }
 }
+
 
 
