@@ -651,6 +651,50 @@ pub(crate) struct Plane {
     count: u32,
     resources: *const This,
 }
+/// A retail PresentX entry (`D3D12XBOX_PRESENT_PLANE_PARAMETERS`): the common
+/// prefix, then view-rectangle pointers, a color space and options; 72 bytes
+/// as codec_d found (cool_fox 1ad6e67), not checked against a header. Only the
+/// prefix is read, the rest stands for the stride. A present of one plane
+/// reads its first entry's prefix alone, whatever the stride.
+#[cfg(windows)]
+#[repr(C)]
+struct RetailPlane {
+    prefix: Plane,
+    source_rects: *const (),
+    destination: *const (),
+    color_space: u32,
+    options: [u32; 7],
+}
+#[cfg(windows)]
+const _: () = assert!(size_of::<RetailPlane>() == 72);
+
+/// The first resource of a present's second plane, which the console's
+/// display puts over the first (the interface over the scene); `None` for a
+/// present of one plane, and where it is not a resource of ours. A retail
+/// PresentX passes [`RetailPlane`]s, 72 bytes apart: only the second's prefix
+/// is read, so a caller with another layout still shows its first plane.
+#[cfg(windows)]
+fn overlay_resource(planes: u32, parameters: *const Plane) -> Option<This> {
+    if planes < 2 || parameters.is_null() {
+        return None;
+    }
+    let second = parameters.cast::<RetailPlane>().wrapping_add(1).cast::<u8>();
+    let mut prefix = [0; size_of::<Plane>()];
+    if !crate::host::read_into(second, &mut prefix) {
+        return None;
+    }
+    // SAFETY: the prefix has the C layout above and its bytes were copied.
+    let plane = unsafe { prefix.as_ptr().cast::<Plane>().read_unaligned() };
+    let mut pointer = [0; size_of::<This>()];
+    if plane.count == 0
+        || plane.resources.is_null()
+        || !crate::host::read_into(plane.resources.cast(), &mut pointer)
+    {
+        return None;
+    }
+    let resource = usize::from_ne_bytes(pointer) as This;
+    crate::resource::is_resource(resource).then_some(resource)
+}
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
@@ -849,10 +893,12 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
-/// Shows the first plane's first resource in our window.
+/// Shows the first plane's first resource in our window, and the second
+/// plane's over it when composing ([`crate::compose`]).
 ///
-/// shortcut: one plane, no scaling or placement, the source expected in
-/// the common state.
+/// shortcut: no placement, the source expected in the common state; the
+/// second plane is scaled to the first's size, whatever rectangles the title
+/// names.
 extern "system" fn present(
     this: This,
     planes: u32,
@@ -923,19 +969,38 @@ extern "system" fn present(
             crate::capture::dump_targets(frame);
         }
     }
+    // The second plane (the interface) is shown over the first, when composing.
+    #[cfg(windows)]
+    let overlay = if crate::compose::wanted() {
+        let overlay = overlay_resource(planes, plane_parameters);
+        // (Its layout is as codec_d found it: told once if it does not fit.)
+        if planes > 1 && overlay.is_none() {
+            static TOLD: AtomicBool = AtomicBool::new(false);
+            if !TOLD.swap(true, Ordering::Relaxed) {
+                tracing::warn!(planes, "a present's second plane is not a resource of ours at the 72-byte retail stride: the first is shown alone");
+            }
+        }
+        overlay
+    } else {
+        None
+    };
     #[cfg(windows)]
     if behind::on() && !this.is_null() {
         const COPY_SOURCE: u32 = 0x800;
-        let texture = if planes > 0
+        let first = if planes > 0
             // SAFETY: the title passes `planes` plane descriptions.
             && let Some(plane) = unsafe { plane_parameters.as_ref() }
             && plane.count > 0
             && !plane.resources.is_null()
         {
             // SAFETY: the plane lists `count` resources.
-            let resource = unsafe { *plane.resources };
-            // The state the lists recorded so far leave it in (the next
-            // frame's, recorded before this is shown, go on from there).
+            Some(unsafe { *plane.resources })
+        } else {
+            None
+        };
+        // The state the lists recorded so far leave a plane in (the next
+        // frame's, recorded before this is shown, go on from there).
+        let take = |resource: This| {
             crate::resource::host_copy(resource).map(|copy| {
                 let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
                 crate::resource::host_transition(resource, state);
@@ -944,11 +1009,16 @@ extern "system" fn present(
                 let state = if crate::list::thin::wanted() { u32::MAX } else { state };
                 (resource as usize, copy, state)
             })
-        } else {
-            None
         };
+        let texture = first.and_then(take);
+        let overlay = overlay.filter(|&o| first != Some(o)).and_then(take);
         let resource = texture.as_ref().map_or(0, |t| t.0);
-        behind::present(this, texture.map(|(_, copy, state)| (copy, state)), Shown { frame, resource });
+        behind::present(
+            this,
+            texture.map(|(_, copy, state)| (copy, state)),
+            overlay.map(|(_, copy, state)| (copy, state)),
+            Shown { frame, resource },
+        );
         called.end();
         #[cfg(feature = "diagnostics")]
         frame_ends();
@@ -968,8 +1038,24 @@ extern "system" fn present(
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        show(texture, state, Shown { frame, resource: resource as usize });
+        // The overlay, in the state its lists left it in, as the first plane is.
+        let over = overlay.filter(|&o| o != resource).and_then(|o| {
+            crate::resource::host_resource(o).map(|over_texture| {
+                let over_state = crate::resource::host_transition(o, COPY_SOURCE)
+                    .map_or(COPY_SOURCE, |(_, before)| before);
+                (o, over_texture, over_state)
+            })
+        });
+        show(
+            texture,
+            state,
+            over.map(|(_, over_texture, over_state)| (over_texture, over_state)),
+            Shown { frame, resource: resource as usize },
+        );
         crate::resource::host_transition(resource, state);
+        if let Some((o, _, over_state)) = over {
+            crate::resource::host_transition(o, over_state);
+        }
         let _ = host;
     }
     #[cfg(not(windows))]
@@ -1006,13 +1092,19 @@ struct Shown {
     resource: usize,
 }
 
-/// Shows `texture`, in host state `state`, in our window.
+/// Shows `texture`, in host state `state`, in our window, with `overlay` (a
+/// second plane, in its host state) over it if there is one.
 #[cfg(windows)]
-fn show(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32, what: Shown) {
+fn show(
+    texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    state: u32,
+    overlay: Option<(&windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)>,
+    what: Shown,
+) {
     let Some(host) = crate::host::host() else {
         return;
     };
-    let shown = host.present(texture, state, what.frame);
+    let shown = host.present(texture, state, overlay, what.frame);
     #[cfg(feature = "diagnostics")]
     blinks(what.frame, what.resource as This, state, shown);
     #[cfg(not(feature = "diagnostics"))]
@@ -1283,5 +1375,42 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
         assert!(at[1] > first);
+    }
+
+    /// Writes a plane's prefix at byte `at` of `memory`, naming `resources`.
+    #[cfg(windows)]
+    fn plane_at(memory: &mut [u8], at: usize, resources: &[This; 1]) {
+        let plane = Plane { token: 0, count: 1, resources: resources.as_ptr() };
+        // SAFETY: the prefix's bytes at `at` are inside `memory`.
+        unsafe { memory.as_mut_ptr().add(at).cast::<Plane>().write_unaligned(plane) };
+    }
+
+    /// Retail PresentX entries are 72 bytes apart. What lies where a prefix-
+    /// sized stride would look (24 bytes in) is another resource of ours, and
+    /// must not be taken for the overlay.
+    #[cfg(windows)]
+    #[test]
+    fn the_overlay_is_the_second_plane_at_the_retail_stride() {
+        let [base, decoy, overlay] = [(); 3].map(|()| crate::resource::test_buffer(64));
+        let (base_at, decoy_at, overlay_at) = ([base], [decoy], [overlay]);
+        let mut memory = vec![0u8; 2 * size_of::<RetailPlane>()];
+        plane_at(&mut memory, 0, &base_at);
+        plane_at(&mut memory, size_of::<Plane>(), &decoy_at);
+        plane_at(&mut memory, size_of::<RetailPlane>(), &overlay_at);
+        assert_eq!(overlay_resource(2, memory.as_ptr().cast()), Some(overlay));
+    }
+
+    /// A present of one plane (older callers pass only the prefix) has no
+    /// second entry: where memory after it looks like a plane of ours, it is
+    /// not read.
+    #[cfg(windows)]
+    #[test]
+    fn a_single_plane_present_has_no_overlay() {
+        let [base, other] = [(); 2].map(|()| crate::resource::test_buffer(64));
+        let (base_at, other_at) = ([base], [other]);
+        let mut memory = vec![0u8; 2 * size_of::<RetailPlane>()];
+        plane_at(&mut memory, 0, &base_at);
+        plane_at(&mut memory, size_of::<RetailPlane>(), &other_at);
+        assert_eq!(overlay_resource(1, memory.as_ptr().cast()), None);
     }
 }
