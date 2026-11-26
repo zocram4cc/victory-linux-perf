@@ -9166,6 +9166,7 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
         let remaining = len - offset;
         // SAFETY: the query inspects an address and fills a local structure.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        crate::vqstat::hit(16);
         let size = unsafe { VirtualQuery(at.cast(), &mut info, size_of_val(&info)) };
         let n = (info.BaseAddress as usize).saturating_add(info.RegionSize)
             .saturating_sub(at as usize).min(remaining);
@@ -9609,6 +9610,13 @@ impl Meter {
         }
         let drawn = crate::draw::drawn();
         let frames = f64::from(self.frames);
+        if crate::shadow::copy_compare() {
+            let [all, same] = [0, 1].map(|i| crate::shadow::COPY_COMPARED[i].swap(0, Ordering::Relaxed) as f64 / 1e6 / frames.max(1.0));
+            tracing::info!(
+                "refreshes compared per frame (VICTORY_COPY_COMPARE=1): {all:.1} MB the title wrote, {same:.1} MB of it \
+                 the same bytes as before (not put in, not sent up)"
+            );
+        }
         let fps = frames / elapsed.as_secs_f64();
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;

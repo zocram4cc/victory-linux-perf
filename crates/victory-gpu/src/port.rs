@@ -50,6 +50,7 @@
 //! nothing waits for them. The title's constants are its CPU's; how many
 //! such steps there are is on the frame-rate line ([`log`]).
 
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -187,6 +188,9 @@ pub(crate) fn place_in(device: &ID3D12Device, start: u64, len: u64) -> Result<Pl
 /// Opens the stretch around `[at, end)` (64 KiB aligned) as a heap through
 /// a view of ours of the same pages.
 fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usize, String)> {
+    if let Some((first, bytes)) = private_stretch(at, end) {
+        return open_private(device, first, bytes);
+    }
     let Some((first, bytes, section, offset)) = stretch(at as usize, (end - at) as usize) else {
         return Err((3, format!("not one stretch of a section: {:?}", cover(at as usize, (end - at) as usize))));
     };
@@ -414,5 +418,77 @@ mod tests {
             mem::VirtualFree(hole.add(3 * K).cast(), 0, mem::MEM_RELEASE);
             windows_sys::Win32::Foundation::CloseHandle(section);
         }
+    }
+}
+
+/// Private memory that `xmem` gave pages of the 32-bit heap under Wine
+/// (`port_private`): base and bytes, adjacent pieces joined.
+static PRIVATE: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
+
+/// `xmem` made `[at, at + len)` private memory for this port (Wine).
+pub fn port_private(at: usize, len: usize) {
+    let mut private = PRIVATE.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut start, mut end) = (at as u64, (at + len) as u64);
+    // Join with the pieces it touches.
+    let touching: Vec<(u64, u64)> = private.range(..=end).filter(|&(&s, &e)| e >= start && s <= end).map(|(&s, &e)| (s, e)).collect();
+    for (s, e) in touching {
+        private.remove(&s);
+        start = start.min(s);
+        end = end.max(e);
+    }
+    private.insert(start, end);
+}
+
+/// `xmem` gave the private memory of `[at, at + len)` back.
+pub fn port_private_gone(at: usize, len: usize) {
+    let (start, end) = (at as u64, (at + len) as u64);
+    let mut private = PRIVATE.lock().unwrap_or_else(|e| e.into_inner());
+    let touching: Vec<(u64, u64)> = private.range(..end).filter(|&(_, &e)| e > start).map(|(&s, &e)| (s, e)).collect();
+    for (s, e) in touching {
+        private.remove(&s);
+        if s < start {
+            private.insert(s, start);
+        }
+        if e > end {
+            private.insert(end, e);
+        }
+    }
+    drop(private);
+    forget(at, len);
+}
+
+/// The joined private piece holding `[at, end)`, if one does.
+fn private_stretch(at: u64, end: u64) -> Option<(u64, u64)> {
+    let private = PRIVATE.lock().unwrap_or_else(|e| e.into_inner());
+    let (&s, &e) = private.range(..=at).next_back()?;
+    (end <= e).then(|| {
+        let (mut first, mut last) = (s, e);
+        if first < LOW && last > LOW {
+            last = LOW;
+        }
+        if last - first > MOST {
+            first = at;
+            last = end;
+        }
+        (first, last - first)
+    })
+}
+
+/// [`open_region`] for private memory: the heap opened on the title's own
+/// pages (anonymous memory, as the driver under vkd3d-proton needs).
+fn open_private(device: &ID3D12Device, first: u64, bytes: u64) -> Result<Region, (usize, String)> {
+    if !committed(first as usize, bytes as usize) {
+        return Err((4, "pages of the private stretch are not committed".to_owned()));
+    }
+    match crate::inplace::open(device, crate::inplace::From::Part(first as usize, bytes as usize)) {
+        Ok(heap) => {
+            tracing::info!(
+                start = format_args!("{first:#x}"),
+                bytes,
+                "renderer port 1: a stretch of the title's graphics memory opened as a host heap on its own private pages (Wine)"
+            );
+            Ok(Region { start: first, end: first + bytes, heap })
+        }
+        Err(e) => Err((5, format!("refused by the host (private pages): {e}"))),
     }
 }

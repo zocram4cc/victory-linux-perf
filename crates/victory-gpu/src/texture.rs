@@ -1753,6 +1753,7 @@ fn committed_by_query(at: *const u8, len: usize) -> bool {
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
+        crate::vqstat::hit(14);
         let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
         if n == 0 || info.State != MEM_COMMIT {
             return false;
@@ -1820,6 +1821,7 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
+        crate::vqstat::hit(15);
         let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
         let next = (info.BaseAddress as usize).saturating_add(info.RegionSize).min(end);
         if n == 0 || next <= p {

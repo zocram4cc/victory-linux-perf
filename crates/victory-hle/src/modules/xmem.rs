@@ -1237,12 +1237,110 @@ pub extern "system" fn XMemMapPhysicalPages(
                 })
             })
             .count();
-        if !map(&mut physical, base + i * PAGE, run * PAGE, first) {
+        let at = base + i * PAGE;
+        if private_backing(at, run * PAGE, &first, run) {
+            i += run;
+            continue;
+        }
+        if !map(&mut physical, at, run * PAGE, first) {
             return std::ptr::null_mut();
         }
         i += run;
     }
     address
+}
+
+/// Renderer port 1 under Wine (`VICTORY_PORT_CONSTANTS=1`): runs of fresh
+/// pages mapped into a 32-bit graphics reservation ([`LOW_RESERVATIONS`])
+/// get private memory instead of a view of their section. vkd3d-proton
+/// opens a heap from an address by giving the pages to the AMD driver as a
+/// user pointer, and the driver takes anonymous memory only: on a view of
+/// Wine's sections (shared, file-backed memory) the card read nothing of
+/// the title's and the picture stayed black. The pages are fresh (never
+/// written: zeros), so which memory holds them is not observable; nothing
+/// else shows them (the heap's pages are never tile-mapped). Unmapping the
+/// range gives the private memory back (`release_private`).
+/// `VICTORY_PORT_PRIVATE=0`: views as before.
+fn private_backing(at: usize, len: usize, first: &Slice, run: usize) -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| {
+        port_on() && on_wine() && std::env::var_os("VICTORY_PORT_PRIVATE").is_none_or(|v| v != "0")
+    });
+    if !*ON {
+        return false;
+    }
+    let inside = LOW_RESERVATIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|&(r, rlen)| r <= at && at + len <= r + rlen);
+    let section = &first.section;
+    let fresh = (first.index..first.index + run)
+        .all(|p| section.committed[p / 64].load(Ordering::Acquire) >> (p % 64) & 1 == 0);
+    if !inside || !fresh {
+        return false;
+    }
+    // SAFETY: a placeholder of the title's reservation (`unmap` just left
+    // it one), replaced by committed private memory of the same bounds.
+    let made = unsafe {
+        VirtualAlloc2(
+            GetCurrentProcess(),
+            at as *const c_void,
+            len,
+            MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
+            PAGE_READWRITE,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if made.is_null() {
+        static SAID: AtomicU64 = AtomicU64::new(0);
+        if SAID.fetch_add(1, Ordering::Relaxed) < 4 {
+            tracing::warn!(
+                at = format_args!("{at:#x}"),
+                len,
+                error = %std::io::Error::last_os_error(),
+                "renderer port 1: private memory refused for the 32-bit heap: a view as before"
+            );
+        }
+        return false;
+    }
+    PRIVATE.lock().unwrap_or_else(|e| e.into_inner()).insert(at, len);
+    victory_gpu::title_memory_remapped(at, len);
+    victory_gpu::port_private(at, len);
+    static SAID: AtomicU64 = AtomicU64::new(0);
+    if SAID.fetch_add(1, Ordering::Relaxed) < 8 {
+        tracing::info!(
+            at = format_args!("{at:#x}"),
+            len,
+            "renderer port 1: pages of the 32-bit heap are private memory (Wine: a heap opens on anonymous memory only)"
+        );
+    }
+    true
+}
+
+/// Private memory given by [`private_backing`]: base and bytes.
+static PRIVATE: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+
+/// Gives back the private memory of [`private_backing`] that `[base, base +
+/// len)` touches, each allocation whole, as placeholders again.
+fn release_private(base: usize, len: usize) {
+    let mut private = PRIVATE.lock().unwrap_or_else(|e| e.into_inner());
+    if private.is_empty() {
+        return;
+    }
+    let end = base + len;
+    let gone: Vec<(usize, usize)> = private
+        .range(..end)
+        .filter(|&(&at, &n)| at + n > base)
+        .map(|(&at, &n)| (at, n))
+        .collect();
+    for (at, n) in gone {
+        private.remove(&at);
+        // SAFETY: our own private allocation, back to a placeholder.
+        unsafe { VirtualFree(at as *mut c_void, n, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) };
+        victory_gpu::title_memory_remapped(at, n);
+        victory_gpu::port_private_gone(at, n);
+    }
 }
 
 /// One page at each address; null `pages`, or a page number 0, unmaps
@@ -1843,6 +1941,7 @@ fn commit_limit_message(
 /// Returns `[base, base + len)` to placeholders; views reaching past it
 /// are mapped again outside it.
 fn unmap(physical: &mut Physical, base: usize, len: usize) {
+    release_private(base, len);
     // No bytes: no view to return. The search below would still find the
     // view holding `base` and cut it in two there, and its range of views
     // starting inside would run backwards (which `BTreeMap` panics on).

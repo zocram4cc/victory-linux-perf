@@ -643,10 +643,12 @@ mod tests {
                     if missing {
                         VirtualFree(pages.0.cast(), 4096, MEM_DECOMMIT);
                     } else {
+                        crate::vqstat::hit(22);
                         VirtualProtect(pages.0.cast(), 4096, PAGE_READONLY, &mut old);
                     }
                     let done = merge(pages.0.add(at), now.as_ptr(), held.as_mut_ptr(), len, take);
                     VirtualAlloc(pages.0.cast(), 4096, MEM_COMMIT, PAGE_READWRITE);
+                    crate::vqstat::hit(23);
                     VirtualProtect(pages.0.cast(), 4096, PAGE_READWRITE, &mut old);
                     done
                 };
@@ -794,18 +796,22 @@ mod tests {
         // SAFETY: pages of our allocations.
         unsafe {
             assert!(copy(b.0, a.0, b.1));
+            crate::vqstat::hit(24);
             VirtualProtect(a.0.add(4096).cast(), 4096, PAGE_NOACCESS, &mut old);
             assert!(!copy(b.0, a.0, b.1));
             assert!(copy(b.0, a.0, 4096));
             assert!(!copy(b.0, a.0.add(8191), 1));
             assert!(copy(b.0, a.0.add(8192), 4096));
+            crate::vqstat::hit(25);
             VirtualProtect(a.0.add(4096).cast(), 4096, PAGE_READWRITE, &mut old);
             VirtualFree(a.0.add(8192).cast(), 4096, MEM_DECOMMIT);
             assert!(!copy(b.0, a.0, b.1));
+            crate::vqstat::hit(26);
             VirtualProtect(b.0.add(4096).cast(), 4096, PAGE_READONLY, &mut old);
             assert!(!copy(b.0, a.0, 8192));
             assert!(!copy(std::ptr::without_provenance_mut(0x10), a.0, 4));
             assert!(!copy(b.0, std::ptr::without_provenance(usize::MAX - 7), 4));
+            crate::vqstat::hit(27);
             VirtualProtect(b.0.add(4096).cast(), 4096, PAGE_READWRITE, &mut old);
         }
         // Many faults, on several threads at once.

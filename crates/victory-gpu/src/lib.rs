@@ -51,6 +51,7 @@ mod indirect;
 mod inplace;
 #[cfg(windows)]
 mod port;
+pub use port::{port_private, port_private_gone};
 #[cfg(windows)]
 mod port_cbv;
 #[cfg(windows)]
@@ -82,6 +83,7 @@ pub mod resource;
 pub mod root;
 #[cfg(windows)]
 mod safecopy;
+mod vqstat;
 #[cfg(windows)]
 mod sampler;
 #[cfg(windows)]

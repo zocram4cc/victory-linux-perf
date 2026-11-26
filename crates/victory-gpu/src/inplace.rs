@@ -646,6 +646,7 @@ pub(crate) fn private_whole(at: usize, len: usize) -> bool {
     // SAFETY: plain data filled in by the query.
     let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
+    crate::vqstat::hit(17);
     let n = unsafe { mem::VirtualQuery(at as *const c_void, &mut info, size_of_val(&info)) };
     n != 0
         && info.State == mem::MEM_COMMIT
@@ -937,6 +938,7 @@ unsafe fn private(p: &mut Probe, rig: &mut Rig) {
                 let new: Vec<u8> = (0..K64).map(|i| (i as u8) ^ 0x5a).collect();
                 let copied = rig.store(buffer, 4096, &new).is_ok() && same(memory.add(4096), &new);
                 let (mut found, mut count, mut granularity) = ([0usize; 64], 64usize, 0u32);
+                crate::vqstat::hit(18);
                 let watched = mem::GetWriteWatch(0, base.cast(), SIZE, found.as_mut_ptr().cast(), &mut count, &mut granularity) == 0;
                 memory.cast::<[u32; 3]>().write([40, 2, 0]);
                 let shaded = rig.shade(buffer.GetGPUVirtualAddress());
@@ -952,6 +954,7 @@ unsafe fn private(p: &mut Probe, rig: &mut Rig) {
             }
             // What the title can still do with the pages while the heap stands.
             let mut old = 0;
+            crate::vqstat::hit(19);
             let protect_in = mem::VirtualProtect(at.add(8 * K64).cast(), K64, mem::PAGE_READONLY, &mut old) != 0;
             if protect_in {
                 mem::VirtualProtect(at.add(8 * K64).cast(), K64, mem::PAGE_READWRITE, &mut old);
@@ -1012,6 +1015,7 @@ unsafe fn section(p: &mut Probe, rig: &mut Rig) {
                 p.section_writes = rig.store(buffer, 0, &new).is_ok() && same(memory, &new);
                 // The guard of `watch.rs`: the view read-only.
                 let mut old = 0;
+                crate::vqstat::hit(20);
                 let guarded = mem::VirtualProtect(memory.cast(), K64, mem::PAGE_READONLY, &mut old) != 0;
                 let new: Vec<u8> = (0..K64).map(|i| (i as u8) ^ 0x44).collect();
                 let through = rig.store(buffer, 0, &new).is_ok() && same(memory, &new);
@@ -1143,6 +1147,7 @@ fn kind_of(at: usize, len: usize, known: &mut Vec<(usize, usize)>) -> usize {
     // SAFETY: plain data filled in by the query.
     let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
+    crate::vqstat::hit(21);
     let n = unsafe { mem::VirtualQuery(at as *const c_void, &mut info, size_of_val(&info)) };
     if n == 0 {
         return 5;
