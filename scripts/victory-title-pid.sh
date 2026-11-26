@@ -14,7 +14,9 @@ descend() {
   done
 }
 for pid in $(descend "${1:?root pid}"); do
-  first=$(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | head -n 1)
+  # A process that has ended meanwhile is passed over quietly (the redirect's
+  # own error is the shell's, hence the braces).
+  first=$( { tr '\0' '\n' < "/proc/$pid/cmdline"; } 2>/dev/null | head -n 1)
   case "${first,,}" in
     *\\victory.exe | */victory.exe | victory.exe) echo "$pid"; exit 0 ;;
   esac

@@ -371,6 +371,9 @@ stopping=0
 stop() {
   (( stopping )) && return
   stopping=1
+  # Ctrl-C again while the title ends changes nothing: this script waits
+  # for it and writes the run's end.
+  trap '' INT
   echo "stopping the title (SIGTERM)..." >&2 || true
   # The title's Wine process first (found below umu-run, never by a name
   # match across the system), then umu's own group; never SIGKILL.
