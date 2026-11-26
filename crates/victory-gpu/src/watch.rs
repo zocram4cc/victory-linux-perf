@@ -3267,16 +3267,20 @@ fn uncommitted_end_cached(block: usize) -> usize {
     end
 }
 
-/// How many frames a hole's answer stands (`VICTORY_HOLES_ONCE=<frames>`;
-/// unset or 0: asked every time, as before; with `VICTORY_AB` naming it,
-/// 30 frames in its phases).
+/// How many frames a hole's answer stands (`VICTORY_HOLES_ONCE=<frames>`,
+/// 30 unless given; 0: asked every time, as before; with `VICTORY_AB` naming
+/// it, 30 frames in its phases).
 fn holes_once() -> u64 {
+    // (Tests map and free memory with no word to the runtime.)
+    if cfg!(test) {
+        return 0;
+    }
     #[cfg(feature = "diagnostics")]
     if let Some(on) = crate::ab::pick("VICTORY_HOLES_ONCE") {
         return if on { 30 } else { 0 };
     }
     static FRAMES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *FRAMES.get_or_init(|| std::env::var("VICTORY_HOLES_ONCE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+    *FRAMES.get_or_init(|| std::env::var("VICTORY_HOLES_ONCE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(30))
 }
 
 /// What the runtime maps, unmaps or commits at `[at, at + len)`: the answers
