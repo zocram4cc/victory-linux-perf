@@ -415,6 +415,9 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
                 tracing::info!(call = calls, code = format_args!("{code:016x}"), "P.4: 0x218 call");
             }
         }
+        if native_compute_skipped(desc as usize) {
+            return E_NOTIMPL;
+        }
         if let Some(container) = native_compute(desc as usize) {
             let hr = crate::pipeline::create_compute_from(&container, _iid, out);
             NATIVE_COMPUTE[usize::from(hr < 0)].fetch_add(1, Ordering::Relaxed);
@@ -437,6 +440,27 @@ pub(crate) static NATIVE_COMPUTE: [std::sync::atomic::AtomicU32; 3] = [const { s
 fn native_compute_max() -> u32 {
     static MAX: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *MAX.get_or_init(|| std::env::var("VICTORY_NATIVE_COMPUTE_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(u32::MAX))
+}
+
+/// `VICTORY_NATIVE_COMPUTE_SKIP=<hex>,<hex>,…`: programs left out by their
+/// code address (the dump's `218_<address>`): those found to break the
+/// picture (`scripts/p4-hunt.sh`).
+#[cfg(windows)]
+fn native_compute_skipped(desc: usize) -> bool {
+    static SKIP: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    let skip = SKIP.get_or_init(|| {
+        std::env::var("VICTORY_NATIVE_COMPUTE_SKIP")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|h| u64::from_str_radix(h.trim().trim_start_matches("0x"), 16).ok())
+            .collect()
+    });
+    if skip.is_empty() {
+        return false;
+    }
+    let mut w = [0u8; 0x30];
+    crate::host::read_into(desc as *const u8, &mut w)
+        && skip.contains(&u64::from_le_bytes(w[0x28..0x30].try_into().unwrap_or([0; 8])))
 }
 
 fn native_compute_on() -> bool {
