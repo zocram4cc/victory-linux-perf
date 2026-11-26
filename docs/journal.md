@@ -4,6 +4,10 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**`VICTORY_ALL_FRESH` flicker explained: the dynamic ring runs out**
+- With `VICTORY_ALL_FRESH=2` (`…-all-fresh-refused`), **550-4,188 dynamic tables a frame are refused for want of slots** (new release-build counter on the frame line); their draws are dropped, which is the flicker and the odd colour. The ring (`DYNAMIC`, 262,144 slots) holds the constant-buffer tables but not every table a draw reads. So part of `ALL_FRESH`'s gain was dropped draws, and that path is not the way to cut the wait.
+- Next: victory-scarlett's `SHOW_AFTER` (a title slot shows a texture new to it only after the submission with its upload has run) in place of `slot_wait`, keeping tables as they are ([forks/victory-scarlett.md](forks/victory-scarlett.md)).
+
 **C.1: the recording threads wait for running submissions; tables in dynamic slots take ~1 s a frame off them, the picture is not right yet**
 - **`make_at`'s 8-9 µs were the slot wait** (`descriptor::host::slot_wait`, S.1), not making: with `VICTORY_SLOT_WAIT=0`, `make_at` 92-95 ms a frame (was ~1,000), bind ~370 ms (was ~1,550), frame 356-361 ms; but the picture breaks (black sky, white specks), so the wait guards something real (`…-no-slot-wait`).
 - **`VICTORY_DYNAMIC_NO_WAIT=1`** (dynamic slots, the recording list's own, made without the wait): `make_at` ~75 ms, but `bind` still 1,300-1,600 ms: the wait moves to the title's own slots (`mirror`, plain tables). About **15-25 writes a frame wait, each for a whole running submission**. Picture right; more flicker in the second run (`…-dynamic-no-wait`, 386-411 ms; control `…-control-flicker` 395 ms).
