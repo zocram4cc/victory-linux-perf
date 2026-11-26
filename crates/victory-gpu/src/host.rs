@@ -2762,7 +2762,9 @@ fn read_backs(list: &HostList) {
 /// 1.3: per frame line, ranges handed back, those another host copy
 /// overlaps, their bytes, the bytes of the overlaps, the copies met
 /// (`VICTORY_BACK_OVERLAP=1`).
-pub(crate) static BACK_OVERLAP: [std::sync::atomic::AtomicU64; 12] = [const { std::sync::atomic::AtomicU64::new(0) }; 12];
+pub(crate) static BACK_OVERLAP: [std::sync::atomic::AtomicU64; 14] = [const { std::sync::atomic::AtomicU64::new(0) }; 14];
+/// [12..14]: ranges in copies of memory that is not write-watched (copied
+/// whole at every refresh), and their bytes.
 /// [9..12]: ranges over a title-filled texture's memory, those textures, the bytes.
 /// [5..9]: overlaps by kind of the written copy and the other: buffer under
 /// buffer, window under buffer, buffer under window, window under window.
@@ -2781,6 +2783,10 @@ fn back_overlap_census(back: &[Declared]) {
             let (at, end) = (from as u64, to as u64);
             let (buffers, windows, bytes) = crate::shadow::overlapping_by_kind(at, end, shadow);
             let copies = buffers + windows;
+            if shadow.unwatched() {
+                BACK_OVERLAP[12].fetch_add(1, Ordering::Relaxed);
+                BACK_OVERLAP[13].fetch_add(end - at, Ordering::Relaxed);
+            }
             let (textures, texture_bytes) = crate::texture::staged_overlapping(at, end);
             if textures > 0 {
                 BACK_OVERLAP[9].fetch_add(1, Ordering::Relaxed);
@@ -5951,6 +5957,11 @@ impl Meter {
                     over / 1e6,
                     crate::shadow::WINDOW_USE[0].swap(0, Ordering::Relaxed) as f64 / frames,
                     crate::shadow::WINDOW_USE[1].swap(0, Ordering::Relaxed) as f64 / frames,
+                );
+                let [unwatched, unwatched_bytes] = [12, 13].map(|i| BACK_OVERLAP[i].swap(0, Ordering::Relaxed) as f64 / frames);
+                tracing::info!(
+                    "copy-back ranges in copies of memory not write-watched per frame (refreshed whole each time): {unwatched:.0} of {ranges:.0}, {:.1} MB",
+                    unwatched_bytes / 1e6
                 );
                 let [ranges_t, textures_t, bytes_t] = [9, 10, 11].map(|i| BACK_OVERLAP[i].swap(0, Ordering::Relaxed) as f64 / frames);
                 tracing::info!(
