@@ -1223,6 +1223,8 @@ impl Staging {
     /// since the last time (and is mapped at all).
     pub(crate) fn refresh(&self) {
         use std::sync::atomic::Ordering::Relaxed;
+        #[cfg(feature = "diagnostics")]
+        let _asker = crate::watch::asker(crate::watch::Asker::Texture);
         let started = std::time::Instant::now();
         let _texture = crate::timeline::span("a texture's refresh");
         let read = self.refresh_now();
