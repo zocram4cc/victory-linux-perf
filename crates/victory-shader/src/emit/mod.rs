@@ -638,6 +638,35 @@ pub fn emit(
                 }
             }
         }
+        // Last of all (`VICTORY_WAVE_LDS_LOOSE=0` turns it off): LDS read and written inside
+        // one lane-branch region, ordered between the two host waves only where the region
+        // is entered and left (`lower::with_loose_lds`, approximate). A 32-lane host refuses
+        // the 64-lane form outright, which drops every dispatch of the program.
+        let loose_on = std::env::var_os("VICTORY_WAVE_LDS_LOOSE").is_none_or(|v| v != "0");
+        if loose_on && !strict {
+            let bases = [forms[0].1.as_ref(), forms[1].1.as_ref()];
+            for (name, f) in [("without early-outs", bases[0]), ("without skips", bases[1])] {
+                if let Some((p, st, io, res)) = f {
+                    let again = lower::with_loose_lds(|| emit_program(c, native, p, st, io, res));
+                    report(&format!("loose LDS (APPROXIMATE), {name}"), &again);
+                    if done(&again) {
+                        return again.map(|(shader, _)| shader);
+                    }
+                }
+            }
+            let again = lower::with_loose_lds(|| emit_program(c, native, p, st, io, res));
+            report("loose LDS (APPROXIMATE)", &again);
+            if done(&again) {
+                return again.map(|(shader, _)| shader);
+            }
+            if local_on && !exact_only {
+                let local = lower::with_loose_lds(|| lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res)));
+                report("loose LDS + local waves (APPROXIMATE, any mask)", &local);
+                if done(&local) {
+                    return local.map(|(shader, _)| shader);
+                }
+            }
+        }
     }
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
     // trace programs): right once the wave takes that skip together ([`widen`]; the
