@@ -69,6 +69,7 @@ pub(crate) fn begin(work: impl FnOnce() -> Vec<Refresh> + Send + 'static) -> std
             // overflowed (Wine: "stack overflow ... victory-aside").
             .stack_size(16 << 20)
             .spawn(move || {
+                let _asker = crate::watch::asker(crate::watch::Asker::Aside);
                 crate::cores::keep_on_fast_cores("victory-aside");
                 jobs.into_iter().for_each(|job| job())
             })

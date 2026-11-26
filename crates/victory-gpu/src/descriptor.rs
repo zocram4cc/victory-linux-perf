@@ -216,6 +216,7 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
     static THREAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     STARTED.call_once(|| {
         let made = std::thread::Builder::new().name("victory-heap-sync".into()).spawn(|| {
+            let _asker = crate::watch::asker(crate::watch::Asker::HeapSync);
             crate::cores::keep_on_fast_cores("victory-heap-sync");
             let rounds = || SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
             /// A round is over, however it ends.

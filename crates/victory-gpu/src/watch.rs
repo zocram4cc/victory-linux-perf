@@ -392,24 +392,69 @@ fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
 #[cfg(feature = "diagnostics")]
 static SLOW: Mutex<Slow> = Mutex::new(Slow::EMPTY);
 
-/// Who asks, for [`SLOW`]: set on a thread by [`asker`].
-#[cfg(feature = "diagnostics")]
+/// Who asks, for [`SLOW`]: set on a thread by [`asker`]. A thread that names no asker is the title's.
 #[derive(Clone, Copy)]
 pub(crate) enum Asker {
-    /// Anything else: the title's threads, the early asks.
+    /// The title's own threads, and any thread that names no asker.
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
     Other,
-    /// A submission, on the thread that makes it.
+    /// A submission, on the thread that makes it, and on the thread that prepares them.
     Submit,
+    /// The thread that lands flights sent ahead ([`crate::host`]).
+    Relay,
+    /// The thread that settles flights sent ahead ([`crate::host`]).
+    Late,
     /// A thread of a refresh pool ([`crate::land`]).
     Refresh,
     /// A texture's refresh.
     Texture,
+    /// A thread of the wide pool ([`crate::shadow`]).
+    Wide,
+    /// A thread that translates lists ([`crate::list`]).
+    List,
+    /// The thread that records the heaps' descriptors ([`crate::descriptor`]).
+    HeapSync,
+    /// The thread that works on the heap's views beside the lists ([`crate::host`]).
+    Aside,
+    /// The thread that asks early (`VICTORY_ASK_EARLY`).
+    Early,
 }
+
+/// The askers, as [`Slow`] counts them.
+#[cfg(feature = "diagnostics")]
+const ASKERS: usize = 11;
 
 #[cfg(feature = "diagnostics")]
 impl Asker {
+    /// Every asker, in the order the line names them.
+    const ALL: [Asker; ASKERS] = [
+        Asker::Submit,
+        Asker::Relay,
+        Asker::Late,
+        Asker::Refresh,
+        Asker::Texture,
+        Asker::Wide,
+        Asker::List,
+        Asker::HeapSync,
+        Asker::Aside,
+        Asker::Early,
+        Asker::Other,
+    ];
+
     fn name(self) -> &'static str {
-        ["other", "the submitting thread", "refresh workers", "texture"][self as usize]
+        match self {
+            Asker::Other => "title threads",
+            Asker::Submit => "the submitting thread",
+            Asker::Relay => "the relay",
+            Asker::Late => "the late helper",
+            Asker::Refresh => "refresh workers",
+            Asker::Texture => "texture",
+            Asker::Wide => "wide workers",
+            Asker::List => "list threads",
+            Asker::HeapSync => "heap sync",
+            Asker::Aside => "aside",
+            Asker::Early => "early asks",
+        }
     }
 }
 
@@ -418,15 +463,23 @@ thread_local! {
     static ASKER: std::cell::Cell<Asker> = const { std::cell::Cell::new(Asker::Other) };
 }
 
-/// Makes `who` the asker on this thread until the guard is dropped.
+/// Makes `who` the asker on this thread until the guard is dropped (without `diagnostics`, nothing).
 #[cfg(feature = "diagnostics")]
 pub(crate) fn asker(who: Asker) -> AskerGuard {
     AskerGuard(ASKER.with(|a| a.replace(who)))
 }
 
+#[cfg(not(feature = "diagnostics"))]
+pub(crate) fn asker(_: Asker) -> AskerGuard {
+    AskerGuard
+}
+
 /// Restores the asker that [`asker`] replaced.
 #[cfg(feature = "diagnostics")]
 pub(crate) struct AskerGuard(Asker);
+
+#[cfg(not(feature = "diagnostics"))]
+pub(crate) struct AskerGuard;
 
 #[cfg(feature = "diagnostics")]
 impl Drop for AskerGuard {
@@ -446,18 +499,20 @@ struct Longest {
 }
 
 /// The askings of a millisecond or more: count and microseconds of all of them (`all`), then by
-/// who asked (0-3), by range size (4-7: under 4, 64, 256 MiB, more) and by dirty runs (8-11: under
-/// 128, 1024, 8192, more).
+/// who asked (one cell per [`Asker`], in its order), by range size (under 4, 64, 256 MiB, more) and
+/// by dirty runs (under 128, 1024, 8192, more).
 #[cfg(feature = "diagnostics")]
 struct Slow {
     all: [u64; 2],
-    by: [[u64; 2]; 12],
+    who: [[u64; 2]; ASKERS],
+    size: [[u64; 2]; 4],
+    runs: [[u64; 2]; 4],
     longest: Option<Longest>,
 }
 
 #[cfg(feature = "diagnostics")]
 impl Slow {
-    const EMPTY: Slow = Slow { all: [0; 2], by: [[0; 2]; 12], longest: None };
+    const EMPTY: Slow = Slow { all: [0; 2], who: [[0; 2]; ASKERS], size: [[0; 2]; 4], runs: [[0; 2]; 4], longest: None };
 }
 
 /// An asking that took `us` microseconds over `bytes` of memory, and found `pages` dirty in `runs`
@@ -467,10 +522,11 @@ fn slow(us: u64, bytes: usize, pages: usize, runs: usize) {
     let who = ASKER.with(|a| a.get());
     let size = [4 << 20, 64 << 20, 256 << 20].iter().filter(|&&n| bytes >= n).count();
     let run = [128, 1024, 8192].iter().filter(|&&n| runs >= n).count();
-    let mut s = SLOW.lock().unwrap_or_else(|e| e.into_inner());
-    for i in [who as usize, 4 + size, 8 + run] {
-        s.by[i][0] += 1;
-        s.by[i][1] += us;
+    let mut guard = SLOW.lock().unwrap_or_else(|e| e.into_inner());
+    let s = &mut *guard;
+    for cell in [&mut s.who[who as usize], &mut s.size[size], &mut s.runs[run]] {
+        cell[0] += 1;
+        cell[1] += us;
     }
     s.all[0] += 1;
     s.all[1] += us;
@@ -483,10 +539,8 @@ fn slow(us: u64, bytes: usize, pages: usize, runs: usize) {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn slow_asks_line(frames: f64) -> String {
     let s = std::mem::replace(&mut *SLOW.lock().unwrap_or_else(|e| e.into_inner()), Slow::EMPTY);
-    let cell = |i: usize| {
-        let [n, us] = s.by[i];
-        format!("{:.1} ({:.1} ms)", n as f64 / frames, us as f64 / 1e3 / frames)
-    };
+    let cell = |[n, us]: [u64; 2]| format!("{:.1} ({:.1} ms)", n as f64 / frames, us as f64 / 1e3 / frames);
+    let who: Vec<String> = Asker::ALL.iter().map(|&a| format!("{} {}", a.name(), cell(s.who[a as usize]))).collect();
     let longest = match s.longest {
         Some(l) => format!(
             "{} asked {} MiB, {} dirty pages in {} runs, {:.1} ms",
@@ -499,21 +553,18 @@ pub(crate) fn slow_asks_line(frames: f64) -> String {
         None => "none".to_owned(),
     };
     format!(
-        "write-watch askings of a millisecond or more: {:.1} a frame, {:.1} ms a frame; by who asked: the submitting thread {}, refresh workers {}, texture {}, other {}; by range under 4, 64, 256 MiB, more: {}, {}, {}, {}; by dirty runs under 128, 1024, 8192, more: {}, {}, {}, {}; the longest: {longest}",
+        "write-watch askings of a millisecond or more: {:.1} a frame, {:.1} ms a frame; by who asked: {}; by range under 4, 64, 256 MiB, more: {}, {}, {}, {}; by dirty runs under 128, 1024, 8192, more: {}, {}, {}, {}; the longest: {longest}",
         s.all[0] as f64 / frames,
         s.all[1] as f64 / 1e3 / frames,
-        cell(1),
-        cell(2),
-        cell(3),
-        cell(0),
-        cell(4),
-        cell(5),
-        cell(6),
-        cell(7),
-        cell(8),
-        cell(9),
-        cell(10),
-        cell(11),
+        who.join(", "),
+        cell(s.size[0]),
+        cell(s.size[1]),
+        cell(s.size[2]),
+        cell(s.size[3]),
+        cell(s.runs[0]),
+        cell(s.runs[1]),
+        cell(s.runs[2]),
+        cell(s.runs[3]),
     )
 }
 
@@ -583,6 +634,7 @@ fn note_hot(written: &[(usize, u16)]) {
 
 fn ask_early(every: std::time::Duration) {
     use std::sync::atomic::Ordering::Relaxed;
+    let _asker = asker(Asker::Early);
     // So many rounds without a submission's asking: wait for one.
     const IDLE: u32 = 100;
     let mut round = 0u32;
