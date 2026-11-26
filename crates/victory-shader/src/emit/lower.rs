@@ -12548,9 +12548,10 @@ impl<'a> Lower<'a> {
                 // store; through a view of an integer format it is a 16-bit
                 // integer, zero- or sign-extended (VIctory 4243a96a: the face
                 // network keeps its halves in UINT views; its output was
-                // noise). shortcut: that is known of the views a program
-                // picks from the heap, not of those in its tables; and the
-                // handle stays a float one, whose bits the drivers pass.
+                // noise). That is known of the views a program picks from
+                // the heap and of those in its tables (the host keeps the
+                // word of both); the handle stays a float one, whose bits
+                // the drivers pass.
                 let integer = if typed { self.integer_view(src)? } else { None };
                 let mut wide = Vec::new();
                 for k in 0..count {
@@ -14135,5 +14136,48 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    /// A d16 typed buffer load through a table asks the host's table by heap
+    /// slot for its view's format kind, as one through the heap does (the
+    /// face network's compute_graph_ops programs, e.g. 0aa7934094794dbf,
+    /// load R16G16B16A16_UINT data this way and compute with it as
+    /// integers); a 32-bit load does not.
+    #[test]
+    fn a_d16_typed_buffer_load_through_a_table_reads_its_views_format_kind() {
+        let layout = vec![root(RootType::Table, 0, 0)];
+        let used = vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 4,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        let words = |d16: bool| {
+            // buffer_load_format(_d16)_xyzw v[1:..], v0, s[8:11], 0 idxen
+            let op: u32 = if d16 { 0x83 } else { 0x03 };
+            [
+                0xBE84_0300, // s_mov_b32 s4, s0
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0x38 << 26 | op << 18 | 1 << 13,
+                0x8002_0100,
+                0xBF8C_3F70, // s_waitcnt vmcnt(0)
+                0xD834_0000,
+                0x0000_0100, // ds_write_b32 v0, v1
+                S_ENDPGM,
+            ]
+        };
+        let asks_for_kind = |d16| {
+            let l = lower_with(&words(d16), layout.clone(), used.clone()).unwrap();
+            l.root_srvs.contains(&super::super::shader::SLOT_STRIDES)
+        };
+        assert!(asks_for_kind(true), "d16");
+        assert!(!asks_for_kind(false), "32-bit");
     }
 }
