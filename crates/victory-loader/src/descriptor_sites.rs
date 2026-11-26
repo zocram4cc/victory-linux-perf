@@ -216,23 +216,26 @@ pub const COPY_CALLS: [CallSite; 2] = [
 
 /// The 128-byte table copy of +0x4d9f200: the window (its four stores, then
 /// `mov rcx, r15 ; mov rdx, rsi ; mov r8, rbx ; xor r9d, r9d`, which sets the
-/// flags before any use), and where the last store and the `mov rcx, r15`
-/// (7 bytes) are replaced by a jump.
+/// flags before any use), and where its last two stores (9 bytes) are
+/// replaced by a jump. Not the `mov rcx, r15` after them: the `memcpy` path
+/// for other sizes jumps back to it (+0x4d9f38b `jmp +0x4d9f272`; run pop-3
+/// ran into the jump's last byte there and stopped).
 pub const COPY_128: Site = Site {
     window: 0x4d9_f25f,
-    store: 15,
-    len: 7,
+    store: 10,
+    len: 9,
     bytes: &[
         0xc5, 0xfc, 0x11, 0x5b, 0x60, 0xc5, 0xfc, 0x11, 0x53, 0x40, 0xc5, 0xfc, 0x11, 0x4b, 0x20, 0xc5, 0xfc, 0x11, 0x03, 0x4c, 0x89,
         0xf9, 0x48, 0x89, 0xf2, 0x49, 0x89, 0xd8, 0x45, 0x31, 0xc9,
     ],
 };
 
-/// The code at `to` for [`COPY_128`] at `at` (its 7 bytes replaced): the last
-/// store, the four slots of `[rbx..rbx+128)` marked if they lie in the heap,
-/// `mov rcx, r15`, back.
+/// The code at `to` for [`COPY_128`] at `at` (its 9 bytes replaced): the last
+/// two stores, the four slots of `[rbx..rbx+128)` marked if they lie in the
+/// heap, back to the `mov rcx, r15`.
 fn copy_128_stub(at: usize, to: usize, marks: usize, len: usize) -> Option<Vec<u8>> {
-    let mut out = vec![0xc5, 0xfc, 0x11, 0x03]; // vmovups [rbx], ymm0
+    let mut out = vec![0xc5, 0xfc, 0x11, 0x4b, 0x20]; // vmovups [rbx+20h], ymm1
+    out.extend([0xc5, 0xfc, 0x11, 0x03]); // vmovups [rbx], ymm0
     out.extend([0x50, 0x52, 0x51]); // push rax ; push rdx ; push rcx
     out.extend([0x48, 0x89, 0xd8]); // mov rax, rbx
     out.extend([0x48, 0xba]); // mov rdx, marks
@@ -259,7 +262,6 @@ fn copy_128_stub(at: usize, to: usize, marks: usize, len: usize) -> Option<Vec<u
     out[skip_a + 1] = u8::try_from(past - (skip_a + 2)).ok()?;
     out[skip_b + 1] = u8::try_from(past - (skip_b + 2)).ok()?;
     out.extend([0x59, 0x5a, 0x58]); // pop rcx ; pop rdx ; pop rax
-    out.extend([0x4c, 0x89, 0xf9]); // mov rcx, r15
     let back = crate::console_insn::jump(to + out.len(), at + len)?;
     out.extend(back);
     Some(out)
@@ -550,6 +552,10 @@ mod tests {
             let mut room = None;
             assert_eq!(copy_128(place, 0x10000, &raw const *marks as usize, &site, &mut room), Hooked::Done);
             assert_eq!(*((place + 0x1100 + COPY_128.store) as *const u8), 0xe9);
+            // The `mov rcx, r15` that another path jumps to is left as it was.
+            let after = COPY_128.store + COPY_128.len;
+            assert_eq!(&COPY_128.bytes[after..after + 3], &[0x4c, 0x89, 0xf9]);
+            assert_eq!(std::slice::from_raw_parts((place + 0x1100 + after) as *const u8, COPY_128.bytes.len() - after), &COPY_128.bytes[after..]);
             let (plain, hooked): (F, F) = (std::mem::transmute(plain), std::mem::transmute(hooked));
             let records: [u8; 128] = std::array::from_fn(|k| (k as u8).wrapping_mul(7) ^ 0x3c);
             // Slots 126..130 of the heap: over the end of chunk 0.
