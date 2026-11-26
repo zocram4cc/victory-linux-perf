@@ -5497,6 +5497,38 @@ mod tests {
         assert_eq!(view_stride(&uav(12, 0, 0)), Some(8));
     }
 
+    /// The dynamic slots of a table made afresh get their words of the table
+    /// of strides (faces move, #114): a typed view of integer halves says
+    /// so, a constant buffer or no view says nothing, and a slot of the
+    /// title's own, which `note_buffer` keeps the word of, is left alone.
+    #[test]
+    fn the_dynamic_slots_of_a_table_get_their_words_in_the_table_of_strides() {
+        use victory_shader::emit::VIEW_INTEGER;
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let Some((_, _, data)) = &heap.strides else {
+            return;
+        };
+        // SAFETY: inside the mapping.
+        let word = |index: u32| unsafe { (*data as *const u32).add(index as usize).read_volatile() };
+        let uav = |format| View::Unordered(0, 0, Some([format, 1, 0, 0, 64, 0, 0, 0, 0, 0]));
+        let first = heap.dynamic(3).expect("dynamic slots");
+        heap.dynamic_word(first, Some(&uav(57)));
+        heap.dynamic_word(first + 1, Some(&View::Constant(0x1000, 256)));
+        heap.dynamic_word(first + 2, None);
+        assert_eq!(word(first), 2 | VIEW_INTEGER, "R16_UINT");
+        assert_eq!(word(first + 1), 0, "a constant buffer");
+        assert_eq!(word(first + 2), 0, "no view");
+        let title = word(1);
+        heap.dynamic_word(1, Some(&uav(57)));
+        assert_eq!(word(1), title, "a title slot is left alone");
+        // A slot of a table made again holds the word of its new view.
+        heap.dynamic_word(first, Some(&View::Constant(0x1000, 256)));
+        assert_eq!(word(first), 0, "a slot made again");
+        heap.release(first, 3);
+    }
+
     /// What may stand for a texture that is not there yet: one of its kind in
     /// another place or size; another one only if asked; nothing a shader
     /// cannot read in its place.
