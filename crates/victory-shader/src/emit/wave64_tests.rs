@@ -738,3 +738,80 @@ fn the_lanes_past_a_count_of_threads_do_not_run() {
         }
     }
 }
+
+/// A console wave32 program with console lanes (`v_mbcnt`) in a 32 x 2 group: thread (x, y)
+/// stores 1 at dword 32y + x. Every dword must be written once: the host's relabelled thread
+/// ids are a bijection of the group. A 32-lane host need not give a host wave a 32-aligned run
+/// of flat ids (2-D groups are filled from 16 x 2 tiles on NVIDIA and RDNA), so the first flat
+/// id of a wave rounded down gave two waves the same ids (fxceless PR #1261, issue #1243); the
+/// waves now take their threads from a group counter. With `VICTORY_THREAD_TICKET=0` (the old
+/// rounding) the count of dwords written is printed, not checked: it depends on the card.
+#[test]
+fn the_console_threads_of_a_two_dimensional_group_are_each_given_once() {
+    let words = [
+        0xD765_0003, // v_mbcnt_lo_u32_b32 v3, exec_lo, 0
+        0x0001_007E,
+        0x3408_0285, // v_lshlrev_b32 v4, 5, v1
+        0x4A08_0104, // v_add_nc_u32 v4, v4, v0
+        0x3408_0882, // v_lshlrev_b32 v4, 2, v4
+        0x7E0A_0281, // v_mov_b32 v5, 1
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | 5 << 8 | 4, // buffer_store_dword v5, v4, s[8:11], 0 offen
+    ];
+    let mut native = native_of(&words, false, 64);
+    native.io = StageIo::Cs(ComputeIo {
+        rsrc2: 5 << 1 | 1 << 11, // 5 user SGPRs, thread ids x and y in v0, v1
+        threads: [32, 2, 1],
+    });
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let lower_with = |ticket: bool| {
+        // SAFETY: tests that read this switch hold ONE_AT_A_TIME
+        unsafe { std::env::set_var("VICTORY_THREAD_TICKET", if ticket { "1" } else { "0" }) };
+        let shader = lowered_on(&native, &p, &HashSet::new(), 32);
+        unsafe { std::env::remove_var("VICTORY_THREAD_TICKET") };
+        shader.expect("lower")
+    };
+    let shader = lower_with(true);
+    let old = lower_with(false);
+    assert_ne!(shader.dxil, old.dxil, "the counter is used for a group of two host waves");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let run = |shader: &HostShader| -> Option<Vec<u32>> {
+        let (root, pso) = match host.compute_pipeline(shader) {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("the hardware device does not take this program: {e}; not run");
+                return None;
+            }
+        };
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(64)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        Some(out[0][..64].to_vec())
+    };
+    let Some(got) = run(&shader) else { return };
+    let missing: Vec<usize> = (0..64).filter(|&i| got[i] != 1).collect();
+    assert!(missing.is_empty(), "dwords not written once: {missing:?}");
+    if let Some(before) = run(&old) {
+        let written = before.iter().filter(|&&d| d == 1).count();
+        eprintln!("the old rounding on this device: {written} of 64 dwords written");
+    }
+    eprintln!("ran on the hardware device: 64 of 64 console threads, each once");
+}
