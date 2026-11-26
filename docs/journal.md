@@ -4,6 +4,12 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**M.2 milestone: title buffers live in VRAM at their own addresses under Wine; the picture breaks as in RAM, so the fault is the layer's, not the memory's**
+- **Wine:** `winevulkan`'s Windows-side loader (`dlls/winevulkan/loader.c`, `is_device_extension_supported`) refuses extensions it does not list, and `VK_EXT_map_memory_placed` is unlisted (`make_vulkan`, `UNEXPOSED_EXTENSIONS`); forcing it from vkd3d gave `vkCreateDevice` `VK_ERROR_EXTENSION_NOT_PRESENT` (-7) and a white screen. **Patched to let that one extension through**, and only `winevulkan.dll` built: GE's prepared tree had an empty generated `include/wine/vulkan.h`, regenerated with `make_vulkan -x vk.xml -X video.xml`; built in a separate tree configured `--with-vulkan` (`wineserver/build-GE-Proton11-14/build-vk`). Installed in a **reflinked copy of GE-Proton11-14** (`victory-data/proton-vr/GE-Proton11-14-vr`, `VP_PROTON`); the user's GE is untouched. The original DLL is kept beside it (`winevulkan.dll.ge`). The shared source's `loader.c` and generated files were changed; the GE tree is reset by the launcher's prep when it rebuilds the wineserver.
+- **vkd3d-proton** (`~/src/vkd3d-proton-vr`, `victory-vram`): also asks for `VK_EXT_map_memory_placed` and `VK_KHR_map_memory2` though Wine does not list them.
+- **Result** (`bench/trials-…-vram-wine`, `VICTORY_INPLACE=3 VKD3D_VRAM_AT_ADDRESS=1`): the device is made, **286 "are VRAM now" placements**: title buffers in ReBAR VRAM at their own addresses, read and written by the CPU and the GPU there. The console model works end to end on this machine.
+- **The picture breaks exactly as with buffers in place in system memory** (the user: "la casa se ve rota, le faltan cosas"; screenshot in the session: the house dark, the dock and the water cut). So the userptr-invalidation hypothesis is wrong: what breaks is how the layer treats the big buffers (≥ 1 MiB) once they are in place, whatever the memory. Next: which big buffers, and what the layer does with them that assumes a copy.
+
 **Buffers in place, split by size: what breaks is the ≥ 1 MiB ones, and they are nearly all the bytes**
 - `VICTORY_INPLACE_BUFFER_KB=min,max` (new, bisection) with `VICTORY_INPLACE=3`, the user watching each run:
 
