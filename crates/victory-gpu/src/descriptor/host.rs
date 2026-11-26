@@ -4831,9 +4831,18 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         _ => return null_view(at),
     };
     if buffer && let Some(z) = zero_buffers() {
+        // Typed, as the null view it stands for (review: a raw view where
+        // the shader loads typed is another kind of descriptor).
+        let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_UINT,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_UAV { NumElements: (ZERO_BYTES / 4) as u32, ..Default::default() },
+            },
+        };
         // SAFETY: a slot of our heap; a live buffer of ours (writes land
         // there and are never read back).
-        unsafe { host.device.CreateUnorderedAccessView(&z[1], None::<&ID3D12Resource>, Some(&zero_uav_desc()), at) };
+        unsafe { host.device.CreateUnorderedAccessView(&z[1], None::<&ID3D12Resource>, Some(&desc), at) };
         return;
     }
     let desc = if buffer {
