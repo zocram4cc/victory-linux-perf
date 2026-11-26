@@ -23,3 +23,7 @@ The author gets 0.5 ms on the write-watch line, ~15 fps at ~7,500 draws.
 - Their "asking the write watch and the guards" is a median of 2-4 ms over a run (peaks 9-11), not 0.5. Ours there was 11-27 ms with zram on; a run with zram off (disk swap only) is being compared.
 - Their log says "no host pipeline library: pipelines are not kept": the null-blob fix of our P.1 (vkd3d rejects a non-null pointer with length 0) applies to them; suggested to the author.
 - The start screen can sit black until a button is pressed (seen once, 26 Nov).
+
+## Third run: zram off (disk swap only), 26 Nov 18:36
+
+36 world lines. Standing or moving little: 9-11 fps, ~100 ms (preparing 63-75, copies 26-46, GPU 3-20, copy-back ~22). Moving and turning: 2-5 fps, 190-470 ms; copies rise to 50-87 ms (85-100 MB), and **the frame exceeds preparing + GPU + copy-back by up to ~250 ms** (time outside the layer's pieces: the title's own threads streaming, or waits). The write-watch line is 10-46 ms (median ~20) with zram off, so zram was not its cause; the author's median is 2-4 ms. The whole picture was black once at start (intermittent; a relaunch was fine).
