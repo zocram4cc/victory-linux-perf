@@ -1587,31 +1587,38 @@ mod host {
         }
     }
 
+    /// A key name of `VICTORY_KEYS` and `VICTORY_KEYS_FILE`: a letter, a
+    /// digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`, `Left`, `Right`
+    /// (the stand-in pad's table maps them to buttons).
+    #[cfg(feature = "diagnostics")]
+    fn key_code(name: &str) -> Option<u8> {
+        Some(match name.trim() {
+            "Enter" => 0x0D,
+            "Esc" => 0x1B,
+            "Tab" => 0x09,
+            "Back" => 0x08,
+            "Up" => 0x26,
+            "Down" => 0x28,
+            "Left" => 0x25,
+            "Right" => 0x27,
+            k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
+                k.as_bytes()[0].to_ascii_uppercase()
+            }
+            _ => return None,
+        })
+    }
+
     /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
     /// 0.2 s that long after input starts (`<from>-<to>:<key>`: all that
-    /// time), with or without focus. A key is a
-    /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
-    /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
+    /// time), with or without focus (names as [`key_code`]); then the keys
+    /// of [`live`].
     #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
         static SCRIPT: LazyLock<(Instant, Vec<(Duration, Duration, u8)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
             let keys = list.split(',').filter_map(|entry| {
                 let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
+                let vk = key_code(key)?;
                 let time = |t: &str| Duration::try_from_secs_f64(t.trim().parse().ok()?).ok();
                 let (from, to) = match at.split_once('-') {
                     Some((from, to)) => (time(from)?, time(to)?),
@@ -1623,10 +1630,88 @@ mod host {
         });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
-        keys.iter()
+        let mut down: Vec<u8> = keys
+            .iter()
             .filter(|&&(from, to, _)| (from..to).contains(&now))
             .map(|&(_, _, vk)| vk)
-            .collect()
+            .collect();
+        for vk in live() {
+            if !down.contains(&vk) {
+                down.push(vk);
+            }
+        }
+        down
+    }
+
+    /// Debugging aid: `VICTORY_KEYS_FILE=<path>`, keys pressed while the game
+    /// runs (a controller stays usable: they merge onto it). Each line
+    /// appended to the file, `<key>[+<key>...][:<ms>]` (names as
+    /// [`key_code`]; held 200 ms unless given), is held once the lines
+    /// before it end. Lines already there at start are skipped; the file is
+    /// looked at every 50 ms.
+    #[cfg(feature = "diagnostics")]
+    fn live() -> Vec<u8> {
+        use std::io::{Read, Seek, SeekFrom};
+        struct Live {
+            path: Option<String>,
+            read: u64,
+            looked: Option<Instant>,
+            queue: VecDeque<(Vec<u8>, Duration)>,
+            held: Option<(Vec<u8>, Instant)>,
+        }
+        static LIVE: LazyLock<Mutex<Live>> = LazyLock::new(|| {
+            let path = std::env::var("VICTORY_KEYS_FILE")
+                .ok()
+                .filter(|p| !p.is_empty());
+            // Lines already there are old: start after them.
+            let read = path
+                .as_deref()
+                .and_then(|p| std::fs::metadata(p).ok())
+                .map_or(0, |m| m.len());
+            Mutex::new(Live {
+                path,
+                read,
+                looked: None,
+                queue: VecDeque::new(),
+                held: None,
+            })
+        });
+        let mut live = LIVE.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(path) = live.path.clone() else {
+            return Vec::new();
+        };
+        let now = Instant::now();
+        if live
+            .looked
+            .is_none_or(|t| now - t >= Duration::from_millis(50))
+        {
+            live.looked = Some(now);
+            let mut text = String::new();
+            if let Ok(mut f) = std::fs::File::open(&path)
+                && f.seek(SeekFrom::Start(live.read)).is_ok()
+                && f.read_to_string(&mut text).is_ok()
+            {
+                // Whole lines only; a line being written waits.
+                let whole = text.rfind('\n').map_or(0, |i| i + 1);
+                live.read += whole as u64;
+                for line in text[..whole].lines() {
+                    let (keys, ms) = line.split_once(':').unwrap_or((line, "200"));
+                    let keys: Vec<u8> = keys.split('+').filter_map(key_code).collect();
+                    if let (false, Ok(ms)) = (keys.is_empty(), ms.trim().parse::<u64>()) {
+                        live.queue.push_back((keys, Duration::from_millis(ms)));
+                    }
+                }
+            }
+        }
+        if live.held.as_ref().is_none_or(|(_, until)| now >= *until)
+            && let Some((keys, hold)) = live.queue.pop_front()
+        {
+            live.held = Some((keys, now + hold));
+        }
+        match &live.held {
+            Some((keys, until)) if now < *until => keys.clone(),
+            _ => Vec::new(),
+        }
     }
 
     /// The foreground window if it belongs to our process.
