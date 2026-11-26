@@ -82,7 +82,15 @@ for ((r = 1; r <= RUNS; r++)); do
         say "in the world after ${entry} s; settling ${SETTLE} s, measuring ${SECS} s"
         sleep "$SETTLE"
         from=$(wc -l <"$log")
-        sleep "$SECS"
+        # K_PERF=1: a profile of the game and the wineserver over the window,
+        # kernel included (needs kernel.perf_event_paranoid <= 1).
+        if [[ ${K_PERF:-0} == 1 ]]; then
+            gp=$(ps -eo pid,args | grep '[r]elease\\victory.exe run' | awk '$2 !~ /cmd.exe/ {print $1}' | tail -n1)
+            sp=$(pgrep -x wineserver | head -n1 || true)
+            perf record -q -m 8 -F 499 -g -p "$gp${sp:+,$sp}" -o "$OUT/run-$r.perf" -- sleep "$SECS" >"$OUT/run-$r.perf.err" 2>&1 || true
+        else
+            sleep "$SECS"
+        fi
         shoot "$OUT/run-$r.png"
         running || result=closed
         tail -n +"$((from + 1))" "$log" | sed 's/\x1b\[[0-9;]*m//g' >"$OUT/run-$r.log"
