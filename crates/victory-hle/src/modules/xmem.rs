@@ -1212,7 +1212,8 @@ pub extern "system" fn XMemMapPhysicalPages(
     // maps what stays of them again, and a mapped view is a reservation
     // until it is committed. A read of title memory in place must not fall
     // into that gap (`victory_gpu::title_memory_remapping`).
-    let _changing = victory_gpu::title_memory_remapping();
+    let ranges = [affected(&physical, base, n * PAGE)];
+    let _changing = victory_gpu::title_memory_remapping_in(&ranges);
     unmap(&mut physical, base, n * PAGE);
     let Some(pages) = pages else {
         return address;
@@ -1296,7 +1297,8 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let _busy = Busy::begin();
     let mut physical = physical();
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
-    let _changing = victory_gpu::title_memory_remapping();
+    let ranges = [affected(&physical, to, len)];
+    let _changing = victory_gpu::title_memory_remapping_in(&ranges);
     unmap(&mut physical, to, len);
     for k in (0..len).step_by(PAGE) {
         if from == 0 {
@@ -1349,7 +1351,8 @@ pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
             ops.push(Op::new(to, slice.flatten()));
             at += 1;
         }
-        let _changing = victory_gpu::title_memory_remapping();
+        let ranges = affected_ops(&physical, &ops);
+        let _changing = victory_gpu::title_memory_remapping_in(&ranges);
         ok &= change(&mut physical, ops);
     }
     ok
@@ -1387,7 +1390,8 @@ fn scatter(wanted: &[(usize, usize)]) -> bool {
         if let Some(costed) = &mut costed {
             costed.pages = Some(ops.len());
         }
-        let _changing = victory_gpu::title_memory_remapping();
+        let ranges = affected_ops(&physical, &ops);
+        let _changing = victory_gpu::title_memory_remapping_in(&ranges);
         ok &= change(&mut physical, ops);
     }
     ok
@@ -1893,6 +1897,32 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             map(physical, end, at + size - end, Slice { index, ..slice });
         }
     }
+}
+
+/// The title memory a change of `[base, base + len)` takes away or maps,
+/// even for a moment: its pages (64 KiB each) and every view that overlaps
+/// them whole ([`unmap`] takes a view away whole and maps what stays of it
+/// again).
+fn affected(physical: &Physical, base: usize, len: usize) -> (usize, usize) {
+    let end = base + len.next_multiple_of(PAGE);
+    let (mut lo, mut hi) = (base / PAGE * PAGE, end.next_multiple_of(PAGE));
+    if let Some((&at, &(size, _))) = physical.views.range(..=base).next_back()
+        && at + size > base
+    {
+        lo = lo.min(at);
+        hi = hi.max(at + size);
+    }
+    if len > 0 {
+        for (&at, &(size, _)) in physical.views.range(base + 1..end) {
+            hi = hi.max(at + size);
+        }
+    }
+    (lo, hi)
+}
+
+/// [`affected`] of each op's page.
+fn affected_ops(physical: &Physical, ops: &[Op]) -> Vec<(usize, usize)> {
+    ops.iter().map(|op| affected(physical, op.at, PAGE)).collect()
 }
 
 /// The oldest layout we know; newer titles pass other flag values (Minecraft

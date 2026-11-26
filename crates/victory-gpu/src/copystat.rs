@@ -131,6 +131,13 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// Reader waits on the mapping lock (title memory read in place) since
+    /// the last line: ranged, or unranged (the whole address space), by count
+    /// and by the microseconds waited.
+    ReadWaitsRanged,
+    ReadWaitsRangedUs,
+    ReadWaitsWhole,
+    ReadWaitsWholeUs,
 }
 const COUNTERS: usize = 80;
 /// One of some sets of counters, each in lines of the processor's memory of
@@ -1338,6 +1345,15 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::PaceUs as usize]),
         c[C::GpuWritesLeftOut as usize],
         mb(c[C::GpuWritesLeftOutBytes as usize]),
+    );
+    tracing::info!(
+        "reader waits on the mapping lock per frame (VICTORY_MAP_LOCK_FINE={}): \
+         ranged {:.2} waits {:.3} ms; unranged {:.2} waits {:.3} ms",
+        u8::from(crate::watch::fine::on()),
+        c[C::ReadWaitsRanged as usize],
+        ms(c[C::ReadWaitsRangedUs as usize]),
+        c[C::ReadWaitsWhole as usize],
+        ms(c[C::ReadWaitsWholeUs as usize]),
     );
     let [together, written, mapped] =
         [0, 1, 2].map(|n| crate::watch::ALIASES[n].load(std::sync::atomic::Ordering::Relaxed));

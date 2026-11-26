@@ -1667,7 +1667,7 @@ pub(crate) fn put_beside(block: usize, weight: u32, put: impl FnOnce(usize)) -> 
     }
     // No mapping changes until all is told: a view of the page that came
     // after the look at them would not be.
-    let Some(_reading) = title_memory_reading_now() else {
+    let Some(_reading) = title_memory_reading_now_in(block * BLOCK, BLOCK) else {
         return Beside::Cannot;
     };
     let Some((page, shown)) = crate::inplace::beside_page(block * BLOCK) else {
@@ -3364,7 +3364,13 @@ static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 /// What the runtime holds while it changes what title memory shows
 /// ([`title_memory_remapping`]).
-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
+pub struct Remapping(#[allow(dead_code)] Changing);
+
+#[allow(dead_code)]
+enum Changing {
+    Whole(std::sync::RwLockWriteGuard<'static, ()>),
+    Fine(fine::WriteGuard),
+}
 
 impl Drop for Remapping {
     fn drop(&mut self) {
@@ -3511,6 +3517,16 @@ pub(crate) fn lost(what: &'static str, at: usize, len: usize) {
 /// place is under way and none begins ([`title_memory_reading`]). Taken
 /// around the whole change, the unmapping and the mapping again.
 pub fn title_memory_remapping() -> Remapping {
+    title_memory_remapping_in(&[(0, usize::MAX)])
+}
+
+/// [`title_memory_remapping`] for a change that touches title memory in
+/// `ranges` (start, end) alone: with `VICTORY_MAP_LOCK_FINE=1` reads in place
+/// of other memory go on meanwhile ([`fine`]); without it, as
+/// [`title_memory_remapping`]. Every address whose mapping the change takes
+/// away or makes, even for a moment (the rest of a view unmapped and mapped
+/// again), must be in `ranges`.
+pub fn title_memory_remapping_in(ranges: &[(usize, usize)]) -> Remapping {
     // For the title's own threads ([`came_back`]).
     install();
     let met = MET.load(std::sync::atomic::Ordering::Relaxed);
@@ -3521,31 +3537,228 @@ pub fn title_memory_remapping() -> Remapping {
             tracing::info!(met, "accesses of title threads that waited for a change of mapping");
         }
     }
-    let changing = MAPPING.write().unwrap_or_else(|e| e.into_inner());
+    let changing = if fine::on() {
+        Changing::Fine(fine::FINE.write(ranges))
+    } else {
+        Changing::Whole(MAPPING.write().unwrap_or_else(|e| e.into_inner()))
+    };
     CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     CHANGING.set((true, false));
     Remapping(changing)
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
-pub struct Reading(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>);
+pub struct Reading(#[allow(dead_code)] Read);
+
+#[allow(dead_code)]
+enum Read {
+    Whole(std::sync::RwLockReadGuard<'static, ()>),
+    Fine(fine::ReadGuard),
+}
 
 /// For reading title memory in place: until what it returns is dropped,
 /// the runtime changes no mapping, so memory found mapped stays mapped.
 /// Not to be taken twice by one thread, nor held across anything that
 /// maps title memory.
 pub fn title_memory_reading() -> Reading {
-    Reading(MAPPING.read().unwrap_or_else(|e| e.into_inner()))
+    title_memory_reading_in(0, usize::MAX)
 }
 
-/// [`title_memory_reading`] if it can be had at once: `None` while the
-/// runtime changes a mapping (or waits to), for a caller that has another
-/// way to read and would rather not wait.
-pub fn title_memory_reading_now() -> Option<Reading> {
+/// [`title_memory_reading`] of `[at, at + len)` alone: with
+/// `VICTORY_MAP_LOCK_FINE=1` only a change of that memory is waited for.
+pub fn title_memory_reading_in(at: usize, len: usize) -> Reading {
+    if fine::on() {
+        let (guard, waited) = fine::FINE.read(at, at.saturating_add(len));
+        if let Some(since) = waited {
+            mapping_waited(at, len, since);
+        }
+        return Reading(Read::Fine(guard));
+    }
+    let guard = match MAPPING.try_read() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            let waited = std::time::Instant::now();
+            let guard = MAPPING.read().unwrap_or_else(|e| e.into_inner());
+            mapping_waited(at, len, waited);
+            guard
+        }
+    };
+    Reading(Read::Whole(guard))
+}
+
+/// A read in place of `[at, at + len)` waited for a change of mapping from
+/// `since` on: counted for the frame's line ([`crate::copystat`]), ranged or
+/// unranged (the whole address space).
+#[cfg(feature = "diagnostics")]
+fn mapping_waited(at: usize, len: usize, since: std::time::Instant) {
+    use crate::copystat::{C, add};
+    let us = since.elapsed().as_micros() as u64;
+    let (waits, waited) = if (at, len) == (0, usize::MAX) {
+        (C::ReadWaitsWhole, C::ReadWaitsWholeUs)
+    } else {
+        (C::ReadWaitsRanged, C::ReadWaitsRangedUs)
+    };
+    add(waits, 1);
+    add(waited, us);
+}
+
+#[cfg(not(feature = "diagnostics"))]
+fn mapping_waited(_at: usize, _len: usize, _since: std::time::Instant) {}
+
+/// [`title_memory_reading_in`] if it can be had at once: `None` while the
+/// runtime changes a mapping of `[at, at + len)` (or waits to), for a caller
+/// that has another way to read and would rather not wait.
+pub fn title_memory_reading_now_in(at: usize, len: usize) -> Option<Reading> {
+    if fine::on() {
+        return fine::FINE.try_read(at, at.saturating_add(len)).map(|g| Reading(Read::Fine(g)));
+    }
     match MAPPING.try_read() {
-        Ok(guard) => Some(Reading(guard)),
-        Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(e.into_inner())),
+        Ok(guard) => Some(Reading(Read::Whole(guard))),
+        Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(Read::Whole(e.into_inner()))),
         Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
+/// `VICTORY_MAP_LOCK_FINE=1`, default off: the mapping lock by range. Without
+/// it each change of mapping holds [`MAPPING`] alone and no read of title
+/// memory in place runs meanwhile; with it a reader waits only for a change
+/// that touches its own range.
+///
+/// Invariant (the guarantee of [`MAPPING`] for a reader of a range R): while
+/// a reader of R holds its guard, no change of mapping of memory overlapping
+/// R is under way. A reader enters only when, under the state's mutex, no
+/// writer whose ranges overlap R is announced, and it is then listed under
+/// the same mutex. A writer announces its ranges under that mutex first and
+/// starts its change only when no listed reader overlaps them. Both checks
+/// and both entries are made under one mutex, so of a reader of R and a
+/// writer of an overlapping W whichever is listed first is seen by the other,
+/// which waits. A writer is announced from before its wait until its guard
+/// is dropped, so a reader arriving meanwhile waits too: writers are not
+/// starved. Writers are one at a time, as the lock had them, so the change
+/// count stays odd exactly while one is under way, and the per-thread change
+/// notes are as before. Unranged readers and writers take the whole address
+/// space and exclude exactly as the lock did.
+pub(crate) mod fine {
+    use std::sync::{Condvar, Mutex, MutexGuard};
+    use std::time::Instant;
+
+    pub(crate) fn on() -> bool {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var("VICTORY_MAP_LOCK_FINE").is_ok_and(|v| v.trim() == "1")
+        });
+        *ON
+    }
+
+    /// The announced writer and the readers in place, under one mutex.
+    struct State {
+        /// The announced writer's ranges (start, end): waiting or changing.
+        writer: Option<Vec<(usize, usize)>>,
+        /// Readers in place: their range, and a ticket to find them by.
+        readers: Vec<(usize, usize, u64)>,
+        next: u64,
+    }
+
+    pub(crate) struct Fine {
+        state: Mutex<State>,
+        /// Signalled when a writer is announced or lets go, and when a reader
+        /// lets go while one is announced.
+        moved: Condvar,
+        /// Writers one at a time.
+        one: Mutex<()>,
+    }
+
+    /// The lock of the title's memory, used when [`on`] says so.
+    pub(crate) static FINE: Fine = Fine::new();
+
+    impl Fine {
+        pub(crate) const fn new() -> Fine {
+            Fine {
+                state: Mutex::new(State { writer: None, readers: Vec::new(), next: 1 }),
+                moved: Condvar::new(),
+                one: Mutex::new(()),
+            }
+        }
+
+        fn state(&self) -> MutexGuard<'_, State> {
+            self.state.lock().unwrap_or_else(|e| e.into_inner())
+        }
+
+        /// Reads `[from, to)` in place, waiting while a writer of an
+        /// overlapping range is announced. Also returns when the wait began,
+        /// if it waited.
+        pub(crate) fn read(&'static self, from: usize, to: usize) -> (ReadGuard, Option<Instant>) {
+            let mut s = self.state();
+            let mut waited = None;
+            while s.writer.as_deref().is_some_and(|w| overlaps(w, from, to)) {
+                waited.get_or_insert_with(Instant::now);
+                s = self.moved.wait(s).unwrap_or_else(|e| e.into_inner());
+            }
+            let ticket = s.next;
+            s.next += 1;
+            s.readers.push((from, to, ticket));
+            (ReadGuard { fine: self, ticket }, waited)
+        }
+
+        /// [`Fine::read`] if it need not wait.
+        pub(crate) fn try_read(&'static self, from: usize, to: usize) -> Option<ReadGuard> {
+            let mut s = self.state();
+            if s.writer.as_deref().is_some_and(|w| overlaps(w, from, to)) {
+                return None;
+            }
+            let ticket = s.next;
+            s.next += 1;
+            s.readers.push((from, to, ticket));
+            Some(ReadGuard { fine: self, ticket })
+        }
+
+        /// Announces `ranges`, then waits until no reader in place overlaps.
+        pub(crate) fn write(&'static self, ranges: &[(usize, usize)]) -> WriteGuard {
+            let one = self.one.lock().unwrap_or_else(|e| e.into_inner());
+            let mut s = self.state();
+            s.writer = Some(ranges.to_vec());
+            while s.readers.iter().any(|r| overlaps(ranges, r.0, r.1)) {
+                s = self.moved.wait(s).unwrap_or_else(|e| e.into_inner());
+            }
+            drop(s);
+            WriteGuard { fine: self, _one: one }
+        }
+    }
+
+    fn overlaps(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
+        ranges.iter().any(|&(a, b)| a < to && from < b)
+    }
+
+    /// A reader in place; lets go on drop.
+    pub(crate) struct ReadGuard {
+        fine: &'static Fine,
+        ticket: u64,
+    }
+
+    impl Drop for ReadGuard {
+        fn drop(&mut self) {
+            let mut s = self.fine.state();
+            if let Some(i) = s.readers.iter().position(|r| r.2 == self.ticket) {
+                s.readers.swap_remove(i);
+            }
+            if s.writer.is_some() {
+                self.fine.moved.notify_all();
+            }
+        }
+    }
+
+    /// A writer of ranges; they stay announced until it is dropped.
+    pub(crate) struct WriteGuard {
+        fine: &'static Fine,
+        /// Held until the writer is gone: writers one at a time.
+        _one: MutexGuard<'static, ()>,
+    }
+
+    impl Drop for WriteGuard {
+        fn drop(&mut self) {
+            self.fine.state().writer = None;
+            self.fine.moved.notify_all();
+        }
     }
 }
 
@@ -4969,7 +5182,7 @@ mod tests {
         // a store that meets one opens the block, as before.
         let mut kept = 0;
         let quiet = || {
-            while title_memory_reading_now().is_none() {
+            while title_memory_reading_now_in(0, usize::MAX).is_none() {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
         };
@@ -5733,6 +5946,137 @@ mod mapping_tests {
         drop(changing);
         reader.join().unwrap();
         assert!(read.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(test)]
+mod fine_tests {
+    use super::fine::Fine;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
+
+    /// Long enough for what should happen; short enough to fail fast.
+    const SOON: Duration = Duration::from_secs(5);
+    /// Long enough for what should not happen to have happened.
+    const LATER: Duration = Duration::from_millis(100);
+
+    /// A reader of `[8000, 9000)` goes on while a writer of `[1000, 2000)`
+    /// changes memory.
+    #[test]
+    fn a_reader_of_r_goes_on_while_a_writer_changes_a_disjoint_w() {
+        static F: Fine = Fine::new();
+        let writing = F.write(&[(0x1000, 0x2000)]);
+        let (entered, went_on) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let (_reading, _) = F.read(0x8000, 0x9000);
+            entered.send(()).unwrap();
+        });
+        let went = went_on.recv_timeout(SOON).is_ok();
+        drop(writing);
+        reader.join().unwrap();
+        assert!(went, "a reader of [8000, 9000) waited for a writer of [1000, 2000)");
+    }
+
+    /// A reader of `[1800, 2800)` waits for a writer of `[1000, 2000)`.
+    #[test]
+    fn a_reader_of_an_overlapping_r_waits_for_the_writer() {
+        static F: Fine = Fine::new();
+        let writing = F.write(&[(0x1000, 0x2000)]);
+        let (entered, went_on) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let (_reading, _) = F.read(0x1800, 0x2800);
+            entered.send(()).unwrap();
+        });
+        let early = went_on.recv_timeout(LATER).is_ok();
+        drop(writing);
+        let after = went_on.recv_timeout(SOON).is_ok();
+        reader.join().unwrap();
+        assert!(!early, "a reader of [1800, 2800) went on during a change of [1000, 2000)");
+        assert!(after, "a reader of [1800, 2800) never went on after the change");
+    }
+
+    /// A writer gets its change in while four readers of `[1000, 3000)` keep
+    /// coming, each holding for a millisecond.
+    #[test]
+    fn a_writer_is_not_starved_by_a_stream_of_overlapping_readers() {
+        static F: Fine = Fine::new();
+        let stop = Arc::new(AtomicBool::new(false));
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let (_reading, _) = F.read(0x1000, 0x3000);
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                })
+            })
+            .collect();
+        std::thread::sleep(LATER);
+        let (done, got) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let _writing = F.write(&[(0x2000, 0x2800)]);
+            done.send(()).unwrap();
+        });
+        let got_it = got.recv_timeout(SOON).is_ok();
+        stop.store(true, Ordering::Relaxed);
+        for reader in readers {
+            reader.join().unwrap();
+        }
+        writer.join().unwrap();
+        assert!(got_it, "a writer of [2000, 2800) waited out a stream of readers of [1000, 3000)");
+    }
+
+    /// An unranged reader (the whole address space) excludes a writer of any
+    /// range, and an unranged writer a reader of any range, as the lock did.
+    #[test]
+    fn an_unranged_reader_or_writer_excludes_as_the_lock_did() {
+        static F: Fine = Fine::new();
+        let (reading, _) = F.read(0, usize::MAX);
+        let (done, went_on) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let _writing = F.write(&[(0x5000, 0x6000)]);
+            done.send(()).unwrap();
+        });
+        let early = went_on.recv_timeout(LATER).is_ok();
+        drop(reading);
+        let after = went_on.recv_timeout(SOON).is_ok();
+        writer.join().unwrap();
+        assert!(!early, "a writer of [5000, 6000) changed memory under an unranged reader");
+        assert!(after, "a writer of [5000, 6000) never went on after the unranged reader");
+
+        let writing = F.write(&[(0, usize::MAX)]);
+        let (done, went_on) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let (_reading, _) = F.read(0x5000, 0x6000);
+            done.send(()).unwrap();
+        });
+        let early = went_on.recv_timeout(LATER).is_ok();
+        drop(writing);
+        let after = went_on.recv_timeout(SOON).is_ok();
+        reader.join().unwrap();
+        assert!(!early, "a reader of [5000, 6000) went on during an unranged change");
+        assert!(after, "a reader of [5000, 6000) never went on after the unranged change");
+    }
+
+    /// With the switch off, a change of mapping excludes a read in place of
+    /// other memory, as the one lock did.
+    #[test]
+    fn with_the_switch_off_a_change_excludes_every_read() {
+        assert!(!super::fine::on(), "run the tests without VICTORY_MAP_LOCK_FINE=1");
+        let changing = super::title_memory_remapping_in(&[(0x1000, 0x2000)]);
+        let (entered, went_on) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let _reading = super::title_memory_reading_in(0x8000, 0x1000);
+            entered.send(()).unwrap();
+        });
+        let early = went_on.recv_timeout(LATER).is_ok();
+        drop(changing);
+        let after = went_on.recv_timeout(SOON).is_ok();
+        reader.join().unwrap();
+        assert!(!early, "a read of [8000, 9000) went on during a change of [1000, 2000)");
+        assert!(after, "a read of [8000, 9000) never went on after the change");
     }
 }
 

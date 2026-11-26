@@ -588,7 +588,7 @@ unsafe fn piece_at(
     // view's address stays where the title sees `title`. Not waited for: if
     // a change is under way, what the record of the views says now does
     // ([`anytime`]), or the title's own address.
-    let reading = beside.then(crate::watch::title_memory_reading_now).flatten();
+    let reading = beside.then(|| crate::watch::title_memory_reading_now_in(title, end)).flatten();
     let beside = if reading.is_some() || beside && anytime() { crate::inplace::beside(title, end) } else { None };
     count(stat::PIECES, 1);
     count(if beside.is_some() { stat::BESIDE } else { stat::DIRECT }, 1);
