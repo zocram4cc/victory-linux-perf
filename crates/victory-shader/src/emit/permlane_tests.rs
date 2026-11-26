@@ -97,6 +97,7 @@ fn lowered(native: &NativeProgram, host_wave: u32) -> Result<HostShader, ShaderE
     lower::TEST_HOST_WAVE.set(was);
     let result = result?;
     let shader = HostShader {
+        half_views: Vec::new(),
         stage: HwStage::Cs,
         dxil: result.dxil,
         user_data: result.user_data,

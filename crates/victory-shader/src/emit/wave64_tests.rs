@@ -142,6 +142,7 @@ fn lowered_counted(
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
+        half_views: lowered.half_views,
     })
 }
 
@@ -272,6 +273,7 @@ fn on_64_lanes(native: &NativeProgram, p: &ir::Program) -> HostShader {
     let lowered = lowered.expect("lower");
     assert_eq!(lowered.wave_size, Some(64));
     let shader = HostShader {
+        half_views: lowered.half_views,
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,

@@ -23,6 +23,7 @@ fn probe() {
     for file in files {
         let name = file.file_stem().unwrap_or_default().to_string_lossy().into_owned();
         let shader = HostShader {
+            half_views: Vec::new(),
             stage: HwStage::Cs,
             dxil: std::fs::read(&file).expect("the file"),
             user_data: (0..4)

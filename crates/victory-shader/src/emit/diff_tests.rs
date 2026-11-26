@@ -1268,7 +1268,24 @@ fn translated_compute_matches_pc() {
             };
             roots.push((1 + n as u32, Root::View { srv, data }));
         }
-        let ours = host.dispatch(&root_t, &pso_t, &dispatch(roots));
+        // A buffer of halves the translated program moves as unsigned
+        // integers is shown to it as its unsigned twin, as the host does
+        // (`HostShader::half_views`); the PC program keeps the float view.
+        let twins: Vec<View> = views
+            .iter()
+            .map(|&v| match v {
+                View::HalfUav(n) if !cs_c.half_views.is_empty() => View::HalfUintUav(n),
+                v => v,
+            })
+            .collect();
+        let ours = host.dispatch(
+            &root_t,
+            &pso_t,
+            &Dispatch {
+                views: &twins,
+                ..dispatch(roots)
+            },
+        );
         if name.starts_with("terminates") {
             match ours {
                 Ok(_) => eprintln!("{name}: finished"),
