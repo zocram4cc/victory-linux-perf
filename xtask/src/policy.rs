@@ -14,8 +14,12 @@ use anyhow::{Context, Result, bail};
 const MAX_FILE_SIZE: usize = 640 * 1024;
 const MAX_ENCODED_RUN: usize = 512;
 
+// (`patch`, `c` and `example` are for linux/: the two changes to Wine as
+// diffs, the test program for one of them, and the example of the machine
+// settings. Owner's decision, 2026-11-26. The other checks apply to them too.)
 const ALLOWED_EXTENSIONS: &[&str] = &[
     "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
+    "patch", "c", "example",
 ];
 const ALLOWED_NAMES: &[&str] = &[
     ".gitignore",
@@ -236,6 +240,9 @@ mod tests {
         assert!(check("crates/x/src/lib.rs", b"fn main() {}\n").is_empty());
         assert!(check(".gitignore", b"/target/\n").is_empty());
         assert!(check(".githooks/pre-commit", b"#!/bin/sh\n").is_empty());
+        assert!(check("linux/wine/a.patch", b"--- a/x.c\n+++ b/x.c\n").is_empty());
+        assert!(check("linux/wine/test.c", b"int main(void){return 0;}\n").is_empty());
+        assert!(check("linux/local.env.example", b"GAME_DIR=/path\n").is_empty());
     }
 
     #[test]

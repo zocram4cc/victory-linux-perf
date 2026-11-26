@@ -1,0 +1,55 @@
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index 3efac71e19..5035986505 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -3794,11 +3794,16 @@ static unsigned int virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG_P
+     vprot |= sec_flags;
+     if (!(sec_flags & SEC_RESERVE)) vprot |= VPROT_COMMITTED;
+ 
++    /* VIctory: MEM_WRITE_WATCH on a mapped view asks for the kernel's write
++     * tracking of it (NtGetWriteWatch then answers for it); refused where
++     * that tracking is not there, so the caller can tell. */
++    if ((alloc_type & MEM_WRITE_WATCH) && !use_kernel_writewatch) return STATUS_NOT_SUPPORTED;
++
+     if ((res = server_get_unix_fd( handle, 0, &unix_handle, &needs_close, NULL, NULL ))) return res;
+ 
+     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+ 
+-    res = map_view( &view, base, size, alloc_type, vprot, limit_low, limit_high, 0 );
++    res = map_view( &view, base, size, alloc_type & ~MEM_WRITE_WATCH, vprot, limit_low, limit_high, 0 );
+     if (res) goto done;
+ 
+     TRACE( "handle=%p size=%lx offset=%s\n", handle, size, wine_dbgstr_longlong(offset.QuadPart) );
+@@ -3823,6 +3828,11 @@ static unsigned int virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG_P
+ 
+     if (NT_SUCCESS(res))
+     {
++        if (alloc_type & MEM_WRITE_WATCH)
++        {
++            view->protect |= VPROT_WRITEWATCH;
++            kernel_writewatch_register_range( view, view->base, view->size );
++        }
+         *addr_ptr = view->base;
+         *size_ptr = size;
+         VIRTUAL_DEBUG_DUMP_VIEW( view );
+@@ -7115,6 +7125,11 @@ NTSTATUS WINAPI NtGetWriteWatch( HANDLE process, ULONG flags, PVOID base, SIZE_T
+     size = ROUND_SIZE( base, size, page_mask );
+     base = ROUND_ADDR( base, page_mask );
+ 
++    /* VIctory: with this flag the range may hold several views and holes,
++     * where the kernel tracks writes; pages nothing tracks count as written. */
++    BOOL span = (flags & 0x80000000) && use_kernel_writewatch;
++
++    if (span) flags &= ~0x80000000;
+     if (!count || !granularity) return STATUS_ACCESS_VIOLATION;
+     if (!*count || !size) return STATUS_INVALID_PARAMETER;
+     if (flags & ~WRITE_WATCH_FLAG_RESET) return STATUS_INVALID_PARAMETER;
+@@ -7126,7 +7141,7 @@ NTSTATUS WINAPI NtGetWriteWatch( HANDLE process, ULONG flags, PVOID base, SIZE_T
+ 
+     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+ 
+-    if (is_write_watch_range( base, size ))
++    if (span || is_write_watch_range( base, size ))
+     {
+         ULONG_PTR pos = 0;
+         char *addr = base;

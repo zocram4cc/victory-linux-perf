@@ -4,10 +4,9 @@ Both are optional. The layer runs on an unchanged Proton; these make it
 faster, or are groundwork that is not used by default. They go into a private
 copy of a Proton build, never into Steam's own.
 
-The two patch files and the test program named below are not in the
-repository yet: its policy check (`cargo xtask policy`) allows only a few
-file types, and `.patch` and `.c` are not among them. Whether to allow them
-is the owner's decision.
+The two patch files and the test program named below are in this folder.
+The patches are changes to Wine's own source, so they carry Wine's licence
+(LGPL 2.1 or later), not this repository's.
 
 Measured on Proton Hotfix `hotfix-20261110` (wine-11.0), kernel 7.3, RADV, an
 RX 9070 XT.
