@@ -4,6 +4,11 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**D.1 split: one full rescan every 16 passes, and streaming textures on the recording thread**
+- New frame line (`bench/trials-20261126-055025-d1-parts`, 478-486 ms): **heap pass per frame: 4-60 ms over ~3,800 changed slots; 231 ms when it looks at all 119,048 slots (every 16th pass); 2-5 ms queueing span refreshes (2.4 GB of spans, refreshed at submission); 6-115 ms in `heap_textures`**.
+- The full rescan is a spike of ~230 ms every 16 frames. `VICTORY_HEAP_ROLL=1` spreads it, a sixteenth of the slots per pass (each slot still looked at every 16 passes). To measure.
+- **`heap_textures` is piece A:** it makes, detiles and stages the textures shaders pick by index (streamed in), up to 192 MB or 250 ms a frame (512 MB / 1.5 s while catching up), on the thread that records the frame. This is the "black world for tens of seconds" path. A.2 (a copy queue fed by workers) is where it belongs.
+
 **1.3 census, all of it: 40 MB a frame copied back, the title reads about one page of it**
 - `VICTORY_BACK_CENSUS=2` (read-write view memory guarded too), `bench/trials-20261126-054413-census-views`: **10,450-10,800 pages a frame written back and guarded (39.5-41 MB), none skipped; the title touched 0-1 page a frame before the next submission** (always a first read; pages `0x15fd93000`, `0x15fdc3000`). Frame 487-488 ms, as without the census.
 - Run 3 ended in an access violation in title code (`+0x4dbf69d`) **reading `0x15fdc3cd0`, in the very page the census had just seen the title read**. So the census caused it: a guard on the one page the title does read is not safe as it is (why the retried read faults is not known yet). Off by default; not to be run again until understood.
