@@ -184,7 +184,14 @@ d VICTORY_INDIRECT_BATCH 2
 d VICTORY_MAP_THREADS 1
 d VICTORY_CARD_AWAKE 1
 d VICTORY_SHOW_AFTER 1
-d VICTORY_AMBIENT 0.8
+# The indirect light's stand-in at 1.2 of its estimate: nights read better
+# (Jason under a street lamp, the car scene) at no cost a frame (runs
+# 20261126-232301 and -232829 against -231332).
+d VICTORY_AMBIENT 1.2
+# NVIDIA caps the shader-visible view heap at 1,000,000 views; more of it
+# for tables made per draw (trustno1's value): dropped draws about 340 a
+# frame before, about 150 after.
+d VICTORY_DYNAMIC_SLOTS 524288
 if (( safe )); then
   # scripts/play.ps1 -Safe: without the newer, faster ways.
   d VICTORY_UNDER_WIDE 0
