@@ -4,6 +4,11 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**M.1 step 1: every overlap is a buffer copy over a 4 MiB window**
+- `bench/trials-20261126-061009-overlap-kinds` (482-483 ms): **240-249 of ~470 written ranges a frame overlap 244-253 other copies (58-62 MB), and all of them are a written buffer copy over a window** (`LOOSE`, made for asks outside buffers). No buffer under a buffer, no window under a window, no written window over a buffer.
+- So M.1 is case 2 of the design alone: windows of title memory that later buffers cover. Step 2 becomes "an ask inside a buffer never meets a window, and a window under a buffer is retired", not the outermost-buffer lookup.
+- (The wait loop of that run matched its own command line with `pgrep -f`; noted for scripts: match the process name, not `-f` on a pattern the waiter contains.)
+
 **1.3: more than half of the ranges written back have another host copy over them; A.1: detiling is not the texture cost**
 - `VICTORY_BACK_OVERLAP=1` (`bench/trials-20261126-060513-back-overlap`, 487-488 ms): **per frame, ~465 written ranges declared (1.07-1.16 GB of views), 253-263 of them overlapped by ~267 other host copies (buffer copies or windows), 66-85 MB of overlap**. Aliases (other addresses of the same pages) are not counted, so this is a lower bound. It confirms the ceiling's reading: what one copy's shaders write reaches the others through title memory.
 - **So 1.3 becomes a piece-M question first:** one host copy per title range (nested buffers and windows resolved to the outermost copy, with views at offsets), or GPU→GPU copies between overlapping copies at the end of a submission. Either removes the hub; then the CPU side is the census's ~1 page a frame, fetched on demand.

@@ -29,6 +29,10 @@ So the copy-back exists mostly to carry what the GPU wrote in one host copy to a
 - **Windows** are made only where no buffer copy holds the ask (today too), and a window under a later buffer is retired as above.
 - **Limits:** a copy has a size limit (heaps of hundreds of MB, `card_limits` for card copies). Outermost wins only up to it. Past it, the cell split stays and overlaps are counted (`VICTORY_BACK_OVERLAP`).
 
+## Measured (step 1, 26 Nov)
+
+All overlaps are **case 2**: a written buffer copy over a 4 MiB window (240-249 ranges a frame, 58-62 MB; `bench/trials-20261126-061009-overlap-kinds`). Cases 1 and 3 do not occur. Step 2 is therefore the window side: windows under buffers are retired, and asks inside a buffer never take a window.
+
 ## Steps
 
 1. **Census, extended:** for each overlapping pair, which of cases 1-3 it is, and the sizes. If most is case 1 (nested buffers), step 2 alone removes most overlap.
