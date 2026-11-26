@@ -16,7 +16,9 @@
 #                   game build): Enter/A at 12-50 s, so the run reaches the load sooner
 #   --proton-log    Wine's own log into the run folder (large)
 #   --new-game      start at the opening scene: the story save and player record are
-#                   moved to ~/.local/share/victory/save-backups/<time> first (settings stay)
+#                   moved to ~/.local/share/victory/save-backups/<time> first (settings stay),
+#                   then ~/.local/share/victory/save-templates/new-game is copied in (a player
+#                   record from just after the terms of service were accepted)
 #   --levels-on-demand  texture mip levels as draws need them
 #                   (VICTORY_LEVELS_ON_DEMAND=1; off by default since it used more memory)
 #   --no-texture-waits  the title's shorter waits for textures in the first frames and
@@ -273,6 +275,12 @@ if (( new_game )); then
     mv "$save" "$backup/$rel" && moved=$((moved + 1))
   done < <(find "$data" -mindepth 5 -maxdepth 5 -path '*/saves/*' \( -name 'SARC*' -o -name 'Player~*' \) -print0)
   (( moved )) && echo "new game: $moved saves moved to $backup" >&2 || echo "new game: no saves to move" >&2
+  # A player record from just after the terms of service were accepted, so
+  # a new game does not ask again.
+  template="$HOME/.local/share/victory/save-templates/new-game"
+  if [[ -d "$template" ]]; then
+    cp -a "$template/." "$data/" && echo "new game: player record from $template" >&2
+  fi
 fi
 
 # The run's folder.
