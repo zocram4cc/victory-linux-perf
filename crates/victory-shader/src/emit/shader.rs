@@ -864,9 +864,7 @@ impl Shader {
         self.m.named_md("dx.shaderModel", vec![sm]);
         self.m.named_md("dx.entryPoints", vec![entry]);
 
-        // One return, and one back edge per loop header, as DXC writes them
-        // (`single_return`, `single_latches`).
-        self.m.single_return();
+        // One back edge per loop header, as DXC writes them (`single_latches`).
         self.m.single_latches();
         let bitcode = self.m.write();
         super::bitcode::census::note(&self.m, &bitcode);
