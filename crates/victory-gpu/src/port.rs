@@ -83,8 +83,49 @@ const MOST: u64 = 512 << 20;
 /// anything else: off, everything as before.
 pub(crate) fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    // Read once, here: the switch of renderer port #1.
-    *ON.get_or_init(|| std::env::var("VICTORY_PORT_CONSTANTS").is_ok_and(|v| v.trim() == "1"))
+    // Read once, here: the switch of renderer port #1 ([`constants_switch`]).
+    *ON.get_or_init(constants_switch_here)
+}
+
+/// Whether renderer port #1 is on, from `VICTORY_PORT_CONSTANTS` (`setting`),
+/// `VICTORY_PORT_CONSTANTS_WINE` (`wine_setting`) and whether we run under
+/// Wine: `1` turns it on, but under Wine only with `VICTORY_PORT_CONSTANTS_WINE=1`
+/// as well. Under Wine 11.22, RADV and vkd3d-proton (RX 7900 XT) the port
+/// was reported to draw the HUD over a black world (PR #380); on Windows the
+/// world is drawn with it (RX 9070 XT, alone and with port #7). Until a
+/// Wine run shows otherwise it stays off there. Both halves read it here:
+/// this crate's [`on`] and `victory_hle`'s xmem.
+pub fn constants_switch(setting: Option<&str>, wine_setting: Option<&str>, wine: bool) -> bool {
+    let one = |v: Option<&str>| v.is_some_and(|v| v.trim() == "1");
+    one(setting) && (!wine || one(wine_setting))
+}
+
+/// [`constants_switch`] from the environment and the platform.
+pub fn constants_switch_here() -> bool {
+    let setting = std::env::var("VICTORY_PORT_CONSTANTS").ok();
+    let wine_setting = std::env::var("VICTORY_PORT_CONSTANTS_WINE").ok();
+    let wine = on_wine();
+    let on = constants_switch(setting.as_deref(), wine_setting.as_deref(), wine);
+    if wine && setting.as_deref().is_some_and(|v| v.trim() == "1") && !on {
+        tracing::warn!(
+            "VICTORY_PORT_CONSTANTS=1 is left off under Wine (a black world was reported there); \
+             VICTORY_PORT_CONSTANTS_WINE=1 turns it on anyway"
+        );
+    }
+    on
+}
+
+/// Whether we run under Wine (its ntdll exports `wine_get_version`).
+fn on_wine() -> bool {
+    static WINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WINE.get_or_init(|| {
+        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+        // SAFETY: plain lookups in ntdll, always loaded.
+        unsafe {
+            let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+            !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+        }
+    })
 }
 
 /// A stretch of title memory opened as a heap through a view of ours.
@@ -357,6 +398,20 @@ mod tests {
     fn the_constants_heap_is_used_in_place_with_the_switch() {
         assert!(wanted(0x34e1_0000, 0xae0_0000), "the title's constants heap is not used in place (a host copy is tracked)");
         assert!(!wanted(0xe_1c80_0000, 0x1000), "memory above 4 GiB was taken in place");
+    }
+
+    /// `VICTORY_PORT_CONSTANTS=1` turns the port on on Windows; under Wine it
+    /// also needs `VICTORY_PORT_CONSTANTS_WINE=1` (a black world was reported
+    /// there); anything but `1` leaves it off everywhere.
+    #[test]
+    fn the_constants_port_stays_off_under_wine_unless_asked_for_there() {
+        assert!(constants_switch(Some("1"), None, false), "off on Windows with the switch");
+        assert!(!constants_switch(Some("1"), None, true), "on under Wine without VICTORY_PORT_CONSTANTS_WINE=1");
+        assert!(constants_switch(Some(" 1 "), Some("1"), true), "off under Wine though both were asked for");
+        assert!(!constants_switch(Some("1"), Some("0"), true));
+        assert!(!constants_switch(None, Some("1"), true));
+        assert!(!constants_switch(Some("0"), None, false));
+        assert!(!constants_switch(None, None, false));
     }
 
     /// Only the title's 32-bit memory is asked for.
