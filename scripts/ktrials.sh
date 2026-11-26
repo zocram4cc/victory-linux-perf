@@ -34,7 +34,9 @@ close_game() {
     local i
     for sig in TERM KILL; do
         running || return 0
-        pkill -"$sig" -x victory.exe 2>/dev/null || true
+        # By pid: under Wine the process's name is not victory.exe (pkill -x
+        # missed it and left the game open, 26 Nov).
+        ps -eo pid,args | grep '[r]elease\\victory.exe run' | awk '{print $1}' | xargs -r kill -s "$sig" 2>/dev/null || true
         for ((i = 0; i < 10; i++)); do running || return 0; sleep 1; done
     done
 }
@@ -86,6 +88,7 @@ for ((r = 1; r <= RUNS; r++)); do
         tail -n +"$((from + 1))" "$log" | sed 's/\x1b\[[0-9;]*m//g' >"$OUT/run-$r.log"
     fi
     close_game
+    running && { say "the game is still running after run $r: stopping here"; exit 1; }
     row=$(python3 -I - "$OUT/run-$r.log" <<'PY' 2>/dev/null || echo "-	-	-	-	-	-	-	-	-"
 import re, statistics as st, sys
 rows = []
