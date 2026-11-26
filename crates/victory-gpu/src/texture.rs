@@ -16,6 +16,7 @@
 //! (every mip and array slice), depth and stencil planes are not.
 
 pub(crate) mod ahead;
+pub(crate) mod delta;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -96,6 +97,9 @@ pub(crate) struct Staging {
     /// recorded again about a second later if the card has room by then
     /// ([`upload`]).
     waiting: std::sync::atomic::AtomicU64,
+    /// (`VICTORY_PARTIAL_DELTA=1`) Which subresources the list's copy leaves
+    /// out, when this upload is one ([`delta`]).
+    delta: Mutex<Option<delta::Plan>>,
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -181,6 +185,12 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     const COPY_SOURCE: u32 = 0x800;
     // (All of its levels: the copy is level by level.)
     crate::resource::want_level(placed, 0);
+    // (`VICTORY_PARTIAL_DELTA=1`) The card writes the host copy: no delta record of it.
+    if delta::on()
+        && let Some(copy) = crate::resource::made_copy(placed)
+    {
+        delta::forget(copy.serial);
+    }
     let (Some(to), Some(from)) = (
         crate::resource::host_resource(placed),
         crate::resource::host_resource(source),
@@ -813,10 +823,40 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         };
         staging.expected.store(there, Relaxed);
     }
+    // (`VICTORY_PARTIAL_DELTA=1`) A host copy uploaded before gets this upload
+    // of a texture picked by index with the subresources whose title bytes
+    // it already holds left out of the list's copy ([`delta`]). Not for a bake.
+    let uploaded_before = copy.uploads.fetch_add(1, Relaxed) > 0;
+    if delta::on() {
+        if picking.is_some() && !BAKING.get() && uploaded_before {
+            let mut plan = staging.delta.lock().unwrap_or_else(|e| e.into_inner());
+            if plan.is_none()
+                && staging.once.load(Relaxed)
+                && !staging.on_demand
+                && !staging.uploaded.load(Relaxed)
+                && let Some(spans) =
+                    delta::spans(&staging.layout, (0..staging.footprints.len()).map(|i| staging.part(i)), staging.read)
+            {
+                *plan = Some(delta::plan(copy.serial, staging.memory, spans));
+            }
+        }
+        delta::line();
+    }
+    let skip: Vec<bool> = if delta::on() {
+        let plan = staging.delta.lock().unwrap_or_else(|e| e.into_inner());
+        match plan.as_ref() {
+            Some(plan) if plan.any_skipped() => (0..staging.footprints.len()).map(|i| plan.skips(i)).collect(),
+            _ => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
     const COPY_DEST: u32 = 0x400;
     // A texture cut from a block may lie where another did: what the card
     // holds of that one is done with before the first upload into this one.
-    if crate::pool::on() && !staging.uploaded.load(Relaxed) {
+    // (Not before one that leaves parts out: this host copy was uploaded
+    // before, and the parts left out are its contents.)
+    if crate::pool::on() && !staging.uploaded.load(Relaxed) && skip.is_empty() {
         let aliasing = D3D12_RESOURCE_BARRIER {
             Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
             Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -844,6 +884,9 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     // The staging buffer lives as long as `staging`, which the deferred
     // refresh below holds until the list is reset.
     for (i, footprint) in staging.footprints.iter().enumerate() {
+        if skip.get(i).copied().unwrap_or(false) {
+            continue;
+        }
         #[cfg(feature = "diagnostics")]
         {
             let f = footprint.Footprint;
@@ -1218,7 +1261,14 @@ impl Staging {
     /// The host copy holds what the staging buffer was filled from
     /// ([`unchanged`]).
     fn note_held(&self) {
-        let hash = self.last.lock().unwrap_or_else(|e| e.into_inner()).hash;
+        let mut hash = self.last.lock().unwrap_or_else(|e| e.into_inner()).hash;
+        // (`VICTORY_PARTIAL_DELTA=1`) A delta upload whose left-out parts the
+        // submission found changed, or did not read: the host copy does not hold them.
+        if let Some(plan) = self.delta.lock().unwrap_or_else(|e| e.into_inner()).as_mut()
+            && !delta::settle(plan, self.memory as u64)
+        {
+            hash = None;
+        }
         *self.holds.lock().unwrap_or_else(|e| e.into_inner()) = hash.map(|hash| (self.first, hash));
     }
 
@@ -1532,6 +1582,8 @@ impl Staging {
                 "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
             );
         }
+        // (`VICTORY_PARTIAL_DELTA=1`) The parts the list's copy leaves out are judged, not detiled ([`delta`]).
+        let mut plan = self.delta.lock().unwrap_or_else(|e| e.into_inner());
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
             let (mip, slice) = self.part(i);
             let f = footprint.Footprint;
@@ -1541,6 +1593,11 @@ impl Staging {
             // block of the pool goes on with another texture's.
             let len = (pitch * rows as usize * f.Depth as usize)
                 .min(self.bytes.saturating_sub(footprint.Offset) as usize);
+            if let Some(plan) = plan.as_mut()
+                && !delta::detiled(plan, i, tiled, len as u64)
+            {
+                continue;
+            }
             // SAFETY: the subresource's part of the mapped staging buffer.
             let linear = unsafe {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
@@ -1962,6 +2019,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         detiled: std::sync::atomic::AtomicU32::new(0),
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
+        delta: Mutex::new(None),
     });
     map.insert(resource as usize, s.clone());
     Some(s)
