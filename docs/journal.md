@@ -4,6 +4,11 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**`VICTORY_INDIRECT_WINDOW=1`: −5 % with the picture held; Series S: −10 % GPU, black picture. The GPU is bound by draws, not pixels**
+- `VICTORY_INDIRECT_WINDOW=1` with the census (`bench/trials-…-indirect-window`): run 1 (same scene, 11,840 draws): **477 ms against 501-502, GPU 261 against 272-273, clamps 5,715 (21.8 ms) against ~9,750 (37 ms)**. Run 2 opened from another camera, closer to Jason (the user saw it; 5,917 draws, 392 ms): not comparable. Picture held ("se ve bien"). A gain but small: ~5,700 clamps a frame still serialise the draws.
+- **Series S** (`--console series-s`, new `BENCH_RUN_ARGS` in `bench.sh`; `bench/trials-…-series-s`): GPU 244 ms against ~270, frame 409 ms, copy-back 18.5 MB against ~45. **The picture is black**: the title's upscaler DLL is refused (`amd_fidelityfx_upscaler_xbox.dll`, host policy). Neptune VI hands those calls to AMD's PC DLL (`VICTORY_FSR_DLL`, `crates/victory-hle/src/modules/fidelityfx.rs`) and plays the Series S path at 9-11 fps. Here a much lower internal resolution saves only ~10 % of GPU, so the GPU is bound by per-draw cost.
+- **Next (piece Q/D, "indirect without serialising"):** clamp a list's indirect records in batches, before the draws (a prologue pass for CPU-written records, one pass after each GPU writer for GPU-written ones: Neptune's `CLAMP_BATCH` and `CLAMP_AFTER_WRITER`), so the draws themselves run back to back.
+
 **G.1 with barriers apart: ~9,700 indirect clamps a frame; barriers themselves are cheap; the clamps serialise every draw**
 - `bench/trials-…-gpu-census-barriers`: **our indirect clamps 37.1-37.5 ms a frame over 9,736-9,806 clamps**; after the title's barriers 0.0 ms (3-4), buffer barriers made global 0 (0), waits for groups (made a global UAV barrier) 2.3 ms (~900), our state transitions 2.6-2.9 ms (~800-900). 218 ms timed.
 - So the barriers we add are not the cost by themselves; the clamp pass around nearly every indirect draw is. Each clamp sits between two global UAV barriers: no two draws ever overlap, and each pays its full ramp-up and drain (mesh draws ~30 µs each). This is the same mechanism Neptune VI fixed (4.6 → 8.4 fps).

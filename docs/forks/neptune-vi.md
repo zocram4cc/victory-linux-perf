@@ -22,6 +22,10 @@ Read on 26 Nov 2026 at `b900c64` (22 commits on a base of 25 Nov evening, "Neptu
 | `VICTORY_RELAY=2`, `VICTORY_RELAY_OWN_QUEUE=1`, `VICTORY_QUIET_BACK=1`, `VICTORY_COPY_CHANGED=1`, `VICTORY_WIDE_*` | overlap and copy-back on Windows/NVIDIA | our lesson 1: the relay made Linux slower; measure each alone |
 | `docs/unified-memory/` (3 documents: architecture, techniques, design) | a map of the same copy/merge model and of zero-copy options (`OpenExistingHeapFromAddress`, GPU upload heap, tiled resources) | input for phase 2; vkd3d-proton implements `OpenExistingHeapFromAddress` through `VK_EXT_external_memory_host` |
 
+## Their Series S path (from `docs/NEPTUNE-README.txt`)
+
+Their 9-11 fps is the **Series S** path (720p upscaled to 1080p) with the title's FidelityFX calls handed to AMD's PC DLL (`VICTORY_FSR_DLL`, module `fidelityfx.rs`, optionally through OptiScaler). The Series X 4K path was "not measured again" (README: "about 14 fps there" in play.ps1's comment). Here, `--console series-s` without that module gives a black picture (the console upscaler DLL is refused), GPU −10 %.
+
 ## To do here (track U)
 
 1. **G.1 with the clamps counted apart** (running), then a switch that runs indirect draws raw where safe, after their model (`CLAMP_AFTER_WRITER`): one sanitising pass after the writer, no barrier pair per draw.
