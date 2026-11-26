@@ -407,9 +407,23 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
                 let _ = &mut bytes;
                 "-".into()
             };
+            // Whole blocks (up to 4 KiB), to decode their layout.
+            let whole = |at: u64, len: u64| -> String {
+                if len == 0 || len > 0x1000 {
+                    return head(at);
+                }
+                let mut bytes = vec![0u8; len as usize];
+                #[cfg(windows)]
+                if at != 0 && crate::host::read_into(at as *const u8, &mut bytes) {
+                    return bytes.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join("");
+                }
+                let _ = &mut bytes;
+                "-".into()
+            };
+            tracing::warn!(slot = format_args!("{:#x}", SLOT), bytes = whole(desc as u64, 0x200), "P.4 description");
             if let Some(w) = &description {
                 for pair in w[1..13].chunks(2) {
-                    tracing::warn!(slot = format_args!("{:#x}", SLOT), at = format_args!("{:#x}", pair[0]), len = format_args!("{:#x}", pair[1]), bytes = head(pair[0]), "P.4 block");
+                    tracing::warn!(slot = format_args!("{:#x}", SLOT), at = format_args!("{:#x}", pair[0]), len = format_args!("{:#x}", pair[1]), bytes = whole(pair[0], pair[1]), "P.4 block");
                 }
                 // The table: entries of 6 words; up to 8 of them.
                 #[cfg(windows)]
