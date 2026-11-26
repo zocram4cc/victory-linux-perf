@@ -149,6 +149,11 @@ pub(crate) struct Replay {
     /// Only write what the dispatches of these lists have bound (`3..7`).
     #[arg(long)]
     flow: Option<String>,
+    /// Only write what the capture holds of these buffers, read from its
+    /// files: `<resource>[:<at>:<bytes>]` (repeatable; numbers as --flow
+    /// names them, `at` and `bytes` in hex).
+    #[arg(long)]
+    bytes: Vec<String>,
     /// With --flow: draws too.
     #[arg(long)]
     flow_draws: bool,
@@ -243,6 +248,18 @@ pub(crate) fn run(r: Replay) -> Result<()> {
     if let Some(text) = &r.listing {
         let lists = range(text).with_context(|| format!("--listing {text}"))?;
         return play::listing(&r.folder, lists, &mut |line| println!("{line}"));
+    }
+    if !r.bytes.is_empty() {
+        let mut what = Vec::new();
+        for text in &r.bytes {
+            let mut parts = text.split(':');
+            let hex = |p: Option<&str>| p.map(|p| u64::from_str_radix(p.trim_start_matches("0x"), 16)).transpose();
+            let res: u32 = parts.next().unwrap_or_default().parse().with_context(|| format!("--bytes {text}"))?;
+            let at = hex(parts.next()).with_context(|| format!("--bytes {text}"))?.unwrap_or(0);
+            let len = hex(parts.next()).with_context(|| format!("--bytes {text}"))?.unwrap_or(0x80);
+            what.push((res, at, len));
+        }
+        return play::look::bytes(&r.folder, &what, &mut |line| println!("{line}"));
     }
     if let Some(text) = &r.flow {
         let lists = range(text).with_context(|| format!("--flow {text}"))?;
