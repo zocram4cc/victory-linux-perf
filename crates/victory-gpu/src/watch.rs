@@ -2587,9 +2587,9 @@ pub(crate) fn install() {
             return match ours {
                 Some(exit) => {
                     // A guard page of title memory fails the copy as the kernel's read would: the
-                    // fault cleared its guard flag, so it is set again.
-                    if r.ExceptionCode == STATUS_GUARD_PAGE_VIOLATION && r.NumberParameters >= 2 {
-                        rearm_guard(r.ExceptionInformation[1]);
+                    // fault cleared its guard flag, so it is set again (or counted, if it cannot be).
+                    if r.ExceptionCode == STATUS_GUARD_PAGE_VIOLATION {
+                        rearm_guard((r.NumberParameters >= 2).then(|| r.ExceptionInformation[1]));
                     }
                     fail(exit)
                 }
@@ -2660,21 +2660,45 @@ pub(crate) fn install() {
     });
 }
 
-/// Sets the guard flag again on the page holding `at`, with the protection it has
-/// now: the fault that reported it cleared the flag.
-fn rearm_guard(at: usize) {
+/// Sets the guard flag again on the page holding `at` (the address the fault
+/// reported, if it did), with the protection the page has now: the fault
+/// cleared the flag. False, and counted by [`not_rearmed`], if the address is
+/// not known, the page is not committed any more, or its protection cannot be
+/// set.
+fn rearm_guard(at: Option<usize>) -> bool {
     use windows_sys::Win32::System::Memory::{
-        MEMORY_BASIC_INFORMATION, PAGE_GUARD, VirtualProtect, VirtualQuery,
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, VirtualProtect, VirtualQuery,
     };
-    let page = at / KERNEL_PAGE * KERNEL_PAGE;
-    // SAFETY: plain data filled in by the query.
-    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    let mut old = 0;
-    // SAFETY: a valid out pointer of the right size; a protection change of one committed page.
-    unsafe {
-        if VirtualQuery(page as *const _, &mut info, size_of_val(&info)) != 0 {
-            VirtualProtect(page as *const _, KERNEL_PAGE, info.Protect | PAGE_GUARD, &mut old);
+    let done = at.is_some_and(|at| {
+        let page = at / KERNEL_PAGE * KERNEL_PAGE;
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let mut old = 0;
+        // SAFETY: valid out pointers of the right size; the protection change is of one page, and
+        // only if that page is committed.
+        unsafe {
+            VirtualQuery(page as *const _, &mut info, size_of_val(&info)) != 0
+                && info.State == MEM_COMMIT
+                && VirtualProtect(page as *const _, KERNEL_PAGE, info.Protect | PAGE_GUARD, &mut old) != 0
         }
+    });
+    if !done {
+        not_rearmed(at);
+    }
+    done
+}
+
+/// Guard pages that a copy stopped at and that could not be guarded again.
+static NOT_REARMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Counts a guard page that could not be guarded again; the first is said
+/// (the title may then not grow its stack, or catch that guard, at the page).
+fn not_rearmed(at: Option<usize>) {
+    if NOT_REARMED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+        tracing::warn!(
+            at = format_args!("{:#x}", at.unwrap_or(0)),
+            "guard not re-armed: a copy of title memory took a guard page and it could not be set again (0: no address)"
+        );
     }
 }
 
@@ -4408,5 +4432,37 @@ mod many_askers_tests {
         BITS.clear(511);
         assert!(!BITS.all(300, 700) && BITS.all(300, 511) && BITS.all(512, 700));
         assert!(!BITS.all(1 << 40, (1 << 40) + 1), "outside the address space");
+    }
+}
+
+#[cfg(test)]
+mod rearm_tests {
+    use super::*;
+    use std::sync::atomic::Ordering::Relaxed;
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_READWRITE,
+        VirtualAlloc, VirtualFree, VirtualQuery,
+    };
+
+    /// A committed page is guarded again; one that is not committed any more is
+    /// not, and that is counted, as is a fault that gave no address.
+    #[test]
+    fn a_page_that_cannot_be_guarded_again_is_counted() {
+        // SAFETY: a fresh page of our own.
+        let page = unsafe { VirtualAlloc(std::ptr::null(), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_ne!(page, 0);
+        let before = NOT_REARMED.load(Relaxed);
+        assert!(rearm_guard(Some(page)));
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: a valid out pointer of the right size.
+        assert_ne!(unsafe { VirtualQuery(page as *const _, &mut info, size_of_val(&info)) }, 0);
+        assert_ne!(info.Protect & PAGE_GUARD, 0, "a committed page is guarded again");
+        // SAFETY: our page; decommitted, it is reserved and not committed.
+        unsafe { VirtualFree(page as *mut _, 4096, MEM_DECOMMIT) };
+        assert!(!rearm_guard(Some(page)), "a page that is not committed cannot be guarded");
+        assert!(!rearm_guard(None), "a fault that gave no address");
+        assert_eq!(NOT_REARMED.load(Relaxed), before + 2);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(page as *mut _, 0, MEM_RELEASE) };
     }
 }
