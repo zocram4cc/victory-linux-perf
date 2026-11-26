@@ -619,6 +619,8 @@ unsafe fn piece_at(
     let since = crate::watch::changes();
     let (mut pages, mut new_pages, mut blocks, mut dwords, mut missing) = (0, 0u64, 0, 0, 0);
     let mut span: Option<(usize, usize)> = None;
+    // Through the title's own address: the parts that changed, told once they are in.
+    let mut apart: Vec<(usize, usize)> = Vec::new();
     for_pages(title, parts, |from, n| {
         pages += 1;
         if !differing[(title + from) / PAGE - base] {
@@ -659,6 +661,8 @@ unsafe fn piece_at(
                 }
                 let s = span.get_or_insert((title + from, title + from + n));
                 s.1 = title + from + n;
+            } else {
+                apart.push((title + from, n));
             }
         }
     });
@@ -669,6 +673,7 @@ unsafe fn piece_at(
         let through = if missing == 0 { copy } else { std::ptr::null() };
         notes.landed.push((title / BLOCK, through));
     }
+    crate::watch::told(&apart);
     count(stat::NEW_PIECES, u64::from(new_pages > 0));
     count(stat::PAGES, pages);
     count(stat::NEW_PAGES, new_pages);
