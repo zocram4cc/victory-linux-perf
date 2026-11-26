@@ -5386,7 +5386,7 @@ impl Host {
                 #[cfg(feature = "diagnostics")]
                 blame_stale(&stale);
                 relay_wait(WHY_STALE, |_| stale.iter().all(|(shadow, from, to)| !shadow.writes_pending_in(*from, *to)));
-                crate::watch::ask_once(ranges);
+                crate::watch::ask_again(ranges);
                 stale = stale_under_flights(runs);
                 if stale.is_empty() {
                     return;
@@ -5396,7 +5396,7 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         blame_stale(&stale);
         self.settle(submitted, WHY_STALE);
-        crate::watch::ask_once(ranges);
+        crate::watch::ask_again(ranges);
     }
 
     /// [`Host::execute`], or with `late` the first half of
