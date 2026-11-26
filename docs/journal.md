@@ -4,6 +4,11 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**C.1: the recording threads' cost is `make_at` in fresh descriptor tables (~1 s a frame across threads)**
+- Timers on the draw path (`draw.rs` `Timed`, frame line "draw path per frame"; `bench/trials-…-drawpath*`): `bind` ~115 µs per draw, of which `tables` ~60 µs; of `tables`, **"fresh made" ~950-1,140 ms a frame** (20,000-24,000 tables at 45-53 µs), plain entries ~220-340 ms, fresh reused ~30 ms. Inside fresh tables: **`make_at` ~980-1,030 ms a frame (110,000-124,000 descriptors at 8-9 µs)**; constant buffers 6 ms, `readable` 30 ms, `mirror` 40-60 ms.
+- So nearly every draw creates every texture/buffer descriptor of its fresh tables anew (`HostHeap::make_at`), then `mirror`s the title's own slot (which makes it again if it changed).
+- **Next (C.1 step 1, not yet written):** in the fresh-table loop, `mirror` the title slot first, and when `made[title + k]` holds the current key, copy its host descriptor into the dynamic slot (`CopyDescriptorsSimple`) and keep its resource for that slot, instead of `make_at`. Behind a switch; check the picture (vkd3d copies from shader-visible heaps). Expected: most of the ~1 s a frame of recording-thread time.
+
 **Where the CPU goes, by our own counters (diagnostics build); the sampling profiles were misleading**
 - `perf` profiles put ~15 % of the process in `std::sync::Mutex` functions (`unlock` 8.8 %), as on 25 Nov. Attribution failed every way tried: branch records (the spin loop fills the 16 records), frame pointers (std has none; a std rebuilt with them through `RUSTC_BOOTSTRAP=1 -Zbuild-std` did not change it), and the callers named were impossible (`now_ms` and `add_ref` take no lock). The release build folds identical functions (lld-link ICF), so a tiny hot function may carry `Mutex::unlock`'s name; with `/OPT:NOICF` the script no longer found the image base (8 candidates). **The mutex diagnosis is not trusted.**
 - `bench.sh` fixes found on the way: `perf report | head` under `set -o pipefail` and `set -e` ended the script before it closed the game, so **every `--perf` run left the game open** (the user found one); fixed, plus a kill by pid as a last resort. `perf-symbols.py` took a profile for branch records when the header listed `BRANCH_STACK` among missing features; fixed.
