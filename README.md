@@ -400,6 +400,7 @@ In roadmap order. Piece letters refer to [the target](#the-target-pieces-that-fi
 | S.8 Bound texture memory | T, L | maintainer | `s5-heap-sync` | the sweep works with the pool again (25,800 live, 9.2 GB); left: release empty heaps |
 | D.1 Heap buffer pass: 133 ms a frame in the open world (`draw.rs` `heap_buffers`, 110,000 views, 4,085 copies) | D, W, A | maintainer | | split: a 231 ms full rescan every 16 passes (`VICTORY_HEAP_ROLL=1` spreads it, measuring) and 6-115 ms of streaming textures on the recording thread (→ A.2) |
 | M.1 One host copy per title byte ([design](docs/design/m1-one-copy-per-range.md)): the overlap is a buffer copy and a 4 MiB window over the same memory (two names) | M | maintainer | | `VICTORY_ONE_COPY=1` (window answers buffer asks) breaks the picture: off; redesign |
+| G.1 GPU census by pipeline in release (`VICTORY_GPU_CENSUS=1`): where the GPU's ~265 ms a frame go | G, P | maintainer | | **next** (26 Nov reorder: the GPU is the biggest piece; the copy-back needs phase 2) |
 | S.9 Interior lighting: white speckles and blown-out areas indoors (Jason at the TV); seen again in play on 26 Nov (`bench/user-play-20261126/shot-now.png`): dark interior, characters as black silhouettes, frost-like white speckles on floors and tables, windows blown out | T | *open* | | seen twice |
 | P.1 Pipeline census and the library: compile time, cache hits, the load into the world | P | maintainer | | **library fixed** (`c436241`, it was never made): world-entry frame 9.5 s → 0.63 s, 993 pipelines from the library and 1,012 started early on the second run; timing counters in |
 | P.2 Pipeline journal and replay at start-up on spare cores (KytyPS5's model) | P | *open* | | after P.1 |
@@ -412,7 +413,7 @@ In roadmap order. Piece letters refer to [the target](#the-target-pieces-that-fi
 | S.4 Open-world baseline (Jason, outside the house) | G | maintainer | `s5-heap-sync` | **done**: 497 ms (2.0 fps), GPU-bound, a serial chain ([baseline.md](docs/baseline.md)) |
 | S.2 Exact lifetimes for host copies | L | *open* | | after S.1 |
 | S.3 Texture coherence without the sweep | T | *open* | | after S.1 |
-| 1.3 Copy back only what the CPU reads ([design](docs/design/p1.3-copyback-on-demand.md)): read census first | B | maintainer | | **in progress**: census: the CPU reads ~1 page of ~40 MB; ceiling: −22 % frame but black picture, because the GPU reads it back through other host copies (title memory is the hub); step 2 must carry GPU writes between copies on the card or join copies (M); gates 3.1 |
+| 1.3 Copy back only what the CPU reads ([design](docs/design/p1.3-copyback-on-demand.md)): read census first | B | maintainer | | **in progress**: **closed for now**: the copy-back is the byte merge that page-granular write tracking needs (~125 MB a frame of GPU bytes would come back stale without it); its ceiling is −22 %; it goes with phase 2 (in-place memory) |
 | 1.2 Cheaper write tracking (ask write watch once per submission) | W | *open* | | |
 | 1.1 Memory census by use | M | maintainer | `p1.1-census` | in progress (input for 1.3 and phase 2) |
 | 1.7 Stop re-copying our own write-back (`VICTORY_F1_OWN`, `VICTORY_F1_CARD_MERGE`) | B | maintainer | `p1.1-census` | **done**: uploads −49 %, hash passes −82 %, frame −2 % |
