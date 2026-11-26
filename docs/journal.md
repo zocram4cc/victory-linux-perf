@@ -4,6 +4,13 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**Buffers in place, what is ruled out and what is left (end of the 26 Nov sessions on M.2)**
+- With the directory bias fixed, `VICTORY_INPLACE=2` (windows and buffers) still breaks (the user: "se ve igual de roto"), and so does `=3`.
+- **Ruled out:** shader writes into memory in place under copies (**0 shader writes are declared on buffers in place**, `…-inplace3-texcensus`); title buffer copies (0 touch it); host-import failures (`VKD3D_DEBUG=warn`, `…-inplace3-warn`: none, only the usual alignment notes); the directory offset (fixed, not the whole cause).
+- **What holds:** windows alone in place (right picture, GPU 2× slower over PCIe); the ≥ 1 MiB buffers alone (right, no gain: read-only, cheap to copy). **What breaks:** the small and mid buffers together in place, and in-place runs lose the device now and then (`…-inplace3-warn` lost it).
+- **Hypothesis left:** those buffers hold per-frame data (constants, transforms) that the title's threads rewrite while the card is still drawing. Copies hand the card a snapshot taken at submission; in place it reads what is being written. The console's card runs within the frame; ours runs ~200 ms later and is waited for, while the title's other threads go on. If so, in place needs to know when the title considers each range free (its fences and rings), or must keep copies for dynamic data and share only static data.
+- **M.2 status:** the mechanism works end to end on this machine (VRAM at the title's address under Wine, patched `winevulkan` and vkd3d). What is missing is the rule for which memory may be shared. Parked here with all switches off; nothing of it is on by default.
+
 **In-place buffers: a bias bug in the address directory, and GPU-written memory under copies**
 - **Bug:** the directory of title memory by address (`memory.rs`, for shaders that read through raw addresses: the ray-tracing builder and the lighting that walks its structures) gave a page's offset as `offset_in` (address − copy start). For memory in place the buffer starts at the 64 KiB line below the title memory, so the right offset is `Shadow::offset` (with the bias). Fixed (`memory.rs`). Descriptor views already used `offset`.
 - With the fix, **the ≥ 1 MiB buffers alone in place hold the picture** (`…-inplace-bigcensus`: 35 buffers, 135 MB, **none written by shaders**; the user: "ahora se veía todo bien"), 399-411 ms.
