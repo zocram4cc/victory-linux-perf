@@ -585,14 +585,62 @@ fn made_now(texture: &ID3D12Resource) {
         }
         recent.push_back((raw, now));
     }
+    unseen_now(raw);
+}
+
+/// Host texture `raw` (its `as_raw`) is new: slots that show it wait until
+/// every submission begun before now has finished ([`begun_before`]).
+fn unseen_now(raw: usize) {
     let begun = crate::host::submissions().0;
     NEWEST_BEGUN.fetch_max(begun, Ordering::Relaxed);
     let mut unseen = UNSEEN.lock().unwrap_or_else(|e| e.into_inner());
     let finished = crate::host::submissions().1;
     // Those every submission begun before them has left behind are no
     // one's concern any more (and a raw pointer may come again).
-    unseen.retain(|_, b| *b > finished);
-    unseen.insert(raw, begun);
+    unseen.retain(|_, b| unseen_by(*b, finished));
+    // (Asked twice, by the pool and by the host copy: the later number.)
+    let at = unseen.entry(raw).or_insert(begun);
+    *at = (*at).max(begun);
+}
+
+/// Every host texture, not only those cut from blocks, is new to the
+/// submissions begun before it was made ([`begun_before`]): under Wine
+/// (`VICTORY_PUBLISH_SAFE=0`: blocks only, as elsewhere). A committed or
+/// reserved texture is memory newer than those submissions, as a block's
+/// piece is: on amdgpu a memory object made after a submission began is not
+/// valid for it, and a slot that submission reads by index, switched to
+/// such a texture, faults inside it. The owner's tree lost the device so
+/// (run play-va1, 2026-11-25: a permission fault inside a live 4096x4096
+/// host texture made the moment the hung submission began) until every
+/// fresh texture's slot write waited (`VICTORY_PUBLISH_SAFE` there). Here
+/// only the pool's were known: a texture over half a block, with a clear
+/// value, several samples or the swizzle the pool leaves out, one the pool
+/// refused, and every target were shown at once.
+pub(crate) fn unseen_any(texture: &ID3D12Resource) {
+    if publish_safe() {
+        UNSEEN_ANY.fetch_add(1, Ordering::Relaxed);
+        unseen_now(texture.as_raw() as usize);
+    }
+}
+
+/// Host textures [`unseen_any`] noted, since the start.
+pub(crate) static UNSEEN_ANY: AtomicU64 = AtomicU64::new(0);
+
+/// Whether every host texture's slot waits as a pooled one's does
+/// ([`unseen_any`]): under Wine, unless `VICTORY_PUBLISH_SAFE=0`.
+pub(crate) fn publish_safe() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::wine::on_wine() && std::env::var_os("VICTORY_PUBLISH_SAFE").is_none_or(|v| v != "0"))
+}
+
+/// Whether a texture made when submissions up to `begun` had begun is still
+/// new to one that may run, with every submission up to `finished` done.
+/// A submission begun later was sent after the texture's memory was made,
+/// so no look at what is in the air now is needed, and none can start
+/// between such a look and the slot's write (the window the owner's first
+/// rule had).
+fn unseen_by(begun: u64, finished: u64) -> bool {
+    begun > finished
 }
 
 /// Pooled textures made while submissions begun before them may still run:
@@ -621,7 +669,7 @@ pub(crate) fn begun_before(texture: &ID3D12Resource) -> Option<u64> {
     let finished = crate::host::submissions().1;
     let raw = texture.as_raw() as usize;
     let unseen = UNSEEN.lock().unwrap_or_else(|e| e.into_inner());
-    unseen.get(&raw).copied().filter(|&begun| begun > finished)
+    unseen.get(&raw).copied().filter(|&begun| unseen_by(begun, finished))
 }
 
 /// Makes `texture` give `piece` back when the last reference to it goes.
@@ -730,6 +778,33 @@ pub(crate) unsafe fn texture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A texture is new to a submission begun before it until every one
+    /// begun by then has finished; one begun later never needs it held.
+    #[test]
+    fn a_texture_is_new_until_those_begun_before_it_finished() {
+        assert!(unseen_by(5, 4));
+        assert!(!unseen_by(5, 5));
+        assert!(!unseen_by(5, 9));
+        // Nothing in the air when it was made: nothing to wait for.
+        assert!(!unseen_by(0, 0));
+    }
+
+    /// Noted twice (the pool, then the host copy), the later number holds,
+    /// and an entry every submission has left behind goes.
+    #[test]
+    fn a_texture_noted_twice_keeps_the_later_number() {
+        let raw = 0x5eed_0001;
+        let (started, finished) = crate::host::submissions();
+        unseen_now(raw);
+        unseen_now(raw);
+        let got = UNSEEN.lock().unwrap().get(&raw).copied();
+        // (Kept only while one begun before it may still run.)
+        if started > finished {
+            assert!(got.is_some_and(|b| b >= started));
+        }
+        UNSEEN.lock().unwrap().remove(&raw);
+    }
 
     #[test]
     fn a_failed_block_is_not_retried_for_each_small_upload() {
