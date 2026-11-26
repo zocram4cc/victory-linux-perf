@@ -2386,6 +2386,11 @@ fn protect_alias(g: &mut Guards, block: usize) -> bool {
     if g.left_alone(block) || g.rests(block, rest()) {
         return false;
     }
+    // Only a block that is plain read-only or read-write throughout: a call's
+    // answer names its first page's old protection alone (see `alike`).
+    if alike(block, block + 1) == 0 {
+        return false;
+    }
     // Ahead of the protection.
     PROTECTED.set(block);
     let mut old = 0;
@@ -2440,17 +2445,17 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
     };
     // Ahead of the protection (`PROTECTED`).
     (from..to).for_each(|block| PROTECTED.set(block));
-    // One call for all of it, then block by block if that is refused. In
-    // runs: one call for as many blocks as Windows says are alike, within
-    // each view the runtime told of (a call across two views is refused, and
-    // every block of the range then had a call of its own), and none for a
-    // block that is not plain read-only or read-write memory throughout: a
-    // call's answer names its first page's old protection alone, and a page
-    // further on that the title guards itself (`PAGE_GUARD`) lost that.
+    // One call for all of it if Windows says it is alike throughout (one
+    // region, plain read-only or read-write), else block by block. In runs:
+    // one call for as many blocks as are alike, within each view the runtime
+    // told of (a call across two views is refused, and every block of the
+    // range then had a call of its own). A block that is not alike gets no
+    // call: a call's answer names its first page's old protection alone, and
+    // a page further on that the title guards itself (`PAGE_GUARD`) lost that.
     let runs = guard_runs();
     let pieces = if runs { view_pieces(from, to) } else { vec![(from, to)] };
     for (from, to) in pieces {
-        if !runs && set(from, to) {
+        if !runs && alike(from, to) == to - from && set(from, to) {
             note(g, from, to);
             continue;
         }
@@ -2461,7 +2466,7 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
             let n = match block < uncommitted_until {
                 true => 0,
                 false if runs => alike(block, to),
-                false => 1,
+                false => alike(block, block + 1),
             };
             if n > 0 && set(block, block + n) {
                 note(g, block, block + n);
@@ -4690,8 +4695,9 @@ mod tests {
         use windows_sys::Win32::System::Memory::PAGE_READONLY;
         const SIZES: [usize; 3] = [2, 3, 1];
         // Told of the views, in runs: calls to guard all, to open all, to open blocks 1 to 3.
+        // Not in runs: one call a block; a range across views is not asked for whole.
         for (told, runs, setting, opening, part) in
-            [(true, true, 3, 3, 2), (true, false, 7, 6, 3), (false, true, 3, 3, 2), (false, false, 7, 6, 3)]
+            [(true, true, 3, 3, 2), (true, false, 6, 6, 3), (false, true, 3, 3, 2), (false, false, 6, 6, 3)]
         {
             RUNS_IN_TEST.set(Some(runs));
             let (section, p, views) = views_in_a_row(&SIZES, told);
@@ -4785,24 +4791,51 @@ mod tests {
     #[test]
     fn a_page_the_title_guards_inside_a_range_keeps_its_guard() {
         use windows_sys::Win32::System::Memory::{PAGE_GUARD, PAGE_READONLY, VirtualProtect};
-        RUNS_IN_TEST.set(Some(true));
-        let (section, p, views) = views_in_a_row(&[4], false);
-        let guarded = p + BLOCK + KERNEL_PAGE;
-        let mut old = 0;
-        // SAFETY: a page of our view.
-        assert_ne!(unsafe { VirtualProtect(guarded as *const _, KERNEL_PAGE, PAGE_READWRITE | PAGE_GUARD, &mut old) }, 0);
-        assert_eq!(guard(p, p + 4 * BLOCK).map(|written| written.len()), Some(4));
-        assert_eq!(protection(guarded), PAGE_READWRITE | PAGE_GUARD, "the title's guard is gone");
-        assert_eq!(protection(p + BLOCK), PAGE_READWRITE, "its block is left as it was");
-        for block in [0, 2, 3] {
-            assert_eq!(protection(p + block * BLOCK), PAGE_READONLY, "block {block}");
+        for runs in [false, true] {
+            RUNS_IN_TEST.set(Some(runs));
+            let (section, p, views) = views_in_a_row(&[4], false);
+            let guarded = p + BLOCK + KERNEL_PAGE;
+            let mut old = 0;
+            // SAFETY: a page of our view.
+            assert_ne!(unsafe { VirtualProtect(guarded as *const _, KERNEL_PAGE, PAGE_READWRITE | PAGE_GUARD, &mut old) }, 0);
+            assert_eq!(guard(p, p + 4 * BLOCK).map(|written| written.len()), Some(4));
+            assert_eq!(protection(guarded), PAGE_READWRITE | PAGE_GUARD, "the title's guard is gone, in runs: {runs}");
+            assert_eq!(protection(p + BLOCK), PAGE_READWRITE, "its block is left as it was, in runs: {runs}");
+            for block in [0, 2, 3] {
+                assert_eq!(protection(p + block * BLOCK), PAGE_READONLY, "block {block}, in runs: {runs}");
+            }
+            // Told as written at every asking: nothing sees a write to it.
+            assert!(guard(p, p + 4 * BLOCK).is_some_and(|written| written.contains(&(p / PAGE + 1))));
+            assert_eq!(protection(guarded), PAGE_READWRITE | PAGE_GUARD);
+            writing(p, 4 * BLOCK);
+            assert_eq!(protection(guarded), PAGE_READWRITE | PAGE_GUARD, "nor when the range is opened, in runs: {runs}");
+            drop_row(section, p, views, &[4]);
         }
-        // Told as written at every asking: nothing sees a write to it.
-        assert!(guard(p, p + 4 * BLOCK).is_some_and(|written| written.contains(&(p / PAGE + 1))));
-        assert_eq!(protection(guarded), PAGE_READWRITE | PAGE_GUARD);
-        writing(p, 4 * BLOCK);
-        assert_eq!(protection(guarded), PAGE_READWRITE | PAGE_GUARD, "nor when the range is opened");
-        drop_row(section, p, views, &[4]);
+        RUNS_IN_TEST.set(None);
+    }
+
+    /// A page the title guards itself inside a block of another view of
+    /// guarded pages keeps its guard: that block is not plain read-only or
+    /// read-write throughout, so it is left as it is; the blocks around it
+    /// are made read-only.
+    #[test]
+    fn a_page_the_title_guards_in_another_view_keeps_its_guard() {
+        use windows_sys::Win32::System::Memory::{PAGE_GUARD, PAGE_READONLY, VirtualProtect};
+        for runs in [false, true] {
+            RUNS_IN_TEST.set(Some(runs));
+            let (section, guarded, other) = two_views(4 * BLOCK);
+            let page = other + BLOCK + KERNEL_PAGE;
+            let mut old = 0;
+            // SAFETY: a page of our other view.
+            assert_ne!(unsafe { VirtualProtect(page as *const _, KERNEL_PAGE, PAGE_READWRITE | PAGE_GUARD, &mut old) }, 0);
+            assert!(guard(guarded, guarded + 4 * BLOCK).is_some());
+            assert_eq!(protection(page), PAGE_READWRITE | PAGE_GUARD, "the title's guard is gone, in runs: {runs}");
+            assert_eq!(protection(other + BLOCK), PAGE_READWRITE, "its block is left as it was, in runs: {runs}");
+            for block in [0, 2, 3] {
+                assert_eq!(protection(other + block * BLOCK), PAGE_READONLY, "block {block}, in runs: {runs}");
+            }
+            drop_views(section, &[guarded, other], 4 * BLOCK);
+        }
         RUNS_IN_TEST.set(None);
     }
 }
