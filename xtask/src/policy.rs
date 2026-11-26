@@ -23,6 +23,8 @@ const ALLOWED_NAMES: &[&str] = &[
     ".editorconfig",
     ".victory-root",
     "pre-commit",
+    "commit-msg",
+    "pre-push",
     "LICENSE",
     "LICENSE-MIT",
     "LICENSE-APACHE",
@@ -236,6 +238,8 @@ mod tests {
         assert!(check("crates/x/src/lib.rs", b"fn main() {}\n").is_empty());
         assert!(check(".gitignore", b"/target/\n").is_empty());
         assert!(check(".githooks/pre-commit", b"#!/bin/sh\n").is_empty());
+        assert!(check(".githooks/commit-msg", b"#!/bin/sh\n").is_empty());
+        assert!(check(".githooks/pre-push", b"#!/bin/sh\n").is_empty());
     }
 
     #[test]

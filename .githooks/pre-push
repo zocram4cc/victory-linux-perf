@@ -1,0 +1,28 @@
+#!/bin/sh
+# The last gate (identity.sh): every commit not yet on any remote is made as
+# local@localhost and unsigned, and nothing pushed to this remote, its whole
+# history on a first push, names a contributor.
+. "$(dirname "$0")/identity.sh"
+remote="$1"
+zero=0000000000000000000000000000000000000000
+fail=0
+while read -r local_ref local_sha remote_ref remote_sha; do
+    [ "$local_sha" = "$zero" ] && continue # a deletion
+    case "$(git cat-file -t "$local_sha")" in commit|tag) ;; *) continue ;; esac
+    for c in $(git rev-list "$local_sha" --not --remotes); do
+        identity_commit_ok "$c" || fail=1
+    done
+    if [ "$remote_sha" = "$zero" ] || ! git cat-file -e "$remote_sha" 2>/dev/null; then
+        sent="$(git rev-list "$local_sha" --not --remotes="$remote")"
+    else
+        sent="$(git rev-list "$remote_sha..$local_sha")"
+    fi
+    for c in $sent; do
+        identity_commit_clean "$c" || fail=1
+    done
+done
+if [ $fail -ne 0 ]; then
+    echo "identity: push refused; commits here are local <local@localhost>, unsigned, naming no one" >&2
+    exit 1
+fi
+exit 0

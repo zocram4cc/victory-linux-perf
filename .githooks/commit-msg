@@ -1,0 +1,14 @@
+#!/bin/sh
+# The message names no contributor (identity.sh); then the user's own global
+# commit-msg hook, which this folder replaces as the hooks path.
+. "$(dirname "$0")/identity.sh"
+if ! grep -v '^#' "$1" | identity_text_ok; then
+    echo "identity: the commit message names a contributor (above)" >&2
+    exit 1
+fi
+global="$(git config --global core.hooksPath 2>/dev/null)"
+case "$global" in "~/"*) global="$HOME/${global#\~/}" ;; esac
+if [ -n "$global" ] && [ -x "$global/commit-msg" ] && [ "$(cd "$global" && pwd)" != "$(cd "$(dirname "$0")" && pwd)" ]; then
+    exec "$global/commit-msg" "$@"
+fi
+exit 0
