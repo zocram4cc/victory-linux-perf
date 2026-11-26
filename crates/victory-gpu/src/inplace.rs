@@ -135,7 +135,12 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
 /// buffers or a title buffer, if [`level`] asks for it and the memory can
 /// be opened; `None` leaves the caller to make a copy, as before.
 pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
-    if level() < if window { 1 } else { 2 } {
+    // Level 3 (M.2, with vkd3d-proton's `VKD3D_VRAM_AT_ADDRESS=1`): title
+    // buffers only, whose memory becomes VRAM at the same address. Windows
+    // stay copies: the title's CPU reads them (IBS census, 26 Nov), and
+    // through ReBAR every such read would be uncached.
+    let vram = level() == 3;
+    if level() < if window { 1 } else { 2 } || (vram && window) {
         return None;
     }
     // View memory: known from the runtime without asking Windows.
@@ -148,8 +153,24 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
         return None;
     }
     let host = crate::host::host()?;
+    // VRAM placed at an address replaces the pages there: two heaps over
+    // one page would leave the CPU on one and the GPU on the other.
+    let pages = (start & !(K64 as u64 - 1), (start + len.max(1)).next_multiple_of(K64 as u64));
+    if vram {
+        let opened = VRAM_PAGES.lock().unwrap_or_else(|e| e.into_inner());
+        if opened.iter().any(|&(a, e)| a < pages.1 && pages.0 < e) {
+            STATS[4].fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+    }
     match place_part(&host.device, start, len) {
         Ok(placed) => {
+            if vram {
+                // Kept for the run: freeing the heap would unmap the title's
+                // memory there (the driver's placed map goes with it).
+                VRAM_PAGES.lock().unwrap_or_else(|e| e.into_inner()).push(pages);
+                VRAM_HEAPS.lock().unwrap_or_else(|e| e.into_inner()).push(placed.heap.clone());
+            }
             let at = if window { 0 } else { 2 };
             STATS[at].fetch_add(1, Ordering::Relaxed);
             STATS[at + 1].fetch_add(len, Ordering::Relaxed);
@@ -167,6 +188,10 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
         }
     }
 }
+
+/// Level 3: the 64 KiB-aligned ranges made VRAM, and their heaps, kept.
+static VRAM_PAGES: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
+static VRAM_HEAPS: std::sync::Mutex<Vec<ID3D12Heap>> = std::sync::Mutex::new(Vec::new());
 
 /// What [`place_for`] gave is gone.
 pub(crate) fn gone(window: bool, bytes: u64) {
