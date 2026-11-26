@@ -4,6 +4,12 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**G.2 capture, how it actually behaves (no usable capture yet)**
+- Present-based captures (`MESA_VK_TRACE_TRIGGER` alone, `MESA_VK_TRACE_FRAME`) never fire: RADV does not see our presents.
+- `MESA_VK_TRACE_PER_SUBMIT=1` needs `MESA_VK_TRACE_TRIGGER` and, once triggered, **captures every submission until the game ends** (not one): thousands of `.rgp` files, ~42 MB each in the world, written to `/tmp` (16 GB tmpfs here). Under tracing the game runs at ~4 s a frame.
+- Moving them to `/home` filled that disk (it had only ~6 GB free); the files kept were the truncated ones. Nothing usable kept.
+- Next time: keep them in `/tmp`, kill `victory.exe` as soon as ~60 non-empty files exist after the trigger, then copy only a few whole files (check sizes) to disk.
+
 **G.2: getting a RADV thread trace (not yet)**
 - RGP 2.7.1 is installed (`/opt/radeon-gpu-profiler`, GUI only). `MESA_VK_TRACE=rgp` with `MESA_VK_TRACE_TRIGGER` (and a 256 MiB buffer): tracing is enabled (`radv: Thread trace support is enabled`) but touching the trigger in the world made no capture; RADV checks it at present, so our present path may not reach its hook.
 - **Do not use `MESA_VK_TRACE_PER_SUBMIT=1`:** it ignored the trigger, wrote one `.rgp` per submission into `/tmp` (a 16 GB tmpfs here) until it was full, and the start screen ran at 2 fps.
