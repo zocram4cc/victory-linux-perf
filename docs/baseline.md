@@ -56,3 +56,21 @@ Moving costs 9 % more than the static scene, because more is copied. Two more ru
 The first `COPY_MODE=none` and `plain` runs were invalid: the switch only worked in the diagnostics build. It is now `medir::copy_mode`, available in any build, and the runs above are the repeated ones.
 
 The analysis is in [memory.md](memory.md).
+
+## Open world, outside the house (Jason save), 26 Nov 2026
+
+- **Machine and stack:** as above; build `c697e7c` (texture pool and slot wait on).
+- **Scene:** the user's save (`royale-save`), the house seen from outside for the ~45 s after the world comes up; then the save cuts indoors, which is not measured. `BENCH_SETTLE=5 scripts/trials.sh -n 3 -l world-out -s 30`.
+- **Runs:** three of 30 s, all valid, none lost the device.
+
+| Measure | run 1 | run 2 | run 3 | **Mean** |
+|---|---|---|---|---|
+| ms per frame | 495.6 | 504.4 | 491.5 | **497** (2.0 fps) |
+| prepare | 124.3 | 116.6 | 115.8 | **119** |
+| copies | 49.4 ms / 134.5 MB | 53.9 / 132.4 | 48.8 / 136.7 | **51 ms / 135 MB** |
+| GPU | 261.8 | 268.7 | 265.7 | **265** (card busy 53 %) |
+| copy-back | 74.2 ms / 46.1 MB | 71.1 / 45.8 | 71.5 / 45.0 | **72 ms / 46 MB** |
+| draws | 12,909 | 13,343 | 13,188 | **13,147** |
+| heap buffer pass | 133 ms, 1 a frame | | | |
+
+With the pool off: 485-502 ms, the same within noise.

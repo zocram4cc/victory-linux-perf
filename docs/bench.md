@@ -100,6 +100,12 @@ scripts/bench.sh run -l profile-A --perf
 
 The window's folder then also has `perf.data`, `perf-wineserver.data` and `perf.txt` (top modules and symbols). Profiling costs a little time, so do not compare its frame times with a run without it.
 
+### Reading a profile
+
+`scripts/perf-symbols.py bench/<run>/perf.data` symbolises the layer's own code. perf shows Wine's PE code as `[JIT]`, and victory.exe lands at a different base every run; the script finds the base, then sums samples per function from the PDB. It also gives the title's share.
+
+Call sites: `BENCH_PERF_G=lbr` records the last 16 calls before each sample (AMD LBR v2), and `--callers PATTERN` attributes samples in matching functions to their callers. `BENCH_PERF_G=1` records frame-pointer stacks instead, which needs a build with `RUSTFLAGS="-C force-frame-pointers=yes"` (into `target-fp/`, run with `VP_EXE`); Rust's std has no frame pointers, so those stacks stop there.
+
 ## Rules for figures that count
 
 - **Three runs per configuration.** If `ms_per_frame` varies by more than 10 % between them, the measurement does not count. Find the cause first: a cold shader cache, other load on the PC, a different scene…

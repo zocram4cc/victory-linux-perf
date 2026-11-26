@@ -4,6 +4,13 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**S.4: the open-world baseline (outside the house), and where its time goes**
+- **Baseline** (`BENCH_SETTLE=5 scripts/trials.sh -n 3 -l world-out -s 30`, all windows valid, none lost): **491-504 ms a frame (2.0 fps)**, prepare 116-124 ms, GPU 262-269 ms (card busy 53 % of it), copies 49-54 ms / 133 MB, copy-back 71-74 ms / 46 MB, ~13,100 draws. Recorded in [baseline.md](baseline.md).
+- **Correction:** with the pool off (and the wait on), the same: 485-502 ms. The pool's earlier "~6 % faster" came from invalid windows of different scenes. Its value is stability without waits (frames in flight), not speed.
+- **Unlike the prologue, the GPU phase dominates** (53 % of the frame). And a once-a-frame pass over the heap's buffer views (`draw.rs` `heap_buffers`, for shaders that pick buffers by index) takes **133 ms a frame**: ~110,000 views over 4,085 host copies spanning 2.4 GB; the full pass every 16th frame takes 389 ms, the others ~23 ms.
+- **Profiles** (`bench.sh --perf`, new `scripts/perf-symbols.py`, which finds victory.exe's base by itself and symbolises it from the PDB): victory.exe 45 % of the process's samples, the title's own code 19 %. **Mutex lock/unlock/spin is ~14 % of all samples**, the same with the pool off, so it predates it. Branch records (`BENCH_PERF_G=lbr`, AMD LBR v2) place it near `shadow::find`, the descriptor slot paths and `Shadow::refresh`, but not exactly: under Wine an unlock enters ntdll, which fills the 16 records. Frame-pointer stacks (`BENCH_PERF_G=1` with a `force-frame-pointers` build) stop at Rust's std, built without them.
+- `bench.sh --perf` leaves the game running at the end (seen 3 times); closed by hand with `victory-proton kill`. To fix.
+
 **The open-world scene is two scenes: outside, then indoors**
 - Draws in the world windows stepped down partway (16,000 → 2,400, 14,000 → 8,100, 14,000 → 6,100) with no input: the A taps stop at 50 s and the world comes at ~78 s.
 - A screenshot at the window's end shows why: after ~45 s of the house from outside, the save **cuts indoors to Jason at the TV** (prompts "PHONE", "TV (X)"). The TV's video plays right. The interior shows **white speckles on the floor and blown-out areas**: a lighting fault for S.3 / phase 5, not stability.

@@ -154,7 +154,14 @@ measure() {
         # attaching: enter it first. User space only (perf_event_paranoid=2).
         # Small buffers: the game has 40+ threads, and the default ones for
         # each go past perf_event_mlock_kb (the first profile came out empty).
-        nsenter -t "$pid" -U --preserve-credentials perf record -q -m 4 -F 999 -e cycles:u -p "$pid" -o "$dir/perf.data" -- sleep "$secs" >"$dir/perf.err" 2>&1 &
+        # BENCH_PERF_G=1: call stacks by frame pointer (build with
+        # RUSTFLAGS="-C force-frame-pointers=yes"; scripts/perf-symbols.py --callers).
+        # BENCH_PERF_G=lbr: the last 16 calls before each sample (AMD
+        # LBR v2; needs no frame pointers, so it sees through Rust's std).
+        local graph=()
+        [[ ${BENCH_PERF_G:-0} == 1 ]] && graph=(--call-graph fp --user-callchains)
+        [[ ${BENCH_PERF_G:-0} == lbr ]] && graph=(-j any_call,u)
+        nsenter -t "$pid" -U --preserve-credentials perf record -q -m 4 -F 999 -e cycles:u ${graph[@]+"${graph[@]}"} -p "$pid" -o "$dir/perf.data" -- sleep "$secs" >"$dir/perf.err" 2>&1 &
         perfs+=($!)
         if [[ -n $srv ]]; then
             nsenter -t "$srv" -U --preserve-credentials perf record -q -m 4 -F 999 -e cycles:u -p "$srv" -o "$dir/perf-wineserver.data" -- sleep "$secs" >>"$dir/perf.err" 2>&1 &
