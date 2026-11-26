@@ -67,6 +67,15 @@ pub(crate) struct Shader {
     /// Its part in the light probe (`crate::lightprobe`).
     #[cfg(windows)]
     pub(crate) probe: Option<crate::lightprobe::Role>,
+    /// `VICTORY_VIEWS_OF=<name part>,...`: its name holds one of the parts,
+    /// so the views it is dispatched with are logged once (`crate::draw`).
+    #[cfg(windows)]
+    pub(crate) views_wanted: bool,
+    /// `VICTORY_CLEAR_AFTER=<name part>:<root parameter>:<dwords>;...`: the
+    /// images of its tables that are set to zero after each dispatch of it
+    /// (an experiment's tool: what a program writes without rays is dropped).
+    #[cfg(windows)]
+    pub(crate) clear_after: Vec<(u8, u32)>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -101,6 +110,32 @@ pub(crate) fn kept() -> [u64; 7] {
         library::SAVED.load(Relaxed),
         library::TRIMMED_BYTES.load(Relaxed),
     ]
+}
+
+/// `VICTORY_CLEAR_AFTER`, read once.
+fn clear_after() -> &'static [(Vec<u8>, u8, u32)] {
+    static SET: OnceLock<Vec<(Vec<u8>, u8, u32)>> = OnceLock::new();
+    SET.get_or_init(|| {
+        std::env::var("VICTORY_CLEAR_AFTER")
+            .unwrap_or_default()
+            .split(';')
+            .filter_map(|entry| {
+                let mut parts = entry.trim().split(':');
+                let name = parts.next()?.trim().as_bytes().to_vec();
+                let slot = parts.next()?.trim().parse().ok()?;
+                let at = parts.next()?.trim().parse().ok()?;
+                (!name.is_empty()).then_some((name, slot, at))
+            })
+            .collect()
+    })
+}
+
+/// `VICTORY_VIEWS_OF`: parts of program names, read once.
+fn views_of() -> &'static [Vec<u8>] {
+    static PARTS: OnceLock<Vec<Vec<u8>>> = OnceLock::new();
+    PARTS.get_or_init(|| {
+        std::env::var("VICTORY_VIEWS_OF").unwrap_or_default().split(',').map(|p| p.trim().as_bytes().to_vec()).filter(|p| !p.is_empty()).collect()
+    })
 }
 
 /// The shared container for `bytes`.
@@ -138,6 +173,14 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
                 #[cfg(windows)]
                 probe: crate::lightprobe::on().then(|| crate::lightprobe::role(bytes)).flatten(),
+                #[cfg(windows)]
+                clear_after: if stage == "compute" {
+                    clear_after().iter().filter(|(part, ..)| bytes.windows(part.len()).any(|w| w == part.as_slice())).map(|(_, slot, at)| (*slot, *at)).collect()
+                } else {
+                    Vec::new()
+                },
+                #[cfg(windows)]
+                views_wanted: stage == "compute" && views_of().iter().any(|part| bytes.windows(part.len()).any(|w| w == part.as_slice())),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
             })
