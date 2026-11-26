@@ -8,6 +8,8 @@ or publisher.
 
 ## Run the codec_d Windows build
 
+codec_d's own instructions, kept as written: this fork has not tested the Windows build, and the codec-d/cool_fox repository and its releases no longer resolve (2026-11-26).
+
 Download and extract the Windows x64 ZIP from the [private releases](https://github.com/codec-d/cool_fox/releases/latest). Open PowerShell in the extracted folder and point the launcher at your own complete Xbox dump.
 
 ```powershell
@@ -17,7 +19,7 @@ $env:VICTORY_GAME_DIR = 'D:\Games\MyDump'
 
 The launcher selects Series S and the RTX-tested residency settings. It builds its shader cache locally under `%LOCALAPPDATA%\VIctory\cache-pareto`. Set `VICTORY_CACHE_DIR` to reuse an existing cache outside the checkout. Windows x64, an AVX2 CPU, and a Direct3D 12 GPU with shader model 6.6 and mesh shader support are required.
 
-To build from this checkout, install the pinned Rust toolchain and the MSVC C++ build tools with a Windows SDK, then run `cargo build --release --locked -p victory`. The same launcher finds `target\release\victory.exe`. The sections below describe the upstream AMD fork and its separate launcher.
+To build from this checkout, install the pinned Rust toolchain and the MSVC C++ build tools with a Windows SDK, then run `cargo build --release --locked -p victory`. The same launcher finds `target\release\victory.exe`. The upstream AMD fork's notes, further down, describe its own separate launcher.
 
 ## Run on Linux (Proton)
 
@@ -42,6 +44,7 @@ What is known to be wrong:
 - Lighting at night is flat and too dark, fine shadows (hair on a neck) are missing, and eyes reflect the sky indoors. The title lights its scenes with rays through a structure its own builder makes; that builder is off (`--ray-tracing` turns it on, and other NVIDIA forks report it does not run there; untried here). What stands in for the indirect light is worked out from the frame.
 - Some z-fighting and shimmer in backgrounds, and a few textures missing (a phone screen in a cutscene).
 - NVIDIA's shader-visible view heap holds 1,000,000 views and the title asks for 1,245,184; the views past the cap read an empty slot.
+- The title fills about 15 GB of the 16 GB card: another program holding GPU memory (a dictation model with 4.9 GB, in one run) took the opening from 24 to 3 frames a second. The launcher lists such programs before a run.
 
 You need rustup, clang, lld and llvm (`sudo dnf install rustup clang lld llvm` on Fedora), `umu-run` on your PATH (on Fedora 45 use the release's zipapp, the RPMs are built for older Python), and **GE-Proton11-13 or later** in `~/.local/share/Steam/compatibilitytools.d/Proton-GE Latest` (or set `PROTONPATH`). Older vkd3d-proton (before v3.1-83, so GE-Proton11-12 and earlier) converts DXIL with dxil-spirv's legacy structurizer, which turns about 6% of the title's pipelines into invalid SPIR-V that NVIDIA's shader compiler crashes on, and the title dies as it loads; the launcher warns when it can tell.
 
@@ -83,9 +86,9 @@ Options for a game run (`scripts/play-linux.sh --help` has them all):
 | `--mangohud` | also MangoHud's frame log (off by default: its NVIDIA thread aborted the title under umu) |
 | `--proton-log` | Wine's own log into the run folder (large) |
 
-The launcher uses its own prefix (`~/.local/share/victory/prefix`), keeps caches in `~/.cache/victory/`, and sets the same defaults as `Play-VIctory.cmd`, plus meeyao's vkd3d settings (`VKD3D_CONFIG=descriptor_heap`, `VK_NV_raw_access_chains` off), `VICTORY_CULL_NONE=1` (both faces drawn), every texture's mip levels as the title loads it (`VICTORY_LEVELS_ON_DEMAND=0`) and the willy build's longer texture waits (`VICTORY_EARLY_TEXTURES_MS=40`, `VICTORY_BAKE_TEXTURES_MS=10000`). Every variable can be overridden from the environment. Before a run it notes when less than 20 GB of RAM is free: the title wants about that much in the world, and swaps otherwise.
+The launcher uses its own prefix (`~/.local/share/victory/prefix`), keeps caches in `~/.cache/victory/`, and sets the same defaults as `Play-VIctory.cmd`, plus meeyao's vkd3d settings (`VKD3D_CONFIG=descriptor_heap`, `VK_NV_raw_access_chains` off), `VICTORY_CULL_NONE=1` (both faces drawn), every texture's mip levels as the title loads it (`VICTORY_LEVELS_ON_DEMAND=0`) and the willy build's longer texture waits (`VICTORY_EARLY_TEXTURES_MS=40`, `VICTORY_BAKE_TEXTURES_MS=10000`). Every variable can be overridden from the environment. Before a run it notes when less than 20 GB of RAM is free (the title wants about that much in the world, and swaps otherwise), and lists other programs holding 1 GB or more of GPU memory.
 
-Game memory goes into VRAM through Resizable BAR by default (`VICTORY_WINDOWS_BAR_MB=2048`, `VICTORY_CARD_WINDOWS_MB=1024`; `0` turns either off). On an RTX 5080 that was the difference between about 8 and 18 fps on Windows; vkd3d-proton has the GPU upload heap it needs.
+Game memory goes into VRAM through Resizable BAR by default (`VICTORY_WINDOWS_BAR_MB=2048`, `VICTORY_CARD_WINDOWS_MB=1024`; `0` turns either off). On an RTX 5080 under Windows it was the difference between about 8 and 18 fps (Zarina35's measurement, not this fork's); vkd3d-proton has the GPU upload heap it needs.
 
 ### Playtesting
 
@@ -208,8 +211,13 @@ commits taken from elsewhere name the commit and its author.
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
   contributors: the loader, the runtime services, the Direct3D 12 back end and
   the shader recompiler.
+- **codec_d's cool_fox** (mirrored at
+  [junikka/cool_fox](https://github.com/junikka/cool_fox)): the Windows build this
+  fork carries on, from its commit f4b48ad.
+- **[avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)**:
+  the upstream AMD fork whose notes are kept above.
 - **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)**: the fork
-  this one started from, and the people whose pull requests it carries.
+  the upstream AMD fork started from, and the people whose pull requests it carries.
 - **[DexNom/VIctory](https://github.com/DexNom/VIctory)**: ray tracing fixes,
   cube gradients, sparse textures.
 - **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**:
