@@ -4,6 +4,12 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**C.1 step 1, `VICTORY_FRESH_COPY=1`: no gain (copying through the title slot costs more than making the view)**
+- `bench/trials-20261126-150217-fresh-copy`: `make_at` is gone from fresh tables, but **"mirror + copy" takes 12.5-13.5 µs per descriptor** (106,000-112,000 a frame, 1.33-1.51 s across threads) against 8-9 µs for `make_at`; frame 540-597 ms against ~400-430. The picture held (the user: all right but Jason's face black, the known intermittent S.9 symptom). **Off.**
+- Reading: `mirror` of the title slot remakes it nearly every time, so the title's descriptor records change from draw to draw or frame to frame (new generations), and a cache keyed by slot misses. The cost is in making a view (`descriptor::host::make`: lookups of the host resource or copy, then the host's `Create*View`), not in where it is written.
+- Next for C.1: (a) time inside `make` (lookup vs the host call) to see what a view costs; (b) a cache keyed by the view's content (resource and description) in a CPU-only heap, copied from there; (c) or cool_fox's `THIN`, which moves the making off the title's threads instead of making it cheaper.
+- Also: both runs were classified "closed" though they measured their whole window; `bench.sh`'s exit status after its new kill-by-pid fallback is to check.
+
 **C.1: the recording threads' cost is `make_at` in fresh descriptor tables (~1 s a frame across threads)**
 - Timers on the draw path (`draw.rs` `Timed`, frame line "draw path per frame"; `bench/trials-…-drawpath*`): `bind` ~115 µs per draw, of which `tables` ~60 µs; of `tables`, **"fresh made" ~950-1,140 ms a frame** (20,000-24,000 tables at 45-53 µs), plain entries ~220-340 ms, fresh reused ~30 ms. Inside fresh tables: **`make_at` ~980-1,030 ms a frame (110,000-124,000 descriptors at 8-9 µs)**; constant buffers 6 ms, `readable` 30 ms, `mirror` 40-60 ms.
 - So nearly every draw creates every texture/buffer descriptor of its fresh tables anew (`HostHeap::make_at`), then `mirror`s the title's own slot (which makes it again if it changed).
