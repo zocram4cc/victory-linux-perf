@@ -3516,6 +3516,28 @@ fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
     }
 }
 
+/// The format the host makes a typed buffer view of title memory in.
+/// Translated shaders declare every typed buffer load and store as 32-bit
+/// float (`bufferLoad.f32`/`bufferStore.f32` in `victory_shader`'s
+/// `emit/lower.rs`), and a view in a 32-bit integer format may convert
+/// between float and integer values on the way: a store of an integer's bits
+/// as a float is written as the integer the float rounds to (zero for most),
+/// where the console moves the bits. The float format of the same width
+/// moves them unchanged and matches what the shader declares. Element sizes,
+/// and so every offset taken from them, stay the same. The view-kind bits a
+/// d16 store reads (`SLOT_STRIDES`) come from the title's own words, not
+/// from this. (meeyao/victory-8gb-linux: meshlet culling appends packed
+/// meshlet numbers to an `R32_UINT` list this way.)
+fn bit_exact_format(format: DXGI_FORMAT) -> DXGI_FORMAT {
+    match format {
+        DXGI_FORMAT_R32G32B32A32_UINT | DXGI_FORMAT_R32G32B32A32_SINT => DXGI_FORMAT_R32G32B32A32_FLOAT,
+        DXGI_FORMAT_R32G32B32_UINT | DXGI_FORMAT_R32G32B32_SINT => DXGI_FORMAT_R32G32B32_FLOAT,
+        DXGI_FORMAT_R32G32_UINT | DXGI_FORMAT_R32G32_SINT => DXGI_FORMAT_R32G32_FLOAT,
+        DXGI_FORMAT_R32_UINT | DXGI_FORMAT_R32_SINT => DXGI_FORMAT_R32_FLOAT,
+        other => other,
+    }
+}
+
 /// A buffer view of title memory at `address` on its host copy: the first
 /// element moves by the copy's offset.
 /// Bytes per element of a buffer view.
@@ -3810,6 +3832,7 @@ fn buffer_srv(
             Flags: D3D12_BUFFER_SRV_FLAG_RAW,
         };
     }
+    desc.Format = bit_exact_format(desc.Format);
     let element = element_size(&desc);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
@@ -3952,6 +3975,7 @@ fn buffer_uav(
         // refused by `buffer_view_ok` and left null, runs 15 and 16.)
         desc.Format = DXGI_FORMAT_R32_TYPELESS;
     }
+    desc.Format = bit_exact_format(desc.Format);
     // SAFETY: a live buffer.
     let width = unsafe { shadow.buffer.GetDesc() }.Width;
     if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
@@ -4858,6 +4882,29 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Typed buffer views of 32-bit integer formats are made in the float
+    /// format of the same width, so the bits a float-declared store writes
+    /// move unchanged; other formats are left as they are.
+    #[test]
+    fn typed_buffer_views_of_32_bit_integers_move_bits() {
+        for (from, to) in [
+            (DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32_FLOAT),
+            (DXGI_FORMAT_R32_SINT, DXGI_FORMAT_R32_FLOAT),
+            (DXGI_FORMAT_R32G32_UINT, DXGI_FORMAT_R32G32_FLOAT),
+            (DXGI_FORMAT_R32G32B32_SINT, DXGI_FORMAT_R32G32B32_FLOAT),
+            (DXGI_FORMAT_R32G32B32A32_UINT, DXGI_FORMAT_R32G32B32A32_FLOAT),
+            (DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_FLOAT),
+            (DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32_TYPELESS),
+            (DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R16_UINT),
+            (DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM),
+            (DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN),
+        ] {
+            assert_eq!(bit_exact_format(from), to, "{from:?}");
+            let bytes = |f: DXGI_FORMAT| crate::resource::element(f.0 as u32).map(|(b, _)| b);
+            assert_eq!(bytes(from), bytes(to), "{from:?}: element size");
+        }
+    }
 
     /// A view of a host copy that begins at a later level shows the same
     /// levels of it.
