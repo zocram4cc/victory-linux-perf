@@ -3004,7 +3004,15 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     if one_copy() && map.get(&key).is_some_and(|e| e.shadow.is_none()) {
         let buffer_end = map.get(&key).map_or(end, |e| e.end);
         drop(map);
-        let window = window_holding(key.0, buffer_end);
+        // `VICTORY_ONE_COPY=2`: a buffer that lies in one window's cell
+        // takes that window, made now if there is none yet (a buffer copy
+        // made before the window was the other half of the overlaps).
+        let in_one_cell = window_of(key.0, buffer_end, window()).1 <= window();
+        let window = if one_copy_cells() && in_one_cell && !cards_take(buffer_end - key.0) {
+            loose(key.0, buffer_end, false, false).filter(|w| !w.in_place())
+        } else {
+            window_holding(key.0, buffer_end)
+        };
         map = buffers();
         if let Some(window) = window
             && let Some(entry) = map.get_mut(&key)
@@ -3214,12 +3222,25 @@ fn longest_tail(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u6
 fn one_copy() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var_os("VICTORY_ONE_COPY").is_some_and(|v| v == "1");
+        let on = std::env::var_os("VICTORY_ONE_COPY").is_some_and(|v| v == "1" || v == "2");
         if on {
             tracing::info!("VICTORY_ONE_COPY=1: buffer asks inside a window share its copy");
         }
         on
     })
+}
+
+/// `VICTORY_ONE_COPY=2`: small buffers take their cell's window, made if
+/// needed.
+fn one_copy_cells() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ONE_COPY").is_some_and(|v| v == "2"))
+}
+
+/// Whether a buffer of `len` bytes gets a copy in the card's memory
+/// (`cards`): those keep their own.
+fn cards_take(len: u64) -> bool {
+    cards() && len.next_multiple_of(1 << 16) >= card_limits().0
 }
 
 /// Buffer asks that took a window instead (`VICTORY_ONE_COPY`), since the

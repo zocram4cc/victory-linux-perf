@@ -4,6 +4,11 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**M.1: `VICTORY_ONE_COPY=1` decided per buffer holds the picture and halves the overlaps**
+- Why the per-ask version broke the picture: descriptor slots ask for the whole buffer (`descriptor::host::buffer_copy`, `view_extent`), which no window holds, and got the buffer copy; smaller asks got the window. One buffer was split between two copies in the same frame.
+- Per buffer (`bench/trials-20261126-064703-one-copy2*`): a buffer with no copy yet that a window holds whole takes the window as its copy for every ask. **The picture holds** (the user, live: "Jason se ve bien y la mayoría de cosas también", black only while streaming in). **Overlapped ranges 240-249 → 130 a frame**; all that is left is a buffer copy over a window (buffers whose copy came before the window). Frame 476-484 ms: unchanged, as expected while half the overlaps remain and the copy-back still runs.
+- Next: `VICTORY_ONE_COPY=2`, a buffer that lies in one window cell takes that cell's window, made if needed (not the card copies).
+
 **M.1 step 2, `VICTORY_ONE_COPY=1`: the picture breaks; off**
 - `bench/trials-20261126-063805-one-copy-overlap` and `…-063931-one-copy`: 15,000-17,000 buffer asks a frame took a window's copy. Overlapped ranges 240-249 → 137-138, but **113 are now a written window over a buffer copy** made before the window (still used by other asks). Frame 478-503 ms (no gain).
 - **The picture breaks** (`shot-1.png` against `…-lookup-miss/shot-1.png`): the deck railings go dark, the umbrella loses its yellow, Jason's head is black. The user saw it live ("se veía su cabeza en negro y también algunas partes de la casa"). A buffer ask answered by a window gets the window's bytes; something about buffer copies (their own refresh by resource, card copies, slots made from the buffer copy) is not carried by a window. **Off; not a base for M.1.**
