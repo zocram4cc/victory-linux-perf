@@ -500,6 +500,83 @@ impl Module {
         self.blocks[block].term = Some(t);
     }
 
+    /// Gives every loop one latch: where several blocks branch back to a
+    /// loop's header, they branch to a new block instead, which joins what
+    /// each brought and branches back alone. Returns how many loops changed.
+    ///
+    /// The program does the same either way. A stopgap
+    /// ([`super::one_latch`]): with dxil-spirv 114e664 (the vkd3d-proton
+    /// 3.2.0 in Proton Experimental 11.0-20261112) six of the title's
+    /// compute programs were never made; reading the converter's source (no
+    /// debugger stack), a pre-pass that runs before its structurizer
+    /// mishandles a loop with two back edges and recurses. DXC writes loops
+    /// with one latch only. dxil-spirv fixed it (694cc67, 3bc8276).
+    pub fn one_latch(&mut self) -> usize {
+        // Back edges: branches to a block still on the depth-first stack.
+        let mut state = vec![0u8; self.blocks.len()];
+        let mut back: Vec<(usize, usize)> = Vec::new();
+        let mut stack = vec![(0usize, 0usize)];
+        state[0] = 1;
+        while let Some(top) = stack.last_mut() {
+            let (b, k) = *top;
+            let succ = successors(self.blocks[b].term);
+            if k < succ.len() {
+                top.1 += 1;
+                let t = succ[k];
+                match state[t] {
+                    0 => {
+                        state[t] = 1;
+                        stack.push((t, 0));
+                    }
+                    1 if !back.contains(&(b, t)) => back.push((b, t)),
+                    _ => {}
+                }
+            } else {
+                state[b] = 2;
+                stack.pop();
+            }
+        }
+        let mut headers: Vec<usize> = back.iter().map(|&(_, h)| h).collect();
+        headers.sort_unstable();
+        headers.dedup();
+        let mut changed = 0;
+        for h in headers {
+            let latches: Vec<usize> = back
+                .iter()
+                .filter(|&&(_, to)| to == h)
+                .map(|&(b, _)| b)
+                .collect();
+            if latches.len() < 2 {
+                continue;
+            }
+            let latch = self.new_block();
+            for p in self.blocks[h].phis.clone() {
+                let Op::Phi(incoming) = self.insts[p as usize].op.clone() else {
+                    continue;
+                };
+                let (round, entering): (Vec<_>, Vec<_>) = incoming
+                    .into_iter()
+                    .partition(|(_, from)| latches.contains(from));
+                let joined = self.phi(latch, self.insts[p as usize].ty);
+                self.set_phi(joined, round);
+                let mut incoming = entering;
+                incoming.push((joined, latch));
+                self.insts[p as usize].op = Op::Phi(incoming);
+            }
+            for &b in &latches {
+                let to = |t: usize| if t == h { latch } else { t };
+                self.blocks[b].term = match self.blocks[b].term {
+                    Some(Term::Br(t)) => Some(Term::Br(to(t))),
+                    Some(Term::CondBr(c, t, f)) => Some(Term::CondBr(c, to(t), to(f))),
+                    other => other,
+                };
+            }
+            self.blocks[latch].term = Some(Term::Br(h));
+            changed += 1;
+        }
+        changed
+    }
+
     pub fn md_str(&mut self, s: &str) -> Md {
         self.mds.push(MdDef::Str(s.into()));
         Md(self.mds.len() as u32 - 1)
@@ -1046,6 +1123,66 @@ impl Writer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loops_get_one_latch() {
+        let mut m = Module::default();
+        let i32t = m.int(32);
+        let void = m.void();
+        let main_ty = m.func_ty(void, vec![]);
+        m.function("main", main_ty, None, true);
+        let (entry, head, a, b, exit) = (
+            m.new_block(),
+            m.new_block(),
+            m.new_block(),
+            m.new_block(),
+            m.new_block(),
+        );
+        let (zero, one, two) = (m.i32(0), m.i32(1), m.i32(2));
+        m.terminate(entry, Term::Br(head));
+        let p = m.phi(head, i32t);
+        let c = m.cmp(head, pred::IULT, p, two);
+        m.terminate(head, Term::CondBr(c, a, b));
+        // Two blocks branch back: one of them leaves the loop too.
+        let x = m.bin(a, Bin::Add, p, one);
+        let again = m.cmp(a, pred::IULT, x, two);
+        m.terminate(a, Term::CondBr(again, head, exit));
+        let y = m.bin(b, Bin::Add, p, two);
+        m.terminate(b, Term::Br(head));
+        m.terminate(exit, Term::Ret);
+        m.set_phi(p, vec![(zero, entry), (x, a), (y, b)]);
+
+        assert_eq!(m.one_latch(), 1);
+        let latch = m.blocks.len() - 1;
+        let back: Vec<usize> = (0..m.blocks.len())
+            .filter(|&i| i != entry && successors(m.blocks[i].term).contains(&head))
+            .collect();
+        assert_eq!(back, vec![latch]);
+        assert!(matches!(m.blocks[a].term, Some(Term::CondBr(_, t, f)) if t == latch && f == exit));
+        assert!(matches!(m.blocks[b].term, Some(Term::Br(t)) if t == latch));
+        assert!(matches!(m.blocks[latch].term, Some(Term::Br(t)) if t == head));
+        // The header joins what came in with what the latch joined.
+        let V::Inst(header_phi) = p else { panic!() };
+        let Op::Phi(incoming) = m.insts[header_phi as usize].op.clone() else {
+            panic!()
+        };
+        assert_eq!(incoming.len(), 2);
+        assert_eq!(incoming[0], (zero, entry));
+        assert_eq!(incoming[1].1, latch);
+        let V::Inst(joined) = incoming[1].0 else {
+            panic!()
+        };
+        assert_eq!(m.blocks[latch].phis, vec![joined]);
+        let Op::Phi(round) = m.insts[joined as usize].op.clone() else {
+            panic!()
+        };
+        assert_eq!(round, vec![(x, a), (y, b)]);
+        // A loop with one latch stays as it is, and the module still writes.
+        let blocks = m.blocks.len();
+        assert_eq!(m.one_latch(), 0);
+        assert_eq!(m.blocks.len(), blocks);
+        assert!(!m.write().is_empty());
+    }
 
     #[test]
     fn vbr_and_blocks() {

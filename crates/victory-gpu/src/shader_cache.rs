@@ -133,6 +133,12 @@ fn build() -> [u8; 32] {
         }
         // And which clean-up passes ran over the translated code.
         bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
+        // And whether loops get one latch (`victory_shader::emit::one_latch`,
+        // a stopgap under Wine): only when they do, so the key of a host
+        // without it (Windows by default) is what it was.
+        if victory_shader::emit::one_latch() {
+            bytes.extend_from_slice(b"one latch");
+        }
         bytes
     });
     let mut hash = blake3::Hasher::new();

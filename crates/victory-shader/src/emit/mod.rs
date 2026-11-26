@@ -184,6 +184,42 @@ pub fn group_sync() -> u8 {
     })
 }
 
+/// Whether every loop gets one latch (`bitcode::Module::one_latch`): under
+/// Wine (`VICTORY_ONE_LATCH`: `0` never, `1` on any host).
+///
+/// shortcut: a stopgap for the vkd3d-proton in Proton today (3.2.0, with
+/// dxil-spirv 114e664), which never makes six of the title's compute
+/// pipelines; dxil-spirv fixed that on 2026-11-24/25 (694cc67, "Only run
+/// fixup passes after structurizer has run", and 3bc8276; in vkd3d-proton
+/// 71cae09), and with that build all six are made without this. Remove it
+/// once Proton ships a vkd3d-proton with those commits. Part of the
+/// translation: the shader cache keys on it when it is on (`victory-gpu`'s
+/// does), and only then.
+pub fn one_latch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var_os("VICTORY_ONE_LATCH") {
+        Some(v) => v != "0",
+        None => on_wine(),
+    })
+}
+
+/// Whether we run under Wine (its ntdll exports `wine_get_version`); the
+/// same probe as `victory_gpu::wine::on_wine`, which this crate cannot use.
+#[cfg(windows)]
+fn on_wine() -> bool {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    // SAFETY: plain lookups in ntdll, always loaded.
+    unsafe {
+        let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+        !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+    }
+}
+
+#[cfg(not(windows))]
+fn on_wine() -> bool {
+    false
+}
+
 /// Whether buffer atomics of the ray-tracing structure builder stand between
 /// two fences (`VICTORY_BVH_FENCES=0`: they do not). Part of the
 /// translation: the shader cache keys on it.

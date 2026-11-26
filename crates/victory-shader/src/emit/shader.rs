@@ -887,6 +887,10 @@ impl Shader {
         self.m.named_md("dx.shaderModel", vec![sm]);
         self.m.named_md("dx.entryPoints", vec![entry]);
 
+        // One latch a loop, for vkd3d-proton's converter (`super::one_latch`).
+        if super::one_latch() {
+            self.m.one_latch();
+        }
         let bitcode = self.m.write();
         super::bitcode::census::note(&self.m, &bitcode);
         let mut dxil = Vec::with_capacity(24 + bitcode.len());
