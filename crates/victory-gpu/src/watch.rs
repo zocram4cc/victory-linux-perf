@@ -1412,6 +1412,43 @@ fn publish(pages: &[usize]) {
     }
 }
 
+/// The sites that question Windows about holes ([`question`]).
+const Q_ASK: usize = 0;
+const Q_PROTECT: usize = 1;
+const Q_SWEEP: usize = 2;
+const Q_VIEW: usize = 3;
+/// Questions to Windows about holes ([`uncommitted_end`], and each query of
+/// [`is_view`]) by site, since the last counter line ([`count_frames`]).
+static QUESTIONS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// The frame the last counter line was made in.
+static COUNTED_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn question(site: usize) {
+    QUESTIONS[site].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Every 256 frames, a line of the questions per frame since the last one
+/// (once a frame, from [`look_at_holes`]).
+fn count_frames() {
+    use std::sync::atomic::Ordering::Relaxed;
+    const FRAMES: u64 = 256;
+    let now = crate::frame::current();
+    let since = COUNTED_AT.load(Relaxed);
+    if now < since + FRAMES || COUNTED_AT.compare_exchange(since, now, Relaxed, Relaxed).is_err() {
+        return;
+    }
+    let frames = now - since;
+    let per_frame: [f64; 4] = std::array::from_fn(|site| QUESTIONS[site].swap(0, Relaxed) as f64 / frames as f64);
+    tracing::info!(
+        "VirtualQuery per frame at the holes' sites, over {} frames: asking {:.1}, protecting {:.1}, sweep {:.2}, is_view {:.1}",
+        frames,
+        per_frame[Q_ASK],
+        per_frame[Q_PROTECT],
+        per_frame[Q_SWEEP],
+        per_frame[Q_VIEW],
+    );
+}
+
 /// Whether placeholders are known for what they are (`VICTORY_KNOWN_HOLES=0`:
 /// every hole is looked at at every asking, as before).
 ///
@@ -1489,6 +1526,7 @@ pub fn title_memory_allocated(at: usize, len: usize) {
 /// [`title_memory_remapped`]), which no title we know does.
 pub(crate) fn look_at_holes() {
     const PARTS: usize = 100;
+    count_frames();
     if !known_holes() {
         return;
     }
@@ -1503,6 +1541,7 @@ pub(crate) fn look_at_holes() {
     let mut until = 0;
     for block in blocks {
         if block >= until {
+            question(Q_SWEEP);
             until = uncommitted_end(block);
         }
         if block >= until {
@@ -2026,6 +2065,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     for block in unsure {
         // One question for the blocks of a region.
         if block >= uncommitted_until {
+            question(Q_ASK);
             uncommitted_until = uncommitted_end(block);
             #[cfg(feature = "diagnostics")]
             tally(9, 1);
@@ -2117,6 +2157,7 @@ fn is_view(start: usize, end: usize) -> bool {
     let holes = *HOLES.get_or_init(|| std::env::var_os("VICTORY_GUARD_HOLES").is_none_or(|v| v != "0"));
     let mut at = start;
     loop {
+        question(Q_VIEW);
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
@@ -2475,6 +2516,7 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
             }
             PROTECTED.clear(block);
             if block >= uncommitted_until {
+                question(Q_PROTECT);
                 uncommitted_until = uncommitted_end(block);
                 #[cfg(feature = "diagnostics")]
                 tally(9, 1);
