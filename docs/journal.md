@@ -4,6 +4,12 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**M.1 step 2, `VICTORY_ONE_COPY=1`: the picture breaks; off**
+- `bench/trials-20261126-063805-one-copy-overlap` and `…-063931-one-copy`: 15,000-17,000 buffer asks a frame took a window's copy. Overlapped ranges 240-249 → 137-138, but **113 are now a written window over a buffer copy** made before the window (still used by other asks). Frame 478-503 ms (no gain).
+- **The picture breaks** (`shot-1.png` against `…-lookup-miss/shot-1.png`): the deck railings go dark, the umbrella loses its yellow, Jason's head is black. The user saw it live ("se veía su cabeza en negro y también algunas partes de la casa"). A buffer ask answered by a window gets the window's bytes; something about buffer copies (their own refresh by resource, card copies, slots made from the buffer copy) is not carried by a window. **Off; not a base for M.1.**
+- So the two names for the same memory cannot be joined by handing out the window. The next design for M.1 must make the window and the buffer copy one object from the start (a buffer copy that is a view into the window's host buffer, or windows that defer to buffers registered later). Back to design before more code.
+- `scripts/trials.sh` now captures the game window only (`hyprctl` geometry), not the whole output: a capture of the output showed another workspace once.
+
 **M.1: the overlaps come from two names for the same memory**
 - `bench/trials-20261126-063417-lookup-miss`: **~87,000 asks a frame take a window, and every one of them because no title buffer held the address then** (0 missed by the 64-start search, 0 running past a buffer's end). The title reaches the same memory both through buffer objects and by raw address (descriptors, root views), and each name got its own copy. (The census's scan per ask is O(buffers): that run's second window was 747 ms; it is for counting only.)
 - **`VICTORY_ONE_COPY=1` (`M.1 step 2`):** a buffer ask that a window holds whole takes the window's copy, so both names share one copy. A buffer copy made before any window, or an ask bigger than a window, still has its own. To measure: overlaps (`VICTORY_BACK_OVERLAP`), frame, picture.

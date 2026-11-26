@@ -26,6 +26,18 @@ LAUNCHER=${VP_LAUNCHER:-victory-proton}
 die() { printf '\e[1;31mtrials:\e[0m %s\n' "$*" >&2; exit 1; }
 say() { printf '\e[1;36mtrials:\e[0m %s\n' "$*" >&2; }
 game_pid() { pgrep -f '^Z:.*(release|diag).victory\.exe run' | head -n1; }
+# The game window only (not the whole output: another workspace there may
+# show the user's own windows). Falls back to the output when no window is
+# found.
+shoot() {
+    local geometry
+    geometry=$(hyprctl clients -j 2>/dev/null | python3 -c 'import json, sys
+c = [c for c in json.load(sys.stdin) if c.get("class") == "victory.exe"]
+if c:
+    a, z = c[0]["at"], c[0]["size"]
+    print("%d,%d %dx%d" % (a[0], a[1], z[0], z[1]))' 2>/dev/null)
+    if [[ -n $geometry ]]; then grim -g "$geometry" "$1" 2>/dev/null; else grim -o "$OUTPUT" "$1" 2>/dev/null; fi
+}
 
 N=5 LABEL= PROFILE=royale-save SECS=20 OUTPUT= EXTRA=()
 while (($#)); do
@@ -57,10 +69,10 @@ for ((i = 1; i <= N; i++)); do
     while kill -0 "$bench" 2>/dev/null; do
         if [[ -n $OUTPUT ]] && ((!shot)) && grep -q 'measuring' "$out"; then
             sleep 8
-            grim -o "$OUTPUT" "$dir/shot-$i.png" 2>/dev/null || true
+            shoot "$dir/shot-$i.png" || true
             shot=1
             # And one near the window's end, to see whether the scene changed.
-            ( sleep $((SECS > 12 ? SECS - 12 : 1)); grim -o "$OUTPUT" "$dir/shot-$i-end.png" 2>/dev/null ) &
+            ( sleep $((SECS > 12 ? SECS - 12 : 1)); shoot "$dir/shot-$i-end.png" ) &
         fi
         sleep 2
     done
