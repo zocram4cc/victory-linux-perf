@@ -429,6 +429,43 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     Some(gpu)
 }
 
+/// Root views bound to zeros because their address had no host copy or
+/// was never set (they would otherwise read address 0 and fault the card).
+pub(crate) static ZERO_ROOTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Binds 64 KiB of zeros (the largest constant buffer) to a root CBV or SRV
+/// whose title address cannot be resolved, so that the shader reads zeros
+/// instead of address 0 (S.7).
+fn bind_zeros(
+    l: &ID3D12GraphicsCommandList,
+    list: &HostList,
+    param: u32,
+    compute: bool,
+    srv: bool,
+    address: u64,
+) {
+    let n = ZERO_ROOTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n < 8 {
+        tracing::warn!(
+            "a root {} at title address {address:#x} has no host copy: bound to zeros (S.7 guard)",
+            if srv { "SRV" } else { "CBV" }
+        );
+    }
+    let Some((gpu, to)) = list.scratch(1 << 16) else {
+        return;
+    };
+    // SAFETY: the list's own scratch, CPU-visible, 64 KiB long; an open list.
+    unsafe {
+        std::ptr::write_bytes(to, 0, 1 << 16);
+        match (compute, srv) {
+            (false, false) => l.SetGraphicsRootConstantBufferView(param, gpu),
+            (false, true) => l.SetGraphicsRootShaderResourceView(param, gpu),
+            (true, false) => l.SetComputeRootConstantBufferView(param, gpu),
+            (true, true) => l.SetComputeRootShaderResourceView(param, gpu),
+        }
+    }
+}
+
 macro_rules! once {
     ($($arg:tt)*) => {{
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -1032,6 +1069,9 @@ impl State {
                         if tabled && !self.root_srv_table(list, None, param, compute, false) {
                             return false;
                         }
+                        if !tabled {
+                            bind_zeros(l, list, param, compute, srv, 0);
+                        }
                         continue;
                     };
                     // The shader adds the bytes a raw view begins early by.
@@ -1047,6 +1087,9 @@ impl State {
                         continue;
                     }
                     let Some(mut gpu) = root_view(list, address, srv) else {
+                        // Left unset, the root view would read address 0
+                        // and fault the card (S.7: SQC at 0): zeros instead.
+                        bind_zeros(l, list, param, compute, srv, address);
                         continue;
                     };
                     if biased {

@@ -5850,6 +5850,10 @@ impl Meter {
         crate::descriptor::host::slot_line(frames);
         crate::resource::textures_made_line(frames);
         crate::pool::pool_line(frames);
+        let zeros = crate::draw::ZERO_ROOTS.load(Ordering::Relaxed);
+        if zeros > 0 {
+            tracing::info!("root views bound to zeros so far (no host copy at their address; S.7 guard): {zeros}");
+        }
         crate::descriptor::sync_line(frames);
         late_line(frames);
         let gpu_pct = card_clock_line(frames, ms);
