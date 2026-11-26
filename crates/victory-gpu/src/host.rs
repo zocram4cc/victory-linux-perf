@@ -6201,6 +6201,10 @@ impl Meter {
         crate::pool::pool_line(frames);
         crate::census::census_line(frames);
         gpu_census_line(frames);
+        let refused = crate::descriptor::host::DYNAMIC_REFUSED.swap(0, Ordering::Relaxed);
+        if refused > 0 {
+            tracing::info!("dynamic descriptor tables refused for want of slots per frame: {:.0} (their draws are dropped)", refused as f64 / frames);
+        }
         {
             let names = ["draw", "draw_indexed", "dispatch", "execute_indirect", "prepare_for", "bind", "tables", "tables: plain entries", "tables: fresh reused", "tables: fresh made", "fresh: constant buffers", "fresh: make_at", "fresh: readable", "fresh: mirror", "fresh: copied (mirror + copy)"];
             let parts: Vec<String> = names

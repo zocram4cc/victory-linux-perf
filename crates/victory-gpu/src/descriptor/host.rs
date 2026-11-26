@@ -693,6 +693,10 @@ pub(crate) fn probe_view_limit() {
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 
+/// Dynamic tables refused for want of free slots, since the last frame line
+/// (in release builds too: C.1).
+pub(crate) static DYNAMIC_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -901,6 +905,7 @@ impl HostHeap {
             }
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
+            DYNAMIC_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             {
                 use crate::copystat::{C, add};
