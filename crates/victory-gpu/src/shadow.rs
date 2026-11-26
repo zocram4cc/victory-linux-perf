@@ -914,8 +914,10 @@ mod card_tests {
 
 /// Whether the copy-back of what shaders wrote runs on a thread of its own,
 /// beside the submitting thread and outside the submission lock
-/// (`VICTORY_RELAY=1` or `2`; off by default; not with kept snapshots,
-/// [`keeps`]). `crate::host::relay` says what it does; here it changes
+/// (`VICTORY_RELAY=1` or `2`; on by default; with kept snapshots too,
+/// [`keeps`]: every write into a copy either marks its pieces changed or
+/// writes the same bytes into the snapshot, the merges included).
+/// `crate::host::relay` says what it does; here it changes
 /// what a copy keeps:
 ///
 /// - the ranges shaders may be writing are counted per submission
@@ -935,7 +937,7 @@ pub(crate) fn relay() -> bool {
     // The crate's own tests run without it unless they ask: several of
     // them look at title memory right after a submission, which the
     // relay's landing thread may still be writing.
-    *ON.get_or_init(|| std::env::var("VICTORY_RELAY").map_or(!cfg!(test), |v| v == "1" || v == "2") && !keeps())
+    *ON.get_or_init(|| std::env::var("VICTORY_RELAY").map_or(!cfg!(test), |v| v == "1" || v == "2"))
 }
 
 /// The submission being prepared (its number among those started): what
@@ -3464,6 +3466,10 @@ impl Shadow {
             if kept.0.is_empty() {
                 kept.0 = vec![false; self.pieces(0, total.max(1)).end];
             }
+            // With `wide_back`, taken with the submission's other snapshots
+            // on several threads (`take_snapshots`), before its lists go to
+            // the card; marked current now, as they will be by then.
+            let mut later = Vec::new();
             for (from, to) in parts {
                 if from >= to {
                     continue;
@@ -3475,12 +3481,19 @@ impl Shadow {
                     let (lo, hi) = self.piece(piece);
                     let whole = from <= lo && hi <= to;
                     let (lo, hi) = (lo.max(from), hi.min(to));
-                    // SAFETY: as below; `hi <= total`.
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(self.data.add(lo), snapshot.as_mut_ptr().add(lo), hi - lo);
+                    if wide_back() {
+                        later.push((self.data as usize + lo, snapshot.as_mut_ptr() as usize + lo, hi - lo));
+                    } else {
+                        // SAFETY: as below; `hi <= total`.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(self.data.add(lo), snapshot.as_mut_ptr().add(lo), hi - lo);
+                        }
                     }
                     kept.0[piece] = whole;
                 }
+            }
+            if !later.is_empty() {
+                SNAPS.lock().unwrap_or_else(|e| e.into_inner()).extend(later);
             }
             return;
         }
