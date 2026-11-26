@@ -13,10 +13,11 @@
 #   --ray-tracing   the title's ray-traced indirect light
 #   --bench <route> a scripted run: keys from scripts/bench/<route>.keys, stopped when it ends
 #   --proton-log    Wine's own log into the run folder (large)
-#   --no-mangohud   without MangoHud's frame log
+#   --mangohud      also MangoHud's frame log (off by default: its NVIDIA thread
+#                   aborted the title under umu, `free(): invalid pointer`)
 #
 # Every game run leaves a folder in ~/.local/share/victory/runs/ (VICTORY_RUNS_DIR):
-# run.json, victory.log, frames.csv, mangohud.csv, system.csv, marks.csv, marks/.
+# run.json, victory.log, frames.csv, system.csv, marks.csv, marks/ (mangohud.csv with --mangohud).
 # scripts/victory-report.py summarises one; scripts/victory-mark.sh marks a moment.
 # Ctrl-C stops the title cleanly (SIGTERM, never SIGKILL: killing it with its
 # mappings live can wedge the NVIDIA driver until a reboot).
@@ -36,7 +37,7 @@ winpath() { local p; p="$(realpath -m -- "$1")"; printf 'Z:%s' "${p//\//\\}"; }
 usage() { sed -n '2,8p' "$0" >&2; exit 2; }
 
 # Options that apply to every command, taken out first.
-profile=release safe=0 bench="" proton_log=0 mangohud=1 args=()
+profile=release safe=0 bench="" proton_log=0 mangohud=0 args=()
 while (( $# )); do
   case "$1" in
     --diag) profile=diag ;;
@@ -44,6 +45,7 @@ while (( $# )); do
     --ray-tracing) export VICTORY_BVH_BUILDER="${VICTORY_BVH_BUILDER:-1}" ;;
     --bench) shift; bench="${1:?--bench needs a route name}" ;;
     --proton-log) proton_log=1 ;;
+    --mangohud) mangohud=1 ;;
     --no-mangohud) mangohud=0 ;;
     -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
     *) args+=("$1") ;;
@@ -190,9 +192,12 @@ python3 -I "$repo/scripts/victory-report.py" --write-run-json "$run" --start \
 # script only, which then asks the title to end.
 echo "run folder: $run"
 setsid umu-run "$win_exe" run "$(winpath "$game/game_scarlett_master.exe")" --console series-s --execute \
-  > >(python3 -I -u -c 'import sys, time
-for line in sys.stdin:
-    sys.stdout.write(time.strftime("%H:%M:%S ") + line)' | tee "$run/victory.log") 2>&1 &
+  > >(python3 -I -u -c 'import re, sys, time
+colour = re.compile(r"\x1b\[[0-9;]*m")
+with open(sys.argv[1], "a", buffering=1, errors="replace") as log:
+    for line in sys.stdin:
+        sys.stdout.write(line)
+        log.write(time.strftime("%H:%M:%S ") + colour.sub("", line))' "$run/victory.log") 2>&1 &
 title=$!
 "$repo/scripts/victory-sampler.sh" "$run" $$ "$title" &
 sampler=$!

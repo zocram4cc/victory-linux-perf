@@ -69,7 +69,7 @@ def write_run_json(args: argparse.Namespace) -> None:
         info.update(ended=time.strftime("%Y-%m-%dT%H:%M:%S%z"), exit_code=args.exit_code, seconds=args.seconds)
         log = run / "victory.log"
         if log.exists():
-            text = log.read_text(errors="replace")
+            text = re.sub(r"\x1b\[[0-9;]*m", "", log.read_text(errors="replace"))
             m = re.search(r"card memory the CPU maps[^\n]*supported=(\w+)", text)
             info["rebar_supported"] = m.group(1) if m else None
     path.write_text(json.dumps(info, indent=2) + "\n")
@@ -117,7 +117,8 @@ class Run:
         self.system = rows(path / "system.csv")
         self.mango = rows(path / "mangohud.csv")
         self.marks = rows(path / "marks.csv")
-        self.log = (path / "victory.log").read_text(errors="replace").splitlines() if (path / "victory.log").exists() else []
+        text = (path / "victory.log").read_text(errors="replace") if (path / "victory.log").exists() else ""
+        self.log = re.sub(r"\x1b\[[0-9;]*m", "", text).splitlines()
 
     # Frame times past the first frame (loading shows as one long one).
     def frame_ms(self) -> list[float]:
@@ -216,7 +217,7 @@ def report(run: Run) -> None:
     levels = Counter()
     messages = Counter()
     for line in run.log:
-        m = re.search(r"\b(ERROR|WARN)\b\s+(\S+?):\s*(.*)", line)
+        m = re.search(r"\b(ERROR|WARN)\b\s+(\S+?):\s+(.*)", line)
         if m:
             levels[m.group(1)] += 1
             messages[(m.group(1), m.group(2), re.sub(r"\d+", "#", m.group(3))[:110])] += 1
