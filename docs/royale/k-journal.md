@@ -32,3 +32,8 @@ Seen: the intro flickers before the loading screen (the author lists it as known
 **Belobug/VIctory-Belobug-AMD (read 26 Nov):** the same base as kroeeee's (`c9c932c`) plus three commits: FSR 4.1.2 to 4K, **texture uploads in the submission prelude "to fix frame-order & flickering"** (`5d6bd84`, a candidate for the flicker while streaming), and an RX 9070 XT set with a guard for AMD's compiler crashing in `amdxc64.dll` (a `warm-bad.txt` list of pipelines left out). No 0x1c8/0x218.
 
 - P.4 bisect, user live: with `VICTORY_NATIVE_COMPUTE_MAX=675` the picture was **all white, Jason's hair and beard black** (other broken runs: black). At least two bad programs: one blowing the picture out (exposure/lighting?), one emptying the scene (draws ~9,000 → ~5,900 below call 1,350, → ~4,000 from call 1,352).
+
+**P.4 bisect: call 169 (program `0f0039f000`) blows the picture out to white**
+- `scripts/p4-bisect.sh` by draws a frame: up to call 168 the scene holds (~10,650 draws); with 169, ~6,000 and the picture white (screenshot `bench/k-…-p4-call169`). (A first bisect by fps was wrong: broken runs went from 29 to 36 fps.)
+- The program (`pso-dump/218_0000000f0039f000`): 16×16 groups, code 0x3200 B, ~25 SRVs, 3 immediate samplers, 3 UAVs and 6 CBVs in two tables (user data 4 and 5): a lighting or exposure pass, by its shape.
+- Now `scripts/p4-hunt.sh` (with `VICTORY_NATIVE_COMPUTE_SKIP`) finds the next ones the same way, round after round, into `bench/p4-bad.txt`, until the scene holds with every other program made.
