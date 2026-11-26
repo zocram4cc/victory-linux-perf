@@ -557,6 +557,81 @@ unsafe fn thrown(p: &[usize]) -> String {
     }
 }
 
+/// What another part of the layer has to say of an access violation, given
+/// the sixteen registers and the address accessed ([`describe_on_crash`]).
+static DESCRIBE: std::sync::OnceLock<fn(&[u64]) -> String> = std::sync::OnceLock::new();
+
+/// `f` is asked at every access violation reported, with the registers
+/// (rax, rbx, rcx, rdx, rsi, rdi, rsp, rbp, r8 to r15) and the address
+/// accessed, for lines to add to the report (each ending in a newline). It
+/// runs on the faulting thread, which may hold any lock of the title's: it
+/// must not wait for one.
+pub fn describe_on_crash(f: fn(&[u64]) -> String) {
+    let _ = DESCRIBE.set(f);
+}
+
+/// `len` bytes at `at` as far as they can be read, without a fault if they
+/// cannot.
+fn read_quietly(at: usize, len: usize) -> Vec<u8> {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut bytes = vec![0u8; len];
+    let mut read = 0usize;
+    // SAFETY: the system copies what is readable into our buffer and says
+    // how much; nothing is read through a pointer of ours.
+    let ok = unsafe { ReadProcessMemory(GetCurrentProcess(), at as *const _, bytes.as_mut_ptr().cast(), len, &mut read) };
+    bytes.truncate(if ok != 0 { len } else { read.min(len) });
+    bytes
+}
+
+/// For an access violation: the code around the instruction, and what each
+/// register points at, if it points at memory that is no image: its kind,
+/// its first bytes, and how many bytes of its 4 KiB page are not zero.
+///
+/// The title's crashes under Proton were reads through a null pointer in its
+/// own code, at another place each time (six by 2026-11-25): a pointer the
+/// title took from an object of its own was null. Whether that object lay in
+/// a page that was all zeros, and in a view of its physical pages or in
+/// memory of its heap, is what the registers and the stack alone do not say.
+fn memory_lines(at: usize, registers: &[(&str, u64)], accessed: u64) -> Vec<String> {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_IMAGE, MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
+    let mut lines = vec![format!("  code before: {} | at: {}", hex(&read_quietly(at.saturating_sub(24), 24)), hex(&read_quietly(at, 16)))];
+    for &(name, value) in registers {
+        if value < 0x1_0000 {
+            continue;
+        }
+        // SAFETY: a zeroed MEMORY_BASIC_INFORMATION is valid; the query reads
+        // the address space's bookkeeping, not the address.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        if unsafe { VirtualQuery(value as *const _, &mut info, size_of_val(&info)) } == 0
+            || info.State != MEM_COMMIT
+            || info.Type == MEM_IMAGE
+        {
+            continue;
+        }
+        let page = read_quietly(value as usize & !0xfff, 0x1000);
+        let first = read_quietly(value as usize, 32);
+        lines.push(format!(
+            "  {name} -> {} memory, allocation {:#x}, region {:#x}+{:#x}; its 4 KiB page: {} of {} bytes not zero; from it: {}",
+            if info.Type == MEM_MAPPED { "mapped (a view)" } else { "private" },
+            info.AllocationBase as usize,
+            info.BaseAddress as usize,
+            info.RegionSize,
+            page.iter().filter(|&&b| b != 0).count(),
+            page.len(),
+            hex(&first),
+        ));
+    }
+    if let Some(describe) = DESCRIBE.get() {
+        let mut values: Vec<u64> = registers.iter().map(|r| r.1).collect();
+        values.push(accessed);
+        lines.extend(describe(&values).lines().map(str::to_owned));
+    }
+    lines
+}
+
 /// # Safety
 /// See [`report_unhandled`].
 unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
@@ -618,6 +693,31 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
     ));
     for (i, pc) in unwind(*context).into_iter().enumerate() {
         line(format!("  #{i:<2} {}", locate(pc as usize)));
+    }
+    // Once for a crash (the first-chance report; the unhandled one repeats
+    // the registers only).
+    if code == EXCEPTION_ACCESS_VIOLATION && !to_file {
+        let registers = [
+            ("rax", context.Rax),
+            ("rbx", context.Rbx),
+            ("rcx", context.Rcx),
+            ("rdx", context.Rdx),
+            ("rsi", context.Rsi),
+            ("rdi", context.Rdi),
+            ("rsp", context.Rsp),
+            ("rbp", context.Rbp),
+            ("r8", context.R8),
+            ("r9", context.R9),
+            ("r10", context.R10),
+            ("r11", context.R11),
+            ("r12", context.R12),
+            ("r13", context.R13),
+            ("r14", context.R14),
+            ("r15", context.R15),
+        ];
+        for l in memory_lines(at, &registers, p[1] as u64) {
+            line(l);
+        }
     }
     if to_file {
         let said = title_output();

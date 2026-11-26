@@ -2129,6 +2129,7 @@ impl Op {
     /// The system calls; whether the host did as asked.
     fn run(&self) -> bool {
         if self.had {
+            recent(b'U', self.at, 0, 0);
             // SAFETY: a view we mapped; it becomes a placeholder again.
             let gone = counted(Call::Unmap, || unsafe {
                 UnmapViewOfFile2(
@@ -2423,6 +2424,7 @@ fn map_joined(physical: &mut Physical, base: usize, len: usize, slice: &Slice) -
         split(base, len);
     }
     for (at, _, _) in &neighbours {
+        recent(b'U', *at, 0, 0);
         // SAFETY: a view we mapped; it becomes a placeholder again.
         counted(Call::Unmap, || unsafe {
             UnmapViewOfFile2(
@@ -2551,6 +2553,75 @@ fn view_watch() -> bool {
     *ON
 }
 
+/// The last changes of mapping, for a crash report ([`recent_at`]): when
+/// (microseconds since the first), what (`M` mapped, `U` unmapped), where,
+/// how many bytes (0: not known there) and from which page of its section.
+static RECENT: Mutex<std::collections::VecDeque<(u64, u8, usize, usize, usize)>> = Mutex::new(std::collections::VecDeque::new());
+
+/// How many of them are kept: a second or two of a stream.
+const RECENT_KEPT: usize = 16 << 10;
+
+fn recent_micros() -> u64 {
+    static BEGAN: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
+    BEGAN.elapsed().as_micros() as u64
+}
+
+/// Notes a change of mapping for [`recent_at`].
+fn recent(what: u8, at: usize, len: usize, page: usize) {
+    let now = recent_micros();
+    let mut kept = RECENT.lock().unwrap_or_else(|e| e.into_inner());
+    if kept.len() >= RECENT_KEPT {
+        kept.pop_front();
+    }
+    kept.push_back((now, what, at, len, page));
+}
+
+/// For the crash report (`victory_loader::describe_on_crash`): the changes
+/// of mapping of the last seconds at the 64 KiB pages the registers point
+/// into, the newest first, and how long ago the last change anywhere was.
+/// The title's crashes under Proton read a null pointer out of an object of
+/// its own; this says whether that object's page was mapped, unmapped or
+/// mapped again moments before. Takes no lock it would have to wait for.
+fn recent_at(values: &[u64]) -> String {
+    use std::fmt::Write;
+    let now = recent_micros();
+    let Ok(kept) = RECENT.try_lock() else {
+        return "  mapping: the notes of the last changes are held by another thread\n".to_owned();
+    };
+    let mut out = String::new();
+    match kept.back() {
+        Some(&(when, ..)) => {
+            let second = kept.iter().rev().take_while(|c| now.saturating_sub(c.0) < 1_000_000).count();
+            let _ = writeln!(out, "  mapping: the last change {} us before this, {second} in the second before it", now.saturating_sub(when));
+        }
+        None => out.push_str("  mapping: no change noted\n"),
+    }
+    let mut said = 0;
+    for &(when, what, at, len, page) in kept.iter().rev() {
+        let end = at + len.max(PAGE);
+        let hit: Vec<String> = values
+            .iter()
+            .filter(|&&v| v as usize >= at && (v as usize) < end)
+            .map(|v| format!("{v:#x}"))
+            .collect();
+        if hit.is_empty() {
+            continue;
+        }
+        let _ = writeln!(
+            out,
+            "  mapping: {} {at:#x}+{len:#x} (page {page} of its section) {} us before this; it holds {}",
+            if what == b'M' { "mapped" } else { "unmapped" },
+            now.saturating_sub(when),
+            hit.join(", ")
+        );
+        said += 1;
+        if said == 24 {
+            break;
+        }
+    }
+    out
+}
+
 /// The system calls of [`map`]; `own`: the placeholder at `base` is `len`
 /// long already; `quiet`: a refusal is the caller's to tell.
 fn show(base: usize, len: usize, slice: &Slice, own: bool, quiet: bool) -> bool {
@@ -2609,6 +2680,7 @@ fn show(base: usize, len: usize, slice: &Slice, own: bool, quiet: bool) -> bool 
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
     }
+    recent(b'M', base, len, slice.index);
     true
 }
 
@@ -2771,6 +2843,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 victory_gpu::title_memory_unmapping(at, size);
             });
         }
+        recent(b'U', at, 0, 0);
         // SAFETY: a view we mapped; it becomes a placeholder again.
         let gone = counted(Call::Unmap, || unsafe {
             UnmapViewOfFile2(
@@ -2921,6 +2994,7 @@ extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u
 }
 
 pub(crate) fn module() -> HleModule {
+    victory_loader::describe_on_crash(recent_at);
     HleModule {
         name: "xmem",
         dlls: &["xmem.dll", "kernel32.dll", "kernelbase.dll", "api-ms-win-core-memory-*"],
