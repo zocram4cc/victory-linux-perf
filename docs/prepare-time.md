@@ -127,6 +127,12 @@ Repeated in a later batch (ab3, 4 more runs of journal + constants): frame 48.6 
 scripts\play.ps1 -Exe <exe> -More @{VICTORY_PORT_JOURNAL='1'; VICTORY_PORT_CONSTANTS='1'}
 ```
 
+**Scope of the final configuration.** Measured and picture-checked on Windows 11 only:
+
+| Platform | Switches | Status |
+|---|---|---|
+| Windows (this machine) | `VICTORY_PORT_JOURNAL=1 VICTORY_PORT_CONSTANTS=1` | measured twice (ab2, ab3: 48.6 ms both), world drawn in the intro |
+| Wine / Proton | `VICTORY_PORT_JOURNAL=1` alone | `PORT_CONSTANTS` reported to draw a black world there (PR #380, RX 7900 XT, Wine 11.22, RADV, vkd3d-proton); not verified either way on this PC, which has no Wine. Journal alone: prepare −6.0 %, frame −3.5 % here (ab1) |
 Picture check (after a report on the PR of a black world with `PORT_CONSTANTS` alone under Wine
 11.22 / RADV / vkd3d-proton on an RX 7900 XT): one run each of base and journal + constants on
 this Windows build, frames saved in the world. With journal + constants the world is drawn as
