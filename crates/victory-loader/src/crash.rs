@@ -471,7 +471,7 @@ unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
 /// how often each was hit. Grand Theft Auto VI 1.0.2.1's pool allocates trap
 /// on an empty pool right before returning NULL (`+0x5149aec`, `+0x63966f`,
 /// #698): stepped over, the allocation fails and the title goes on.
-#[cfg(feature = "diagnostics")]
+#[cfg(feature = "scripted")]
 static STEP_OVER: std::sync::LazyLock<Vec<(usize, std::sync::atomic::AtomicU64)>> =
     std::sync::LazyLock::new(|| {
         std::env::var("VICTORY_STEP_OVER")
@@ -490,7 +490,7 @@ static STEP_OVER: std::sync::LazyLock<Vec<(usize, std::sync::atomic::AtomicU64)>
 ///
 /// # Safety
 /// `info` comes from the system, for an exception being dispatched.
-#[cfg(feature = "diagnostics")]
+#[cfg(feature = "scripted")]
 unsafe fn step_over(info: *mut EXCEPTION_POINTERS) -> bool {
     use windows_sys::Win32::System::Memory::{MEM_IMAGE, MEMORY_BASIC_INFORMATION, VirtualQuery};
     let list = &*STEP_OVER;
@@ -548,7 +548,7 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     if unsafe { emulate_amd_only(info) } {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
     }
-    #[cfg(feature = "diagnostics")]
+    #[cfg(feature = "scripted")]
     // SAFETY: as above.
     if unsafe { step_over(info) } {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
