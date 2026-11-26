@@ -15,8 +15,8 @@
 #   --skip-intro    press through the boot screens and logos (meeyao's timings, same
 #                   game build): Enter/A at 12-50 s, so the run reaches the load sooner
 #   --proton-log    Wine's own log into the run folder (large)
-#   --no-levels-on-demand  every texture's mip levels as the title loads it
-#                   (VICTORY_LEVELS_ON_DEMAND=0, as the willy build runs; for a memory A/B)
+#   --levels-on-demand  texture mip levels as draws need them
+#                   (VICTORY_LEVELS_ON_DEMAND=1; off by default since it used more memory)
 #   --texture-waits wait longer for textures in the first frames and the first
 #                   cutscene (VICTORY_EARLY_TEXTURES_MS=40, VICTORY_BAKE_TEXTURES_MS=10000,
 #                   the willy build's; against faces of noise)
@@ -54,7 +54,7 @@ while (( $# )); do
     --ray-tracing) export VICTORY_BVH_BUILDER="${VICTORY_BVH_BUILDER:-1}" ;;
     --bench) shift; bench="${1:?--bench needs a route name}" ;;
     --proton-log) proton_log=1 ;;
-    --no-levels-on-demand) export VICTORY_LEVELS_ON_DEMAND="${VICTORY_LEVELS_ON_DEMAND:-0}" ;;
+    --levels-on-demand) export VICTORY_LEVELS_ON_DEMAND="${VICTORY_LEVELS_ON_DEMAND:-1}" ;;
     --texture-waits)
       export VICTORY_EARLY_TEXTURES_MS="${VICTORY_EARLY_TEXTURES_MS:-40}"
       export VICTORY_BAKE_TEXTURES_MS="${VICTORY_BAKE_TEXTURES_MS:-10000}" ;;
@@ -177,7 +177,12 @@ else
   d VICTORY_JOIN_PARTS 8
   d VICTORY_UPLOAD_AHEAD 1
 fi
-d VICTORY_LEVELS_ON_DEMAND 1
+# Every texture's mip levels as the title loads it. On demand (1) used more
+# memory, stuttered more and left Jason's skin black in the first cutscene
+# (runs 20261126-220716 against -221207: title peak 23.0 -> 21.0 GB, swap
+# 11.2 -> 9.7 GB, 99th percentile frame 802 -> 578 ms); the willy build's
+# setting. --levels-on-demand turns it back on.
+d VICTORY_LEVELS_ON_DEMAND 0
 d VICTORY_CARD_BUFFERS_MIN_KB 64
 # Both faces: under Proton character heads and hair are culled away otherwise.
 d VICTORY_CULL_NONE 1
