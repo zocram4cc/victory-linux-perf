@@ -17,6 +17,8 @@ pub mod dsp;
 #[cfg(windows)]
 pub mod dstorage;
 #[cfg(windows)]
+pub mod endpoint;
+#[cfg(windows)]
 pub mod fidelityfx;
 #[cfg(windows)]
 pub mod files;
@@ -63,6 +65,8 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(media::module());
     #[cfg(windows)]
     all.push(dstorage::module());
+    #[cfg(windows)]
+    all.push(endpoint::module());
     #[cfg(windows)]
     all.push(files::module());
     #[cfg(windows)]
