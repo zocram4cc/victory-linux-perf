@@ -1422,6 +1422,9 @@ const Q_VIEW: usize = 3;
 static QUESTIONS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 /// The frame the last counter line was made in.
 static COUNTED_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Of the askings and protections (`Q_ASK`, `Q_PROTECT`), those a known run
+/// answered without a question ([`KnownRuns`]), since the last counter line.
+static ANSWERED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 fn question(site: usize) {
     QUESTIONS[site].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1438,15 +1441,152 @@ fn count_frames() {
         return;
     }
     let frames = now - since;
-    let per_frame: [f64; 4] = std::array::from_fn(|site| QUESTIONS[site].swap(0, Relaxed) as f64 / frames as f64);
+    let asked: [f64; 4] = std::array::from_fn(|site| QUESTIONS[site].swap(0, Relaxed) as f64 / frames as f64);
+    let answered: [f64; 2] = std::array::from_fn(|site| ANSWERED[site].swap(0, Relaxed) as f64 / frames as f64);
     tracing::info!(
-        "VirtualQuery per frame at the holes' sites, over {} frames: asking {:.1}, protecting {:.1}, sweep {:.2}, is_view {:.1}",
+        "VirtualQuery per frame at the holes' sites, over {} frames (known runs {}): asking {:.1}, protecting {:.1}, sweep {:.2}, is_view {:.1}; answered by known runs: asking {:.1}, protecting {:.1}",
         frames,
-        per_frame[Q_ASK],
-        per_frame[Q_PROTECT],
-        per_frame[Q_SWEEP],
-        per_frame[Q_VIEW],
+        known_reserved(),
+        asked[Q_ASK],
+        asked[Q_PROTECT],
+        asked[Q_SWEEP],
+        asked[Q_VIEW],
+        answered[Q_ASK],
+        answered[Q_PROTECT],
     );
+}
+
+/// What a question to Windows began under: the frame, and the changes the
+/// hooks had told of by then ([`KnownRuns::learn`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Begun(u64, u64);
+
+/// Blocks that questions to Windows found uncommitted, as runs (first block,
+/// past the last), kept for the frame they were found in ([`known_reserved`]).
+///
+/// Not every commit comes through a hook: the title imports `VirtualAlloc`
+/// from the host's own API set, which the host passes through unhooked
+/// (`victory-hle`, `HostPolicy`). So a run lives for one frame at most, a hook
+/// that may commit or map memory drops the runs it covers ([`KnownRuns::changed`]),
+/// and a question that a hook overtook is not kept ([`KnownRuns::learn`]).
+struct KnownRuns {
+    /// The frame the runs are kept for.
+    frame: u64,
+    /// The changes the hooks have told of so far.
+    changes: u64,
+    /// Disjoint, by first block.
+    runs: BTreeMap<usize, usize>,
+}
+
+impl KnownRuns {
+    const fn new() -> KnownRuns {
+        KnownRuns { frame: 0, changes: 0, runs: BTreeMap::new() }
+    }
+
+    /// Keeps the runs of the frame that is now: another frame's are gone.
+    fn this_frame(&mut self) {
+        let frame = crate::frame::current();
+        if frame != self.frame {
+            self.frame = frame;
+            self.runs.clear();
+        }
+    }
+
+    /// Where a question begins now.
+    fn begun(&mut self) -> Begun {
+        self.this_frame();
+        Begun(self.frame, self.changes)
+    }
+
+    /// The end of the known run that `block` is in.
+    fn until(&mut self, block: usize) -> Option<usize> {
+        self.this_frame();
+        self.runs.range(..=block).next_back().map(|(_, &end)| end).filter(|&end| end > block)
+    }
+
+    /// Of `blocks` (ascending, within `[first, last)`): those no known run
+    /// covers, and how many known runs cover some of them.
+    fn uncovered(&mut self, first: usize, last: usize, blocks: Vec<usize>) -> (Vec<usize>, u64) {
+        self.this_frame();
+        let mut spans: Vec<(usize, usize)> =
+            self.runs.range(..last).rev().take_while(|&(_, &end)| end > first).map(|(&start, &end)| (start, end)).collect();
+        spans.reverse();
+        let (mut answered, mut counted, mut k) = (0, usize::MAX, 0);
+        let uncovered = blocks
+            .into_iter()
+            .filter(|&block| {
+                while k < spans.len() && spans[k].1 <= block {
+                    k += 1;
+                }
+                let covered = k < spans.len() && spans[k].0 <= block;
+                if covered && counted != k {
+                    counted = k;
+                    answered += 1;
+                }
+                !covered
+            })
+            .collect();
+        (uncovered, answered)
+    }
+
+    /// Keeps `[first, end)` as uncommitted, as asked under `begun`: unless a
+    /// hook told of a change since, or the frame ended.
+    fn learn(&mut self, begun: Begun, first: usize, end: usize) {
+        self.this_frame();
+        if begun != Begun(self.frame, self.changes) || first >= end {
+            return;
+        }
+        let touching: Vec<(usize, usize)> =
+            self.runs.range(..=end).rev().take_while(|&(_, &e)| e >= first).map(|(&s, &e)| (s, e)).collect();
+        let (mut first, mut end) = (first, end);
+        for (s, e) in touching {
+            self.runs.remove(&s);
+            first = first.min(s);
+            end = end.max(e);
+        }
+        self.runs.insert(first, end);
+    }
+
+    /// A hook tells that `[first, end)` may have been committed or mapped, or
+    /// freed: the runs there are not known, and no question begun before is
+    /// kept.
+    fn changed(&mut self, first: usize, end: usize) {
+        self.this_frame();
+        self.changes += 1;
+        if first >= end {
+            return;
+        }
+        let overlapping: Vec<(usize, usize)> =
+            self.runs.range(..end).rev().take_while(|&(_, &e)| e > first).map(|(&s, &e)| (s, e)).collect();
+        for (s, e) in overlapping {
+            self.runs.remove(&s);
+            if s < first {
+                self.runs.insert(s, first);
+            }
+            if e > end {
+                self.runs.insert(end, e);
+            }
+        }
+    }
+}
+
+/// Whether the runs that questions find are kept for their frame and not
+/// asked again until a hook tells of them (`VICTORY_KNOWN_RESERVED=1`, off by
+/// default; needs [`known_holes`]). See [`KnownRuns`].
+fn known_reserved() -> bool {
+    #[cfg(test)]
+    if let Some(on) = KNOWN_RESERVED_IN_TEST.with(|c| c.get()) {
+        return on && known_holes();
+    }
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("VICTORY_KNOWN_RESERVED").is_some_and(|v| v == "1"));
+    *ON && known_holes()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`known_reserved`], for what this thread asks, when a test sets it.
+    static KNOWN_RESERVED_IN_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// Whether placeholders are known for what they are (`VICTORY_KNOWN_HOLES=0`:
@@ -1514,6 +1654,9 @@ pub fn title_memory_allocated(at: usize, len: usize) {
         return;
     }
     let mut g = guards();
+    if known_reserved() {
+        g.known_runs.changed(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    }
     let blocks: Vec<usize> = g.held.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).collect();
     for block in blocks {
         g.held.remove(block);
@@ -1781,6 +1924,9 @@ struct Guards {
     aliased: Blocks,
     /// Blocks opened by a write fault, and when ([`rest`]).
     opened: std::collections::HashMap<usize, std::time::Instant, std::hash::BuildHasherDefault<PageHash>>,
+    /// Blocks found uncommitted by questions, not asked again until a hook
+    /// tells of them ([`KnownRuns`]).
+    known_runs: KnownRuns,
 }
 
 impl Guards {
@@ -1817,6 +1963,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     changing: Vec::new(),
     aliased: Blocks::new(),
     opened: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+    known_runs: KnownRuns::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -2050,17 +2197,26 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // runtime's. Windows is asked with the lock not held (the range is, no
     // other thread asks about it: `ASKING`); what the runtime tells meanwhile
     // takes the block out of the set, and it is looked at as any other.
-    let unsure: Vec<usize> = {
-        let g = guards_timed();
+    let (unsure, begun): (Vec<usize>, Begun) = {
+        let mut g = guards_timed();
         if g.clean.range(first..last).count() == last - first && !BESIDE.any(first, last) {
             // Nothing written, mapped or new since the range was last taken.
             #[cfg(feature = "diagnostics")]
             tally(3, 1);
             return Some(Vec::new());
         }
-        g.absent.range(first..last).filter(|block| !g.held.contains(*block)).collect()
+        let absent: Vec<usize> = g.absent.range(first..last).filter(|block| !g.held.contains(*block)).collect();
+        let begun = g.known_runs.begun();
+        if known_reserved() {
+            let (unsure, answered) = g.known_runs.uncovered(first, last, absent);
+            ANSWERED[Q_ASK].fetch_add(answered, std::sync::atomic::Ordering::Relaxed);
+            (unsure, begun)
+        } else {
+            (absent, begun)
+        }
     };
     let mut came: Vec<(usize, bool)> = Vec::new();
+    let mut found: Vec<(usize, usize)> = Vec::new();
     let mut uncommitted_until = first;
     for block in unsure {
         // One question for the blocks of a region.
@@ -2069,6 +2225,9 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             uncommitted_until = uncommitted_end(block);
             #[cfg(feature = "diagnostics")]
             tally(9, 1);
+            if block < uncommitted_until && known_reserved() {
+                found.push((block, uncommitted_until));
+            }
         }
         if block >= uncommitted_until {
             // The hole may have been given up, and its address be the
@@ -2084,6 +2243,9 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         if g.absent.remove(block) && !view {
             g.foreign.insert(block);
         }
+    }
+    for (block, end) in found {
+        g.known_runs.learn(begun, block, end);
     }
     // The range's blocks that are neither clean nor known to be holes. A
     // frame asks about some 10 GB of view memory, 150,000 blocks, nearly all
@@ -2516,10 +2678,20 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
             }
             PROTECTED.clear(block);
             if block >= uncommitted_until {
-                question(Q_PROTECT);
-                uncommitted_until = uncommitted_end(block);
-                #[cfg(feature = "diagnostics")]
-                tally(9, 1);
+                let known = if known_reserved() { g.known_runs.until(block) } else { None };
+                if let Some(end) = known {
+                    ANSWERED[Q_PROTECT].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    uncommitted_until = end;
+                } else {
+                    question(Q_PROTECT);
+                    let begun = g.known_runs.begun();
+                    uncommitted_until = uncommitted_end(block);
+                    #[cfg(feature = "diagnostics")]
+                    tally(9, 1);
+                    if block < uncommitted_until && known_reserved() {
+                        g.known_runs.learn(begun, block, uncommitted_until);
+                    }
+                }
             }
             if block < uncommitted_until {
                 g.absent.insert(block);
@@ -3102,6 +3274,9 @@ pub fn title_memory_freed(at: usize, len: usize) {
     } else {
         allocation_end(at, noted * BLOCK).div_ceil(BLOCK)
     };
+    if known_reserved() {
+        g.known_runs.changed(first, end);
+    }
     if noted >= end {
         return;
     }
@@ -3153,6 +3328,9 @@ fn title_memory_changed(at: usize, len: usize) -> std::sync::MutexGuard<'static,
     crate::inplace::title_memory_freeing(at, len);
     let mut g = guards();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
+    if known_reserved() {
+        g.known_runs.changed(range.start, range.end);
+    }
     let absent: Vec<usize> = g.absent.range(range.clone()).collect();
     for block in absent {
         g.absent.remove(block);
@@ -4879,6 +5057,188 @@ mod tests {
             drop_views(section, &[guarded, other], 4 * BLOCK);
         }
         RUNS_IN_TEST.set(None);
+    }
+
+    /// Sets [`known_reserved`] for this thread until dropped.
+    struct KnownRunsOn(Option<bool>);
+
+    impl KnownRunsOn {
+        fn set(on: bool) -> KnownRunsOn {
+            KnownRunsOn(KNOWN_RESERVED_IN_TEST.with(|c| c.replace(Some(on))))
+        }
+    }
+
+    impl Drop for KnownRunsOn {
+        fn drop(&mut self) {
+            KNOWN_RESERVED_IN_TEST.with(|c| c.set(self.0));
+        }
+    }
+
+    /// `blocks` blocks of reserved memory, neither committed nor placeholders:
+    /// as the title reserves a range it maps into later.
+    fn reserved(blocks: usize) -> usize {
+        // SAFETY: a fresh reservation, released by [`release`].
+        let p = unsafe { VirtualAlloc(std::ptr::null(), blocks * BLOCK, MEM_RESERVE, PAGE_READWRITE) } as usize;
+        assert_ne!(p, 0);
+        p
+    }
+
+    /// Releases a [`reserved`] range, first as the runtime tells of it.
+    fn release(p: usize, blocks: usize) {
+        title_memory_freed(p, blocks * BLOCK);
+        // SAFETY: our reservation.
+        assert_ne!(unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) }, 0);
+    }
+
+    /// Questions to Windows about holes at the asking and protecting sites.
+    fn questions() -> u64 {
+        QUESTIONS[Q_ASK].load(std::sync::atomic::Ordering::Relaxed) + QUESTIONS[Q_PROTECT].load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A known uncommitted run is not asked again until a hook tells of it.
+    #[test]
+    fn a_known_run_is_not_asked_again_until_a_hook_tells() {
+        let _on = KnownRunsOn::set(true);
+        crate::frame::test_advance();
+        let p = reserved(3);
+        let ask = || guard(p, p + 3 * BLOCK).expect("as a view");
+        ask();
+        let before = questions();
+        ask();
+        assert_eq!(questions() - before, 0, "known uncommitted: not asked again");
+        // A hook over other memory does not tell of this run.
+        title_memory_allocated(p + 8 * BLOCK, BLOCK);
+        ask();
+        assert_eq!(questions() - before, 0, "a hook elsewhere: still not asked");
+        // A hook over its first block does: asked once, still uncommitted.
+        title_memory_allocated(p, BLOCK);
+        ask();
+        assert_eq!(questions() - before, 1, "a hook over the block: asked again");
+        assert!(guards().absent.contains(p / BLOCK), "still uncommitted");
+        release(p, 3);
+    }
+
+    /// After the allocation hook over a block, the next asking queries it and
+    /// finds it committed: private memory, which is no view and not guarded.
+    #[test]
+    fn after_the_allocation_hook_the_next_asking_sees_the_block_committed() {
+        let _on = KnownRunsOn::set(true);
+        crate::frame::test_advance();
+        let p = reserved(3);
+        let ask = || guard(p, p + 3 * BLOCK).expect("as a view");
+        ask();
+        ask();
+        // The runtime commits the first block, and tells of it.
+        // SAFETY: our reservation.
+        let got = unsafe { VirtualAlloc(p as *const _, BLOCK, MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_eq!(got, p);
+        title_memory_allocated(p, BLOCK);
+        let before = questions();
+        ask();
+        assert!(questions() - before >= 1, "the committed block is asked again");
+        {
+            let g = guards();
+            assert!(!g.absent.contains(p / BLOCK), "seen committed: no longer absent");
+            assert!(g.foreign.contains(&(p / BLOCK)), "as private memory: not a view");
+            assert!(g.absent.contains(p / BLOCK + 1) && g.absent.contains(p / BLOCK + 2), "the rest stays uncommitted");
+        }
+        release(p, 3);
+    }
+
+    /// A remap over a known run asks it again, as an allocation does.
+    #[test]
+    fn a_remap_over_a_known_run_asks_again() {
+        let _on = KnownRunsOn::set(true);
+        crate::frame::test_advance();
+        let p = reserved(3);
+        let ask = || guard(p, p + 3 * BLOCK).expect("as a view");
+        ask();
+        ask();
+        let before = questions();
+        title_memory_remapped(p, BLOCK);
+        ask();
+        assert!(questions() - before >= 1, "the remapped block is asked again");
+        release(p, 3);
+    }
+
+    /// A known run lasts for its frame: the next frame asks again.
+    #[test]
+    fn known_runs_last_for_their_frame() {
+        let _on = KnownRunsOn::set(true);
+        crate::frame::test_advance();
+        let p = reserved(3);
+        let ask = || guard(p, p + 3 * BLOCK).expect("as a view");
+        ask();
+        let before = questions();
+        ask();
+        assert_eq!(questions() - before, 0, "the same frame: not asked again");
+        crate::frame::test_advance();
+        ask();
+        assert_eq!(questions() - before, 1, "the next frame: asked again");
+        release(p, 3);
+    }
+
+    /// Off unless asked for: every asking asks again, as before.
+    #[test]
+    fn known_runs_are_off_unless_asked_for() {
+        let _off = KnownRunsOn::set(false);
+        crate::frame::test_advance();
+        let p = reserved(3);
+        let ask = || guard(p, p + 3 * BLOCK).expect("as a view");
+        ask();
+        let before = questions();
+        ask();
+        ask();
+        assert_eq!(questions() - before, 2, "every asking asks again");
+        release(p, 3);
+    }
+
+    /// Runs merge when they touch, a hook takes a piece out of one, and a
+    /// question that a hook overtook is not kept.
+    #[test]
+    fn known_runs_merge_and_split() {
+        let mut k = KnownRuns::new();
+        let begun = k.begun();
+        k.learn(begun, 10, 20);
+        k.learn(begun, 30, 40);
+        k.learn(begun, 20, 30);
+        assert_eq!(k.until(10), Some(40));
+        assert_eq!(k.until(39), Some(40));
+        assert_eq!(k.until(40), None);
+        assert_eq!(k.until(9), None);
+        assert_eq!(k.uncovered(10, 40, vec![10, 15, 25, 39]), (Vec::new(), 1));
+        k.changed(15, 25);
+        assert_eq!(k.until(12), Some(15));
+        assert_eq!(k.until(15), None);
+        assert_eq!(k.until(25), Some(40));
+        assert_eq!(k.uncovered(10, 40, vec![10, 15, 16, 25, 30]), (vec![15, 16], 2));
+        k.learn(begun, 50, 60);
+        assert_eq!(k.until(50), None, "a change since the question began: not kept");
+    }
+
+    /// Questions per frame for a range asked four times a frame: four with the
+    /// known runs off, one with them on.
+    #[test]
+    fn known_runs_ask_once_a_frame_where_asking_asks_four_times() {
+        let per_frame = |on: bool| {
+            let _set = KnownRunsOn::set(on);
+            let p = reserved(16);
+            let mut total = 0;
+            for _ in 0..8 {
+                crate::frame::test_advance();
+                let before = questions();
+                for _ in 0..4 {
+                    guard(p, p + 16 * BLOCK).expect("as a view");
+                }
+                total += questions() - before;
+            }
+            release(p, 16);
+            total as f64 / 8.0
+        };
+        let (off, on) = (per_frame(false), per_frame(true));
+        println!("VirtualQuery per frame, 4 askings a frame of 16 reserved blocks: known runs off {off}, on {on}");
+        assert_eq!(off, 4.0);
+        assert_eq!(on, 1.0);
     }
 }
 
