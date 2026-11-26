@@ -4,6 +4,8 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**Milestone (the user, watching the prologue gate):** "es la primera vez que veo las cinemáticas sin estar totalmente bugeadas, no es perfecto pero todo carga a tiempo más o menos". The first build where the intro cutscenes play nearly whole and load in time: the pipeline library that now exists (`c436241`: pipelines made before they are needed), with the indirect clamps out of the draws' way (I.1, I.2).
+
 **Gates passed: `VICTORY_INDIRECT_BATCH` and `VICTORY_INDIRECT_WINDOW` on by default**
 - Jason (`bench/trials-20261126-075607-gate-batch-jason` plus `…-batch-window`): **world 4 of 4, 395-408 ms**. A fifth run stayed on the start screen for 6 minutes (30 fps, 3 draws a frame, **no indirect draw at all**, 6 DirectStorage "request ran before its page array was filled" warnings): it never reached anything the switches touch; noted as a start-screen hang to watch.
 - Prologue (`…-gate-batch-prologue`): **world 3 of 3, 351-371 ms** (windows invalid as always: the intro cutscene).
