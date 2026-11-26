@@ -3608,6 +3608,8 @@ impl State {
             // used-resource list names (descriptor arrays).
             for k in 0..n {
                 let index = first + k;
+                // (What shaders ask of a typed view in a table: its kind.)
+                host.dynamic_word(index, crate::descriptor::view(table + u64::from(k) * 32).as_ref());
                 // A view this list has made before: its descriptor copied,
                 // and nothing more if nothing changed in the list since.
                 if list_views
