@@ -143,6 +143,23 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     if level() < if window { 1 } else { 2 } || (vram && window) {
         return None;
     }
+    // `VICTORY_INPLACE_BUFFER_KB=min,max` (M.2 bisection): only title
+    // buffers whose size lies in [min, max) KiB go in place.
+    if !window {
+        static RANGE: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+        let (lo, hi) = *RANGE.get_or_init(|| {
+            std::env::var("VICTORY_INPLACE_BUFFER_KB")
+                .ok()
+                .and_then(|v| {
+                    let (a, b) = v.split_once(',')?;
+                    Some((a.trim().parse::<u64>().ok()? << 10, b.trim().parse::<u64>().ok()? << 10))
+                })
+                .unwrap_or((0, u64::MAX))
+        });
+        if len < lo || len >= hi {
+            return None;
+        }
+    }
     // View memory: known from the runtime without asking Windows.
     if cover(start as usize, len as usize) != Cover::None {
         STATS[4].fetch_add(1, Ordering::Relaxed);
