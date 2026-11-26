@@ -79,3 +79,6 @@ Thumbs.db
 
 # Python bytecode (scripts/victory-report.py)
 __pycache__/
+
+# vkd3d-proton writes its pipeline cache beside a test executable run from here
+vkd3d-proton.cache*

@@ -17,7 +17,27 @@ To build from this checkout, install the pinned Rust toolchain and the MSVC C++ 
 
 ## Run on Linux (Proton)
 
-The Windows build runs under Proton-GE through [umu-launcher](https://github.com/Open-Wine-Components/umu-launcher), with vkd3d-proton turning Direct3D 12 into Vulkan. Tested so far on Fedora 45 with an RTX 5080: it builds, starts under Proton, and passes the unit tests there; a full game run is still to come.
+The Windows build runs under Proton-GE through [umu-launcher](https://github.com/Open-Wine-Components/umu-launcher), with vkd3d-proton turning Direct3D 12 into Vulkan.
+
+### Where it stands on Linux (2026-11-26)
+
+One machine, one route: Fedora 45, NVIDIA RTX 5080 (16 GB, driver 620.70.06), Ryzen 7 9800X3D, 30 GB RAM, GE-Proton11-14 through umu, the Series S profile, the opening of the story from a new game.
+
+| | |
+|---|---|
+| Menus, videos, loading screens | 30 fps |
+| Opening cutscenes, first 305 s in the world | about 22 fps on average (25 median), with the view-tree wineserver; 7.7 on average without it |
+| The drive after the first cutscene | slower: frames drop while the title streams the city |
+| Faces | drawn and animated: mouths move, expressions show (the fxceless PR #927 port) |
+| Memory | the title holds 19-26 GB in the world; on 30 GB it swaps (the launcher notes when less than 20 GB is free) |
+| Longest run so far | about 7 minutes, no crash |
+
+What is known to be wrong:
+
+- Stutter on camera cuts, and pop-in: after a quick cut the title shows its far, plain versions of people and places until the real ones stream in.
+- Lighting at night is flat and too dark, fine shadows (hair on a neck) are missing, and eyes reflect the sky indoors. The title lights its scenes with rays through a structure its own builder makes; that builder is off (`--ray-tracing` turns it on, and other NVIDIA forks report it does not run there; untried here). What stands in for the indirect light is worked out from the frame.
+- Some z-fighting and shimmer in backgrounds, and a few textures missing (a phone screen in a cutscene).
+- NVIDIA's shader-visible view heap holds 1,000,000 views and the title asks for 1,245,184; the views past the cap read an empty slot.
 
 You need rustup, clang, lld and llvm (`sudo dnf install rustup clang lld llvm` on Fedora), `umu-run` on your PATH (on Fedora 45 use the release's zipapp, the RPMs are built for older Python), and **GE-Proton11-13 or later** in `~/.local/share/Steam/compatibilitytools.d/Proton-GE Latest` (or set `PROTONPATH`). Older vkd3d-proton (before v3.1-83, so GE-Proton11-12 and earlier) converts DXIL with dxil-spirv's legacy structurizer, which turns about 6% of the title's pipelines into invalid SPIR-V that NVIDIA's shader compiler crashes on, and the title dies as it loads; the launcher warns when it can tell.
 
@@ -38,12 +58,28 @@ scripts/build-linux.sh            # or --diag for the diagnostics build
 Put `dxcompiler.dll` and `dxil.dll` from the x64 folder of Microsoft's [DirectXShaderCompiler release](https://github.com/microsoft/DirectXShaderCompiler/releases) in `~/.local/share/victory/dxc` (or set `VICTORY_DXC_DIR`); the launcher copies them beside `victory.exe`. Under Wine the system shader compiler refuses the indirect-draw clamp and the card compare, and without DXC there is no 3D.
 
 ```sh
-VICTORY_GAME_DIR=~/Games/MyDump scripts/play-linux.sh pareto-residency
+VICTORY_GAME_DIR=~/Games/MyDump scripts/play-linux.sh --skip-intro --new-game
 scripts/play-linux.sh shaders <the shader archives>   # translate every shader ahead of time
 scripts/play-linux.sh warm --used                     # pipelines earlier runs drew with
+scripts/play-linux.sh --help                          # every option
 ```
 
-The launcher uses its own prefix (`~/.local/share/victory/prefix`), keeps caches in `~/.cache/victory/`, sets the same defaults as `Play-VIctory.cmd` plus `VICTORY_CULL_NONE=1` and meeyao's vkd3d settings, and takes `--safe` and `--ray-tracing` like `scripts/play.ps1`. Every variable can be overridden from the environment. The Wine-specific fixes come from [meeyao/victory-8gb-linux](https://github.com/meeyao/victory-8gb-linux); the NVIDIA wave32 fixes, scripted sticks and the Resizable BAR settings from [Zarina35/victory-coolfox-nvidia](https://github.com/Zarina35/victory-coolfox-nvidia).
+Options for a game run (`scripts/play-linux.sh --help` has them all):
+
+| Option | What |
+|---|---|
+| `--skip-intro` | presses through the boot screens and logos (Enter/A at 12-50 s), so the run reaches the load sooner |
+| `--new-game` | starts at the opening scene: the story save and player record are moved to `~/.local/share/victory/save-backups/<time>` (nothing is deleted; settings stay), then a player record from `~/.local/share/victory/save-templates/new-game` is copied in, so the terms of service are not asked again. Runs started this way compare frame for frame |
+| `--diag` | the diagnostics build (`scripts/build-linux.sh --diag`) |
+| `--stock-wineserver` | Proton-GE Latest as shipped, even where the view-tree copy is installed |
+| `--levels-on-demand` | texture mip levels as draws need them (off by default: it used more memory, stuttered more and left a face black) |
+| `--no-texture-waits` | the title's shorter waits for textures in the first frames and the first cutscene |
+| `--safe`, `--ray-tracing` | as `scripts/play.ps1 -Safe` and `-RayTracing` |
+| `--bench <route>` | a scripted run from `scripts/bench/<route>.keys`, stopped when it ends |
+| `--mangohud` | also MangoHud's frame log (off by default: its NVIDIA thread aborted the title under umu) |
+| `--proton-log` | Wine's own log into the run folder (large) |
+
+The launcher uses its own prefix (`~/.local/share/victory/prefix`), keeps caches in `~/.cache/victory/`, and sets the same defaults as `Play-VIctory.cmd`, plus meeyao's vkd3d settings (`VKD3D_CONFIG=descriptor_heap`, `VK_NV_raw_access_chains` off), `VICTORY_CULL_NONE=1` (both faces drawn), every texture's mip levels as the title loads it (`VICTORY_LEVELS_ON_DEMAND=0`) and the willy build's longer texture waits (`VICTORY_EARLY_TEXTURES_MS=40`, `VICTORY_BAKE_TEXTURES_MS=10000`). Every variable can be overridden from the environment. Before a run it notes when less than 20 GB of RAM is free: the title wants about that much in the world, and swaps otherwise.
 
 Game memory goes into VRAM through Resizable BAR by default (`VICTORY_WINDOWS_BAR_MB=2048`, `VICTORY_CARD_WINDOWS_MB=1024`; `0` turns either off). On an RTX 5080 that was the difference between about 8 and 18 fps on Windows; vkd3d-proton has the GPU upload heap it needs.
 
@@ -56,17 +92,17 @@ Each game run leaves a folder in `~/.local/share/victory/runs/<date-time>/` (`la
 | `run.json` | build, git revision, Proton, umu, driver, GPU, CPU, RAM, every `VICTORY_*`/`VKD3D_*` setting, exit code, length, whether Resizable BAR was taken |
 | `victory.log` | the engine's output, with times |
 | `frames.csv` | one row a frame (`VICTORY_FRAMES_CSV`): frame time, the submitting thread's work, the card's idle and waits, copies, copy-back, uploads, draws and drops, pipelines queued and made, VRAM |
-| `mangohud.csv` | MangoHud's own frame log (Shift+F2 pauses it, Shift+F12 shows its overlay) |
+| `mangohud.csv` | with `--mangohud`: MangoHud's own frame log (Shift+F2 pauses it, Shift+F12 shows its overlay) |
 | `system.csv` | once a second: the title's memory and swap, free RAM, swap, commit, VRAM, GPU load, clock and heat, CPU load |
 | `marks.csv`, `marks/` | moments you marked, with a screenshot each |
 
 ```sh
-scripts/play-linux.sh pareto-residency [--diag]     # play; Ctrl-C (or closing the window) ends the run cleanly
+scripts/play-linux.sh --skip-intro [--diag]         # play; Ctrl-C (or closing the window or the terminal) ends the run cleanly
 scripts/victory-mark.sh --install                   # once: the desktop entry; bind it to Ctrl+Alt+M in System Settings
 scripts/victory-mark.sh --note 3 "bridge stutter"   # a note on mark 3 afterwards
 scripts/victory-report.py                           # the newest run, summed up
 scripts/victory-report.py <run> --against <run>     # two runs side by side
-scripts/play-linux.sh pareto-residency --bench <route>   # a scripted run from scripts/bench/<route>.keys
+scripts/play-linux.sh --bench <route>               # a scripted run from scripts/bench/<route>.keys
 ```
 
 Press the mark shortcut at anything odd: a stutter, a glitch, a crash coming. The run is ended with SIGTERM, never SIGKILL: killing the title while its mappings are live can wedge the NVIDIA driver until a reboot. A benchmark route is a list of `VICTORY_KEYS` holds and a `duration=` line; see `scripts/bench/example.keys`. Leave enough RAM free before a run: the title wants most of 30 GB.
@@ -80,7 +116,7 @@ one PC, without giving up the picture. It is not there yet.
 copy of the game. It is not affiliated with or endorsed by the game's developer
 or publisher.
 
-## Where it stands (2026-11-25)
+## Where it stands on Windows and AMD (2026-11-25)
 
 Tested on one machine only: Windows 11, Intel i9-12900K, 64 GB RAM, Radeon
 RX 7900 XTX, 1440p, the Series X profile.
@@ -178,6 +214,27 @@ commits taken from elsewhere name the commit and its author.
 - **Geckomacabre** and **cxy0072019-sketch**: the texture read-back.
 - **[XCL](https://github.com/ivall/xcl)** (GPL-2.0-only) was read for how the same
   title behaves under another layer; no code of it is here.
+- For Linux and NVIDIA, this fork took:
+  - [fxceless PR #927](https://github.com/fxceless/victory-fork/pull/927): 16-bit
+    values through descriptor tables move as they are, so the face network
+    computes and faces animate.
+  - [trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA):
+    d1fe0bd and fdc8bbc (D3D12 error 538), c05b44b (error 646) and
+    `VICTORY_PIPELINE_WAIT_ONCE`.
+  - The willy build (a release zip): the NaN guard on stores
+    (`VICTORY_NAN_GUARD`), R11G11B10 for R9G9B9E5 targets (`VICTORY_E5_TARGETS`),
+    and its texture settings (mip levels as a texture loads, longer texture waits).
+  - [GE-Proton PR #1016](https://github.com/GloriousEggroll/proton-ge-custom/pull/1016):
+    the wineserver that keeps memory views in a tree.
+  - [meeyao/victory-8gb-linux](https://github.com/meeyao/victory-8gb-linux): the
+    Wine fixes (the DXC fallback, the null pipeline-library blob, both faces
+    drawn) and the vkd3d settings.
+  - [Zarina35/victory-coolfox-nvidia](https://github.com/Zarina35/victory-coolfox-nvidia):
+    the NVIDIA wave32 fixes, scripted sticks and the Resizable BAR sizes for an
+    RTX 5080.
+  - [kroeeee-eeee/VIctory-Linux-Proton-Wine-7900XT-XTX](https://github.com/kroeeee-eeee/VIctory-Linux-Proton-Wine-7900XT-XTX):
+    one back edge per loop header (single latches), and the idea of the
+    view-tree wineserver.
 - This fork's changes were made with [Claude Code](https://claude.com/claude-code).
 
 ## License
