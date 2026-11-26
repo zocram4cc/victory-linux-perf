@@ -483,7 +483,7 @@ fn a_landing_under_a_standing_asking_is_seen_by_the_refresh_after_it() {
     // The card wrote 7s into the block's second page; title memory holds zeros there.
     let now = [7u8; BLOCK];
     let mut held = [0u8; BLOCK];
-    crate::watch::ask_once(&[(at, at + BLOCK)]);
+    crate::watch::ask_once(&[(at, at + BLOCK)], &[]);
     let (asked, _) = crate::watch::writes(at, at + BLOCK, false).expect("watched");
     let mut notes = Notes::default();
     // SAFETY: the part lies in the block, and `now` and `held` are a block each.
