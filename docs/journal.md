@@ -4,6 +4,13 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**I.1 `VICTORY_INDIRECT_BATCH=1`: GPU 272 → 200 ms (−26 %), frame 501 → 422-441 ms (−14 %), picture held**
+- Every indirect record was clamped right before its draw into **the list's one scratch buffer** (`indirect_scratch`: every clamp writes offset 0), so two global UAV barriers per draw were needed by construction, and no two draws ever overlapped.
+- **I.1:** a single record that no shader of the list wrote before it gets a slot of its own in a per-list buffer (`HostList::batch_slot`). Its clamp is left for the list's **prelude** (`indirect::record_batch`: one wait, all the clamps back to back, one wait and the move to `INDIRECT_ARGUMENT`), and the draw reads its slot with no pass of ours.
+- First run (`…-indirect-batch`): only ~270 records a frame batched. Why (`…-batch-why`): 344 split dispatches, **~5,000 in card copies** (excluded out of caution, but they are synced by their own lists before the submission's: `card_before`), **~4,000 written by the list's own shaders**.
+- With card copies batched (`bench/trials-20261126-073515-batch-cards`, same scene, ~11,800 draws): **4,800 records a frame clamped in preludes; GPU 199-201 ms against 269-273; frame 422-441 ms against 501-515**; clamps left inline 4,500 (22 ms). The user: "se ve bien", only Jason's head black (pre-existing).
+- **Next, I.2:** the ~3,800 records the list's own shaders write (the title's GPU culling): clamp each written range once, after its writer, into slots of their own, and let the draws read them until the next writer (Neptune VI's `CLAMP_AFTER_WRITER`).
+
 **`VICTORY_INDIRECT_WINDOW=1`: −5 % with the picture held; Series S: −10 % GPU, black picture. The GPU is bound by draws, not pixels**
 - `VICTORY_INDIRECT_WINDOW=1` with the census (`bench/trials-…-indirect-window`): run 1 (same scene, 11,840 draws): **477 ms against 501-502, GPU 261 against 272-273, clamps 5,715 (21.8 ms) against ~9,750 (37 ms)**. Run 2 opened from another camera, closer to Jason (the user saw it; 5,917 draws, 392 ms): not comparable. Picture held ("se ve bien"). A gain but small: ~5,700 clamps a frame still serialise the draws.
 - **Series S** (`--console series-s`, new `BENCH_RUN_ARGS` in `bench.sh`; `bench/trials-…-series-s`): GPU 244 ms against ~270, frame 409 ms, copy-back 18.5 MB against ~45. **The picture is black**: the title's upscaler DLL is refused (`amd_fidelityfx_upscaler_xbox.dll`, host policy). Neptune VI hands those calls to AMD's PC DLL (`VICTORY_FSR_DLL`, `crates/victory-hle/src/modules/fidelityfx.rs`) and plays the Series S path at 9-11 fps. Here a much lower internal resolution saves only ~10 % of GPU, so the GPU is bound by per-draw cost.
