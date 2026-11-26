@@ -3414,6 +3414,7 @@ fn land() {
 /// value while the submitting thread waits for that thread would never
 /// see it.
 fn late_helper() {
+    let _asker = crate::watch::asker(crate::watch::Asker::Late);
     crate::cores::keep_on_fast_cores("victory-late-wait");
     let Some(host) = host() else {
         return;
@@ -3558,6 +3559,7 @@ struct RelayFetch {
 /// anything a caller of [`Host::settle`] may hold: resetting the landed
 /// lists and looking at what queues hold are left to [`late_helper`].
 fn relay_worker() {
+    let _asker = crate::watch::asker(crate::watch::Asker::Relay);
     crate::cores::keep_on_fast_cores("victory-relay");
     let Some(host) = host() else {
         return;
@@ -5661,7 +5663,6 @@ impl Host {
     /// ([`joins`]): those go to the queue in calls of their own, one after the
     /// other, as they would have.
     fn submit<'a>(&'a self, runs: &[&HostList], parts: &[usize], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
-        #[cfg(feature = "diagnostics")]
         let _asker = crate::watch::asker(crate::watch::Asker::Submit);
         #[cfg(feature = "diagnostics")]
         let called = std::time::Instant::now();
