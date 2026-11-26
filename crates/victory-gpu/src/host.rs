@@ -2762,7 +2762,9 @@ fn read_backs(list: &HostList) {
 /// 1.3: per frame line, ranges handed back, those another host copy
 /// overlaps, their bytes, the bytes of the overlaps, the copies met
 /// (`VICTORY_BACK_OVERLAP=1`).
-pub(crate) static BACK_OVERLAP: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+pub(crate) static BACK_OVERLAP: [std::sync::atomic::AtomicU64; 9] = [const { std::sync::atomic::AtomicU64::new(0) }; 9];
+/// [5..9]: overlaps by kind of the written copy and the other: buffer under
+/// buffer, window under buffer, buffer under window, window under window.
 
 fn back_overlap_census(back: &[Declared]) {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -2776,7 +2778,11 @@ fn back_overlap_census(back: &[Declared]) {
         // Declared ranges are title addresses (`Shadow::writing`).
         for &(from, to) in declared {
             let (at, end) = (from as u64, to as u64);
-            let (copies, bytes) = crate::shadow::overlapping(at, end, shadow);
+            let (buffers, windows, bytes) = crate::shadow::overlapping_by_kind(at, end, shadow);
+            let copies = buffers + windows;
+            let own = if shadow.is_window() { 2 } else { 0 };
+            BACK_OVERLAP[5 + own].fetch_add(buffers, Ordering::Relaxed);
+            BACK_OVERLAP[6 + own].fetch_add(windows, Ordering::Relaxed);
             BACK_OVERLAP[0].fetch_add(1, Ordering::Relaxed);
             BACK_OVERLAP[2].fetch_add(end - at, Ordering::Relaxed);
             if copies > 0 {
@@ -5895,11 +5901,12 @@ impl Meter {
         crate::pool::pool_line(frames);
         crate::census::census_line(frames);
         {
-            let [ranges, overlapped, bytes, over, copies] =
-                [0, 1, 2, 3, 4].map(|i| BACK_OVERLAP[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            let [ranges, overlapped, bytes, over, copies, bb, bw, wb, ww] =
+                [0, 1, 2, 3, 4, 5, 6, 7, 8].map(|i| BACK_OVERLAP[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if ranges > 0.0 {
                 tracing::info!(
-                    "copy-back ranges per frame (1.3 overlap): {ranges:.0} declared ({:.1} MB), {overlapped:.0} overlapped by {copies:.0} other host copies ({:.1} MB of overlap)",
+                    "copy-back ranges per frame (1.3 overlap): {ranges:.0} declared ({:.1} MB), {overlapped:.0} overlapped by {copies:.0} other host copies ({:.1} MB of overlap); \
+                     written buffer copy over another buffer copy {bb:.0}, over a window {bw:.0}; written window over a buffer copy {wb:.0}, over another window {ww:.0}",
                     bytes / 1e6,
                     over / 1e6
                 );

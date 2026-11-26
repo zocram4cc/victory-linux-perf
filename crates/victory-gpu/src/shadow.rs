@@ -2857,11 +2857,13 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     n
 }
 
-/// 1.3 (`VICTORY_BACK_OVERLAP=1`): the other host copies, buffer copies
-/// and windows, whose title range overlaps `[at, end)`, besides `own`.
-/// Aliases (other addresses of the same pages) are not seen.
-pub(crate) fn overlapping(at: u64, end: u64, own: &Arc<Shadow>) -> (u64, u64) {
+/// 1.3 (`VICTORY_BACK_OVERLAP=1`): the other host copies whose title
+/// range overlaps `[at, end)`, besides `own`: buffer copies, windows, and
+/// the bytes of overlap. Aliases (other addresses of the same pages) are
+/// not seen.
+pub(crate) fn overlapping_by_kind(at: u64, end: u64, own: &Arc<Shadow>) -> (u64, u64, u64) {
     let mut copies = 0;
+    let mut windows = 0;
     let mut bytes = 0;
     {
         let map = buffers();
@@ -2878,11 +2880,18 @@ pub(crate) fn overlapping(at: u64, end: u64, own: &Arc<Shadow>) -> (u64, u64) {
     let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     for (key, shadow) in loose.range((at.saturating_sub(WINDOW), 0)..(end, 0)) {
         if key.0 + key.1 > at && !Arc::ptr_eq(shadow, own) {
-            copies += 1;
+            windows += 1;
             bytes += (key.0 + key.1).min(end) - key.0.max(at);
         }
     }
-    (copies, bytes)
+    (copies, windows, bytes)
+}
+
+impl Shadow {
+    /// Whether the copy is a window of title memory outside buffers.
+    pub(crate) fn is_window(&self) -> bool {
+        self.window
+    }
 }
 
 /// For the in-place census (`crate::inplace`): the title buffers (start,
