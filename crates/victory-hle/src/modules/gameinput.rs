@@ -1198,10 +1198,18 @@ mod host {
             // connected the stand-in is not there, and a title that listens
             // to the pad (the title's start screen) saw nothing.
             if slot == 0 {
-                for vk in scripted() {
+                let held = scripted();
+                for &vk in &held {
                     if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
                         pad.buttons |= button;
                     }
+                }
+                // Perso: the scripted keys move the sticks and triggers too
+                // (W/A/S/D, I/J/K/L, Z/C), so an unattended run can walk.
+                if !held.is_empty() {
+                    let keys: Vec<super::KeyState> =
+                        held.iter().map(|&vk| super::KeyState { virtual_key: vk, ..Default::default() }).collect();
+                    pad = super::merged(pad, super::fallback(&keys));
                 }
             }
             Some(pad)
