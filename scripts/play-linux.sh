@@ -42,6 +42,11 @@
 #   PROTONPATH      Proton build to use (default: Proton-GE Latest from Steam's compatibilitytools.d)
 #   WINEPREFIX      prefix for VIctory alone (default: ~/.local/share/victory/prefix)
 #   VICTORY_EXE     victory.exe to run (default: the cross-built build, then a release exe beside this repo)
+# The whole script is one block: bash reads it all before running any of it,
+# so a change to this file during a run cannot break that run (bash reads a
+# script as it goes; an edit mid-run once made it read "en" as a command at
+# Ctrl-C, and the run's end went unwritten).
+{
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -71,7 +76,7 @@ while (( $# )); do
     --view-tree) ;; # the default where the copy is installed
     --mangohud) mangohud=1 ;;
     --no-mangohud) mangohud=0 ;;
-    -h|--help) sed -n '2,/^set -euo/p' "$0" | sed '$d'; exit 0 ;;
+    -h|--help) sed -n '2,/^# The whole script is one block/p' "$0" | sed '$d'; exit 0 ;;
     *) args+=("$1") ;;
   esac
   shift
@@ -164,6 +169,10 @@ cd "$repo"   # victory.toml is looked for in the working directory
 # work as they are, since the working directory is on Wine's Z: drive.
 win_exe="$(winpath "$exe")"
 
+# Both faces: under Proton character heads and hair are culled away otherwise.
+# Set before `shaders` and `warm` too: warm makes the pipelines with it.
+[[ -n "${VICTORY_CULL_NONE:-}" ]] || export VICTORY_CULL_NONE=1
+
 case "${1:-}" in
   shaders|warm) exec umu-run "$win_exe" "$@" ;;
   exe) shift; exec umu-run "$win_exe" "$@" ;;
@@ -222,8 +231,6 @@ d VICTORY_LEVELS_ON_DEMAND 0
 # start was black for about 5 s and faces popped in soon after (runs
 # 20261126-232829 against -233440).
 d VICTORY_CARD_BUFFERS_MIN_KB 64
-# Both faces: under Proton character heads and hair are culled away otherwise.
-d VICTORY_CULL_NONE 1
 # Game memory in the card's memory through Resizable BAR (Zarina35's RTX 5080
 # numbers; 0 turns either off). vkd3d-proton has the GPU upload heap this needs.
 d VICTORY_WINDOWS_BAR_MB 2048
@@ -328,6 +335,14 @@ fi
 started=$(date +%s)
 python3 -I "$repo/scripts/victory-report.py" --write-run-json "$run" --start \
   --profile "$profile" --exe "$exe" --repo "$repo" ${bench:+--bench "$bench"} || true
+# The run's end is written even if this script is killed outright (a
+# terminal closed under it kills its group, traps or not): a watcher in a
+# session of its own writes it, exit code -1, when this script is gone
+# without having written it.
+setsid bash -c 'while kill -0 "$1" 2>/dev/null; do sleep 2; done
+  grep -q "\"exit_code\"" "$2/run.json" 2>/dev/null ||
+    python3 -I "$3" --write-run-json "$2" --end --exit-code -1 --seconds $(( $(date +%s) - $4 ))' \
+  finisher $$ "$run" "$repo/scripts/victory-report.py" "$started" </dev/null >/dev/null 2>&1 &
 
 # The title in a process group of its own, so that Ctrl-C here reaches this
 # script only, which then asks the title to end.
@@ -392,3 +407,4 @@ python3 -I "$repo/scripts/victory-report.py" --write-run-json "$run" --end --exi
 echo "run finished (exit $code, $(( $(date +%s) - started )) s): $run" || true
 echo "summary: scripts/victory-report.py $run" || true
 exit "$code"
+}
