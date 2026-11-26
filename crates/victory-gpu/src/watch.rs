@@ -1818,16 +1818,28 @@ fn placeholder(block: usize) -> bool {
         return region.region_type & PLACEHOLDER_RESERVATION != 0;
     }
     // Wine answers no class 7 (STATUS_INVALID_INFO_CLASS) and never sets the
-    // flag: without this every hole was asked about at every asking, ~13,000
-    // VirtualQuery a frame contending on Wine's one virtual_mutex. A plain
-    // reservation in title memory is committed only through the runtime,
-    // which tells (`title_memory_allocated`), and `look_at_holes` checks.
-    use windows_sys::Win32::System::Memory::{MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    // flag: without a fallback every hole was asked about at every asking,
+    // ~13,000 VirtualQuery a frame contending on Wine's one virtual_mutex
+    // (Kayotic1337, avatarmanz/VIctory-7900XTX#59). What Wine does tell is how
+    // the allocation was made: a placeholder is a private reservation of
+    // PAGE_NOACCESS (MEM_RESERVE_PLACEHOLDER takes no other protection) and
+    // an ordinary commit over one is refused, so only the runtime fills it,
+    // and tells. A reservation of another kind (read-write, or a mapped
+    // view) can be committed by an ordinary VirtualAlloc nobody tells of: it
+    // is asked about, as is a block that is not uncommitted to its end.
+    use windows_sys::Win32::System::Memory::{
+        MEM_PRIVATE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery,
+    };
+    let at = block * BLOCK;
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
-    let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
-    n != 0 && info.State == MEM_RESERVE
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    n != 0
+        && info.State == MEM_RESERVE
+        && info.Type == MEM_PRIVATE
+        && info.AllocationProtect == PAGE_NOACCESS
+        && (info.BaseAddress as usize).saturating_add(info.RegionSize) >= at.saturating_add(BLOCK)
 }
 
 /// The runtime gave the title memory at `[at, at + len)`, allocated or
