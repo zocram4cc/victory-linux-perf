@@ -43,10 +43,8 @@ pub(crate) struct Pending {
     used: AtomicBool,
     /// A pass over the screen ([`GraphicsState::screen_pass`]).
     screen: bool,
-    /// A dispatch has waited for it outside the frame's budget
-    /// ([`compute_waits`]): later ones wait within the budget.
-    waited_long: AtomicBool,
-    /// That wait ended without it: later dispatches do not wait at all.
+    /// A dispatch waited for it outside the frame's budget
+    /// ([`compute_waits`]) and it was not made: later ones do not wait.
     given_up: AtomicBool,
 }
 
@@ -73,7 +71,6 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
-            waited_long: AtomicBool::new(false),
             given_up: AtomicBool::new(false),
         }
     }
@@ -175,12 +172,8 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         start(p, REQUESTED);
         if !compute_waits(&p.shaders) {
             wait(p, crate::frame::current());
-        } else if !p.waited_long.swap(true, Ordering::Relaxed) {
-            if !wait_long(p) {
-                give_up(p);
-            }
-        } else if !p.given_up.load(Ordering::Relaxed) {
-            wait(p, crate::frame::current());
+        } else if !p.given_up.load(Ordering::Relaxed) && !wait_long(p) {
+            give_up(p);
         }
     }
     p.made.get()?.as_ref()
@@ -201,12 +194,15 @@ const COMPUTE_WAIT_MOST: Duration = Duration::from_secs(20);
 /// (61e54e90adccaf6a): its maps stayed at the title's fill and every head
 /// was culled for the rest of the session (characters without heads; runs
 /// blend-1 to blend-6 on the owner's tree). The wait is on the recording
-/// thread before the dispatch is recorded, so it keeps its place. Once per
-/// pipeline: one that is never made would otherwise hold every frame that
-/// dispatches it for 20 s, and within the frame's budget it would take the
-/// whole budget of every such frame (six never made took 500 ms of every
-/// frame before loops got one latch): one not made in 20 s is given up,
-/// its later dispatches dropped without a wait.
+/// thread before the dispatch is recorded, so it keeps its place. Every
+/// dispatch of it waits so, not only the first: a second thread that
+/// dispatched it during the first one's wait waited within the frame's
+/// spent budget, and a dispatch of 91b10a73e48b2192 was dropped 18 ms
+/// before its pipeline was made (run t1). One not made in 20 s is given
+/// up and its later dispatches dropped without a wait: a pipeline that is
+/// never made would otherwise hold every frame that dispatches it for 20 s,
+/// or, within the frame's budget, take the whole budget of every such frame
+/// (six never made took 500 ms of every frame before loops got one latch).
 fn compute_waits(shaders: &[Arc<Shader>]) -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     shaders.first().is_some_and(|s| s.stage == "compute")
@@ -240,7 +236,10 @@ static GIVEN_UP: AtomicU64 = AtomicU64::new(0);
 
 /// Gives up waiting for `p` ([`compute_waits`]); a worker may still make it.
 fn give_up(p: &Pending) {
-    p.given_up.store(true, Ordering::Relaxed);
+    // Threads that waited for it together give it up once.
+    if p.given_up.swap(true, Ordering::Relaxed) {
+        return;
+    }
     let count = GIVEN_UP.fetch_add(1, Ordering::Relaxed) + 1;
     tracing::warn!(
         shaders = %hashes(p),
