@@ -76,3 +76,6 @@
 *.swp
 Thumbs.db
 .DS_Store
+
+# Machine settings for the Linux scripts (paths to YOUR files): see linux/local.env.example
+/linux/local.env
