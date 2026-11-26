@@ -889,6 +889,47 @@ pub(crate) fn tally_preparing(i: usize, v: u64) {
     tally(&PREPARING, &TOTAL_PREPARING, i, v, Ordering::Relaxed);
 }
 
+/// Takes `v` back off counter `i` of [`PREPARING`] and [`TOTAL_PREPARING`]
+/// (threads' summed time replaced by the time it took).
+fn untally_preparing(i: usize, v: u64, order: Ordering) {
+    PREPARING[i].fetch_sub(v, order);
+    TOTAL_PREPARING[i].fetch_sub(v, Ordering::Relaxed);
+}
+
+/// Of the refreshes done on several threads, since the last line: the
+/// threads' nanoseconds asking whether a span is known to copy nothing, and
+/// updating the others; the spans; the host copies they fell in, counted
+/// once a flush; and the flushes' wall-clock nanoseconds.
+#[cfg(feature = "diagnostics")]
+pub(crate) static REFRESH_SPLIT: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// [`REFRESH_SPLIT`] of the shadows `spans` fall in, once a flush.
+#[cfg(feature = "diagnostics")]
+fn note_refresh_copies<'a>(spans: impl Iterator<Item = &'a std::sync::Arc<crate::shadow::Shadow>>) {
+    let mut seen = std::collections::HashSet::new();
+    let mut n = 0u64;
+    for s in spans {
+        n += 1;
+        seen.insert(std::sync::Arc::as_ptr(s) as usize);
+    }
+    REFRESH_SPLIT[2].fetch_add(n, Ordering::Relaxed);
+    REFRESH_SPLIT[3].fetch_add(seen.len() as u64, Ordering::Relaxed);
+}
+
+/// Times `f` into counter `i` of [`REFRESH_SPLIT`] (diagnostics builds).
+#[inline]
+fn refresh_timed<T>(i: usize, f: impl FnOnce() -> T) -> T {
+    #[cfg(feature = "diagnostics")]
+    {
+        let began = std::time::Instant::now();
+        let got = f();
+        REFRESH_SPLIT[i].fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        got
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    f()
+}
+
 /// Host buffers made since the start, as (count, bytes): in the upload heap
 /// (staging, list scratch), shared with the processor (host copies of title
 /// memory) and the graphics card's own (indirect arguments, twins' copies).
@@ -7958,6 +7999,18 @@ fn split_line(frames: f64) {
         e[0],
         e[1] / 1e3,
     );
+    {
+        let r: Vec<f64> = REFRESH_SPLIT.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        tracing::info!(
+            "refreshes on several threads per frame: {:.1} ms wall, threads' {:.1} ms asking whether a span is known to copy nothing and {:.1} ms \
+             updating the others; {:.0} spans in {:.0} host copies (counted once a flush)",
+            r[4] / 1e6,
+            r[0] / 1e6,
+            r[1] / 1e6,
+            r[2],
+            r[3],
+        );
+    }
     tracing::info!(
         "asking about title memory per frame, all threads: {:.0} kernel askings over {:.0} MB ({:.1} ms, {:.0} pages of 4 KiB found \
          written, {:.0} askings refused); {:.0} questions about holes; view ranges: {:.0} answered by their \
@@ -8788,6 +8841,10 @@ impl Batch {
         }
         #[cfg(feature = "diagnostics")]
         FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        note_refresh_copies(spans.iter().map(|s| &s.0));
+        #[cfg(feature = "diagnostics")]
+        let wall = std::time::Instant::now();
         crate::shadow::wide_each(spans.len() + due.len(), move |i| {
             // The textures first: they are the longer pieces.
             let Some(i) = i.checked_sub(due.len()) else {
@@ -8795,21 +8852,23 @@ impl Batch {
                 return;
             };
             let (shadow, from, to) = &spans[i];
-            if many && shadow.nothing_new(*from, *to - *from) {
+            if many && refresh_timed(0, || shadow.nothing_new(*from, *to - *from)) {
                 #[cfg(feature = "diagnostics")]
                 FLUSHES[2].fetch_add(1, Ordering::Relaxed);
                 return;
             }
-            Self::update(shadow, *from, *to);
+            refresh_timed(1, || Self::update(shadow, *from, *to));
         });
+        #[cfg(feature = "diagnostics")]
+        REFRESH_SPLIT[4].fetch_add(wall.elapsed().as_nanos() as u64, Ordering::Relaxed);
         if ahead {
             crate::watch::ask_ahead_done();
         }
         // The time counted is the time it took, not the threads' sum.
         let took = started.elapsed().as_micros() as u64;
         let summed = [0, 2].map(|i| PREPARING[i].load(Ordering::Relaxed)).iter().zip(before).map(|(now, was)| now.saturating_sub(was)).collect::<Vec<_>>();
-        PREPARING[2].fetch_sub(summed[1], Ordering::Relaxed);
-        PREPARING[0].fetch_sub(summed[0], Ordering::Relaxed);
+        untally_preparing(2, summed[1], Ordering::Relaxed);
+        untally_preparing(0, summed[0], Ordering::Relaxed);
         tally(&PREPARING, &TOTAL_PREPARING, 0, took, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         SPLIT[6].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -8854,7 +8913,7 @@ impl Batch {
         });
         // The time counted is the time it took, not the threads' sum.
         let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
-        PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
+        untally_preparing(0, summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         {
             let ns = began.elapsed().as_nanos() as u64;
@@ -8903,7 +8962,7 @@ impl Batch {
         let due = std::mem::take(&mut self.due);
         crate::shadow::wide_each(due.len(), move |i| due[i].refresh());
         let summed = PREPARING[2].load(Ordering::Relaxed).saturating_sub(before);
-        PREPARING[2].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
+        untally_preparing(2, summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
     }
 
     fn flush(&mut self) {
@@ -8980,15 +9039,21 @@ impl Batch {
             if light {
                 // A number to a free thread, not a job to each copy.
                 let refreshes = std::mem::take(&mut self.refreshes);
+                #[cfg(feature = "diagnostics")]
+                note_refresh_copies(refreshes.iter().map(|s| &s.0));
+                #[cfg(feature = "diagnostics")]
+                let wall = std::time::Instant::now();
                 crate::shadow::wide_each(refreshes.len(), move |i| {
                     let (shadow, from, to) = &refreshes[i];
-                    if (refreshes.len() > FEW || beside) && shadow.nothing_new(*from, *to - *from) {
+                    if (refreshes.len() > FEW || beside) && refresh_timed(0, || shadow.nothing_new(*from, *to - *from)) {
                         #[cfg(feature = "diagnostics")]
                         FLUSHES[2].fetch_add(1, Ordering::Relaxed);
                         return;
                     }
-                    Self::update(shadow, *from, *to);
+                    refresh_timed(1, || Self::update(shadow, *from, *to));
                 });
+                #[cfg(feature = "diagnostics")]
+                REFRESH_SPLIT[4].fetch_add(wall.elapsed().as_nanos() as u64, Ordering::Relaxed);
             } else {
                 let jobs: Vec<Box<dyn FnOnce() + Send>> = self
                     .refreshes
@@ -8998,7 +9063,7 @@ impl Batch {
                 crate::shadow::wide_run(jobs);
             }
             let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
-            PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
+            untally_preparing(0, summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
         } else {
             for (shadow, from, to) in self.refreshes.drain(..) {
                 Self::update(&shadow, from, to);

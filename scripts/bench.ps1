@@ -1,4 +1,4 @@
-# One benchmark run: the title started with scripts\play.ps1's settings, scripted presses
+﻿# One benchmark run: the title started with scripts\play.ps1's settings, scripted presses
 # into the same scene, a per-frame record (VICTORY_FRAME_CSV) and the log, stopped after
 # -Seconds; then the frames of a fixed window are summed up.
 #   scripts\bench.ps1 -Exe <exe> -TitleDir <dump> -Label base -Run 1
@@ -15,7 +15,7 @@ param(
     [double]$To = 140,
     # Frames with at least this many draws count as world frames.
     [int]$MinDraws = 100,
-    [string]$Keys = '20:Enter,26:Enter,32:Enter,38:Enter,44:Enter,50:Enter',
+    [string]$Keys = '20:Enter,25:Enter,30:Enter,35:Enter,40:Enter,45:Enter,50:Enter,55:Enter',
     [string]$CaptureFrames = '',
     [hashtable]$More = @{},
     [string]$Out = ''
@@ -69,6 +69,7 @@ while ((Get-Date) -lt $deadline -and -not $p.HasExited) {
 $early = $p.HasExited
 $tree = @(@($tree) + @(Get-Tree $p.Id) | Select-Object -Unique)
 foreach ($id in ($tree | Sort-Object -Descending)) { Stop-Process -Id $id -Force -ErrorAction SilentlyContinue }
+$null = $p.WaitForExit(15000); $p.Dispose()
 Start-Sleep -Seconds 3
 
 # The window's world frames.
@@ -101,3 +102,6 @@ $line = [pscustomobject]$summary
 $results = Join-Path $Out 'results.csv'
 $line | Export-Csv -Append -NoTypeInformation $results
 $line | Format-List | Out-String | Write-Host
+
+
+
