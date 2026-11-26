@@ -652,6 +652,7 @@ extern "system" fn close(this: This) -> HRESULT {
     #[cfg(windows)]
     if let Some(host) = host_list(this) {
         host.close();
+        with_state(this, |_, state| state.closed());
     }
     S_OK
 }
