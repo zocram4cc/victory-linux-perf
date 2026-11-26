@@ -1351,15 +1351,92 @@ fn plane_pass() -> Option<&'static PlanePass> {
     .as_ref()
 }
 
-/// Compiles function `entry` of `source` for `target` with the system's
-/// compiler, as the indirect-argument clamp is (`crate::indirect`).
+/// Compiles function `entry` of `source` for `target`: every shader of ours
+/// is compiled here, as the indirect-argument clamp is (`crate::indirect`).
 ///
-/// When the system's compiler refuses it, `dxcompiler.dll` (DXC, found
-/// beside the executable first) compiles it for shader model 6.0 instead.
-/// Under Wine, `d3dcompiler_47` rejects `InterlockedAdd`/`InterlockedOr` and
-/// `Load4` on a `RWByteAddressBuffer` (E5005), which loses the argument clamp
-/// (every indirect draw dropped, no 3D) and the card compare.
+/// The system's compiler (`d3dcompiler_47`) is used where it can be trusted.
+/// Wine's cannot: it rejects `InterlockedAdd`/`InterlockedOr` and `Load4` on a
+/// `RWByteAddressBuffer` (E5005), and it compiles the rest without error but
+/// leaves out the `[RootSignature]` (no `RTS0` part), so the root signature
+/// made from those bytes fails. Where the system's compiler drops root
+/// signatures ([`system_keeps_root_signatures`]), every shader goes to DXC
+/// (`dxcompiler.dll` beside the executable, shader model 6.0), which also
+/// keeps a pipeline's stages in one format. Elsewhere DXC is the fallback for
+/// a shader the system's compiler refuses.
 pub(crate) fn compile(
+    source: &str,
+    entry: windows::core::PCSTR,
+    target: windows::core::PCSTR,
+) -> windows::core::Result<Vec<u8>> {
+    // SAFETY: both names are NUL-terminated literals of the caller's.
+    let names = unsafe { (entry.to_string(), target.to_string()) };
+    if !system_keeps_root_signatures()
+        && let (Ok(entry), Ok(target)) = &names
+    {
+        match dxc_compile(source, entry, target) {
+            Ok(bytes) => return Ok(bytes),
+            Err(e) => tracing::warn!(
+                error = %e, %entry, %target,
+                "the system compiler drops root signatures and DXC failed (is dxcompiler.dll beside victory.exe?)"
+            ),
+        }
+    }
+    let e = match system_compile(source, entry, target) {
+        Ok(bytes) => return Ok(bytes),
+        Err(e) => e,
+    };
+    let (Ok(entry), Ok(target)) = names else {
+        return Err(e);
+    };
+    match dxc_compile(source, &entry, &target) {
+        Ok(bytes) => {
+            tracing::info!(%entry, %target, "the system compiler refused a shader of ours; DXC compiled it");
+            Ok(bytes)
+        }
+        Err(dxc) => {
+            tracing::warn!(error = %dxc, "DXC could not compile it either (is dxcompiler.dll beside victory.exe?)");
+            Err(e)
+        }
+    }
+}
+
+/// Whether the system's compiler keeps a shader's `[RootSignature]`: asked
+/// once, by compiling a shader that names one and looking for its `RTS0`
+/// part. Wine's `d3dcompiler_47` compiles it but leaves the part out.
+fn system_keeps_root_signatures() -> bool {
+    static KEEPS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *KEEPS.get_or_init(|| {
+        const PROBE: &str = "#define RS \"RootConstants(num32BitConstants = 1, b0)\"\n\
+            cbuffer C : register(b0) { uint n; };\n\
+            RWByteAddressBuffer o : register(u0);\n\
+            [RootSignature(RS)] [numthreads(1, 1, 1)] void main() {}\n";
+        let keeps = system_compile(PROBE, windows::core::s!("main"), windows::core::s!("cs_5_1"))
+            .is_ok_and(|bytes| dxbc_has_part(&bytes, b"RTS0"));
+        if keeps {
+            tracing::debug!("the system's shader compiler keeps root signatures");
+        } else {
+            tracing::info!("the system's shader compiler drops root signatures (Wine): our shaders are compiled with DXC");
+        }
+        keeps
+    })
+}
+
+/// Whether the DXBC container `bytes` has a part of kind `fourcc`.
+fn dxbc_has_part(bytes: &[u8], fourcc: &[u8; 4]) -> bool {
+    let word = |at: usize| bytes.get(at..at + 4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]) as usize);
+    if !bytes.starts_with(b"DXBC") {
+        return false;
+    }
+    // "DXBC", a 16-byte digest, a version, the size, then the part count and
+    // each part's offset; a part starts with its kind.
+    let Some(parts) = word(28) else { return false };
+    (0..parts.min(64)).any(|i| {
+        word(32 + 4 * i).is_some_and(|at| bytes.get(at..at + 4) == Some(&fourcc[..]))
+    })
+}
+
+/// Compiles with the system's `d3dcompiler_47`; its messages go to the log.
+fn system_compile(
     source: &str,
     entry: windows::core::PCSTR,
     target: windows::core::PCSTR,
@@ -1395,21 +1472,7 @@ pub(crate) fn compile(
             };
             tracing::warn!("a shader of ours: {}", String::from_utf8_lossy(text).trim());
         }
-        // SAFETY: both names are NUL-terminated literals of the caller's.
-        let (entry, target) = unsafe { (entry.to_string(), target.to_string()) };
-        let (Ok(entry), Ok(target)) = (entry, target) else {
-            return Err(e);
-        };
-        return match dxc_compile(source, &entry, &target) {
-            Ok(bytes) => {
-                tracing::info!(%entry, %target, "the system compiler refused a shader of ours; DXC compiled it");
-                Ok(bytes)
-            }
-            Err(dxc) => {
-                tracing::warn!(error = %dxc, "DXC could not compile it either (is dxcompiler.dll beside victory.exe?)");
-                Err(e)
-            }
-        };
+        return Err(e);
     }
     let code = code.ok_or_else(windows::core::Error::empty)?;
     // SAFETY: the blob's own bytes.

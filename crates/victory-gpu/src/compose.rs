@@ -2,8 +2,6 @@
 //! (the interface) over the first (the scene), each scaled to the screen.
 //! Grand Theft Auto VI presents so on Series S.
 
-use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::{PCSTR, s};
@@ -42,26 +40,10 @@ unsafe impl Send for Composer {}
 // SAFETY: as above.
 unsafe impl Sync for Composer {}
 
-fn compile(entry: PCSTR, target: PCSTR) -> windows::core::Result<ID3DBlob> {
-    let mut code: Option<ID3DBlob> = None;
-    // SAFETY: the source and names live through the call; the out pointer is
-    // ours.
-    unsafe {
-        D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
-            s!("compose"),
-            None,
-            None,
-            entry,
-            target,
-            0,
-            0,
-            &mut code,
-            None,
-        )?;
-    }
-    code.ok_or_else(windows::core::Error::empty)
+/// One stage of [`SOURCE`], through `crate::host::compile` (DXC under Wine,
+/// whose compiler drops the root signature).
+fn compile(entry: PCSTR, target: PCSTR) -> windows::core::Result<Vec<u8>> {
+    crate::host::compile(SOURCE, entry, target)
 }
 
 impl Composer {
@@ -70,16 +52,13 @@ impl Composer {
             compile(s!("vs"), s!("vs_5_1"))?,
             compile(s!("ps"), s!("ps_5_1"))?,
         );
-        // SAFETY: the blobs' own bytes, alive through the calls.
+        // SAFETY: the compiled bytes, alive through the calls.
         unsafe {
-            let bytes = |b: &ID3DBlob| {
-                std::slice::from_raw_parts(b.GetBufferPointer().cast::<u8>(), b.GetBufferSize())
-            };
             let device = &host.device;
-            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes(&vs))?;
-            let code = |b: &ID3DBlob| D3D12_SHADER_BYTECODE {
-                pShaderBytecode: b.GetBufferPointer(),
-                BytecodeLength: b.GetBufferSize(),
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, &vs)?;
+            let code = |b: &Vec<u8>| D3D12_SHADER_BYTECODE {
+                pShaderBytecode: b.as_ptr().cast(),
+                BytecodeLength: b.len(),
             };
             let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
