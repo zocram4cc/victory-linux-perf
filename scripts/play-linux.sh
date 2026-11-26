@@ -343,6 +343,10 @@ setsid bash -c 'while kill -0 "$1" 2>/dev/null; do sleep 2; done
   grep -q "\"exit_code\"" "$2/run.json" 2>/dev/null ||
     python3 -I "$3" --write-run-json "$2" --end --exit-code -1 --seconds $(( $(date +%s) - $4 ))' \
   finisher $$ "$run" "$repo/scripts/victory-report.py" "$started" </dev/null >/dev/null 2>&1 &
+# Not one of this script's jobs: the wait at the end must not wait for it
+# (it waits for this script, and the two waited for each other until the
+# terminal was closed, runs 20261126-233924 and -235120).
+disown $!
 
 # The title in a process group of its own, so that Ctrl-C here reaches this
 # script only, which then asks the title to end.
@@ -398,7 +402,7 @@ done
 trap - INT TERM HUP
 [[ -n "${timer:-}" ]] && kill "$timer" 2>/dev/null || true
 kill "$sampler" 2>/dev/null || true
-wait 2>/dev/null || true
+wait "$sampler" ${timer:+"$timer"} 2>/dev/null || true
 
 # MangoHud names its files after the program; give them fixed names.
 for f in "$run"/*_summary.csv; do [[ -e "$f" ]] && mv -f "$f" "$run/mangohud-summary.csv"; done
