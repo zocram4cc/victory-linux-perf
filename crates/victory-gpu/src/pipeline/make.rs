@@ -116,9 +116,11 @@ impl Pending {
     }
 
     fn make(&self) {
-        let _ = self.begun.set(Instant::now());
+        let began = Instant::now();
+        let _ = self.begun.set(began);
         self.made
             .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        WORK_US.fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -313,6 +315,10 @@ fn wait(p: &Pending, frame: u64) {
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
     drop(held);
+    WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    if p.made.get().is_none() {
+        DROPPED.fetch_add(1, Ordering::Relaxed);
+    }
     let waited = started.elapsed().min(left);
     let past = waited.saturating_sub(wait_budget());
     past_total.fetch_add(past.as_millis() as u64, Ordering::Relaxed);
@@ -448,6 +454,16 @@ fn workers() -> bool {
     })
 }
 
+/// Microseconds the workers spent on pipelines since the start: the
+/// translation of their shaders (when not cached) and the host's calls.
+static WORK_US: AtomicU64 = AtomicU64::new(0);
+
+/// Draws and dispatches dropped because their pipeline was not ready
+/// within the frame's budget, and microseconds title threads waited for
+/// pipelines, since the start (P.1).
+pub(crate) static DROPPED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static WAITED_US: AtomicU64 = AtomicU64::new(0);
+
 /// The most pipelines waiting at once since the workers last ran out.
 static PEAK: AtomicU64 = AtomicU64::new(0);
 
@@ -456,10 +472,16 @@ static PEAK: AtomicU64 = AtomicU64::new(0);
 fn drained() {
     use super::library::{EARLY, LOADED, MADE};
     if PEAK.swap(0, Ordering::Relaxed) >= 10 {
+        use super::library::{LOADED_US, MADE_US};
         tracing::info!(
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
+            made_ms = MADE_US.load(Ordering::Relaxed) / 1000,
+            loaded_ms = LOADED_US.load(Ordering::Relaxed) / 1000,
+            workers_ms = WORK_US.load(Ordering::Relaxed) / 1000,
+            title_waited_ms = WAITED_US.load(Ordering::Relaxed) / 1000,
+            dropped = DROPPED.load(Ordering::Relaxed),
             "host pipelines all made"
         );
     }

@@ -67,6 +67,11 @@ pub fn use_pipeline_cache(dir: PathBuf) {
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LOADED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EARLY: AtomicU64 = AtomicU64::new(0);
+/// Microseconds spent in the host's calls since the start: making
+/// pipelines (vkd3d and the driver) and loading them from the library
+/// (P.1, the pipeline census).
+pub(crate) static MADE_US: AtomicU64 = AtomicU64::new(0);
+pub(crate) static LOADED_US: AtomicU64 = AtomicU64::new(0);
 /// For the memory lines: the bytes of the library's file, kept in memory
 /// while the library lives, and the bytes the last save wrote (a buffer of
 /// that size is made, filled and written every time pipelines were added,
@@ -453,6 +458,26 @@ fn library() -> Option<&'static Library> {
 /// adapter or driver change, damage).
 fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
+        if bytes.is_empty() {
+            // An empty library is asked for with a null blob: vkd3d-proton
+            // refuses a pointer with a length of 0 (E_INVALIDARG,
+            // `d3d12_pipeline_library_init`), and an empty slice's pointer
+            // is not null. Until 26 Nov 2026 that left every run without a
+            // library: no pipeline was ever kept.
+            let mut out = std::ptr::null_mut();
+            // SAFETY: the host's own method, with a null blob of length 0.
+            unsafe {
+                (Interface::vtable(device).CreatePipelineLibrary)(
+                    Interface::as_raw(device),
+                    std::ptr::null(),
+                    0,
+                    &ID3D12PipelineLibrary::IID,
+                    &mut out,
+                )
+                .ok()?;
+                return ID3D12PipelineLibrary::from_raw(out).cast();
+            }
+        }
         // SAFETY: the bytes outlive the library (kept beside it).
         unsafe {
             device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
@@ -484,7 +509,13 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     // The rejected bytes are let go (a mapped file is unmapped) before the
     // empty library is made: nothing reads them any more.
     drop(blob);
-    let library = make(&[]).ok()?;
+    let library = match make(&[]) {
+        Ok(library) => library,
+        Err(e) => {
+            tracing::warn!(error = %e, "the host refused an empty pipeline library");
+            return None;
+        }
+    };
     Some(Library {
         library,
         _blob: Blob::None,
@@ -514,7 +545,10 @@ pub(crate) fn pipeline(
     let wide = HSTRING::from(name);
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
-        return create();
+        let began = std::time::Instant::now();
+        let made = create();
+        MADE_US.fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+        return made;
     };
     let began = std::time::Instant::now();
     let loaded = {
@@ -529,6 +563,7 @@ pub(crate) fn pipeline(
     let refused = match loaded {
         Ok(pso) => {
             LOADED.fetch_add(1, Ordering::Relaxed);
+            LOADED_US.fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
             crate::host::trail(|| {
                 let label = LABEL.with(|l| l.borrow().clone());
                 format!("pipeline library: loaded {label} in {:.1} ms", began.elapsed().as_secs_f64() * 1e3)
@@ -540,7 +575,10 @@ pub(crate) fn pipeline(
     // Compiled outside any lock: compiles take up to seconds.
     let pso = {
         let _call = call("make", name);
-        create()?
+        let making = std::time::Instant::now();
+        let made = create();
+        MADE_US.fetch_add(making.elapsed().as_micros() as u64, Ordering::Relaxed);
+        made?
     };
     MADE.fetch_add(1, Ordering::Relaxed);
     crate::host::trail(|| {
