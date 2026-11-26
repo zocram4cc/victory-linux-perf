@@ -7534,7 +7534,7 @@ impl HostList {
                         copies += 1;
                     }
                     batch.fill();
-                    batch.title_written();
+                    batch.title_written_at(dst, len);
                     crate::port::copied(dst, src, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
@@ -7875,6 +7875,10 @@ struct Batch {
     /// `ahead` holds everything the submission refreshes
     /// ([`Batch::refresh_front`]).
     front: bool,
+    /// (`VICTORY_REFRESH_ONCE=1`) Copies (by address) brought up to date by a
+    /// flush of this submission, and the range (from, to), until a step of ours
+    /// writes title memory there ([`Batch::title_written_at`]).
+    once: ByCopy<(usize, usize)>,
 }
 
 /// Whether the copies that a submission's shaders write are brought up to
@@ -7886,6 +7890,95 @@ struct Batch {
 fn ahead_of_writes() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_AHEAD").is_none_or(|v| v != "0") && wide_refresh() && crate::watch::light())
+}
+
+/// (`VICTORY_REFRESH_ONCE=1`, default off) A copy's range brought up to date in
+/// a submission is not asked again in it until a step of ours writes title
+/// memory there. Fox's skip (`Batch::ahead`) is cleared at every title copy;
+/// this one trims only the ranges a title copy overlaps (the larger side of
+/// each stays), and takes in what a flush brought up to date. Counted in
+/// copystat's "refreshes ..., N skipped M MB" (diagnostics builds).
+/// `=verify` (diagnostics builds): every skip is decided and the refresh done
+/// all the same; a refresh that took bytes is counted, and must read 0.
+fn refresh_once() -> Once {
+    static ON: std::sync::LazyLock<Once> = std::sync::LazyLock::new(|| match std::env::var("VICTORY_REFRESH_ONCE").as_deref().map(str::trim) {
+        Ok("1") => Once::On,
+        Ok("verify") if cfg!(feature = "diagnostics") => Once::Verify,
+        _ => Once::Off,
+    });
+    *ON
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Once {
+    Off,
+    On,
+    Verify,
+}
+
+/// (`VICTORY_REFRESH_ONCE=verify`) Since the start: skips checked, of them
+/// those whose refresh took bytes (the skip would have missed them), and those bytes.
+static ONCE_VERIFY: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// (`VICTORY_REFRESH_ONCE=verify`) The refresh a skip leaves out, done here.
+fn once_verify(shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
+    let copied = shadow.update(address, len);
+    let n = ONCE_VERIFY[0].fetch_add(1, Ordering::Relaxed) + 1;
+    if copied > 0 {
+        let missed = ONCE_VERIFY[1].fetch_add(1, Ordering::Relaxed) + 1;
+        ONCE_VERIFY[2].fetch_add(copied as u64, Ordering::Relaxed);
+        if missed <= 16 || missed.is_power_of_two() {
+            let (start, bytes) = shadow.span();
+            tracing::warn!(
+                missed,
+                copy = shadow.id(),
+                copy_start = format_args!("{start:#x}"),
+                copy_bytes = bytes,
+                in_place = shadow.in_place(),
+                address = format_args!("{address:#x}"),
+                len,
+                taken = copied,
+                "VICTORY_REFRESH_ONCE=verify: a refresh the skip would have left out took bytes"
+            );
+        }
+    }
+    if n.is_power_of_two() && n >= 1024 {
+        tracing::info!(
+            "VICTORY_REFRESH_ONCE=verify, since the start: skips checked {n}, refreshes the skip would have missed {} ({:.1} MB)",
+            ONCE_VERIFY[1].load(Ordering::Relaxed),
+            ONCE_VERIFY[2].load(Ordering::Relaxed) as f64 / 1048576.0
+        );
+    }
+}
+
+/// `entry`, a copy's range brought up to date in a submission, with `[from, to)`
+/// brought up to date too: joined if they touch, else the larger of the two.
+fn join_once(entry: &mut (usize, usize), from: usize, to: usize) {
+    if from >= to {
+        return;
+    }
+    if from <= entry.1 && entry.0 <= to {
+        (entry.0, entry.1) = (entry.0.min(from), entry.1.max(to));
+    } else if to - from > entry.1 - entry.0 {
+        *entry = (from, to);
+    }
+}
+
+/// `entry` without `[at, at + len)`, which a title write changed: the larger
+/// part beside the write stays. False when nothing is left.
+fn trim_once(entry: &mut (usize, usize), at: usize, len: usize) -> bool {
+    let end = at + len;
+    let (from, to) = *entry;
+    if end <= from || to <= at {
+        return true;
+    }
+    let (left, right) = (at.saturating_sub(from), to.saturating_sub(end));
+    if left >= right {
+        entry.1 = from + left;
+    } else {
+        entry.0 = end;
+    }
+    entry.0 < entry.1
 }
 
 /// Whether everything a submission refreshes is brought up to date in one go,
@@ -8103,6 +8196,23 @@ impl Batch {
         if self.ahead.get(&key).is_some_and(|&(from, to)| from <= address && end <= to) {
             return;
         }
+        // (`VICTORY_REFRESH_ONCE=1`) Brought up to date by a flush of this
+        // submission, and no step of ours wrote title memory there since.
+        if refresh_once() != Once::Off && self.once.get(&key).is_some_and(|&(from, to)| from <= address && end <= to) {
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::copystat::add(crate::copystat::C::Skipped, 1);
+                crate::copystat::add(crate::copystat::C::SkippedBytes, len as u64);
+            }
+            if refresh_once() == Once::On {
+                return;
+            }
+            // `=verify`: the refresh is done here all the same (the title's
+            // bytes are what the flush would find: nothing of ours wrote them
+            // since), and what it takes is what the skip would have missed.
+            once_verify(shadow, address, len);
+            return;
+        }
         match self.index.get(&key) {
             Some(&at) => {
                 let r = &mut self.refreshes[at];
@@ -8168,7 +8278,29 @@ impl Batch {
     fn title_written(&mut self) {
         self.flush();
         self.ahead.clear();
+        self.once.clear();
         self.textures.clear();
+    }
+
+    /// [`Batch::title_written`] for a copy of ours into `[at, at + len)`: of
+    /// what a flush brought up to date, only the ranges that hold some of those
+    /// bytes are trimmed (`VICTORY_REFRESH_ONCE=1`); fox's skip goes whole, as before.
+    fn title_written_at(&mut self, at: usize, len: usize) {
+        self.flush();
+        self.ahead.clear();
+        if refresh_once() != Once::Off {
+            self.once.retain(|_, entry| trim_once(entry, at, len));
+        }
+        self.textures.clear();
+    }
+
+    /// (`VICTORY_REFRESH_ONCE=1`) `[from, to)` of the copy `key` is brought up to
+    /// date in this submission ([`join_once`]).
+    fn brought(&mut self, key: usize, from: usize, to: usize) {
+        if from >= to {
+            return;
+        }
+        join_once(self.once.entry(key).or_insert((from, to)), from, to);
     }
 
     /// Before the steps of `runs` ([`refresh_front`]), a new part of the
@@ -8374,6 +8506,19 @@ impl Batch {
     }
 
     fn flush_all(&mut self) {
+        // (`VICTORY_REFRESH_ONCE=1`) What this flush brings up to date is not
+        // asked again in the submission until a step writes title memory there
+        // (noted now: the flush is done before the next step).
+        if refresh_once() != Once::Off {
+            let done: Vec<(usize, usize, usize)> = self
+                .refreshes
+                .iter()
+                .map(|(shadow, from, to)| (std::sync::Arc::as_ptr(shadow) as usize, *from, *to))
+                .collect();
+            for (key, from, to) in done {
+                self.brought(key, from, to);
+            }
+        }
         // Most of a flush's copies are as they were: they are told so here,
         // from what the submission's asking found, before anything is asked
         // and any thread woken. (Thousands of them, the heap's buffer views
@@ -11205,3 +11350,34 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     }
 }
 
+
+#[cfg(test)]
+mod refresh_once_tests {
+    use super::{join_once, trim_once};
+
+    #[test]
+    fn a_flushed_range_joins_what_touches_it_and_otherwise_keeps_the_larger() {
+        let mut entry = (100, 200);
+        join_once(&mut entry, 200, 250);
+        assert_eq!(entry, (100, 250), "touching ranges join");
+        join_once(&mut entry, 300, 320);
+        assert_eq!(entry, (100, 250), "a smaller range apart is not kept");
+        join_once(&mut entry, 400, 600);
+        assert_eq!(entry, (400, 600), "a larger range apart replaces it");
+    }
+
+    #[test]
+    fn a_title_write_trims_a_range_to_its_larger_side() {
+        let mut entry = (0, 100);
+        assert!(trim_once(&mut entry, 60, 10));
+        assert_eq!(entry, (0, 60), "the left part (60) is larger than the right (30)");
+        let mut entry = (0, 100);
+        assert!(trim_once(&mut entry, 10, 10));
+        assert_eq!(entry, (20, 100), "the right part (80) is larger than the left (10)");
+        let mut entry = (0, 100);
+        assert!(!trim_once(&mut entry, 0, 200), "a write over the whole range leaves nothing");
+        let mut entry = (0, 100);
+        assert!(trim_once(&mut entry, 200, 10));
+        assert_eq!(entry, (0, 100), "a write apart from the range leaves it");
+    }
+}
