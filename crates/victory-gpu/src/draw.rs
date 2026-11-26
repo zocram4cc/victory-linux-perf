@@ -475,7 +475,7 @@ fn bind_zeros(
 /// C.1 census: inclusive time and calls of the draw path's parts since the
 /// last frame line (draw, draw_indexed, dispatch, execute_indirect,
 /// prepare_for, bind, tables), on the title's recording threads.
-pub(crate) static TIMED: [[AtomicU64; 2]; 10] = [const { [AtomicU64::new(0), AtomicU64::new(0)] }; 10];
+pub(crate) static TIMED: [[AtomicU64; 2]; 14] = [const { [AtomicU64::new(0), AtomicU64::new(0)] }; 14];
 
 pub(crate) struct Timed(usize, std::time::Instant);
 
@@ -2210,6 +2210,7 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        let _timed = Timed::new(10);
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);
                             continue;
@@ -2218,13 +2219,18 @@ impl State {
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {
-                        host.make_at(index, &view);
+                        {
+                            let _timed = Timed::new(11);
+                            host.make_at(index, &view);
+                        }
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
                         if let Some(kind) = kind {
+                            let _timed = Timed::new(12);
                             readable(list, kind, &view);
                         }
+                        let _timed = Timed::new(13);
                         // The title's slot is a table's: out of the queue
                         // of textures picked by index if the draw read it
                         // (its texture is up to date now), and made in
