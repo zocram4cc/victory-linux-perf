@@ -2759,7 +2759,37 @@ fn read_backs(list: &HostList) {
 
 /// After the card ran what declared `back`: what shaders wrote there goes
 /// into title memory, and the ranges are done with.
+/// 1.3: per frame line, ranges handed back, those another host copy
+/// overlaps, their bytes, the bytes of the overlaps, the copies met
+/// (`VICTORY_BACK_OVERLAP=1`).
+pub(crate) static BACK_OVERLAP: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+fn back_overlap_census(back: &[Declared]) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_BACK_OVERLAP").is_some_and(|v| v == "1")) {
+        return;
+    }
+    for (shadow, declared) in back {
+        if shadow.in_place() {
+            continue;
+        }
+        // Declared ranges are title addresses (`Shadow::writing`).
+        for &(from, to) in declared {
+            let (at, end) = (from as u64, to as u64);
+            let (copies, bytes) = crate::shadow::overlapping(at, end, shadow);
+            BACK_OVERLAP[0].fetch_add(1, Ordering::Relaxed);
+            BACK_OVERLAP[2].fetch_add(end - at, Ordering::Relaxed);
+            if copies > 0 {
+                BACK_OVERLAP[1].fetch_add(1, Ordering::Relaxed);
+                BACK_OVERLAP[3].fetch_add(bytes, Ordering::Relaxed);
+                BACK_OVERLAP[4].fetch_add(copies, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 fn hand_back(back: &[Declared]) {
+    back_overlap_census(back);
     if crate::shadow::back_ceiling() {
         // Measurement only: nothing goes back (see `back_ceiling`).
         for (shadow, declared) in back {
@@ -5864,6 +5894,17 @@ impl Meter {
         crate::resource::textures_made_line(frames);
         crate::pool::pool_line(frames);
         crate::census::census_line(frames);
+        {
+            let [ranges, overlapped, bytes, over, copies] =
+                [0, 1, 2, 3, 4].map(|i| BACK_OVERLAP[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if ranges > 0.0 {
+                tracing::info!(
+                    "copy-back ranges per frame (1.3 overlap): {ranges:.0} declared ({:.1} MB), {overlapped:.0} overlapped by {copies:.0} other host copies ({:.1} MB of overlap)",
+                    bytes / 1e6,
+                    over / 1e6
+                );
+            }
+        }
         let zeros = crate::draw::ZERO_ROOTS.load(Ordering::Relaxed);
         if zeros > 0 {
             tracing::info!("root views bound to zeros so far (no host copy at their address; S.7 guard): {zeros}");
