@@ -135,6 +135,7 @@ scripts\play.ps1 -Exe <exe> -More @{VICTORY_PORT_JOURNAL='1'; VICTORY_PORT_CONST
 |---|---|---|
 | Windows (this machine) | `VICTORY_PORT_JOURNAL=1 VICTORY_PORT_CONSTANTS=1` | measured twice (ab2, ab3: 48.6 ms both), world drawn in the intro |
 | Wine / Proton | the same switches; **the code now leaves `PORT_CONSTANTS` off under Wine** unless `VICTORY_PORT_CONSTANTS_WINE=1`, so they act as journal alone there | `PORT_CONSTANTS` reported to draw a black world there (PR #380, RX 7900 XT, Wine 11.22, RADV, vkd3d-proton); not verified either way on this PC, which has no Wine. Journal alone: prepare −6.0 %, frame −3.5 % here (ab1) |
+
 **Wine guard (code).** `constants_switch` (victory-gpu `port.rs`, used by both halves of port #1, the GPU's and xmem's): `VICTORY_PORT_CONSTANTS=1` turns it on, but under Wine (ntdll exports `wine_get_version`) only together with `VICTORY_PORT_CONSTANTS_WINE=1`; a warning says so. Test `the_constants_port_stays_off_under_wine_unless_asked_for_there`: red against the old rule ("on under Wine without VICTORY_PORT_CONSTANTS_WINE=1"), green after. On Windows nothing changes: a check run on the new build drew port 1's log lines and measured frame 47.9 ms, prepare 40.3 ms, copy-back 23.8 ms. The final configuration is therefore the same two switches on every platform, and on Wine it cannot turn on the unverified port by accident.
 
 Picture check (after a report on the PR of a black world with `PORT_CONSTANTS` alone under Wine
