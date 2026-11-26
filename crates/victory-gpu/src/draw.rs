@@ -476,7 +476,15 @@ fn bind_zeros(
 /// measured; meant with `VICTORY_DYNAMIC_NO_WAIT=1`.
 fn all_fresh() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_ALL_FRESH").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ALL_FRESH").is_some_and(|v| v == "1" || v == "2"))
+}
+
+/// `VICTORY_ALL_FRESH=2`: as 1, but the title's own slots of the textures a
+/// draw read are still made (`mirror`), for shaders that pick them by index
+/// from the heap (without, things flickered black after loading).
+fn all_fresh_mirrors() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ALL_FRESH").is_some_and(|v| v == "2"))
 }
 
 /// `VICTORY_FRESH_COPY=1` (C.1): fresh tables copy the host descriptors of
@@ -2274,7 +2282,7 @@ impl State {
                             && crate::descriptor::host::is_texture_view(&view)
                         {
                             host.texture_slot_tabled(title + k, kind.is_some());
-                            if kind.is_some() && !copied && !all {
+                            if kind.is_some() && !copied && !(all && !all_fresh_mirrors()) {
                                 host.mirror(title + k, table + u64::from(k) * 32, true);
                             }
                         }
