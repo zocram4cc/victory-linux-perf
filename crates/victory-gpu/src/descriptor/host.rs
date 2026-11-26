@@ -1497,9 +1497,31 @@ fn dynamic_slots(count: u32, null: u32) -> u32 {
             .unwrap_or(DYNAMIC << 2)
     });
     if null < PORTABLE_VIEWS {
-        return DYNAMIC;
+        // A host heap capped at 1,000,000 views (NVIDIA; the title asks for
+        // 1,245,184) ran these out with the fast settings: 1,100-4,800 of
+        // 12,000-16,600 tables a frame refused, each a dropped draw
+        // (trustno1's NVIDIA fork). `VICTORY_DYNAMIC_SLOTS` takes more of
+        // them from the title's slots kept in place (tables past those are
+        // made afresh here anyway), at most half the heap; there 524,288
+        // left 0-33 refused a frame.
+        static CAPPED: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        return *CAPPED.get_or_init(|| {
+            let asked = std::env::var("VICTORY_DYNAMIC_SLOTS").ok().and_then(|v| v.trim().parse::<u32>().ok());
+            let slots = capped_dynamic_slots(asked, null);
+            if slots != DYNAMIC {
+                tracing::info!(slots, title_in_place = null - slots, "dynamic descriptor slots on a capped view heap (VICTORY_DYNAMIC_SLOTS)");
+            }
+            slots
+        });
     }
     null.saturating_sub(count).min(most).max(DYNAMIC)
+}
+
+/// [`dynamic_slots`] on a capped view heap ending at `null`, for a value
+/// of `VICTORY_DYNAMIC_SLOTS`: [`DYNAMIC`] unless asked for more, and at
+/// most half the heap.
+fn capped_dynamic_slots(asked: Option<u32>, null: u32) -> u32 {
+    asked.unwrap_or(DYNAMIC).clamp(DYNAMIC, (null / 2).max(DYNAMIC))
 }
 
 impl HostHeap {
@@ -6030,6 +6052,18 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    /// On a view heap capped at 1,000,000 (NVIDIA), `VICTORY_DYNAMIC_SLOTS`
+    /// sets the dynamic slots between 2^18 and half the heap.
+    #[test]
+    fn capped_heaps_take_the_dynamic_slots_asked_for_up_to_half() {
+        let null = 999_999;
+        assert_eq!(capped_dynamic_slots(None, null), DYNAMIC);
+        assert_eq!(capped_dynamic_slots(Some(524_288), null), 499_999);
+        assert_eq!(capped_dynamic_slots(Some(400_000), null), 400_000);
+        assert_eq!(capped_dynamic_slots(Some(1_000), null), DYNAMIC);
+        assert_eq!(capped_dynamic_slots(Some(400_000), 100_000), DYNAMIC);
     }
 
     #[test]
