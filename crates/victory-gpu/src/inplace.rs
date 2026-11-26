@@ -165,6 +165,7 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     }
     match place_part(&host.device, start, len) {
         Ok(placed) => {
+            PLACED_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((start, start + len.max(1)));
             if vram {
                 // Kept for the run: freeing the heap would unmap the title's
                 // memory there (the driver's placed map goes with it).
@@ -187,6 +188,26 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
             None
         }
     }
+}
+
+/// Title buffers put in place, by (start, end): for the census of windows
+/// over them (a GPU write into title memory is not a write the write watch
+/// sees, so a window copy of the same bytes would miss it).
+static PLACED_RANGES: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
+
+/// Windows (copies) over title buffers in place now: how many in-place
+/// buffers have one, and the bytes of overlap.
+pub(crate) fn windows_over_placed() -> (u64, u64, u64) {
+    let ranges = PLACED_RANGES.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let (mut buffers, mut bytes) = (0, 0);
+    for &(a, e) in &ranges {
+        let over = crate::shadow::windows_over(a, e);
+        if over > 0 {
+            buffers += 1;
+            bytes += over;
+        }
+    }
+    (ranges.len() as u64, buffers, bytes)
 }
 
 /// Level 3: the 64 KiB-aligned ranges made VRAM, and their heaps, kept.

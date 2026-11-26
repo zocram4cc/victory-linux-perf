@@ -2882,6 +2882,16 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     n
 }
 
+/// Bytes of windows (copies) over `[at, end)`.
+pub(crate) fn windows_over(at: u64, end: u64) -> u64 {
+    let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    loose
+        .range((at.saturating_sub(WINDOW), 0)..(end, 0))
+        .filter(|(key, shadow)| key.0 + key.1 > at && !shadow.in_place())
+        .map(|(key, _)| (key.0 + key.1).min(end) - key.0.max(at))
+        .sum()
+}
+
 /// M.1: asks that went to a window: a buffer held them whole but the
 /// search for it (64 starts below) missed it; a buffer holds the address
 /// but the ask runs past its end; no buffer holds the address.
