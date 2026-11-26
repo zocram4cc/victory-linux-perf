@@ -128,6 +128,7 @@ report counts them). `--no-merge` runs the copies as recorded.
 | `--upcopies` | runs the frame twice: which words the copies of the CPU's sides of card buffers bring that the card holds another value of (those the card wrote alike in both runs are the ones to look at), and which pieces shaders wrote that were not declared as written. The live check is `VICTORY_UPCOPY_CHECK=1` (`host/upcheck.rs`) |
 | `--flow <lists>` | what the dispatches (`--flow-draws`: draws too) have bound: pipeline, root arguments, heap slots their constants lead to; no device is made |
 | `--images <folder>` | runs the frame once and saves the textures its shaders write (or `--texture <id>[.<sub>]`, repeatable) as pictures, with least, mean and greatest values; `--raw`: the values too; of a buffer named, its bytes |
+| `--bytes <resource>[:<at>:<bytes>]` | what the capture holds of a buffer (its number as `--flow` names it; `at` and `bytes` in hex): its contents at the frame's start and what the CPU had changed by each submission, with how many dwords are not zero and the dwords from `at`; no device is made (repeatable) |
 | `--until <list>:<command>` | nothing but barriers after that command |
 | `--dump <text>` | the DXIL of the pipelines named, in `shaders` |
 

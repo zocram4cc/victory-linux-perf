@@ -451,3 +451,54 @@ mod tests {
         assert!(texel(54, &[1, 0x7c])[0].is_nan());
     }
 }
+
+/// `--bytes <resource>[:<at>:<len>]`: what the capture holds of a buffer, read
+/// from the capture alone (no device is made): its contents at the start of
+/// the frame and what the CPU had changed in it by each submission, each
+/// with how many of its dwords are not zero, and the dwords from `at` (as
+/// hex and as floats).
+pub fn bytes(folder: &Path, what: &[(u32, u64, u64)], line: &mut dyn FnMut(&str)) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let folder = find(folder)?;
+    let frame = Frame::read(&folder.join("frame.bin"))?;
+    let mut contents = File::open(folder.join("contents.bin"))?;
+    let mut deltas = File::open(folder.join("deltas.bin"))?;
+    let mut piece = |file: &mut File, from: u64, len: u64, first: u64, at: u64, most: u64, zero: bool| -> Result<String> {
+        let mut all = vec![0u8; len as usize];
+        if !zero {
+            file.seek(SeekFrom::Start(from))?;
+            file.read_exact(&mut all)?;
+        }
+        let dwords: Vec<u32> = all.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let set = dwords.iter().filter(|&&d| d != 0).count();
+        let mut text = format!("{set} of {} dwords not zero", dwords.len());
+        // The window asked for, where this piece holds it.
+        let (lo, hi) = (at.max(first), (at + most).min(first + len));
+        if lo < hi {
+            let shown = &dwords[((lo - first) / 4) as usize..((hi - first).div_ceil(4) as usize).min(dwords.len())];
+            let set = shown.iter().filter(|&&d| d != 0).count();
+            text += &format!("; at {lo:#x}+{:#x}: {set} of {} not zero:", hi - lo, shown.len());
+            for d in shown.iter().take(48) {
+                text += &format!(" {d:08x}({:.4})", f32::from_bits(*d));
+            }
+        }
+        Ok(text)
+    };
+    for &(res, at, most) in what {
+        match frame.resources.iter().find(|r| r.id == res) {
+            Some(r) => line(&format!("#{res} '{}' {:#x} bytes, {:?}, idle {}", r.name, r.desc.width, r.place, r.idle)),
+            None => line(&format!("#{res} is not in the capture")),
+        }
+        for c in frame.contents.iter().filter(|c| c.res == res) {
+            let text = piece(&mut contents, c.file, c.len, c.first, at, most, c.file == wire::ZERO)?;
+            line(&format!("  at the frame's start {:#x}+{:#x}: {text}", c.first, c.len));
+        }
+        for (i, s) in frame.submits.iter().enumerate() {
+            for d in s.deltas.iter().filter(|d| d.res == res) {
+                let text = piece(&mut deltas, d.file, d.len, d.at, at, most, false)?;
+                line(&format!("  by submission {i} the CPU's side {:#x}+{:#x}: {text}", d.at, d.len));
+            }
+        }
+    }
+    Ok(())
+}
