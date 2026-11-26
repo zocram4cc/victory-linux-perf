@@ -15,10 +15,12 @@ another card or another driver.
 
 The changes below are on by default only under Wine (ntdll exports
 `wine_get_version`), each with a switch: `0` turns it off, `1` turns it on
-on any host. That is a choice, not a finding: the compute dispatch wait is
-for a cause that is not Wine-specific. None of them has been tried on
-Windows or on other cards. The null-blob pipeline library is the one change
-that is the same on every host.
+on any host (`VICTORY_PUBLISH_SAFE` and the null-page switches,
+`VICTORY_NULL_BUFFER_ZEROS` and `VICTORY_NULL_ROOTS`, only turn off). That
+is a choice, not a finding: the compute dispatch wait is for a cause that is
+not Wine-specific. None of them has been tried on Windows or on other cards.
+The null-blob pipeline library and the faces fix (the d16 accesses through
+tables) are the same on every host.
 
 ## Requirements
 
@@ -173,6 +175,55 @@ it, in two cold starts (one on 3.2.0 with the single latch off, one on
 71cae09), and four more with earlier forms of the bounds, the heads had skin,
 the head map was made within 15 ms of its dispatch, and the title ran on. With
 `VICTORY_COMPUTE_WAIT=0` on this tree the heads had no skin again.
+
+### Faces still, eyes glowing, or faces torn
+
+Seen: no face moved, and the eyes glowed (the rig drives the eye meshes too).
+Once faces moved, some were torn: mouths agape, teeth under the nose.
+
+Cause of the still faces: the face network's programs (`compute_graph_ops`)
+keep 16-bit integers in typed views of R16_UINT and R16G16B16A16_UINT in
+descriptor tables. Their `_d16` accesses took the data as halves of a float
+view, which gave zeros, a face at rest. The translation could ask the host's
+table of strides for the integer kind of a view picked from the heap (upstream
+9a6c829), not of one in a table, and the host wrote that word only for the
+title's own slots. Fix, on every host and without a switch (PR #114): the d16
+accesses ask for the kind of a view in a table too, and the host writes the
+word for the dynamic slots of a table made afresh. It changes the
+translations: `TRANSLATOR_VERSION` is 2. Seen working on an RTX 4080 SUPER
+(`docs/findings.md`); not run on a Radeon on this tree.
+
+Cause of the torn faces, on an RX 9070 (Beqren's report, not run here): on
+RADV through vkd3d-proton a typed (texel buffer) load after a group barrier
+can return a value from before another wave's store that came before the
+barrier; a raw (storage buffer) load of the same bytes sees it. Found in the
+face controls' interpreter (0aa7934094794dbf) by replaying it alone. Fix, on
+under Wine (`VICTORY_RAW_TYPED_LOADS`: `0` off, any other value on any host):
+in compute programs that store to UAVs and use `s_barrier`, a 16-bit integer
+typed load also reads the slot's raw view, and the table of strides picks at
+run time: only views of an integer format with 2, 4 or 8 bytes an element take
+the raw value. When it is on, the shader cache's key has it.
+
+### GPU page faults, the device lost
+
+Seen by Beqren on amdgpu (not run here): the device lost on reads at GPU
+addresses near 0, or inside a texture made a moment before. Fixes, each on
+under Wine only and off with `0`:
+
+- `VICTORY_PUBLISH_SAFE`: the slot of every host texture waits for the
+  submissions begun before the texture was made (`VICTORY_SHOW_NEW_LATER` did
+  so for the pooled ones), and a first upload on the copy queue waits for them
+  too. On amdgpu a memory object newer than a running submission is not valid
+  for it.
+- `VICTORY_NULL_BUFFER_ZEROS`: views of buffers that read nothing (null
+  shader, constant and unordered ones, the title-memory run's slot 0) are views
+  of 64 MiB of real zeros, unordered ones of a second 64 MiB written into and
+  never read back; a null typed buffer UAV is a typed view of them. On
+  vkd3d-proton's path a null buffer view holds a load to no bound.
+- `VICTORY_NULL_ROOTS`, with the zeros above: a root constant or shader view
+  the title never set, with no host copy, or at a host address under 1 MiB is
+  bound to the zeros instead of address 0 (each pipeline and cause is logged
+  once). The bind goes through the same cache as the title's own root binds.
 
 ## Not known
 

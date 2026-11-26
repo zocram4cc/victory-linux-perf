@@ -93,8 +93,16 @@ In a frame captured at a cutscene (`victory replay <capture> --flow`, `--bytes`)
 Fixed: the d16 accesses ask for the kind of a view in a table too, and the host
 writes the word of the table of strides for the dynamic slots of a table it makes
 afresh (the network's tables hold constant buffers, so they always are). Faces move
-on the RTX 4080 SUPER; not yet seen on the RX 7900 XTX. No test covers the table
-case.
+on the RTX 4080 SUPER; not yet seen on the RX 7900 XTX. Tests: a d16 typed load
+through a table binds the table of strides, a 32-bit one does not
+(`a_d16_typed_buffer_load_through_a_table_reads_its_views_format_kind`, shader
+crate); the dynamic slots of a table get their words
+(`the_dynamic_slots_of_a_table_get_their_words_in_the_table_of_strides`, host;
+needs a card). The translations changed, so `TRANSLATOR_VERSION` is 2.
+
+Faces then moved but some were torn (mouths agape, teeth under the nose) on an
+RX 9070 under Proton (RADV, vkd3d-proton; Beqren's report): see "Faces still,
+eyes glowing, or faces torn" in `docs/proton.md` (`VICTORY_RAW_TYPED_LOADS`).
 
 ## Measured and not worth it
 
