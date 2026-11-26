@@ -2,6 +2,10 @@
 
 codec_d's cool_fox build of [VIctory](https://github.com/Marvisak/VIctory), carried on for **Linux under Proton** (tested on an NVIDIA RTX 5080), with the Wine and NVIDIA fixes of the forks credited below and tooling to measure playtests. The Windows instructions and the upstream AMD fork's notes follow unchanged.
 
+**This repository contains no game files, code or assets.** You need your own
+copy of the game. It is not affiliated with or endorsed by the game's developer
+or publisher.
+
 ## Run the codec_d Windows build
 
 Download and extract the Windows x64 ZIP from the [private releases](https://github.com/codec-d/cool_fox/releases/latest). Open PowerShell in the extracted folder and point the launcher at your own complete Xbox dump.
@@ -107,19 +111,22 @@ scripts/play-linux.sh --bench <route>               # a scripted run from script
 
 Press the mark shortcut at anything odd: a stutter, a glitch, a crash coming. The run is ended with SIGTERM, never SIGKILL: killing the title while its mappings are live can wedge the NVIDIA driver until a reboot. A benchmark route is a list of `VICTORY_KEYS` holds and a `duration=` line; see `scripts/bench/example.keys`. Leave enough RAM free before a run: the title wants most of 30 GB.
 
+## The upstream AMD fork's notes
+
+What follows is the upstream AMD fork's own description, as codec_d's cool_fox
+carried it: its goals, its measurements (made on that author's Windows PC, not
+by this fork) and its changes.
+
 A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
 that runs an Xbox Series title natively on Windows from files the user supplies.
 This one is about **speed on AMD RDNA 3**: the world at 30 frames a second on
 one PC, without giving up the picture. It is not there yet.
 
-**This repository contains no game files, code or assets.** You need your own
-copy of the game. It is not affiliated with or endorsed by the game's developer
-or publisher.
+### Where it stood upstream, on Windows and AMD (2026-11-25)
 
-## Where it stands on Windows and AMD (2026-11-25)
-
-Tested on one machine only: Windows 11, Intel i9-12900K, 64 GB RAM, Radeon
-RX 7900 XTX, 1440p, the Series X profile.
+Measured by the upstream AMD fork on its author's machine, not by this fork:
+Windows 11, Intel i9-12900K, 64 GB RAM, Radeon RX 7900 XTX, 1440p, the Series X
+profile.
 
 | | |
 |---|---|
@@ -143,7 +150,7 @@ What is known to be wrong:
   pipelines (`victory warm` makes them ahead).
 - Recording a frame in the world makes the title's own watchdog end it.
 
-## How to run it
+### How to run it (upstream, Windows)
 
 You need Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader
 model 6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build
@@ -171,7 +178,7 @@ Commands, debugging switches and upstream's own description:
 [docs/README-fxceless.md](docs/README-fxceless.md). Every `VICTORY_...` switch is
 described in a comment where it is read.
 
-## What is different here
+### What is different upstream
 
 In short; the reasons and the measurements are in [docs/findings.md](docs/findings.md).
 
