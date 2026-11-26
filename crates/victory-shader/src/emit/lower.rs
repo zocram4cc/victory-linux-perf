@@ -12793,7 +12793,16 @@ impl<'a> Lower<'a> {
         if let Some(g) = guard
             && !mesh
         {
-            if !(e.done && self.s.pixel) {
+            // A pixel's colour export before its last one, under the same EXEC: the lanes
+            // outside it are killed at the last one (a lane of a live quad that runs on as a
+            // helper gets here too, [`crate::structure`]).
+            let same_as_done = self.s.pixel
+                && !e.done
+                && (i + 1..self.x.p.blocks[b].insts.len()).any(|k| {
+                    self.exports.get(&(b, k)).is_some_and(|d| d.done)
+                        && self.x.st.guards[b][k] == self.x.st.guards[b][i]
+                });
+            if !(e.done && self.s.pixel || same_as_done) {
                 return Err("a conditional export");
             }
             let t = self.s.m.bool(true);

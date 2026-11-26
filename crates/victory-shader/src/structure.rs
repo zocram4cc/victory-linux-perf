@@ -13,8 +13,10 @@
 //!
 //! The control-flow graph keeps its shape and must be reducible (DXIL's
 //! only requirement). Helper lanes of a pixel shader count as live: on PC
-//! their side effects are dropped too, and what they compute is only read
-//! through derivatives.
+//! their side effects are dropped too, and what they compute is read through
+//! derivatives and quad operations. A lane a pixel program kills goes on as
+//! such a helper while its quad lives (`s_wqm` of the live mask): the branch
+//! that leaves when no lane is live is not its own bit's to take.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
@@ -537,6 +539,8 @@ struct Lanes<'a> {
     scc_every: HashSet<Value>,
     /// See [`Structured::wave_any`].
     wave_any: Vec<Option<bool>>,
+    /// Mask values an `s_wqm` reads: a pixel program's live lanes, whose quads go on.
+    quad_sources: HashSet<Value>,
 }
 
 /// A mask join taken as `value` in every lane that reaches `block`: each
@@ -581,6 +585,7 @@ impl<'a> Lanes<'a> {
         check_reducible(p, &order, &index)?;
         let mut incoming = vec![Vec::new(); blocks.len()];
         let (mut defs, mut phis) = (Map::default(), Map::default());
+        let mut quad_sources = HashSet::new();
         for (b, block) in blocks.iter().enumerate() {
             for (k, s) in block.exit.successors().into_iter().enumerate() {
                 incoming[s].push((b, k == 0));
@@ -591,6 +596,14 @@ impl<'a> Lanes<'a> {
             for (i, inst) in block.insts.iter().enumerate() {
                 for &(_, v) in &inst.writes {
                     defs.insert(v, (b, i));
+                }
+                if inst.name().starts_with("s_wqm_b") {
+                    quad_sources.extend(
+                        inst.reads
+                            .iter()
+                            .filter(|r| matches!(r.0, Reg::S(_)))
+                            .map(|r| r.1),
+                    );
                 }
             }
         }
@@ -617,6 +630,7 @@ impl<'a> Lanes<'a> {
             wide: HashSet::new(),
             scc_every: HashSet::new(),
             wave_any: vec![None; blocks.len()],
+            quad_sources,
         })
     }
 
@@ -1219,7 +1233,18 @@ impl<'a> Lanes<'a> {
                             self.active.insert(k.0);
                         }
                     }
-                    if let (Some(scc), Some(m)) = (inst.write(Reg::Scc), r.scc) {
+                    if let (Some(scc), Some(mut m)) = (inst.write(Reg::Scc), r.scc) {
+                        // A pixel program's live lanes (`s_andn2` of the killed ones), which
+                        // `s_wqm` widens again: a lane whose own bit is clear goes on with its
+                        // quad (a helper that computes what the quad reads, not only
+                        // derivatives), so "no lane is set" is not its own bit's answer.
+                        if let Some((k, _)) = r.dst
+                            && self.quad_sources.contains(&k.0)
+                        {
+                            let born = self.born(k.0);
+                            let q = self.b.atom(Atom::Quad(k.0), born);
+                            m = self.b.or(m, q);
+                        }
                         self.scc_lane.insert(scc, m);
                     }
                 }
@@ -1683,6 +1708,37 @@ mod tests {
             .expect("the select");
         let mask = select.write(Reg::S(3)).unwrap();
         assert_eq!(s.masks.get(&mask), Some(&Bool::FALSE));
+    }
+
+    #[test]
+    fn killed_lanes_of_a_live_quad_go_on() {
+        // A pixel program's kill: the live mask loses the killed lanes, the wave leaves
+        // when none is left, else its quads go on in whole-quad mode (the killed lanes as
+        // helpers, whose values quad reads take). Without `s_wqm` a killed lane leaves.
+        for wqm in [true, false] {
+            // s_wqm_b32 s1, s76, or s_mov_b32 s1, s76
+            let widen = if wqm { 0xBE81_094C } else { 0xBE81_034C };
+            let p = build(
+                &[
+                    0xBECC_037E, // s_mov_b32 s76, exec_lo
+                    0x7C28_10F2, // v_cmpx_gt_f32 exec_lo, 1.0, v8
+                    0x8A4C_7E4C, // s_andn2_b32 s76, s76, exec_lo
+                    0xBF84_0003, // s_cbranch_scc0 -> 28
+                    widen,
+                    0xBEFE_0301, // s_mov_b32 exec_lo, s1
+                    0x7E02_0280, // v_mov_b32 v1, 0
+                    S_ENDPGM,    // 28
+                ],
+                false,
+            );
+            let s = structure(&p).unwrap();
+            let LaneExit::Branch { when, .. } = s.exits[0] else {
+                panic!()
+            };
+            let support = s.bools.support(when);
+            let quad = support.iter().any(|a| matches!(a, Atom::Quad(_)));
+            assert_eq!(quad, wqm, "s_wqm {wqm}");
+        }
     }
 
     #[test]
