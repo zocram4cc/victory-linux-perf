@@ -211,6 +211,16 @@ unsafe impl Send for Memory {}
 
 static MEMORY: Mutex<Option<Memory>> = Mutex::new(None);
 
+/// Host view heap `heap` is let go: its run leaves the map. Kept, a heap
+/// made later at the same address took the old one's run, slots it never
+/// set aside and that other writers fill: the directory's numbers then
+/// name whatever views those hold.
+pub(crate) fn heap_gone(heap: usize) {
+    if let Some(m) = MEMORY.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        m.heaps.remove(&heap);
+    }
+}
+
 /// What a draw binds.
 pub(crate) struct Ready {
     pub(crate) directory: u64,
