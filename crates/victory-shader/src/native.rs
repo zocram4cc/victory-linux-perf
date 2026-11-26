@@ -544,6 +544,10 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
         let sgprs = match root {
             RootType::Table => 1,
             RootType::Descriptor => 2,
+            // Root constants (a constant buffer the root signature holds in
+            // place; device method 0x218's programs, P.4): as many user
+            // SGPRs as the record's descriptor dwords say.
+            RootType::Constants => u32::from(e[20]),
             // The code holds its words; no user data.
             RootType::ImmediateSampler => 0,
             _ => return Err(Malformed("an FSPX resource of an unknown root type")),
