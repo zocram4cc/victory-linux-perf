@@ -16,3 +16,10 @@ The author gets 0.5 ms on the write-watch line, ~15 fps at ~7,500 draws.
 - **Their GPU takes 2-28 ms a frame for the same scene; ours ~165 ms.** Our GPU time is ours (our translation, clamps, barriers or pipelines), not the card's or RADV's. The biggest single lead we have.
 - Their frame is CPU preparation (copies) and copy-back; ~5,000-8,000 draws.
 - Write watch under Wine is very sensitive to swap (zram): 60 ms with 16 GB swapped, 11-27 with 5. Check ours the same way.
+
+## From the author (26 Nov)
+
+- Their own runs also drop ~290-380 draws a frame "without a host pipeline (0 being made)": the title builds those pipelines from the console's precompiled shader binaries through device method slot 0x218, which no fork implements (our P.4; fxceless added `VICTORY_NATIVE_PSO_DUMP` to start on it). Solving P.4 would help every fork.
+- Their "asking the write watch and the guards" is a median of 2-4 ms over a run (peaks 9-11), not 0.5. Ours there was 11-27 ms with zram on; a run with zram off (disk swap only) is being compared.
+- Their log says "no host pipeline library: pipelines are not kept": the null-blob fix of our P.1 (vkd3d rejects a non-null pointer with length 0) applies to them; suggested to the author.
+- The start screen can sit black until a button is pressed (seen once, 26 Nov).
