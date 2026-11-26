@@ -116,6 +116,15 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    // `VICTORY_RETRANSLATE=<hash>,...` (the 16 digits the log names a
+    // shader by): those are translated now, whatever the cache holds: to
+    // try a changed translator on a few programs without a new cache.
+    static AGAIN: OnceLock<Vec<String>> = OnceLock::new();
+    let again = AGAIN.get_or_init(|| std::env::var("VICTORY_RETRANSLATE").unwrap_or_default().split(',').map(|h| h.trim().to_owned()).filter(|h| !h.is_empty()).collect());
+    if !again.is_empty() && again.iter().any(|h| *h == blake3::hash(container).to_hex()[..16]) {
+        tracing::info!(hash = &blake3::hash(container).to_hex()[..16], "translated again (VICTORY_RETRANSLATE)");
+        return translate(container);
+    }
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),
         None => translate(container),
