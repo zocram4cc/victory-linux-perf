@@ -35,6 +35,15 @@ These are shader containers by (pointer, length), like the PC description's `D3D
 
 **Checked offline, 26 Nov:** in the cached image the `0x14…` addresses of the pairs fall in code (x86 bytes). So either they are not image data, or the image's data there differs at run time. The blocks must be dumped from the running process (step 2), not read from the file.
 
+## Dumped at run time (26 Nov, `royale-save/logs/20261126-053724-run.log`, `P.4 block` / `P.4 table entry` lines)
+
+- **The table is root signatures, not shaders.** Every entry's container starts with `DXBC` and holds an `RTS0` part: a serialized root signature. Entry words: `{device object, index << 32, length, pointer, length, id 0x8075_00NN_0000_0003}` with consecutive ids. So word 0 of the description names the root signature(s) the pipeline uses (or a list they live in).
+- **The heap blocks are console GPU code.** `0xf00220200` (0x200 bytes) and `0xf00220000` (0x180) begin `920c80d5 33d7fe03 … 0300a0bf 040388be 800389be`: RDNA instructions (`s_mov_b32 s8, s4`, `s_mov_b32 s9, 0`, …). These pipelines are made from **precompiled ISA in GPU memory**, not from a DXBC/DXIL container.
+- **The image blocks are small metadata structures** next to each code block (0x14-0x184 bytes: counts, register numbers, `03040000 04010000 60000000…`), likely the shader's register and user-data layout, which a DXIL container gives through its own parts.
+- Some later "pairs" are not (pointer, length) at all (lengths like `0x147ecf7c0`): the description is a structure with more fields than six pairs, and its exact layout is still to be read from the code that fills it.
+
+**What this means:** implementing them needs the translator to start from raw ISA plus this metadata, instead of from a container. Next: compare with what `victory_shader` extracts from a container (it translates console ISA carried inside the containers `create_graphics` receives). If the container's ISA part and these blocks are the same format, a container can be built from them and handed to the existing path.
+
 ## Steps
 
 1. **Census:** count the calls of each method per run, and the draws and indirect draws dropped for want of a pipeline. Is it these pipelines, or other ones (untranslated shaders, slow compiles)? Log `missing()` reasons for the top dropped pipelines in a diagnostics build.

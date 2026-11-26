@@ -157,9 +157,12 @@ pub(crate) fn lift() {
     use windows_sys::Win32::System::Memory::{PAGE_GUARD, VirtualProtect};
     let mut s = state();
     s.noted.clear();
-    let armed = std::mem::take(&mut s.armed);
+    // Left in `armed` until their guards are off: a title thread that
+    // meets a guard meanwhile must still find its page there, or its guard
+    // fault goes on to the title's handlers and ends the run (it did, in
+    // all three of the census's first runs: 0x80000001 in title code).
+    let pages: Vec<(usize, u32)> = s.armed.iter().map(|(&p, &v)| (p, v)).collect();
     drop(s);
-    let pages: Vec<(usize, u32)> = armed.into_iter().collect();
     let mut k = 0;
     while k < pages.len() {
         let mut l = k + 1;
@@ -178,6 +181,12 @@ pub(crate) fn lift() {
         }
         k = l;
     }
+    // The guards are off: the pages are armed no more.
+    let mut s = state();
+    for (page, _) in &pages {
+        s.armed.remove(page);
+    }
+    drop(s);
     // Runs of touched pages, for the frame line.
     let mut touched = std::mem::take(&mut *TOUCHED.lock().unwrap_or_else(|e| e.into_inner()));
     touched.sort_unstable();
