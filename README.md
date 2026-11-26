@@ -15,7 +15,7 @@ To build from this checkout, install the pinned Rust toolchain and the MSVC C++ 
 
 ## Run on Linux (Proton)
 
-The Windows build runs under Proton-GE through [umu-launcher](https://github.com/Open-Wine-Components/umu-launcher), with vkd3d-proton turning Direct3D 12 into Vulkan. Tested so far on Fedora 45 with an RTX 5080 (build and launch only; see the plan's status before expecting a picture).
+The Windows build runs under Proton-GE through [umu-launcher](https://github.com/Open-Wine-Components/umu-launcher), with vkd3d-proton turning Direct3D 12 into Vulkan. Tested so far on Fedora 45 with an RTX 5080: it builds, starts under Proton, and passes the unit tests there; a full game run is still to come.
 
 You need rustup, clang, lld and llvm (`sudo dnf install rustup clang lld llvm` on Fedora), `umu-run` on your PATH (on Fedora 45 use the release's zipapp, the RPMs are built for older Python), and Proton-GE in `~/.local/share/Steam/compatibilitytools.d/Proton-GE Latest` (or set `PROTONPATH`).
 
@@ -26,7 +26,7 @@ rustup-init -y --default-toolchain none --no-modify-path
 export PATH="$HOME/.cargo/bin:$PATH"
 rustup toolchain install 1.98.1 --target x86_64-pc-windows-msvc
 cargo install --locked cargo-xwin
-XWIN_ARCH=x86_64 XWIN_ACCEPT_LICENSE=1 cargo xwin build --release --locked -p victory --target x86_64-pc-windows-msvc
+scripts/build-linux.sh            # or --diag for the diagnostics build
 ```
 
 Put `dxcompiler.dll` and `dxil.dll` from the x64 folder of Microsoft's [DirectXShaderCompiler release](https://github.com/microsoft/DirectXShaderCompiler/releases) in `~/.local/share/victory/dxc` (or set `VICTORY_DXC_DIR`); the launcher copies them beside `victory.exe`. Under Wine the system shader compiler refuses the indirect-draw clamp and the card compare, and without DXC there is no 3D.
@@ -37,7 +37,33 @@ scripts/play-linux.sh shaders <the shader archives>   # translate every shader a
 scripts/play-linux.sh warm --used                     # pipelines earlier runs drew with
 ```
 
-The launcher uses its own prefix (`~/.local/share/victory/prefix`), keeps caches in `~/.cache/victory/`, sets the same defaults as `Play-VIctory.cmd` plus `VICTORY_CULL_NONE=1` and meeyao's vkd3d settings, and takes `--safe` and `--ray-tracing` like `scripts/play.ps1`. Every variable can be overridden from the environment. The Wine-specific fixes come from [meeyao/victory-8gb-linux](https://github.com/meeyao/victory-8gb-linux).
+The launcher uses its own prefix (`~/.local/share/victory/prefix`), keeps caches in `~/.cache/victory/`, sets the same defaults as `Play-VIctory.cmd` plus `VICTORY_CULL_NONE=1` and meeyao's vkd3d settings, and takes `--safe` and `--ray-tracing` like `scripts/play.ps1`. Every variable can be overridden from the environment. The Wine-specific fixes come from [meeyao/victory-8gb-linux](https://github.com/meeyao/victory-8gb-linux); the NVIDIA wave32 fixes, scripted sticks and the Resizable BAR settings from [Zarina35/victory-coolfox-nvidia](https://github.com/Zarina35/victory-coolfox-nvidia).
+
+Game memory goes into VRAM through Resizable BAR by default (`VICTORY_WINDOWS_BAR_MB=2048`, `VICTORY_CARD_WINDOWS_MB=1024`; `0` turns either off). On an RTX 5080 that was the difference between about 8 and 18 fps on Windows; vkd3d-proton has the GPU upload heap it needs.
+
+### Playtesting
+
+Each game run leaves a folder in `~/.local/share/victory/runs/<date-time>/` (`latest` points at the newest). It holds no game data, only numbers, logs and your screenshots:
+
+| File | What |
+|---|---|
+| `run.json` | build, git revision, Proton, umu, driver, GPU, CPU, RAM, every `VICTORY_*`/`VKD3D_*` setting, exit code, length, whether Resizable BAR was taken |
+| `victory.log` | the engine's output, with times |
+| `frames.csv` | one row a frame (`VICTORY_FRAMES_CSV`): frame time, the submitting thread's work, the card's idle and waits, copies, copy-back, uploads, draws and drops, pipelines queued and made, VRAM |
+| `mangohud.csv` | MangoHud's own frame log (Shift+F2 pauses it, Shift+F12 shows its overlay) |
+| `system.csv` | once a second: the title's memory and swap, free RAM, swap, commit, VRAM, GPU load, clock and heat, CPU load |
+| `marks.csv`, `marks/` | moments you marked, with a screenshot each |
+
+```sh
+scripts/play-linux.sh pareto-residency [--diag]     # play; Ctrl-C (or closing the window) ends the run cleanly
+scripts/victory-mark.sh --install                   # once: the desktop entry; bind it to Ctrl+Alt+M in System Settings
+scripts/victory-mark.sh --note 3 "bridge stutter"   # a note on mark 3 afterwards
+scripts/victory-report.py                           # the newest run, summed up
+scripts/victory-report.py <run> --against <run>     # two runs side by side
+scripts/play-linux.sh pareto-residency --bench <route>   # a scripted run from scripts/bench/<route>.keys
+```
+
+Press the mark shortcut at anything odd: a stutter, a glitch, a crash coming. The run is ended with SIGTERM, never SIGKILL: killing the title while its mappings are live can wedge the NVIDIA driver until a reboot. A benchmark route is a list of `VICTORY_KEYS` holds and a `duration=` line; see `scripts/bench/example.keys`. Leave enough RAM free before a run: the title wants most of 30 GB.
 
 A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
 that runs an Xbox Series title natively on Windows from files the user supplies.
