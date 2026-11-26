@@ -30,7 +30,7 @@ const PAGE: usize = 0x1000;
 pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var_os("VICTORY_BACK_CENSUS").is_some_and(|v| v == "1")
+        let on = std::env::var_os("VICTORY_BACK_CENSUS").is_some_and(|v| v == "1" || v == "2")
             && crate::fastcopy::on()
             && !crate::host::relay();
         if on {
@@ -39,6 +39,14 @@ pub(crate) fn on() -> bool {
         }
         on
     })
+}
+
+/// `VICTORY_BACK_CENSUS=2`: view (mapped) memory that is read-write is
+/// guarded too. Its aliases are not: a read through another view of the
+/// same pages goes unseen, so this counts a lower bound there.
+fn views() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BACK_CENSUS").is_some_and(|v| v == "2"))
 }
 
 struct State {
@@ -57,7 +65,9 @@ fn state() -> std::sync::MutexGuard<'static, State> {
 /// pages it wrote first, pages our own copies met, pages skipped (not
 /// private, already guarded, or not committed read-write), bytes written
 /// back on the armed pages, runs of touched pages, pages lifted untouched.
-pub(crate) static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+pub(crate) static STATS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+// [8]: of the skipped, mapped (view) pages that are read-write; [9]: of the
+// skipped, pages read-only or otherwise protected (`crate::watch`'s guards).
 
 /// Largest runs of touched pages since the last frame line: (pages, first
 /// address), for the log.
@@ -87,7 +97,7 @@ pub(crate) fn arm() {
         return;
     }
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_READWRITE, VirtualProtect, VirtualQuery,
+        MEM_COMMIT, MEM_MAPPED, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_READWRITE, VirtualProtect, VirtualQuery,
     };
     let mut s = state();
     let noted = std::mem::take(&mut s.noted);
@@ -111,9 +121,14 @@ pub(crate) fn arm() {
         // Private read-write memory only: view memory has our own write
         // guards (`crate::watch`), and a page the title guards or made
         // read-only is left as it is.
-        let fit = info.State == MEM_COMMIT && info.Type == MEM_PRIVATE && info.Protect == PAGE_READWRITE;
+        let views = views();
+        let fit = info.State == MEM_COMMIT
+            && (info.Type == MEM_PRIVATE || (views && info.Type == MEM_MAPPED))
+            && info.Protect == PAGE_READWRITE;
         if !fit {
             STATS[4].fetch_add((j - i) as u64, Ordering::Relaxed);
+            let reason = if info.State == MEM_COMMIT && info.Type == MEM_MAPPED && info.Protect == PAGE_READWRITE { 8 } else { 9 };
+            STATS[reason].fetch_add((j - i) as u64, Ordering::Relaxed);
             i = j;
             continue;
         }
@@ -311,12 +326,14 @@ pub(crate) fn census_line(frames: f64) {
     let f = |n: u64| n as f64 / frames;
     let touched = s[1] + s[2];
     tracing::info!(
-        "read census per frame: {:.0} pages written back and guarded ({:.1} MB written on them), {:.0} skipped; \
+        "read census per frame: {:.0} pages written back and guarded ({:.1} MB written on them), {:.0} skipped ({:.0} view pages read-write, {:.0} protected or other); \
          the title touched {:.1} before the next submission ({:.1} read first, {:.1} written first; {:.1} % of the guarded), \
          in {:.1} runs; the layer's own reads met {:.1}; the largest runs (pages at address): {:x?}",
         f(s[0]),
         f(s[5]) / 1e6,
         f(s[4]),
+        f(s[8]),
+        f(s[9]),
         f(touched),
         f(s[1]),
         f(s[2]),
