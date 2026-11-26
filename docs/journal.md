@@ -4,6 +4,10 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**M.1: the windows under buffers are in use**
+- `bench/trials-20261126-063055-window-use`: of 272-301 windows met under written buffer copies a frame, **250-290 were used in the last two frames, ~100 were asked for in the very bytes the buffer covers**. They are live copies the GPU reads, not leftovers: retiring them alone would only make them again.
+- Next measurement: why an ask inside a buffer takes a window (`lookup` searches only the 64 buffers starting below the address; or the ask runs past the buffer's end; or no buffer holds it).
+
 **M.1 step 1: every overlap is a buffer copy over a 4 MiB window**
 - `bench/trials-20261126-061009-overlap-kinds` (482-483 ms): **240-249 of ~470 written ranges a frame overlap 244-253 other copies (58-62 MB), and all of them are a written buffer copy over a window** (`LOOSE`, made for asks outside buffers). No buffer under a buffer, no window under a window, no written window over a buffer.
 - So M.1 is case 2 of the design alone: windows of title memory that later buffers cover. Step 2 becomes "an ask inside a buffer never meets a window, and a window under a buffer is retired", not the outermost-buffer lookup.
