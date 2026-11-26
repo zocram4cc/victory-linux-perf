@@ -2315,6 +2315,32 @@ fn under_wide() -> bool {
 /// shortcut: a piece with very many runs has them joined over small gaps,
 /// where the old race is left.
 fn put_changed(at: usize, title: &[u8], merged: &[u8]) -> usize {
+    let put = put_bytes(at, title, merged);
+    crate::watch::told(&changed_spans(at, title, merged));
+    put
+}
+
+/// The stretches of `merged` that differ from `title` (address, bytes), by 4 KiB: what
+/// [`put_changed`] changed, for the journal. Nothing unless [`crate::watch::noting`].
+fn changed_spans(at: usize, title: &[u8], merged: &[u8]) -> Vec<(usize, usize)> {
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    if !crate::watch::noting() {
+        return spans;
+    }
+    for (k, (was, now)) in title.chunks(4096).zip(merged.chunks(4096)).enumerate() {
+        if was != now {
+            let from = at + k * 4096;
+            match spans.last_mut() {
+                Some(last) if last.0 + last.1 == from => last.1 += now.len(),
+                _ => spans.push((from, now.len())),
+            }
+        }
+    }
+    spans
+}
+
+/// [`put_changed`], without telling the journal.
+fn put_bytes(at: usize, title: &[u8], merged: &[u8]) -> usize {
     crate::watch::landing(at, title.len());
     if !exact_back() {
         crate::host::write_mapped(at as *mut u8, merged.as_ptr(), merged.len());

@@ -468,3 +468,34 @@ fn what_landing_costs() {
         busy.store(false, Ordering::Relaxed);
     });
 }
+
+/// A landing through the title's own address, under a standing asking, is in the journal before the
+/// refresh after it. While the asking stands the journal answers for the range, so a landing it does
+/// not note leaves the copy with the bytes from before.
+#[test]
+fn a_landing_under_a_standing_asking_is_seen_by_the_refresh_after_it() {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+    const MEM_WRITE_WATCH: u32 = 0x20_0000;
+    assert!(crate::safecopy::on());
+    // SAFETY: a fresh write-watched allocation, freed at the end.
+    let at = unsafe { VirtualAlloc(std::ptr::null(), BLOCK, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+    assert_ne!(at, 0);
+    // The card wrote 7s into the block's second page; title memory holds zeros there.
+    let now = [7u8; BLOCK];
+    let mut held = [0u8; BLOCK];
+    crate::watch::ask_once(&[(at, at + BLOCK)]);
+    let (asked, _) = crate::watch::writes(at, at + BLOCK, false).expect("watched");
+    let mut notes = Notes::default();
+    // SAFETY: the part lies in the block, and `now` and `held` are a block each.
+    let put = unsafe { piece_at(at, now.as_ptr(), held.as_mut_ptr(), &[(PAGE, 2 * PAGE)], true, &mut notes, false, std::ptr::null()) };
+    notes.flush();
+    let (_, after) = crate::watch::writes(at, at + BLOCK, false).expect("watched");
+    crate::watch::ask_once_end();
+    // SAFETY: our allocation.
+    unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+    assert_eq!(put, PAGE as u64);
+    assert!(
+        after.iter().any(|&(page, n)| page == at / crate::watch::PAGE && n > asked),
+        "the landed page is not in the journal: {after:?} (asked {asked})"
+    );
+}
