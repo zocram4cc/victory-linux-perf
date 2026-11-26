@@ -105,6 +105,8 @@ mod upload;
 mod watch;
 #[cfg(windows)]
 mod texback;
+#[cfg(windows)]
+mod wine;
 
 #[cfg(windows)]
 pub use host::on_failure;
