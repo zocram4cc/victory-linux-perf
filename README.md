@@ -1,7 +1,6 @@
-> **Linux / Proton fork.** This is avatarmanz/VIctory-7900XTX with the changes it
-
 > **victory-royale (private), branch `k7900`:** this tree plus our pieces. The plan, what carries over and in what order: [docs/royale/PLAN.md](docs/royale/PLAN.md).
 
+> **Linux / Proton fork.** This is avatarmanz/VIctory-7900XTX with the changes it
 > takes to run under Proton on AMD (RADV): ~16-17 fps in the open world on an
 > RX 7900 XT / Ryzen 5800X3D / 32 GB. **Start with [LINUX.md](LINUX.md).**
 > No game files are included.
