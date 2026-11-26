@@ -739,6 +739,7 @@ pub(crate) fn private_whole(at: usize, len: usize) -> bool {
     n != 0
         && info.State == mem::MEM_COMMIT
         && info.Type == mem::MEM_PRIVATE
+        && !crate::watch::in_view_space(at)
         && info.Protect == mem::PAGE_READWRITE
         && (info.BaseAddress as usize).saturating_add(info.RegionSize) >= at.saturating_add(len)
 }

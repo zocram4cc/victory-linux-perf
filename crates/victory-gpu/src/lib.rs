@@ -144,3 +144,5 @@ pub use watch::{
     title_memory_unmapping, title_memory_written,
     writing as kernel_will_write,
 };
+#[cfg(windows)]
+pub use watch::title_view_space;

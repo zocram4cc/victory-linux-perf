@@ -17,7 +17,7 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_COMMITMENT_LIMIT, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER,
+    CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_DECOMMIT, MEM_EXTENDED_PARAMETER,
     MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
     MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
     MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE, SEC_COMMIT,
@@ -30,6 +30,7 @@ use windows_sys::Win32::System::ProcessStatus::{
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::core::BOOL;
 
+use super::wine_map;
 use crate::{HleModule, hle_export};
 
 const MIB: usize = 1 << 20;
@@ -137,6 +138,25 @@ pub extern "system" fn XMemVirtualAlloc(
             kind |= MEM_WRITE_WATCH;
         }
     }
+    // With pages shown by the host's mmap (`wine_map`, `VICTORY_WINE_MAP=1`):
+    // a plain reservation where the host would have a placeholder, and a
+    // commit where the title replaces part of one with memory. Without it
+    // `wine_map::on()` and `holds` are false and none of this runs.
+    let direct = kind & MEM_RESERVE_PLACEHOLDER != 0 && kind & (MEM_COMMIT | MEM_REPLACE_PLACEHOLDER) == 0 && wine_map::on();
+    if direct {
+        kind &= !MEM_RESERVE_PLACEHOLDER;
+    } else if kind & MEM_REPLACE_PLACEHOLDER != 0 && !base.is_null() && wine_map::holds(base as usize) {
+        kind &= !(MEM_REPLACE_PLACEHOLDER | MEM_RESERVE);
+        static SAID: AtomicU64 = AtomicU64::new(0);
+        if SAID.fetch_add(1, Ordering::Relaxed) < 8 {
+            tracing::info!(
+                at = format_args!("{base:p}"),
+                size,
+                kind = format_args!("{kind:#x}"),
+                "memory asked for in a placeholder's place: committed in the reservation that stands for it (VICTORY_WINE_MAP)"
+            );
+        }
+    }
     // SAFETY: the title's own arguments, cleaned of console bits; the
     // parameter points at `requirements`, which outlives the call.
     let at = unsafe {
@@ -176,6 +196,9 @@ pub extern "system" fn XMemVirtualAlloc(
             at = format_args!("{at:p}"),
             "XMemVirtualAlloc"
         );
+    }
+    if !at.is_null() && direct {
+        wine_map::spaces().made(at as usize, size);
     }
     if !at.is_null() && !placeholder {
         victory_gpu::title_memory_allocated(at as usize, size);
@@ -431,6 +454,9 @@ struct Section {
     window: std::sync::OnceLock<usize>,
     /// A bit per page: committed, as far as [`Section::window`] asked.
     committed: Box<[std::sync::atomic::AtomicU64]>,
+    /// With pages shown by the host's mmap (`wine_map`): the section's file
+    /// there.
+    fd: Option<i32>,
 }
 
 impl Section {
@@ -528,6 +554,9 @@ impl Drop for Section {
             };
         }
         victory_gpu::title_memory_section_gone(self.handle as usize);
+        if let Some(fd) = self.fd {
+            wine_map::close(fd);
+        }
         // SAFETY: our handle; views keep the section alive on their own.
         unsafe { CloseHandle(self.handle) };
     }
@@ -722,7 +751,11 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         pages: n,
         window: std::sync::OnceLock::new(),
         committed: (0..n.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
+        fd: wine_map::fd_of(handle),
     });
+    if wine_map::on() && section.fd.is_none() {
+        tracing::warn!(n, "the host gave no file descriptor for a section of physical pages: its pages cannot be shown (VICTORY_WINE_MAP unset shows them as views)");
+    }
     let mut table = page_table_mut();
     let first = table.next_page;
     table.next_page += n * FRAMES;
@@ -1541,18 +1574,8 @@ impl Op {
 
     /// The system calls; whether the host did as asked.
     fn run(&self) -> bool {
-        if self.had {
-            // SAFETY: a view we mapped; it becomes a placeholder again.
-            let gone = counted(Call::Unmap, || unsafe {
-                UnmapViewOfFile2(
-                    GetCurrentProcess(),
-                    MEMORY_MAPPED_VIEW_ADDRESS { Value: self.at as *mut c_void },
-                    MEM_PRESERVE_PLACEHOLDER,
-                )
-            });
-            if gone == 0 {
-                return false;
-            }
+        if self.had && !counted(Call::Unmap, || hide(self.at, PAGE)) {
+            return false;
         }
         let Some(slice) = &self.slice else {
             return true;
@@ -1762,6 +1785,9 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
 /// Cuts `[base, base + len)` out of the placeholder it is in (which fails
 /// harmlessly when the range is the whole placeholder).
 fn split(base: usize, len: usize) {
+    if wine_map::holds(base) {
+        return; // no placeholder there, and nothing to cut
+    }
     // SAFETY: acts only on a placeholder.
     counted(Call::Split, || unsafe {
         VirtualFree(
@@ -1775,6 +1801,21 @@ fn split(base: usize, len: usize) {
 /// The system calls of [`map`]; `own`: the placeholder at `base` is `len`
 /// long already.
 fn show(base: usize, len: usize, slice: &Slice, own: bool) -> bool {
+    if wine_map::holds(base) {
+        // With `wine_map`: the section's file mapped there by the host's
+        // kernel, committed whole as the section is.
+        let Some(fd) = slice.section.fd else {
+            tracing::warn!(address = format_args!("{base:#x}"), len, "mapping physical pages failed: their section has no file descriptor");
+            return false;
+        };
+        let shown = counted(Call::Map, || wine_map::show(base, len, fd, (slice.index * PAGE) as u64));
+        if !shown {
+            tracing::warn!(address = format_args!("{base:#x}"), len, "mapping physical pages with the host's mmap failed");
+        }
+        // (Noted as committed, which under Wine the whole section is: such a
+        // page is fresh no more, [`arrange`].)
+        return shown && slice.section.commit_shown(slice.index, base, len);
+    }
     let map_view = || {
         // SAFETY: maps the section over a placeholder; acts only on one.
         counted(Call::Map, || unsafe {
@@ -1811,6 +1852,19 @@ fn show(base: usize, len: usize, slice: &Slice, own: bool) -> bool {
         return false;
     }
     true
+}
+
+/// Takes the view (or what [`wine_map`] put in its stead) at
+/// `[base, base + len)` away: a placeholder again, or reserved. Whether the
+/// host did.
+fn hide(base: usize, len: usize) -> bool {
+    if wine_map::holds(base) {
+        return wine_map::hide(base, len);
+    }
+    // SAFETY: a view we mapped; it becomes a placeholder again.
+    unsafe {
+        UnmapViewOfFile2(GetCurrentProcess(), MEMORY_MAPPED_VIEW_ADDRESS { Value: base as *mut c_void }, MEM_PRESERVE_PLACEHOLDER) != 0
+    }
 }
 
 /// Commits the section pages a view shows (once per page, whichever view).
@@ -1905,17 +1959,8 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             victory_gpu::title_memory_splitting(at, size);
         }
         victory_gpu::title_memory_unmapping(at, size);
-        // SAFETY: a view we mapped; it becomes a placeholder again.
-        let gone = counted(Call::Unmap, || unsafe {
-            UnmapViewOfFile2(
-                GetCurrentProcess(),
-                MEMORY_MAPPED_VIEW_ADDRESS {
-                    Value: at as *mut c_void,
-                },
-                MEM_PRESERVE_PLACEHOLDER,
-            )
-        });
-        if gone != 0 && at >= base && at + size <= end {
+        let gone = counted(Call::Unmap, || hide(at, size));
+        if gone && at >= base && at + size <= end {
             physical.holes.insert(at, size);
         }
         if at < base {
@@ -2040,10 +2085,68 @@ pub extern "system" fn XMemTransferMemory(kind: u32, size: usize) -> BOOL {
     moved.into()
 }
 
+/// The title's `VirtualFree` of a placeholder that with `wine_map` is a plain
+/// reservation: done as the host would do it to a placeholder, on the pieces
+/// kept of it. `None`: not such memory, or a call the host takes as it is.
+fn free_in_space(at: usize, size: usize, kind: u32) -> Option<bool> {
+    const MEM_COALESCE_PLACEHOLDERS: u32 = 1;
+    if !wine_map::holds(at) {
+        return None;
+    }
+    static SAID: AtomicU64 = AtomicU64::new(0);
+    if SAID.fetch_add(1, Ordering::Relaxed) < 16 {
+        tracing::info!(
+            at = format_args!("{at:#x}"),
+            size,
+            kind = format_args!("{kind:#x}"),
+            "the title's VirtualFree in a reservation that stands for a placeholder (VICTORY_WINE_MAP)"
+        );
+    }
+    // No view may lie in what is cut out or released, as on the host.
+    let views_in = |at: usize, len: usize| {
+        let physical = physical();
+        physical.views.range(..at + len).next_back().is_some_and(|(base, view)| base + view.0 > at)
+    };
+    if kind == MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER {
+        if size == 0 || views_in(at, size) || !wine_map::spaces().split(at, size) {
+            return Some(false);
+        }
+        // Memory the title had put in the placeholder's place goes.
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size, in our own process.
+        let asked = unsafe { VirtualQueryEx(GetCurrentProcess(), at as *const c_void, &mut info, size_of_val(&info)) };
+        if asked == 0 || info.State == MEM_COMMIT || info.RegionSize < size {
+            victory_gpu::title_memory_freed(at, size);
+            // SAFETY: a range of a reservation of the title's with no view in it.
+            unsafe { VirtualFree(at as *mut c_void, size, MEM_DECOMMIT) };
+        }
+        return Some(true);
+    }
+    if kind == MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS {
+        return Some(wine_map::spaces().join(at, size));
+    }
+    if kind == MEM_RELEASE {
+        let piece = wine_map::spaces().piece(at).filter(|piece| piece.0 == at && (size == 0 || size == piece.1));
+        let Some((_, len)) = piece.filter(|&(_, len)| !views_in(at, len)) else {
+            return Some(false);
+        };
+        victory_gpu::title_memory_freed(at, len);
+        wine_map::spaces().released(at);
+        // SAFETY: a piece of a reservation of the title's, which it gives up
+        // (under Wine part of a reservation can be released).
+        return Some(unsafe { VirtualFree(at as *mut c_void, len, MEM_RELEASE) } != 0);
+    }
+    None
+}
+
 /// The title's own `VirtualFree`. What the GPU side noted of the memory goes
 /// first: the address may be other memory's the moment it is free.
 extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u32) -> BOOL {
     const MEM_COALESCE_PLACEHOLDERS: u32 = 1;
+    if let Some(done) = free_in_space(address as usize, size, kind) {
+        return done.into();
+    }
     // Splitting and joining placeholders changes nothing they show.
     if kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) == 0 {
         victory_gpu::title_memory_freed(address as usize, size);

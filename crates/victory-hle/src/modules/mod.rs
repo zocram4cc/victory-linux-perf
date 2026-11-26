@@ -38,6 +38,8 @@ pub mod xgameruntime;
 pub mod xgamesave;
 pub mod xgameui;
 #[cfg(windows)]
+mod wine_map;
+#[cfg(windows)]
 pub mod xmem;
 pub mod xnetworking;
 pub mod xpackage;
