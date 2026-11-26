@@ -21,6 +21,8 @@ The Windows build runs under Proton-GE through [umu-launcher](https://github.com
 
 You need rustup, clang, lld and llvm (`sudo dnf install rustup clang lld llvm` on Fedora), `umu-run` on your PATH (on Fedora 45 use the release's zipapp, the RPMs are built for older Python), and **GE-Proton11-13 or later** in `~/.local/share/Steam/compatibilitytools.d/Proton-GE Latest` (or set `PROTONPATH`). Older vkd3d-proton (before v3.1-83, so GE-Proton11-12 and earlier) converts DXIL with dxil-spirv's legacy structurizer, which turns about 6% of the title's pipelines into invalid SPIR-V that NVIDIA's shader compiler crashes on, and the title dies as it loads; the launcher warns when it can tell.
 
+**For speed, a patched wineserver.** The title maps memory views by the hundred thousand, and Wine's wineserver keeps each process's views in a list it walks on every map. [GE-Proton PR #1016](https://github.com/GloriousEggroll/proton-ge-custom/pull/1016) keeps them in a tree instead. Built into a copy of GE-Proton11-14 at `~/.local/share/victory/proton/GE-Proton11-14-viewtree` (GE's own patch set, then that patch, then `make server/wineserver`, with the copy's `files/bin/wineserver` replaced), it took the opening cutscenes on an RTX 5080 from 7.7 to 22 frames a second on average, and the long stalls went away. The launcher uses that copy when it is there; `--stock-wineserver` runs Proton as shipped.
+
 Cross-compile with [cargo-xwin](https://github.com/rust-cross/cargo-xwin); it downloads Microsoft's CRT and Windows SDK, whose licence you accept with `XWIN_ACCEPT_LICENSE=1`:
 
 ```sh

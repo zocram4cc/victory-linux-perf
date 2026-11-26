@@ -19,8 +19,10 @@
 #                   (VICTORY_LEVELS_ON_DEMAND=1; off by default since it used more memory)
 #   --no-texture-waits  the title's shorter waits for textures in the first frames and
 #                   the first cutscene (VICTORY_EARLY_TEXTURES_MS=12, VICTORY_BAKE_TEXTURES_MS=1500)
-#   --view-tree     GE-Proton11-14 with GE PR #1016's wineserver (memory views kept in a
-#                   tree), from ~/.local/share/victory/proton/GE-Proton11-14-viewtree
+#   --stock-wineserver  Proton-GE Latest as it is, even where the view-tree copy is
+#                   installed (by default the launcher uses that copy when it is there:
+#                   ~/.local/share/victory/proton/GE-Proton11-14-viewtree, GE-Proton11-14
+#                   with GE PR #1016's wineserver, memory views kept in a tree)
 #   --mangohud      also MangoHud's frame log (off by default: its NVIDIA thread
 #                   aborted the title under umu, `free(): invalid pointer`)
 #
@@ -45,7 +47,7 @@ winpath() { local p; p="$(realpath -m -- "$1")"; printf 'Z:%s' "${p//\//\\}"; }
 usage() { sed -n '2,8p' "$0" >&2; exit 2; }
 
 # Options that apply to every command, taken out first.
-profile=release safe=0 bench="" proton_log=0 mangohud=0 args=()
+profile=release safe=0 bench="" proton_log=0 mangohud=0 stock_wineserver=0 args=()
 while (( $# )); do
   case "$1" in
     --diag) profile=diag ;;
@@ -58,7 +60,8 @@ while (( $# )); do
       export VICTORY_EARLY_TEXTURES_MS="${VICTORY_EARLY_TEXTURES_MS:-12}"
       export VICTORY_BAKE_TEXTURES_MS="${VICTORY_BAKE_TEXTURES_MS:-1500}" ;;
     --skip-intro) export VICTORY_KEYS="${VICTORY_KEYS-12:Enter,16:Enter,20:A,25:Enter,30:A,35:Enter,40:A,50:Enter}" ;;
-    --view-tree) export PROTONPATH="${PROTONPATH:-$HOME/.local/share/victory/proton/GE-Proton11-14-viewtree}" ;;
+    --stock-wineserver) stock_wineserver=1 ;;
+    --view-tree) ;; # the default where the copy is installed
     --mangohud) mangohud=1 ;;
     --no-mangohud) mangohud=0 ;;
     -h|--help) sed -n '2,/^set -euo/p' "$0" | sed '$d'; exit 0 ;;
@@ -69,6 +72,16 @@ done
 set -- "${args[@]+"${args[@]}"}"
 
 command -v umu-run >/dev/null || { echo "umu-run not found (README: install the umu-launcher zipapp)" >&2; exit 2; }
+# GE-Proton11-14 with GE PR #1016's wineserver where it is installed: the
+# title maps memory views by the hundred thousand, and the stock wineserver
+# looks each one up in a list. Over the same 305 s of the intro (runs
+# 20261126-221648 against -223848) frames went from 7.7 to 22.2 a second on
+# average, 2349 to 6801 drawn, and the card's idle time a frame from
+# 67-200 ms to 9-28 ms. How the copy is built: VIEW-TREE-NOTES.txt in it.
+view_tree="$HOME/.local/share/victory/proton/GE-Proton11-14-viewtree"
+if [[ -z "${PROTONPATH:-}" ]] && (( ! stock_wineserver )) && [[ -x "$view_tree/files/bin/wineserver" ]]; then
+  export PROTONPATH="$view_tree"
+fi
 export PROTONPATH="${PROTONPATH:-$HOME/.local/share/Steam/compatibilitytools.d/Proton-GE Latest}"
 export WINEPREFIX="${WINEPREFIX:-$HOME/.local/share/victory/prefix}"
 export GAMEID="${GAMEID:-umu-0}"
