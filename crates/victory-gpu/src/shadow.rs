@@ -504,6 +504,13 @@ mod card_tests {
 /// (copies in the card's memory still go back). The title then reads its
 /// own stale bytes wherever the GPU wrote: the picture or the run may
 /// break. It gives the frame time 1.3 could reach at most.
+/// `VICTORY_BACK_CEILING=2`: only ranges that another host copy overlaps
+/// go back (measurement only).
+pub(crate) fn back_ceiling_overlapped() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BACK_CEILING").is_some_and(|v| v == "2"))
+}
+
 pub(crate) fn back_ceiling() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {

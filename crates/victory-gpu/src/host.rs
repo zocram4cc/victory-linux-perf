@@ -2803,6 +2803,34 @@ fn back_overlap_census(back: &[Declared]) {
 
 fn hand_back(back: &[Declared]) {
     back_overlap_census(back);
+    if crate::shadow::back_ceiling_overlapped() {
+        // Measurement only: only ranges another host copy overlaps go back
+        // (`VICTORY_BACK_CEILING=2`); does the picture hold?
+        let kept: Vec<Declared> = back
+            .iter()
+            .map(|(shadow, declared)| {
+                let over: Vec<(usize, usize)> = declared
+                    .iter()
+                    .copied()
+                    .filter(|&(from, to)| {
+                        let (b, w, _) = crate::shadow::overlapping_by_kind(from as u64, to as u64, shadow);
+                        b + w > 0
+                    })
+                    .collect();
+                (shadow.clone(), over)
+            })
+            .filter(|(_, over)| !over.is_empty())
+            .collect();
+        hand_back_all(&kept);
+        for (shadow, declared) in back {
+            shadow.copy_back_done(declared);
+        }
+        return;
+    }
+    hand_back_all(back);
+}
+
+fn hand_back_all(back: &[Declared]) {
     if crate::shadow::back_ceiling() {
         // Measurement only: nothing goes back (see `back_ceiling`).
         for (shadow, declared) in back {

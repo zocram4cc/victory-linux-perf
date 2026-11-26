@@ -4,6 +4,10 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**Not textures: no written range lies over a title-filled texture**
+- `bench/trials-20261126-065834-texture-overlap` (`VICTORY_ONE_COPY=2`): **0 copy-back ranges over the memory of textures the title fills** (their staging), every frame. Overlaps with other buffer copies: 46-47 ranges, ~100 MB (big buffers across cells).
+- Left as suspects: (a) those ~46 overlaps; (b) title reads one frame or more later (the census lifted its guards at the next submission); (c) aliases (the same pages at another address). `VICTORY_BACK_CEILING=2` sends back only ranges another copy overlaps: if the picture holds, (a); if not, (b) or (c).
+
 **Ceiling with one copy: still no picture, so buffers and windows are not the only consumers**
 - `VICTORY_BACK_CEILING=1 VICTORY_ONE_COPY=2` (`bench/trials-…-ceiling-onecopy`): the user, live: "no se ve nada, la pantalla parpadea en blanco y negro", in both runs. Overlaps between our buffer copies are down 82 %, yet without the copy-back there is no picture at all.
 - So other consumers read what the GPU wrote through title memory. The likeliest: **textures the title fills** (`crate::texture` staging: detiled from title memory by us at the next use). A pass that writes a buffer the title then samples as a texture reaches the texture only through the copy-back. Our own reads were outside the CPU census (lifted at the next submission). Next: count written ranges over title-filled textures' memory.
