@@ -113,6 +113,19 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .or_insert_with(|| {
             KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            // `VICTORY_SHADER_NAMES=1`: every program's name in its container
+            // with its hash, to tell which programs a report's hashes are.
+            if std::env::var_os("VICTORY_SHADER_NAMES").is_some_and(|v| v == "1") {
+                let name = bytes
+                    .windows(3)
+                    .position(|w| matches!(w, b"CS_" | b"PS_" | b"VS_" | b"MS_" | b"AS_"))
+                    .map(|at| {
+                        let end = bytes[at..].iter().position(|b| !(b.is_ascii_alphanumeric() || *b == b'_')).map_or(bytes.len(), |n| at + n);
+                        String::from_utf8_lossy(&bytes[at..end]).into_owned()
+                    })
+                    .unwrap_or_default();
+                tracing::info!(stage, hash = &full.to_hex()[..16], size = bytes.len(), name, "shader name");
+            }
             #[cfg(windows)]
             if stage == "compute" && crate::ambient::role(bytes) == Some(crate::ambient::Role::Reflected) {
                 tracing::info!(hash = &full.to_hex()[..16], size = bytes.len(), "the title's last reflection program is loaded");
