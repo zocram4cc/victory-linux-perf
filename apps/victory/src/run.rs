@@ -192,10 +192,11 @@ pub fn run(
         let patched = done.iter().filter(|d| **d == Hooked::Done).count();
         println!("renderer port 2: {patched} of {} descriptor record stores of the title patched", SITES.len());
         victory_hle::port_descriptors::hooked(image.base(), size, patched);
-        // And the frame allocator's table copies the six stores miss (its own
-        // memcpy, a 128-byte copy): without them thousands of slots a frame
-        // went on showing an older view (POPIN.md). VICTORY_PORT_COPIES=0: not.
-        if std::env::var("VICTORY_PORT_COPIES").map_or(true, |v| v.trim() != "0") {
+        // VICTORY_PORT_COPIES=1: the frame allocator's table copies the six
+        // stores miss (its own memcpy, a 128-byte copy) mark their slots too.
+        // A third fewer records left to the fallback (runs pop-4/pop-5), no
+        // change seen in the picture (POPIN.md): off by default.
+        if std::env::var("VICTORY_PORT_COPIES").is_ok_and(|v| v.trim() == "1") {
             use victory_loader::descriptor_sites::{TITLE_MEMCPY, apply_copies};
             let hook = victory_hle::port_descriptors::title_copy_hook(image.base() + TITLE_MEMCPY);
             // SAFETY: as above; the hook is a function of ours.

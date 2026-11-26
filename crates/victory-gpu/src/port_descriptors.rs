@@ -21,11 +21,11 @@
 //! ([`take`]) in place of the changed pages, and compares and makes only
 //! those, as before.
 //!
-//! Correctness first, the fallback: every page the write watch says was
-//! written is looked at whole once a frame, as before the port
-//! ([`check_budget`], [`check_every`]: the port's first default was 16 pages
-//! a frame, the watch asked every 8 frames, which left thousands of slots a
-//! frame showing an old view; see [`budget_of`]); a slot found
+//! Correctness first, the fallback: once a frame a few of the pages the
+//! write watch says were written ([`check_budget`], every
+//! [`check_every`] frames asked; `VICTORY_PORT_DESCRIPTORS_CHECK=all
+//! VICTORY_PORT_DESCRIPTORS_EVERY=1`: all of them at every sync, see
+//! [`budget_of`]) are looked at whole, as before; a slot found
 //! with a new view record that no mark told of is made (so it is right from
 //! then on) and counted, with the place in the title's code that last
 //! faulted on its 64 KiB block when the guards saw one ([`faulted`]): a writer
@@ -227,43 +227,39 @@ pub(crate) fn faulted(at: usize, rip: usize) {
 }
 
 /// Frames between askings of the write watch for the fallback
-/// (`VICTORY_PORT_DESCRIPTORS_EVERY=<frames>`; 1 if not given: every frame).
+/// (`VICTORY_PORT_DESCRIPTORS_EVERY=<frames>`, 8 if not given).
 fn check_every() -> u64 {
     static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *N.get_or_init(|| every_of(std::env::var("VICTORY_PORT_DESCRIPTORS_EVERY").ok().as_deref()))
 }
 
-/// Pages the fallback looks at a frame (`VICTORY_PORT_DESCRIPTORS_CHECK=<pages>`;
-/// all that were written if not given or `all`; 0: none).
+/// Pages the fallback looks at a frame (`VICTORY_PORT_DESCRIPTORS_CHECK=<pages>`,
+/// 16 if not given; `all`: every written page at every sync; 0: none).
 fn check_budget() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| budget_of(std::env::var("VICTORY_PORT_DESCRIPTORS_CHECK").ok().as_deref()))
 }
 
-/// What `VICTORY_PORT_DESCRIPTORS_CHECK` says. Unset: every page the write
-/// watch says was written, every frame, as the layer looked before the
-/// port. With the six stores' marks alone (and 16 pages a frame of the
-/// rest, the port's first default) the records the title copies into its
-/// heap otherwise (its own `memcpy` +0x5f40560 and a 128-byte copy at
-/// +0x4d9f25f, PORT-PATCH-2.md) went on showing the view the slot held
-/// before, often another object's texture of an earlier frame, until the
-/// fallback came round to their page: 110-250 such records a frame in the
-/// 16 pages looked at of ~290 written (run pop-1, the boat mission's
-/// cutscene), so a few thousand a frame heap-wide. Textures picked by
-/// index read them: palm trees, trees and a factory in the distance came
-/// and went from frame to frame, things showed other textures for a frame
-/// (POPIN.md).
+/// What `VICTORY_PORT_DESCRIPTORS_CHECK` says: 16 pages a frame unless told
+/// otherwise; `all` (with `VICTORY_PORT_DESCRIPTORS_EVERY=1`): every page the
+/// write watch says was written, at every sync, as the layer looked before the
+/// port. With 16 pages, 110-250 view records a frame on them had no mark
+/// (run pop-1; 70-175 with `VICTORY_PORT_COPIES=1`, pop-4), so slots of
+/// textures picked by index can show an older view until the fallback comes
+/// round. Looking at every page made them right but cost 15-25 ms a frame
+/// in the boat scenes, and the trees and palms that come and go flickered
+/// just the same (runs pop-5, pop-6: POPIN.md), so it is not the default.
 fn budget_of(spec: Option<&str>) -> usize {
     match spec.map(str::trim) {
-        None | Some("all") => usize::MAX,
-        Some(v) => v.parse().unwrap_or(usize::MAX),
+        None => 16,
+        Some("all") => usize::MAX,
+        Some(v) => v.parse().unwrap_or(16),
     }
 }
 
-/// What `VICTORY_PORT_DESCRIPTORS_EVERY` says (unset: 1, every frame; 8 was
-/// the port's first default).
+/// What `VICTORY_PORT_DESCRIPTORS_EVERY` says (unset: 8).
 fn every_of(spec: Option<&str>) -> u64 {
-    spec.and_then(|v| v.trim().parse().ok()).unwrap_or(1u64).max(1)
+    spec.and_then(|v| v.trim().parse().ok()).unwrap_or(8u64).max(1)
 }
 
 /// The fallback's pages: those the watch said were written, not looked at yet;
@@ -717,17 +713,17 @@ mod tests {
         assert_eq!(mark_range(start, 32), 0);
     }
 
-    /// Unset, the fallback looks at every written page every frame; the
-    /// port's first budget (16 pages every 8 frames) stays one setting away.
+    /// Unset, the fallback keeps the port's budget (16 pages, the watch
+    /// asked every 8 frames); `all` is every written page.
     #[test]
-    fn fallback_looks_at_every_written_page_unless_told_otherwise() {
-        assert_eq!(budget_of(None), usize::MAX);
+    fn fallback_keeps_the_ports_budget_unless_told_otherwise() {
+        assert_eq!(budget_of(None), 16);
         assert_eq!(budget_of(Some("all")), usize::MAX);
-        assert_eq!(budget_of(Some(" 16 ")), 16);
+        assert_eq!(budget_of(Some(" 32 ")), 32);
         assert_eq!(budget_of(Some("0")), 0);
-        assert_eq!(budget_of(Some("x")), usize::MAX);
-        assert_eq!(every_of(None), 1);
-        assert_eq!(every_of(Some("8")), 8);
+        assert_eq!(budget_of(Some("x")), 16);
+        assert_eq!(every_of(None), 8);
+        assert_eq!(every_of(Some("1")), 1);
         assert_eq!(every_of(Some("0")), 1);
     }
 
