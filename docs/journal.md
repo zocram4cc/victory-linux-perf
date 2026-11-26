@@ -4,6 +4,12 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**`VICTORY_SLOT_WAIT=2` (wait only for submissions older than the texture's host copy): −6 to −9 %, picture wrong**
+- `…-slot-wait-born`: frame 359-372 ms (control ~395), bind 420-710 ms (~1,300-1,550 with the full wait); 1-6 texture slot writes a frame wait, ~12,000-14,000 do not need to.
+- The picture (the user, screenshot in the session): a different colour over the screen while loading, a black flash of the sky, and **when the camera moves everything smears and blurs**; the satellite dish black, a black strip at the left edge.
+- Reading: the wait does not only cover new textures' page tables. **A title slot rewritten while a running submission reads it makes that submission read the new view instead of the one it was recorded with**; the smear on camera moves fits temporal passes (TAA, motion history) reading another frame's targets. So it is the slot's *content* that has to stay put for running work, which a per-texture rule cannot give.
+- What would: give each submission its own copy of the title's slots it reads (versioned host heap). `ALL_FRESH` did that per draw but overflowed the 262,144-slot dynamic ring (550-4,188 tables refused a frame); a bigger ring (the shader-visible heap can hold ~1,000,000) or copying per submission instead of per draw are the two routes. Default unchanged (`VICTORY_SLOT_WAIT=1`).
+
 **`VICTORY_ALL_FRESH` flicker explained: the dynamic ring runs out**
 - With `VICTORY_ALL_FRESH=2` (`…-all-fresh-refused`), **550-4,188 dynamic tables a frame are refused for want of slots** (new release-build counter on the frame line); their draws are dropped, which is the flicker and the odd colour. The ring (`DYNAMIC`, 262,144 slots) holds the constant-buffer tables but not every table a draw reads. So part of `ALL_FRESH`'s gain was dropped draws, and that path is not the way to cut the wait.
 - Next: victory-scarlett's `SHOW_AFTER` (a title slot shows a texture new to it only after the submission with its upload has run) in place of `slot_wait`, keeping tables as they are ([forks/victory-scarlett.md](forks/victory-scarlett.md)).
