@@ -89,10 +89,10 @@ vkd3d-proton otherwise writes its cache into the working directory. Proton
 does not pass a console program's output on: run it under `cmd /c` with the
 output redirected to a file.
 
-The launch settings of `scripts/play.ps1` apply on Linux as on Windows. Under
-Proton add `VICTORY_PIPELINE_WAIT_MS=0` for now (see "Every frame waits
-500 ms"). `VICTORY_KEYS` presses the pad's A on the start screen in every
-build, so an unattended run gets past it.
+The launch settings of `scripts/play.ps1` apply on Linux as on Windows.
+`VICTORY_KEYS` presses the pad's A on the start screen in every build, so an
+unattended run gets past it. On a build without the single-latch fix (see
+"Every frame waits 500 ms") add `VICTORY_PIPELINE_WAIT_MS=0`.
 
 ## Problems seen under Proton
 
@@ -114,10 +114,13 @@ pipeline stays "being made". Every frame that asks for one of them then spends
 the whole pipeline-wait budget (`VICTORY_PIPELINE_WAIT_MS`, 500 ms a frame)
 waiting for it.
 
-What to do: `VICTORY_PIPELINE_WAIT_MS=0` until the fix is in the tree. The
-fix: DXC writes loops with one latch, so the translation gives every loop one
-(the blocks that branched back branch to a new block that branches back
-alone); with it the six convert.
+The fix, on under Wine (`VICTORY_ONE_LATCH`): DXC writes loops with one latch,
+so the translation gives every loop one (the blocks that branched back branch
+to a new block that branches back alone). With it the six convert, nothing
+stays "being made", and the default budget costs 0.0 to 0.4 ms a frame
+(median frame 53 to 60 ms in the same scenes). On a build without it,
+`VICTORY_PIPELINE_WAIT_MS=0` avoids the wait: draws whose pipeline is not
+ready are dropped instead.
 
 ### Characters without heads (or heads without skin)
 
