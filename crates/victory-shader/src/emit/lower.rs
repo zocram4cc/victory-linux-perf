@@ -387,8 +387,6 @@ struct Lower<'a> {
     /// Loop headers' iteration counters (see [`LOOP_LIMIT`]): the phi by
     /// IR block, and its incoming (value, DXIL block) pairs.
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
-    /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
-    abort: Option<usize>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -1755,7 +1753,6 @@ impl<'a> Lower<'a> {
             section_out: HashSet::new(),
             code_table: None,
             counters: HashMap::new(),
-            abort: None,
         }
     }
 
@@ -12625,11 +12622,13 @@ impl<'a> Lower<'a> {
         over
     }
 
-    /// The block a lane stopped by [`LOOP_LIMIT`] leaves through.
+    /// The block a lane stopped by [`LOOP_LIMIT`] leaves through: one of its
+    /// own for each loop that has one. A block shared by several loops was
+    /// made the merge block of each by vkd3d-proton's dxil-spirv ("already a
+    /// merge block for another header"), invalid SPIR-V on which NVIDIA's
+    /// compiler trapped; the returns meet in one block anyway
+    /// (`single_return`).
     fn abort_block(&mut self) -> usize {
-        if let Some(a) = self.abort {
-            return a;
-        }
         let a = self.s.m.new_block();
         if self.s.pixel {
             let t = self.s.m.bool(true);
@@ -12637,7 +12636,6 @@ impl<'a> Lower<'a> {
                 .op(a, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
         }
         self.s.m.terminate(a, Term::Ret);
-        self.abort = Some(a);
         a
     }
 

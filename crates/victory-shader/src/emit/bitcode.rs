@@ -500,6 +500,28 @@ impl Module {
         self.blocks[block].term = Some(t);
     }
 
+    /// One return for the whole program: where several blocks end in `ret`,
+    /// they branch to a new block that does, as DXC's programs end (LLVM
+    /// merges returns). A return inside a loop then leaves the loop by a
+    /// branch, so every loop has an exit to merge at. vkd3d-proton's
+    /// dxil-spirv gave a loop left only by returns (a pixel program's
+    /// discard and return inside one, or our iteration limit's abort) a
+    /// merge block with no terminator: invalid SPIR-V, on which NVIDIA's
+    /// compiler (libnvidia-gpucomp 620.70.06) trapped instead of refusing it,
+    /// in about one pipeline of the title's in seventeen.
+    pub fn single_return(&mut self) {
+        let returns: Vec<usize> =
+            (0..self.blocks.len()).filter(|&b| matches!(self.blocks[b].term, Some(Term::Ret))).collect();
+        if returns.len() < 2 {
+            return;
+        }
+        let end = self.new_block();
+        self.blocks[end].term = Some(Term::Ret);
+        for b in returns {
+            self.blocks[b].term = Some(Term::Br(end));
+        }
+    }
+
     /// Gives every loop header one back edge: where several blocks branch
     /// back to a header (an edge to a block not after them in reverse
     /// postorder), they branch to a new latch instead, which branches to the
@@ -1146,6 +1168,46 @@ mod tests {
         assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 1);
         assert_eq!(signed(-3), 7);
         assert_eq!(signed(2), 4);
+    }
+
+    /// Several returns become branches to one return block; one is left be.
+    #[test]
+    fn returns_merge_into_one() {
+        let mut m = Module::default();
+        let i32t = m.int(32);
+        let (entry, head, body, out, done) = (m.new_block(), m.new_block(), m.new_block(), m.new_block(), m.new_block());
+        let ten = m.i32(10);
+        let zero = m.i32(0);
+        m.terminate(entry, Term::Br(head));
+        let p = m.phi(head, i32t);
+        let c = m.cmp(head, pred::IULT, p, ten);
+        // A loop left only by returns: from `out` and from `done`.
+        m.terminate(head, Term::CondBr(c, body, out));
+        let one = m.i32(1);
+        let next = m.bin(body, Bin::Add, p, one);
+        let again = m.cmp(body, pred::IULT, next, ten);
+        m.terminate(body, Term::CondBr(again, head, done));
+        m.set_phi(p, vec![(zero, entry), (next, body)]);
+        m.terminate(out, Term::Ret);
+        m.terminate(done, Term::Ret);
+        let blocks = m.blocks.len();
+        m.single_return();
+        assert_eq!(m.blocks.len(), blocks + 1);
+        let end = blocks;
+        assert!(matches!(m.blocks[end].term, Some(Term::Ret)));
+        assert_eq!(
+            (0..m.blocks.len()).filter(|&b| matches!(m.blocks[b].term, Some(Term::Ret))).count(),
+            1,
+            "one return left"
+        );
+        assert!(matches!(m.blocks[out].term, Some(Term::Br(e)) if e == end));
+        assert!(matches!(m.blocks[done].term, Some(Term::Br(e)) if e == end));
+        assert!(!m.write().is_empty());
+
+        let mut once = synthetic(4, 2, 2);
+        let before = once.blocks.len();
+        once.single_return();
+        assert_eq!(once.blocks.len(), before, "a program with one return is not touched");
     }
 
     /// A loop whose header two blocks branch back to gets one latch they both
