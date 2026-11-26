@@ -5923,6 +5923,16 @@ impl Meter {
         let picked_ms =
             crate::draw::HEAP_BUFFER_MICROS.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
         {
+            let [us, bytes, count] = [0, 1, 2].map(|i| crate::texture::DETILED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if count > 0.0 {
+                tracing::info!(
+                    "textures detiled per frame (A.1): {count:.1}, {:.1} MB, {:.1} ms (all threads)",
+                    bytes / 1e6,
+                    us / 1e3
+                );
+            }
+        }
+        {
             let [slots_us, refresh_us, textures_us, slots, bytes] =
                 [0, 1, 2, 3, 4].map(|i| crate::draw::HEAP_PARTS[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if picked > 0.0 {

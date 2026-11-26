@@ -352,6 +352,10 @@ thread_local! {
 
 /// Calls `f` with `size` bytes of this thread's read buffer (their
 /// contents are whatever the last texture left).
+/// A.1: since the last frame line, microseconds detiling, bytes detiled,
+/// and textures detiled (on whichever thread asked).
+pub(crate) static DETILED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
 fn with_read<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
     READ.with(|read| {
         let mut read = read.borrow_mut();
@@ -851,6 +855,14 @@ impl Staging {
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
+        let began = std::time::Instant::now();
+        self.detile_timed(tiled);
+        DETILED[0].fetch_add(began.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        DETILED[1].fetch_add(tiled.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        DETILED[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn detile_timed(&self, tiled: &[u8]) {
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
