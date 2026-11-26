@@ -2561,10 +2561,10 @@ impl State {
         // of its own: no pass of ours and no wait here.
         let batched = hit.is_none() && crate::indirect::batch_on() && {
             // Why a record is not batched, counted for the frame line.
+            // Windows (`VICTORY_INDIRECT_WINDOW`) are for what is left:
+            // records the list's shaders write.
             let why = if parts.is_some() {
                 1
-            } else if windowed {
-                2
             } else if max != 1 || count.is_some() {
                 3
             } else if args.carded() && !crate::indirect::batch_cards() {
