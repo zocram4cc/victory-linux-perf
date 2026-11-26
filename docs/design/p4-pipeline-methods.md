@@ -63,6 +63,22 @@ These are shader containers by (pointer, length), like the PC description's `D3D
   So **`0x218` makes compute pipelines from console ISA**. That fits the ~800-980 indirect dispatches dropped a frame.
 - The metadata blocks (0x118, 0x158) start `03040000 04010000 60000000 …`. They are not laid out like an `FSSM` record (whose first word is a code offset): the user-data layout, resource table and group size must be found in them by comparing a few calls (e.g. the group size 8×8 must appear somewhere).
 
+**First decode of the metadata (as 32-bit words):**
+- **The 0x1c header** `4005cf00 6c090102 0 00080008 1 402c0343 b8a`: words 3-4 are the **thread-group size, x = 8, y = 8 (two u16), z = 1**, as the code computes (`group id * 8 + thread id`). Words 0-1 look like the program's resource registers (`COMPUTE_PGM_RSRC1`/`RSRC2`-like). This is the compute stage data `FSSM` keeps after its record.
+- **The 0x14 records** `a7a5d2fa 3 0 0 0` and `046c85e2 3 0 0 0`: a 32-bit id (hash) and a count.
+- **The 0x118 metadata** is a list of 8-dword entries after a short head (`403 104 60 0 0 40440`):
+  ```
+  41 401 0 3 0 b0004 ffffffff 0
+  41 300 0 10a 4 408 ffffffff 0     <- tag 0x41: resources (0x300/0x302/0x303: kinds; 0x10a/0x17/0x1b: offsets)
+  41 303 8 17 4 408 ffffffff 0
+  41 302 10 1b 0 404 ffffffff 0
+  42 0 70001 10a 1 0 ffffffff 0     <- tag 0x42: user-data / table mapping (0x10a, 0x17, 0x1b again)
+  42 0 70101 17 1 0 ffffffff 0
+  42 0 d0201 1b 1 0 ffffffff 0
+  43 6a41cebf 7f5348e6 1fdc7a86 fdb6f05a 0 0 0   <- tag 0x43: a 128-bit hash
+  ```
+  These play the part of `FSSM`'s root layout and used-resource tables. Their fields must be mapped onto `RootParam` and `UsedResource` (`native.rs`): kind, root slot, table offset, register, user-data dword.
+
 ## Steps
 
 1. **Census:** count the calls of each method per run, and the draws and indirect draws dropped for want of a pipeline. Is it these pipelines, or other ones (untranslated shaders, slow compiles)? Log `missing()` reasons for the top dropped pipelines in a diagnostics build.
