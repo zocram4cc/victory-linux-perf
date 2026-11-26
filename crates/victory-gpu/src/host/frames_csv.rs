@@ -5,8 +5,8 @@
 //! A row is what the counters of the frame line and the panel moved by since
 //! the frame before (they go back to 0 at each frame line, so the frame
 //! after one reads from 0). The presenting thread only formats the row; a
-//! thread of its own writes the file and flushes it once a second, so a
-//! crash loses at most the last second.
+//! thread of its own writes the file, each row at most a second after it
+//! came, so a crash loses at most the last second.
 
 use std::io::Write;
 use std::sync::Mutex;
@@ -72,15 +72,26 @@ fn open() -> Option<State> {
     let spawned = std::thread::Builder::new().name("frames csv".into()).spawn(move || {
         let mut out = std::io::BufWriter::with_capacity(1 << 16, file);
         let _ = writeln!(out, "{HEADER}");
+        let _ = out.flush();
+        // When the oldest row not yet in the file came: written at most a
+        // second later however fast rows come (an abort runs no destructors,
+        // so what is still buffered then is lost).
+        let mut pending: Option<Instant> = None;
         loop {
-            match received.recv_timeout(Duration::from_secs(1)) {
+            let wait = pending.map_or(Duration::from_secs(1), |since| {
+                Duration::from_secs(1).saturating_sub(since.elapsed())
+            });
+            match received.recv_timeout(wait) {
                 Ok(row) => {
                     let _ = writeln!(out, "{row}");
+                    pending.get_or_insert_with(Instant::now);
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    let _ = out.flush();
-                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+            if pending.is_some_and(|since| since.elapsed() >= Duration::from_secs(1)) {
+                let _ = out.flush();
+                pending = None;
             }
         }
         let _ = out.flush();
