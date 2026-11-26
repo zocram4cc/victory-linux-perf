@@ -27,6 +27,10 @@ Also: textures on a copy queue of their own, shown only after their upload ran (
 
 Series S profile, smaller textures, a second drawing queue, wave sizes, fast math, leaving out barriers ("nothing to 0.1 ms each"), running console ISA natively ("the Windows driver takes no raw code").
 
+## Their build on this machine (26 Nov, the user played it, no warm)
+
+`perfiles/coolfox/logs/20261126-100428-run.log`: **436-603 ms a frame (~2 fps)**, 3,900-6,800 draws. Faces show; some textures broken (others report it too). The card's clock: **about 11 % busy (~60 ms a frame), and most of the frame "the title had not submitted"**: on Linux their wall is before submission (the title's threads and their list-call translation under Wine), not the card. Their frame line's "on the GPU" (20-34 ms) counts the submitting thread's wait, not the card's work; by the card's clock the cost per draw (~12 µs) is close to ours (~15 µs). So their Windows card figure (41 ms) is not evidence of a cheaper layer on this platform.
+
 ## For us
 
 1. **Run their build here** (the user is): their fps on Linux says whether our gap is the layer or the platform.
