@@ -48,6 +48,21 @@ These are shader containers by (pointer, length), like the PC description's `D3D
 
 **Hypothesis to test next:** each image block of a `0x1c8`/`0x218` description is one stage's record plus its stage data (sizes 0xbc-0x2f0 fit: a 0x54-byte record and the VS/PS/CS data after it), with absolute pointers where `FSSM` has payload-relative offsets, and the heap block next to it is that stage's code. If so, a `NativeProgram` can be built from each (metadata, code) pair and handed to the existing translator, and the pipeline made as `create_graphics` makes it, with the root signature from the table.
 
+**Whole blocks dumped (26 Nov, `royale-save/logs/20261126-0544…`), `0x218`:**
+- The description is a run of (pointer, length) pairs after word 0: a 0x1c-byte header, 0x14-byte records, code blocks of 0x180 and 0x200 bytes, metadata blocks of 0x118 and 0x158 bytes. Two programs per description in the first calls.
+- **A code block disassembles as a valid RDNA2 compute program** (`llvm-mc --disassemble -arch=amdgcn -mcpu=gfx1030`, after a 32-byte header):
+  ```
+  s_inst_prefetch 0x3
+  s_mov_b32 s8, s4 ; s_mov_b32 s9, 0
+  s_load_dwordx4 s[12:15], s[8:9], 0x40
+  s_load_dwordx16 s[24:39], s[8:9], null      ; descriptors through a user-data pointer
+  v_lshl_add_u32 v2, s5, 3, v0                 ; group id * 8 + thread id: 8x8 groups
+  v_lshl_add_u32 v3, s6, 3, v1
+  ... image store, s_endpgm, s_code_end padding
+  ```
+  So **`0x218` makes compute pipelines from console ISA**. That fits the ~800-980 indirect dispatches dropped a frame.
+- The metadata blocks (0x118, 0x158) start `03040000 04010000 60000000 …`. They are not laid out like an `FSSM` record (whose first word is a code offset): the user-data layout, resource table and group size must be found in them by comparing a few calls (e.g. the group size 8×8 must appear somewhere).
+
 ## Steps
 
 1. **Census:** count the calls of each method per run, and the draws and indirect draws dropped for want of a pipeline. Is it these pipelines, or other ones (untranslated shaders, slow compiles)? Log `missing()` reasons for the top dropped pipelines in a diagnostics build.
