@@ -779,7 +779,29 @@ fn wait_for(resource: usize, handle: u64) {
 /// textures made since the last call. Called before a submission runs, by
 /// the thread that submits: a slot is read when a list runs.
 #[cfg(windows)]
+/// C.1 (`VICTORY_ALL_FRESH=2`): title slots a draw read, whose host slot is
+/// brought up to date at the next submission's start instead of during the
+/// draw (where writing it waited for the running submission).
+static DEFERRED_MIRRORS: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+
+/// Queues title slot `handle` for [`make_waiting`].
+pub(crate) fn defer_mirror(handle: u64) {
+    DEFERRED_MIRRORS.lock().unwrap_or_else(|e| e.into_inner()).push(handle);
+}
+
 pub(crate) fn make_waiting() {
+    // Before the lists run, with no submission running: the title slots
+    // draws read through fresh tables, for shaders that pick them by index.
+    let mut deferred = std::mem::take(&mut *DEFERRED_MIRRORS.lock().unwrap_or_else(|e| e.into_inner()));
+    deferred.sort_unstable();
+    deferred.dedup();
+    for handle in deferred {
+        if let Some((heap, index)) = shader_slot(handle)
+            && let Some(Some(host)) = heap.host.get()
+        {
+            host.mirror(index, handle, true);
+        }
+    }
     let made = std::mem::take(&mut *MADE_LATE.lock().unwrap_or_else(|e| e.into_inner()));
     for resource in made {
         let handles = WAITING

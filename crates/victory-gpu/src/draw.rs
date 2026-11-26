@@ -481,7 +481,9 @@ fn all_fresh() -> bool {
 
 /// `VICTORY_ALL_FRESH=2`: as 1, but the title's own slots of the textures a
 /// draw read are still made (`mirror`), for shaders that pick them by index
-/// from the heap (without, things flickered black after loading).
+/// from the heap (without, things flickered black after loading), at the
+/// next submission's start (made during the draw, ~23 writes a frame each
+/// waited for a whole running submission).
 fn all_fresh_mirrors() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_ALL_FRESH").is_some_and(|v| v == "2"))
@@ -2282,8 +2284,13 @@ impl State {
                             && crate::descriptor::host::is_texture_view(&view)
                         {
                             host.texture_slot_tabled(title + k, kind.is_some());
-                            if kind.is_some() && !copied && !(all && !all_fresh_mirrors()) {
-                                host.mirror(title + k, table + u64::from(k) * 32, true);
+                            if kind.is_some() && !copied {
+                                if !all {
+                                    host.mirror(title + k, table + u64::from(k) * 32, true);
+                                } else if all_fresh_mirrors() {
+                                    // At the next submission's start, when nothing runs.
+                                    crate::descriptor::defer_mirror(table + u64::from(k) * 32);
+                                }
                             }
                         }
                     }
