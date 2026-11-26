@@ -340,12 +340,13 @@ fn in_place_order() -> bool {
     crate::toggled!("VICTORY_PORT_CONSTANTS_ORDER")
 }
 
-/// With [`in_place_order`]: such executions never in a batch
-/// (`VICTORY_PORT_CONSTANTS_ORDER_ALONE=1`, run pop-14); unset, in a batch
-/// opened after the last shader that may write buffers.
+/// With [`in_place_order`]: such executions never in a batch (unset or
+/// `VICTORY_PORT_CONSTANTS_ORDER_ALONE=1`: the palms stayed in every frame,
+/// run pop-14). `=0`: in a batch opened after the last shader that may
+/// write buffers; not enough, the palms still came and went (run pop-15).
 fn in_place_alone() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PORT_CONSTANTS_ORDER_ALONE").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PORT_CONSTANTS_ORDER_ALONE").is_none_or(|v| v != "0"))
 }
 
 /// Since the last line: indirect executions with arguments in place, those
@@ -382,7 +383,7 @@ pub(crate) fn in_place_indirect_line(frames: f64) {
         .map(|(mb, n)| format!("{:#x}+1MiB: {:.0} draws {:.0} dispatches {:.0} mesh", mb << 20, n[0] as f64 / frames, n[1] as f64 / frames, n[2] as f64 / frames))
         .collect();
     tracing::info!(
-        "renderer port 1: indirect executions with arguments or count in place per frame: {:.0}, of them {:.0} clamped after the last shader write before them (VICTORY_PORT_CONSTANTS_ORDER); from {} ranges of 1 MiB, the busiest: {}",
+        "renderer port 1: indirect executions with arguments or count in place per frame: {:.0}, of them {:.0} clamped after every shader write before them (VICTORY_PORT_CONSTANTS_ORDER); from {} ranges of 1 MiB, the busiest: {}",
         all as f64 / frames,
         alone as f64 / frames,
         by.len(),
