@@ -1298,13 +1298,6 @@ fn video_memory_percent() -> u64 {
 /// How many of a streamed placed 2D texture's largest mips to skip so no side
 /// passes `VICTORY_TEXTURE_MAX` (0: uncapped; unset: 1024, then 512 from 92 %
 /// of the VRAM budget and 256 from 97 %, after `VIctory-vitesse` 7ada43b6).
-/// Whether ray-tracing BVH building is enabled (`VICTORY_BVH_BUILDER=1`).
-#[cfg(windows)]
-fn bvh_rt_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"))
-}
-
 /// Keeps 16 GB cards from filling VRAM and stalling thousands of textures.
 #[cfg(windows)]
 fn over_cap(desc: &ResourceDesc) -> u32 {
@@ -2682,6 +2675,7 @@ pub(crate) fn first_shown(this: This) -> Option<u32> {
 /// A host copy made without memory of its own (`crate::tiles`), as a
 /// submission-time step of a list holds it.
 #[cfg(windows)]
+#[derive(Clone)]
 pub(crate) struct OnDemand(std::sync::Arc<HostTexture>);
 
 // SAFETY: the host texture is named only in queue calls, which any thread

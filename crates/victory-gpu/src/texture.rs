@@ -68,11 +68,10 @@ pub(crate) struct Staging {
     shape: crate::texstore::Shape,
     memory: *const u8,
     last: Mutex<Last>,
-    /// Whether the staging buffer was detiled since a submitted list last
-    /// uploaded it, and whether one has uploaded it at all: a list records
-    /// the upload only then. (Every list that sampled a title texture
-    /// uploaded all of it again, changed or not: 5,411 subresource copies
-    /// of 1,120 textures in one frame of run 18.)
+    /// Whether the staging buffer was detiled since a list's prelude last
+    /// uploaded it, and whether one has uploaded it at all: a list's prelude
+    /// records `CopyTextureRegion` at submission time (after `refresh()`)
+    /// only when `!uploaded || dirty`.
     dirty: std::sync::atomic::AtomicBool,
     uploaded: std::sync::atomic::AtomicBool,
     /// When a list last recorded a use of it (`crate::host::moment`).
@@ -648,10 +647,9 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
     unsafe { texture.GetDesc() }.Flags.0 & TARGET_DEPTH_UNORDERED == 0
 }
 
-/// Records, once per list, the copy of `resource`'s staging buffer into
-/// its host copy, and the detiling that refreshes the staging buffer at
-/// submission if the memory changed. Leaves the texture in the copy
-/// destination state.
+/// Registers, once per list, `resource`'s staging buffer so that at submission
+/// time its memory is refreshed and, if changed (or never uploaded), copied
+/// into its host texture on the list's prelude command list.
 pub(crate) fn upload(list: &HostList, resource: This, _texture: &ID3D12Resource) {
     upload_from(list, resource, 0);
 }
@@ -753,7 +751,6 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     let Some(copy) = crate::resource::host_copy(resource) else {
         return;
     };
-    let texture = &copy.texture;
     ahead::listed(&copy);
     let Some(staging) = staging(resource, &copy, first) else {
         return;
@@ -768,7 +765,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     // Levels on demand: a view of the texture now starts at another
     // level, or another texture now starts inside its span, with no byte
     // of its memory changed. The levels are judged anew: detiled again at
-    // this list's submission, and uploaded by this list.
+    // this list's submission, and uploaded by this list's prelude.
     if staging.on_demand && staging.judgement() != staging.judged() {
         staging.forget();
         staging.dirty.store(true, Relaxed);
@@ -791,18 +788,6 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
             }
         }
     }
-    // The host texture has the staging buffer's contents: only the check
-    // at submission is left, and what it finds changed the next list that
-    // samples the texture uploads (a frame late where every list of the
-    // frame was recorded before that check).
-    if staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) {
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::TexSkipped, 1);
-        list.defer_texture(staging);
-        return;
-    }
-    #[cfg(feature = "diagnostics")]
-    crate::copystat::add(crate::copystat::C::TexUploads, 1);
     if no_wait() && fill_unlocked() {
         let there = match picking {
             Some(there) if there != u64::MAX => there,
@@ -810,133 +795,142 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         };
         staging.expected.store(there, Relaxed);
     }
-    const COPY_DEST: u32 = 0x400;
-    // A texture cut from a block may lie where another did: what the card
-    // holds of that one is done with before the first upload into this one.
-    if crate::pool::on() && !staging.uploaded.load(Relaxed) {
-        let aliasing = D3D12_RESOURCE_BARRIER {
-            Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
-            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-            Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                Aliasing: std::mem::ManuallyDrop::new(D3D12_RESOURCE_ALIASING_BARRIER {
-                    pResourceBefore: std::mem::ManuallyDrop::new(None),
-                    // SAFETY: a borrowed pointer the barrier never releases.
-                    pResourceAfter: unsafe { std::mem::transmute_copy(texture) },
-                }),
-            },
-        };
-        // SAFETY: an open list and a live texture.
-        unsafe { list.list.barriers(&[aliasing]) };
-    }
-    crate::list::ensure_state(list, resource, COPY_DEST);
-    // A host copy made whole from the store (`crate::texstore`): its larger
-    // levels, once, before the ones from title memory.
-    let prefill = copy.prefill.lock().unwrap_or_else(|e| e.into_inner()).take();
-    if let Some((levels, bytes)) = prefill
-        && prefill_levels(list, &copy, levels, &bytes)
-    {
-        let texture = resource as usize;
-        list.defer_host(move || crate::texlate::whole(texture));
-    }
-    // The staging buffer lives as long as `staging`, which the deferred
-    // refresh below holds until the list is reset.
-    for (i, footprint) in staging.footprints.iter().enumerate() {
-        #[cfg(feature = "diagnostics")]
-        {
-            let f = footprint.Footprint;
-            // SAFETY: live resources.
-            let (gpu, d) = unsafe { (staging.buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
-            let len = u64::from(f.RowPitch) * u64::from(staging.rows[i]) * u64::from(f.Depth);
-            list.note_read(
-                || {
-                    format!(
-                        "texture upload {resource:?} ({}x{}x{} f{} mips {}) sub {i} of {} from staging {gpu:#x}+{:#x}: offset {:#x} {}x{}x{} pitch {}",
-                        d.Width,
-                        d.Height,
-                        d.DepthOrArraySize,
-                        d.Format.0,
-                        d.MipLevels,
-                        staging.footprints.len(),
-                        staging.size,
-                        staging.base + footprint.Offset,
-                        f.Width,
-                        f.Height,
-                        f.Depth,
-                        f.RowPitch
-                    )
-                },
-                (gpu + staging.base + footprint.Offset, len),
-            );
-        }
-        let to = D3D12_TEXTURE_COPY_LOCATION {
-            // SAFETY: a borrowed pointer the location never releases.
-            pResource: unsafe { std::mem::transmute_copy(texture) },
-            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                SubresourceIndex: staging.first - staging.level0 + i as u32,
-            },
-        };
-        let from = D3D12_TEXTURE_COPY_LOCATION {
-            // SAFETY: as above.
-            pResource: unsafe { std::mem::transmute_copy(&staging.buffer) },
-            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-                    Offset: staging.base + footprint.Offset,
-                    ..*footprint
-                },
-            },
-        };
-        // SAFETY: an open list; both locations name live resources.
-        unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
-    }
-    // When the list is submitted, its copy takes what the staging buffer
-    // holds by then: noted before the check below, which sets `dirty`
-    // again if it detiles (the next list then uploads once more).
-    {
-        let staging = staging.clone();
-        list.defer_host(move || {
-            staging.uploaded.store(true, Relaxed);
-            staging.dirty.store(false, Relaxed);
-        });
-    }
-    // A host copy that took the place of one with fewer levels: the slots
-    // that show that one are made again once this upload has run.
-    if staging.first == staging.level0 && copy.grown.swap(false, Relaxed) {
-        let start = staging.memory as u64;
-        list.defer_host(move || crate::descriptor::host::levels_changed_after(start));
-    }
-    let noted = staging.clone();
-    // Levels on demand (`crate::tiles`): after the check below, in the
-    // order of this list's steps, and before the list is executed, the
-    // levels the staging buffer holds as the title's are given the card's
-    // memory if they have none. The list copies every level, so each one
-    // given here is written whole by it (the rest are copies into no
-    // memory, which the card drops).
+    // At submission time, `staging.refresh()` runs first (in parallel via
+    // `Batch::refresh_front` or `Batch::refresh_textures`), and only then does
+    // `PreludeUpload::finish_refresh` decide whether the list's prelude must
+    // record `CopyTextureRegion`. This guarantees zero frames of latency when
+    // title memory changes (including 3-buffer Bink video rings) and eliminates
+    // the race with `VICTORY_JOIN_PARTS` / `VICTORY_THIN`.
     let on_demand = if staging.on_demand { crate::resource::host_tiled(resource) } else { None };
-    let Some(on_demand) = on_demand else {
-        // Once per submission however many of its lists sample the texture.
-        list.defer_texture(staging);
-        // Then what the list's copy puts in the host copy is known.
-        list.defer_host(move || noted.note_held());
-        return;
-    };
-    list.defer_texture(staging.clone());
-    list.defer_host(move || {
-        let waiting = on_demand.uploaded(staging.detiled.load(Relaxed), staging.memory as u64);
-        staging.waiting.store(if waiting { crate::host::moment().max(1) } else { 0 }, Relaxed);
-        // A texture picked by index has no staging buffer after this
-        // upload: its slots are made due again by the texture pass.
-        if waiting {
-            crate::descriptor::host::levels_waiting(staging.memory as u64);
-        }
+    list.defer_texture(PreludeUpload {
+        staging,
+        copy,
+        resource: resource as usize,
+        on_demand,
     });
+}
+
+/// Pure claim helper for [`PreludeUpload::finish_refresh`]: returns
+/// `Some(first_upload)` when the host texture has never been uploaded or the
+/// staging buffer was detiled since the last upload, and `None` when the host
+/// texture already holds the staging buffer's current contents.
+fn claim_upload(
+    uploaded: &std::sync::atomic::AtomicBool,
+    dirty: &std::sync::atomic::AtomicBool,
+) -> Option<bool> {
+    use std::sync::atomic::Ordering::AcqRel;
+    let was_uploaded = uploaded.swap(true, AcqRel);
+    let was_dirty = dirty.swap(false, AcqRel);
+    (!was_uploaded || was_dirty).then_some(!was_uploaded)
+}
+
+/// A title texture deferred to submission time so `staging.refresh()` runs
+/// before deciding whether `HostList::prelude` must record `CopyTextureRegion`.
+#[derive(Clone)]
+pub(crate) struct PreludeUpload {
+    pub(crate) staging: Arc<Staging>,
+    pub(crate) copy: Arc<crate::resource::HostTexture>,
+    resource: usize,
+    on_demand: Option<crate::resource::OnDemand>,
+}
+
+impl PreludeUpload {
+    /// The title memory the texture is read from: address and bytes.
+    pub(crate) fn memory(&self) -> (usize, usize) {
+        self.staging.memory()
+    }
+
+    /// Called on the submitting thread after `self.staging.refresh()` has
+    /// completed for this submission. Returns `Some(first_upload)` when the
+    /// list's prelude must record `CopyTextureRegion` into `self.copy.texture`.
+    pub(crate) fn finish_refresh(&self) -> Option<bool> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(first_upload) = claim_upload(&self.staging.uploaded, &self.staging.dirty) else {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::TexSkipped, 1);
+            return None;
+        };
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::TexUploads, 1);
+        // A host copy that took the place of one with fewer levels: the slots
+        // that show that one are made again once this upload has run.
+        if self.staging.first == self.staging.level0 && self.copy.grown.swap(false, Relaxed) {
+            crate::descriptor::host::levels_changed_after(self.staging.memory as u64);
+        }
+        // Levels on demand (`crate::tiles`): after `refresh()` has detiled,
+        // give the held levels their memory on the queue before the prelude
+        // copies into them; otherwise record what the host copy now holds.
+        if let Some(on_demand) = &self.on_demand {
+            let waiting = on_demand.uploaded(
+                self.staging.detiled.load(Relaxed),
+                self.staging.memory as u64,
+            );
+            self.staging.waiting.store(
+                if waiting { crate::host::moment().max(1) } else { 0 },
+                Relaxed,
+            );
+            // A texture picked by index has no staging buffer after this
+            // upload: its slots are made due again by the texture pass.
+            if waiting {
+                crate::descriptor::host::levels_waiting(self.staging.memory as u64);
+            }
+        } else {
+            self.staging.note_held();
+        }
+        Some(first_upload)
+    }
+
+    /// Records `CopyTextureRegion` (and any `texstore` prefill) onto `cmd_list`
+    /// (the prelude command list). `self.copy.texture` must already be in
+    /// `D3D12_RESOURCE_STATE_COPY_DEST`.
+    pub(crate) fn record(&self, host_list: &HostList, cmd_list: &ID3D12GraphicsCommandList) {
+        let texture = &self.copy.texture;
+        // A host copy made whole from the store (`crate::texstore`): its larger
+        // levels, once, before the ones from title memory.
+        let prefill = self.copy.prefill.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some((levels, bytes)) = prefill
+            && prefill_levels(host_list, cmd_list, &self.copy, levels, &bytes)
+        {
+            crate::texlate::whole(self.resource);
+        }
+        // The staging buffer lives as long as `self.staging`, which the list's
+        // deferred steps hold until the list is reset after GPU completion.
+        for (i, footprint) in self.staging.footprints.iter().enumerate() {
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: a borrowed pointer the location never releases.
+                pResource: unsafe { std::mem::transmute_copy(texture) },
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    SubresourceIndex: self.staging.first - self.staging.level0 + i as u32,
+                },
+            };
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: as above.
+                pResource: unsafe { std::mem::transmute_copy(&self.staging.buffer) },
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: self.staging.base + footprint.Offset,
+                        ..*footprint
+                    },
+                },
+            };
+            // SAFETY: an open prelude list; both locations name live resources.
+            unsafe { cmd_list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+        }
+    }
 }
 
 /// Records copies of levels `0..levels` of `copy` (in the copy destination
 /// state) from `bytes`, laid out as the host lays out those subresources;
 /// its views show them from then on.
-fn prefill_levels(list: &HostList, copy: &crate::resource::HostTexture, levels: u32, bytes: &[u8]) -> bool {
+fn prefill_levels(
+    host_list: &HostList,
+    cmd_list: &ID3D12GraphicsCommandList,
+    copy: &crate::resource::HostTexture,
+    levels: u32,
+    bytes: &[u8],
+) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     let Some(host) = host() else {
         return false;
@@ -961,7 +955,7 @@ fn prefill_levels(list: &HostList, copy: &crate::resource::HostTexture, levels: 
     };
     // SAFETY: the mapping holds `total` bytes.
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), data, total as usize) };
-    list.keep(&buffer);
+    host_list.keep(&buffer);
     for (i, footprint) in footprints.iter().enumerate() {
         let to = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: a borrowed pointer the location never releases.
@@ -976,7 +970,7 @@ fn prefill_levels(list: &HostList, copy: &crate::resource::HostTexture, levels: 
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *footprint },
         };
         // SAFETY: an open list; both locations name live resources.
-        unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+        unsafe { cmd_list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
     copy.prefilled.store(levels, Relaxed);
     crate::texstore::PREFILLED.fetch_add(1, Relaxed);
@@ -1496,7 +1490,7 @@ impl Staging {
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
-        self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.dirty.store(true, std::sync::atomic::Ordering::Release);
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step
         // that gives levels their memory goes by this answer.
@@ -2060,6 +2054,75 @@ mod title_memory_tests {
                     .expect("the staging buffer's bytes are enough");
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod prelude_upload_tests {
+    use super::claim_upload;
+    use std::sync::atomic::{AtomicBool, Ordering::Release};
+
+    #[test]
+    fn first_upload_clean_skip_and_immediate_same_frame_reupload() {
+        let uploaded = AtomicBool::new(false);
+        let dirty = AtomicBool::new(true);
+
+        // Frame 1: first upload runs after refresh() detiled into staging.
+        assert_eq!(claim_upload(&uploaded, &dirty), Some(true));
+        // Second list in the same submission skips redundant copy.
+        assert_eq!(claim_upload(&uploaded, &dirty), None);
+
+        // Frame 2: texture unchanged — refresh() does not detile, prelude skips.
+        assert_eq!(claim_upload(&uploaded, &dirty), None);
+
+        // Frame 3: texture changed — refresh()/detile() runs BEFORE claim_upload,
+        // so upload is claimed on the exact same frame (0 frames late).
+        dirty.store(true, Release);
+        assert_eq!(claim_upload(&uploaded, &dirty), Some(false));
+
+        // Frame 4: consecutive change (e.g. refresh_front() on every frame)
+        // must also upload immediately, never alternating upload/skip.
+        dirty.store(true, Release);
+        assert_eq!(claim_upload(&uploaded, &dirty), Some(false));
+    }
+
+    #[test]
+    fn three_buffer_ring_never_displays_stale_frame() {
+        let ring: [(AtomicBool, AtomicBool); 3] =
+            std::array::from_fn(|_| (AtomicBool::new(false), AtomicBool::new(true)));
+        let mut gpu_frame = [0u32; 3];
+
+        // 12 decoded frames cycling through the 3-buffer ring (like Bink intro),
+        // with frame 5 repeated once to exercise the clean-frame transition.
+        let schedule = [
+            (0, 1, true),
+            (1, 2, true),
+            (2, 3, true),
+            (0, 4, true),
+            (1, 5, true),
+            (1, 5, false), // held frame: unchanged
+            (2, 6, true),
+            (0, 7, true),
+            (1, 8, true),  // immediately after held frame: must NOT be stale!
+            (2, 9, true),
+            (0, 10, true),
+            (1, 11, true),
+        ];
+
+        for (slot, video_frame, changed) in schedule {
+            let (uploaded, dirty) = &ring[slot];
+            if changed {
+                dirty.store(true, Release);
+            }
+            if claim_upload(uploaded, dirty).is_some() {
+                gpu_frame[slot] = video_frame;
+            }
+            assert_eq!(
+                gpu_frame[slot], video_frame,
+                "slot {slot} displayed stale frame {} instead of {video_frame}",
+                gpu_frame[slot]
+            );
         }
     }
 }
