@@ -65,6 +65,37 @@ in that order of size:
   normalized buffer codes were one step off.
 - **Every ray missed**: the dispatch flag that says counts are threads, not groups.
 
+### Faces stood still (2026-11-25): found and fixed
+
+On an RX 7900 XTX and an RTX 4080 SUPER, with and without `-Safe`, no face moved
+(lips, brows, blinks) while bodies, hair and cloth did; never seen working in this
+fork. It was no program that does not translate, no pipeline the host refuses and no
+draw left out: every program of the chain ran every frame.
+
+The chain: a network of about twenty kinds of matrix programs (`CS_*Operation`, 671
+dispatches in the frame captured, three faces), then
+`CS_BlendshapeTranslationsHSSGraphOutputExtract`, then
+`CSComputeSkinningPedBlendShapes*` and `CS_ReconstructBlendshapeNormals`.
+
+In a frame captured at a cutscene (`victory replay <capture> --flow`, `--bytes`):
+
+- The buffer the extract reads the network's result from (views of `R16_UINT`) held
+  nothing but zeros after a whole frame, while the network's weights and the
+  extract's other inputs were there. Zero translations are a face at rest.
+- The network keeps its 16-bit halves in views of integer formats and reads and
+  writes them with `_d16` accesses. The translator took d16 data as f16 through a
+  float view unless it knew the view was an integer one, and it knew that only of
+  views a program picks from the heap, not of those in its tables (after VIctory
+  4243a96a). The network's programs have theirs in tables: `CS_GatherOperation`,
+  which writes the result, had `legacyF32ToF16` on every load and no look at the
+  view's kind. An integer's bits taken as a float are a denormal, and its f16 is zero.
+
+Fixed: the d16 accesses ask for the kind of a view in a table too, and the host
+writes the word of the table of strides for the dynamic slots of a table it makes
+afresh (the network's tables hold constant buffers, so they always are). Faces move
+on the RTX 4080 SUPER; not yet seen on the RX 7900 XTX. No test covers the table
+case.
+
 ## Measured and not worth it
 
 - Unordered early pipelines for everything (AMD's compiler crashed).

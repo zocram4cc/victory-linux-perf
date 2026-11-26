@@ -1895,6 +1895,22 @@ impl HostHeap {
         self.count
     }
 
+    /// Writes the word of the table of element strides for the dynamic slot
+    /// `index`, which holds `view` of a table made afresh: shaders ask it
+    /// whether a typed view in a table is of an integer format
+    /// (`victory_shader::emit::VIEW_INTEGER`).
+    pub(crate) fn dynamic_word(&self, index: u32, view: Option<&View>) {
+        if let Some((_, _, data)) = &self.strides
+            && index >= self.count
+            && index < victory_shader::emit::SLOT_STRIDES_COUNT
+        {
+            let word = view.and_then(view_stride).unwrap_or(0) | view.map_or(0, view_kind);
+            // SAFETY: inside the mapping; the slot is this caller's until
+            // its flight has landed.
+            unsafe { (*data as *mut u32).add(index as usize).write_volatile(word) };
+        }
+    }
+
     /// The GPU address of the table of element strides by title slot (view
     /// heaps).
     pub(crate) fn strides_gpu(&self) -> Option<u64> {

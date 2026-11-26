@@ -8101,7 +8101,7 @@ impl<'a> Lower<'a> {
     /// `ResourceHeap`): read from the host's table by heap slot in the
     /// current block.
     fn slot_stride(&mut self, src: &Source) -> Result<Option<V>, Why> {
-        let word = self.slot_word(src)?;
+        let word = self.slot_word(src, false)?;
         Ok(word.map(|word| {
             let bits = self.s.m.i32(super::shader::VIEW_STRIDE_BITS);
             self.s.m.bin(self.cur, Bin::And, word, bits)
@@ -8109,10 +8109,13 @@ impl<'a> Lower<'a> {
     }
 
     /// Whether the typed buffer view `src` names is one of an integer format,
-    /// and whether a signed one, as [`Self::slot_stride`] (`None`: a view the
-    /// program does not pick from the heap).
+    /// and whether a signed one, as [`Self::slot_stride`], and of a view in a
+    /// table too: the host keeps the word of a table's slots as well (the
+    /// face network's programs have their views of halves in tables, and
+    /// their results were all zero: `docs/findings.md`, 2026-11-25).
+    /// `None`: a view that is in neither.
     fn integer_view(&mut self, src: &Source) -> Result<Option<(V, V)>, Why> {
-        let Some(word) = self.slot_word(src)? else {
+        let Some(word) = self.slot_word(src, true)? else {
             return Ok(None);
         };
         let c = self.cur;
@@ -8126,8 +8129,9 @@ impl<'a> Lower<'a> {
     }
 
     /// The host's word for the buffer view `src` names: its stride and
-    /// format kind ([`super::shader::SLOT_STRIDES`]).
-    fn slot_word(&mut self, src: &Source) -> Result<Option<V>, Why> {
+    /// format kind ([`super::shader::SLOT_STRIDES`]); `tables`: of a view in
+    /// a table too, not only of one picked from the heap.
+    fn slot_word(&mut self, src: &Source, tables: bool) -> Result<Option<V>, Why> {
         let Source::Loaded { load, first } = src else {
             return Ok(None);
         };
@@ -8135,7 +8139,7 @@ impl<'a> Lower<'a> {
             .scalar
             .get(load)
             .and_then(|a| self.x.native.layout.get(a.param))
-            .is_some_and(|p| p.root == RootType::ResourceHeap);
+            .is_some_and(|p| p.root == RootType::ResourceHeap || tables && p.root == RootType::Table);
         if !heap {
             return Ok(None);
         }
