@@ -27,6 +27,171 @@ use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 use sets::Bound;
 
+/// What the descriptor tables of one shader stage are made of, worked out
+/// once when the shader is translated: [`State::tables`] runs for every draw
+/// of every stage, and used to search the stage's list of used resources
+/// several times over for each of them (after codec_d's `TablePlan` in
+/// cool_fox, e05d463).
+pub(crate) struct TablePlan {
+    /// By root parameter, ascending: the order tables are made afresh in.
+    groups: Vec<TableGroup>,
+    /// Every table entry in the order the shader declares it, as (group,
+    /// place in the group). The entries of different slots interleave, and
+    /// what is read, written and transitioned for them follows this order.
+    direct: Vec<(usize, usize)>,
+}
+
+/// The entries a stage reads of the table at one root parameter.
+struct TableGroup {
+    slot: u8,
+    has_cbv: bool,
+    has_uav: bool,
+    /// The largest table offset of its entries, in dwords.
+    max_dword: u32,
+    /// In declaration order.
+    entries: Vec<UsedResource>,
+    /// The stage's indexed views of this table.
+    indexed: Vec<RootIndexedView>,
+    /// Descriptor number (offset / 8), ascending, and the place in `entries`
+    /// of the first declaration of it: what a search of `entries` in order
+    /// for the descriptor finds.
+    by_descriptor: Vec<(u32, usize)>,
+}
+
+/// The root parameters a draw makes tables afresh for.
+#[derive(Clone, Copy, Default)]
+struct Fresh([u64; 4]);
+
+impl Fresh {
+    fn insert(&mut self, slot: u8) {
+        self.0[usize::from(slot / 64)] |= 1u64 << (slot % 64);
+    }
+
+    fn contains(&self, slot: u8) -> bool {
+        self.0[usize::from(slot / 64)] & (1u64 << (slot % 64)) != 0
+    }
+}
+
+impl TablePlan {
+    pub(crate) fn new(used: &[UsedResource], indexed: &[RootIndexedView]) -> Self {
+        let tables = |u: &&UsedResource| u.root == RootType::Table;
+        let mut slots: Vec<u8> = used.iter().filter(tables).map(|u| u.slot).collect();
+        slots.sort_unstable();
+        slots.dedup();
+        let mut groups: Vec<TableGroup> = slots
+            .iter()
+            .map(|&slot| TableGroup {
+                slot,
+                has_cbv: false,
+                has_uav: false,
+                max_dword: 0,
+                entries: Vec::new(),
+                indexed: indexed
+                    .iter()
+                    .filter(|v| v.table_slot == slot)
+                    .copied()
+                    .collect(),
+                by_descriptor: Vec::new(),
+            })
+            .collect();
+        let mut direct = Vec::new();
+        for &u in used.iter().filter(tables) {
+            // (The slot is among `slots`, which came from these entries.)
+            let g = slots.partition_point(|&slot| slot < u.slot);
+            let group = &mut groups[g];
+            group.has_cbv |= u.kind == ResourceType::Cbv;
+            group.has_uav |= u.kind == ResourceType::Uav;
+            group.max_dword = group.max_dword.max(u.table_offset_dwords);
+            direct.push((g, group.entries.len()));
+            group
+                .by_descriptor
+                .push((u.table_offset_dwords / 8, group.entries.len()));
+            group.entries.push(u);
+        }
+        for group in &mut groups {
+            // By descriptor, then declaration: the first of each stays.
+            group.by_descriptor.sort_unstable();
+            group.by_descriptor.dedup_by_key(|item| item.0);
+        }
+        Self { groups, direct }
+    }
+
+    /// The slots made afresh for a draw: the tables holding a constant
+    /// buffer, and the ones `snapshot` says reach past the host heap.
+    fn fresh(&self, snapshot: impl Fn(&TableGroup) -> bool) -> Fresh {
+        let mut fresh = Fresh::default();
+        for group in &self.groups {
+            if group.has_cbv || snapshot(group) {
+                fresh.insert(group.slot);
+            }
+        }
+        fresh
+    }
+
+    /// The entries of the tables not made afresh, in the order they are
+    /// declared: the title's own slots, brought up to date one by one.
+    fn direct_entries<'a>(&'a self, fresh: &'a Fresh) -> impl Iterator<Item = &'a UsedResource> {
+        self.direct
+            .iter()
+            .filter(move |&&(g, _)| !fresh.contains(self.groups[g].slot))
+            .map(move |&(g, e)| &self.groups[g].entries[e])
+    }
+}
+
+impl TableGroup {
+    /// The first entry, in declaration order, that reads descriptor
+    /// `descriptor` of the table.
+    fn entry(&self, descriptor: u32) -> Option<&UsedResource> {
+        let i = self
+            .by_descriptor
+            .binary_search_by_key(&descriptor, |item| item.0)
+            .ok()?;
+        Some(&self.entries[self.by_descriptor[i].1])
+    }
+
+    /// Whether an entry of the table reaches past the host heap, which is
+    /// smaller than the title's (its limit is 1,000,000 views on NVIDIA).
+    /// `index_at` is the heap index of the table's entry at a dword offset,
+    /// None where that is outside the title's heap.
+    fn needs_snapshot(&self, index_at: impl Fn(u32) -> Option<u32>, host_count: u32) -> bool {
+        match index_at(self.max_dword) {
+            // Heap indexes do not fall as the offset rises (`Heap::index`):
+            // the last entry is the one that reaches farthest...
+            Some(i) => i >= host_count,
+            // ...unless it lies beyond the title's heap, and earlier ones do not.
+            None => self
+                .entries
+                .iter()
+                .any(|u| index_at(u.table_offset_dwords).is_some_and(|i| i >= host_count)),
+        }
+    }
+
+    /// The descriptors the table's indexed views pick, ascending, each once.
+    /// `constant` is the value of the root constant a view adds in.
+    fn selected(&self, constant: impl Fn(&RootIndexedView) -> u32) -> Vec<u32> {
+        let mut selected: Vec<u32> = self
+            .indexed
+            .iter()
+            .map(|index| {
+                // The shader adds i32 byte offsets and shifts by 5.
+                index
+                    .byte_offset
+                    .wrapping_add(constant(index) << index.shift)
+                    / 32
+            })
+            .collect();
+        selected.sort_unstable();
+        selected.dedup();
+        selected
+    }
+
+    /// The descriptors of the table made afresh: up to the last entry and
+    /// the last of the `selected` ones.
+    fn span(&self, selected: &[u32]) -> u32 {
+        (self.max_dword / 8).max(selected.last().copied().unwrap_or(0)) + 1
+    }
+}
+
 /// A root argument as the title set it.
 #[derive(Debug, Clone, Default)]
 enum Root {
@@ -1633,7 +1798,7 @@ impl State {
             if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
                 crate::picked::runs_in(list);
             }
-            let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
+            let made = self.tables(list, &t.tables, compute);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -3322,55 +3487,40 @@ impl State {
     pub(crate) fn tables(
         &mut self,
         list: &HostList,
-        used: &[UsedResource],
-        indexed: &[RootIndexedView],
+        plan: &TablePlan,
         compute: bool,
     ) -> Few<(u8, u32), 16> {
-        let tables = |u: &&UsedResource| u.root == RootType::Table;
-        let mut fresh: Few<u8, 16> = Few::default();
-        for u in used.iter().filter(tables).filter(|u| u.kind == ResourceType::Cbv) {
-            if !fresh.contains(&u.slot) {
-                fresh.push(u.slot);
-            }
-        }
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
         // title's slots there have no host slot of their own.
-        for u in used.iter().filter(tables) {
-            if fresh.contains(&u.slot) {
-                continue;
-            }
-            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
-                continue;
+        let fresh = plan.fresh(|group| {
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(group.slot))
+            else {
+                return false;
             };
-            let end = table + u64::from(u.table_offset_dwords) * 4;
             let Some(heap) = self.heap_of(table) else {
-                continue;
+                return false;
             };
-            let (Some(host), Some(index)) = (heap.host(), heap.index(end)) else {
-                continue;
+            let Some(host) = heap.host() else {
+                return false;
             };
-            if index >= host.count() {
-                fresh.push(u.slot);
-            }
-        }
-        fresh.sort_unstable();
-        for u in used.iter().filter(tables) {
-            if !fresh.contains(&u.slot) {
-                self.table_entry(list, u, compute);
-            }
+            group.needs_snapshot(
+                |dword| heap.index(table + u64::from(dword) * 4),
+                host.count(),
+            )
+        });
+        for u in plan.direct_entries(&fresh) {
+            self.table_entry(list, u, compute);
         }
         let mut made = Few::default();
-        for &slot in fresh.iter() {
+        for group in &plan.groups {
+            let slot = group.slot;
+            if !fresh.contains(slot) {
+                continue;
+            }
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
-            // (Their places among `used`.)
-            let mut places: Few<u16, 32> = Few::default();
-            for (i, _) in used.iter().enumerate().filter(|(_, u)| tables(u) && u.slot == slot) {
-                places.push(i as u16);
-            }
-            let entries = || places.iter().map(|&i| &used[usize::from(i)]);
             let Some(heap) = self.heap_of(table) else {
                 continue;
             };
@@ -3380,28 +3530,15 @@ impl State {
             let Some(host) = heap.host() else {
                 continue;
             };
-            let mut selected: Vec<u32> = indexed
-                .iter()
-                .filter(|index| index.table_slot == slot)
-                .map(|index| {
-                    let constant = self.user_value(
-                        compute,
-                        index.constant_slot,
-                        RootType::Constants,
-                        index.constant_dword,
-                    );
-                    // The shader adds i32 byte offsets and shifts by 5.
-                    index.byte_offset.wrapping_add(constant << index.shift) / 32
-                })
-                .collect();
-            selected.sort_unstable();
-            selected.dedup();
-            let n = entries()
-                .map(|u| u.table_offset_dwords / 8)
-                .chain(selected.last().copied())
-                .max()
-                .unwrap_or(0)
-                + 1;
+            let selected = group.selected(|index| {
+                self.user_value(
+                    compute,
+                    index.constant_slot,
+                    RootType::Constants,
+                    index.constant_dword,
+                )
+            });
+            let n = group.span(&selected);
             let last = table.checked_add(u64::from(n - 1) * 32);
             if n > crate::descriptor::host::DYNAMIC
                 || last.and_then(|handle| heap.index(handle)).is_none()
@@ -3420,12 +3557,17 @@ impl State {
                 (table, n, h.0)
             };
             // Who reads of it, and as what, as far as [`readable`] goes by it.
-            let reader = (used.as_ptr() as usize, used.len(), STORES.get(), TESTED_DEPTH.get().0);
+            let reader = (
+                std::ptr::from_ref(plan) as usize,
+                plan.direct.len(),
+                STORES.get(),
+                TESTED_DEPTH.get().0,
+            );
             if let Some(known) = self.fresh_tables.get_mut(&key) {
                 let first = known.first;
                 // This reader had it brought up to date, and nothing in the
                 // list changed since: nothing to do again.
-                let once = ready_once() && selected.is_empty() && entries().all(|u| u.kind != ResourceType::Uav);
+                let once = ready_once() && selected.is_empty() && !group.has_uav;
                 if once
                     && known.epoch == list.epoch()
                     && let Some((_, depth)) = known.ready.iter().find(|(r, _)| *r == reader)
@@ -3438,14 +3580,14 @@ impl State {
                 }
                 let depth_before = TESTED_DEPTH.get();
                 TESTED_DEPTH.set((depth_before.0, false));
-                for u in entries().filter(|u| u.kind != ResourceType::Cbv) {
+                for u in group.entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
                         readable(list, u.kind, &view);
                     }
                 }
                 for k in selected {
-                    if entries().any(|u| u.table_offset_dwords / 8 == k) {
+                    if group.entry(k).is_some() {
                         continue;
                     }
                     let handle = table + u64::from(k) * 32;
@@ -3488,7 +3630,7 @@ impl State {
             // which may lie over slots shaders pick by index, only the ones
             // the shader names.)
             if let Some(title) = title_first {
-                for k in (0..n).filter(|&k| n <= 64 || entries().any(|u| u.table_offset_dwords / 8 == k)) {
+                for k in (0..n).filter(|&k| n <= 64 || group.entry(k).is_some()) {
                     host.slot_tabled(title + k);
                 }
             }
@@ -3508,8 +3650,8 @@ impl State {
                     && let Some(words) = crate::descriptor::record_at(table + u64::from(k) * 32)
                     && let Some(mut listed) = host.make_listed(recording, words, index)
                 {
-                    let kind = entries()
-                        .find(|u| u.table_offset_dwords / 8 == k)
+                    let kind = group
+                        .entry(k)
                         .map(|u| u.kind)
                         .or_else(|| selected.binary_search(&k).ok().and(listed.kind));
                     let was = (listed.ready, listed.tabled);
@@ -3544,7 +3686,7 @@ impl State {
                     }
                     continue;
                 }
-                let used = entries().find(|u| u.table_offset_dwords / 8 == k);
+                let used = group.entry(k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
                         let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
@@ -4664,5 +4806,479 @@ mod record_hash_tests {
         // (One record of zeros is among the above.)
         let zeros: Vec<u64> = (2..100).map(|n| of(&vec![[0; 3]; n])).collect();
         assert!(zeros.iter().all(|h| seen.insert(*h)));
+    }
+}
+
+#[cfg(test)]
+mod table_plan_tests {
+    use std::collections::HashMap;
+
+    use super::{ResourceType, RootIndexedView, RootType, TablePlan, UsedResource};
+    use ResourceType::{Cbv, Sampler, Srv, Uav};
+
+    fn resource(kind: ResourceType, root: RootType, slot: u8, dword: u32) -> UsedResource {
+        UsedResource {
+            kind,
+            root,
+            table_offset_dwords: dword,
+            lower_bound: 0,
+            stride: 1,
+            dwords: 8,
+            user_data: 0,
+            slot,
+        }
+    }
+
+    /// An entry of the table at root parameter `slot`, `dword` into it (8
+    /// dwords to a descriptor).
+    fn entry(kind: ResourceType, slot: u8, dword: u32) -> UsedResource {
+        resource(kind, RootType::Table, slot, dword)
+    }
+
+    /// An indexed view of the table at `table_slot`: it picks descriptor
+    /// `(byte_offset + (constant << shift)) / 32`, the root constant at
+    /// `constant_dword` being worth that number (`World::constant`).
+    fn view(table_slot: u8, constant_dword: u32, byte_offset: u32, shift: u8) -> RootIndexedView {
+        RootIndexedView {
+            table_slot,
+            constant_slot: 9,
+            constant_dword,
+            byte_offset,
+            shift,
+        }
+    }
+
+    /// What `State::tables` finds out of the title's heap and the host's.
+    struct World {
+        /// The title's heap: its first descriptor, and how many it has.
+        start: u64,
+        count: u32,
+        /// The host heap's descriptors (None: no host heap).
+        host: Option<u32>,
+        /// The table each root parameter holds.
+        tables: HashMap<u8, u64>,
+    }
+
+    impl World {
+        /// A heap of `count` descriptors, the host's `host`, and the tables
+        /// as (root parameter, first descriptor).
+        fn new(count: u32, host: Option<u32>, tables: &[(u8, u32)]) -> World {
+            let start = 0x1000;
+            let tables = tables
+                .iter()
+                .map(|&(slot, first)| (slot, start + u64::from(first) * 32))
+                .collect();
+            World {
+                start,
+                count,
+                host,
+                tables,
+            }
+        }
+
+        /// As `Heap::index`, for descriptors of 32 bytes.
+        fn index(&self, handle: u64) -> Option<u32> {
+            let index = handle.checked_sub(self.start)? / 32;
+            (index < u64::from(self.count)).then_some(index as u32)
+        }
+
+        /// The heap index of the table's entry `dword` in, as `Heap::index`
+        /// of its handle.
+        fn index_at(&self, slot: u8, dword: u32) -> Option<u32> {
+            self.index(self.tables.get(&slot)? + u64::from(dword) * 4)
+        }
+
+        /// The host heap's descriptors, if the root parameter holds a table
+        /// in a heap that has a host heap.
+        fn host_count(&self, slot: u8) -> Option<u32> {
+            self.index(*self.tables.get(&slot)?)?;
+            self.host
+        }
+
+        /// What `State::user_value` gives for the view's root constant.
+        fn constant(&self, view: &RootIndexedView) -> u32 {
+            view.constant_dword
+        }
+    }
+
+    /// A table made afresh, as far as the plan decides it.
+    #[derive(Debug, PartialEq)]
+    struct Made {
+        slot: u8,
+        /// Whether an entry is of unordered access.
+        uav: bool,
+        /// The entries read, other than constant buffers, in order.
+        reads: Vec<UsedResource>,
+        /// The descriptors the indexed views pick.
+        selected: Vec<u32>,
+        /// The descriptors in the table.
+        n: u32,
+        /// What each is read as: by the first entry naming it.
+        kinds: Vec<Option<ResourceType>>,
+    }
+
+    /// What a draw decides about a stage's tables before it touches the host
+    /// list.
+    #[derive(Debug, PartialEq)]
+    struct Decisions {
+        /// The slots made afresh, ascending.
+        fresh: Vec<u8>,
+        /// The entries given from the title's own slots, in the order of the
+        /// calls.
+        direct: Vec<UsedResource>,
+        /// The tables made afresh, in order.
+        made: Vec<Made>,
+    }
+
+    /// The decisions of `State::tables` as it was at 0a43566: the stage's
+    /// list searched for each, per draw.
+    fn scanned(used: &[UsedResource], indexed: &[RootIndexedView], world: &World) -> Decisions {
+        let tables = |u: &&UsedResource| u.root == RootType::Table;
+        let mut fresh: Vec<u8> = Vec::new();
+        for u in used.iter().filter(tables).filter(|u| u.kind == Cbv) {
+            if !fresh.contains(&u.slot) {
+                fresh.push(u.slot);
+            }
+        }
+        for u in used.iter().filter(tables) {
+            if fresh.contains(&u.slot) {
+                continue;
+            }
+            let (Some(count), Some(index)) = (
+                world.host_count(u.slot),
+                world.index_at(u.slot, u.table_offset_dwords),
+            ) else {
+                continue;
+            };
+            if index >= count {
+                fresh.push(u.slot);
+            }
+        }
+        fresh.sort_unstable();
+        let direct = used
+            .iter()
+            .filter(tables)
+            .filter(|u| !fresh.contains(&u.slot))
+            .copied()
+            .collect();
+        let made = fresh
+            .iter()
+            .map(|&slot| {
+                let entries = || used.iter().filter(tables).filter(move |u| u.slot == slot);
+                let mut selected: Vec<u32> = indexed
+                    .iter()
+                    .filter(|index| index.table_slot == slot)
+                    .map(|index| {
+                        index
+                            .byte_offset
+                            .wrapping_add(world.constant(index) << index.shift)
+                            / 32
+                    })
+                    .collect();
+                selected.sort_unstable();
+                selected.dedup();
+                let n = entries()
+                    .map(|u| u.table_offset_dwords / 8)
+                    .chain(selected.last().copied())
+                    .max()
+                    .unwrap_or(0)
+                    + 1;
+                Made {
+                    slot,
+                    uav: entries().any(|u| u.kind == Uav),
+                    reads: entries().filter(|u| u.kind != Cbv).copied().collect(),
+                    selected,
+                    n,
+                    kinds: (0..n)
+                        .map(|k| {
+                            entries()
+                                .find(|u| u.table_offset_dwords / 8 == k)
+                                .map(|u| u.kind)
+                        })
+                        .collect(),
+                }
+            })
+            .collect();
+        Decisions {
+            fresh,
+            direct,
+            made,
+        }
+    }
+
+    /// The same decisions, from the plan.
+    fn planned(used: &[UsedResource], indexed: &[RootIndexedView], world: &World) -> Decisions {
+        let plan = TablePlan::new(used, indexed);
+        let fresh = plan.fresh(|group| match world.host_count(group.slot) {
+            Some(count) => group.needs_snapshot(|dword| world.index_at(group.slot, dword), count),
+            None => false,
+        });
+        let made = plan
+            .groups
+            .iter()
+            .filter(|group| fresh.contains(group.slot))
+            .map(|group| {
+                let selected = group.selected(|index| world.constant(index));
+                let n = group.span(&selected);
+                Made {
+                    slot: group.slot,
+                    uav: group.has_uav,
+                    reads: group
+                        .entries
+                        .iter()
+                        .filter(|u| u.kind != Cbv)
+                        .copied()
+                        .collect(),
+                    selected,
+                    n,
+                    kinds: (0..n).map(|k| group.entry(k).map(|u| u.kind)).collect(),
+                }
+            })
+            .collect();
+        Decisions {
+            fresh: (0..=u8::MAX).filter(|&slot| fresh.contains(slot)).collect(),
+            direct: plan.direct_entries(&fresh).copied().collect(),
+            made,
+        }
+    }
+
+    /// Both ways of deciding, which must agree; the plan's decisions.
+    fn check(
+        name: &str,
+        used: &[UsedResource],
+        indexed: &[RootIndexedView],
+        world: &World,
+    ) -> Decisions {
+        let (old, new) = (scanned(used, indexed, world), planned(used, indexed, world));
+        assert_eq!(
+            new, old,
+            "{name}: the plan decided otherwise than the search did\nused: {used:#?}\nindexed: {indexed:#?}"
+        );
+        new
+    }
+
+    #[test]
+    fn interleaved_slots_are_given_in_declaration_order() {
+        let used = [
+            entry(Srv, 2, 0),
+            entry(Srv, 5, 0),
+            // A root view of the same parameter number is not a table entry.
+            resource(Cbv, RootType::Descriptor, 5, 0),
+            entry(Uav, 2, 8),
+            entry(Srv, 7, 0),
+            entry(Srv, 5, 8),
+            entry(Srv, 2, 16),
+        ];
+        let world = World::new(100, Some(100), &[(2, 0), (5, 10), (7, 20)]);
+        let d = check("interleaved", &used, &[], &world);
+        assert!(d.fresh.is_empty());
+        let tables: Vec<UsedResource> = used
+            .iter()
+            .filter(|u| u.root == RootType::Table)
+            .copied()
+            .collect();
+        assert_eq!(d.direct, tables);
+    }
+
+    #[test]
+    fn a_table_with_a_constant_buffer_is_fresh_and_leaves_the_others_in_order() {
+        let used = [
+            entry(Srv, 2, 0),
+            entry(Srv, 7, 0),
+            entry(Srv, 5, 0),
+            entry(Uav, 2, 8),
+            entry(Cbv, 5, 8),
+            entry(Srv, 7, 8),
+            entry(Srv, 2, 16),
+        ];
+        let world = World::new(100, Some(100), &[(2, 0), (5, 10), (7, 20)]);
+        let d = check("cbv", &used, &[], &world);
+        assert_eq!(d.fresh, vec![5u8]);
+        // Slots 2 and 7 keep their interleaving around the fresh slot 5.
+        assert_eq!(d.direct, vec![used[0], used[1], used[3], used[5], used[6]]);
+        assert_eq!(d.made.len(), 1);
+        let made = &d.made[0];
+        assert_eq!((made.slot, made.uav, made.n), (5, false, 2));
+        assert_eq!(made.reads, vec![used[2]]);
+        assert_eq!(made.kinds, vec![Some(Srv), Some(Cbv)]);
+    }
+
+    #[test]
+    fn a_descriptor_named_twice_is_read_as_its_first_declaration() {
+        // Offsets 8, 9 and 15 are all descriptor 1.
+        let used = [
+            entry(Cbv, 3, 0),
+            entry(Srv, 3, 8),
+            entry(Uav, 3, 9),
+            entry(Sampler, 3, 16),
+            entry(Uav, 3, 15),
+        ];
+        let world = World::new(100, Some(100), &[(3, 0)]);
+        let d = check("duplicates", &used, &[], &world);
+        let made = &d.made[0];
+        assert_eq!(made.kinds, vec![Some(Cbv), Some(Srv), Some(Sampler)]);
+        assert!(made.uav);
+        assert_eq!(made.n, 3);
+    }
+
+    #[test]
+    fn indexed_views_widen_the_table_and_count_once() {
+        let used = [entry(Cbv, 4, 0), entry(Srv, 4, 8)];
+        let indexed = [
+            // Descriptor 12, twice; descriptor 6 (96 + (3 << 5) bytes); and
+            // one of a table the stage does not read.
+            view(4, 0, 12 * 32, 0),
+            view(4, 0, 12 * 32, 0),
+            view(4, 3, 3 * 32, 5),
+            view(8, 0, 90 * 32, 0),
+        ];
+        let world = World::new(100, Some(100), &[(4, 0), (8, 0)]);
+        let d = check("indexed", &used, &indexed, &world);
+        assert_eq!(d.fresh, vec![4u8]);
+        let made = &d.made[0];
+        assert_eq!(made.selected, vec![6, 12]);
+        assert_eq!(made.n, 13);
+        assert_eq!(made.kinds[..2], [Some(Cbv), Some(Srv)]);
+        assert!(made.kinds[2..].iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn a_table_reaching_past_the_host_heap_is_fresh() {
+        // The title's heap has 100 descriptors, the host's 40.
+        let used = [
+            entry(Srv, 1, 0),
+            entry(Srv, 2, 0),
+            entry(Srv, 3, 560),
+            entry(Srv, 4, 0),
+            entry(Srv, 1, 96),
+            entry(Srv, 7, 0),
+            entry(Srv, 3, 48),
+            entry(Srv, 2, 72),
+            entry(Srv, 4, 800),
+            entry(Srv, 3, 0),
+        ];
+        // Slot 1: its last entry is descriptor 30 + 12, past the host's.
+        // Slot 2: all inside (the last is 30 + 9). Slot 3: the last entry is
+        // past the title's heap too, but 35 + 6 is past the host's. Slot 4:
+        // the last is past the title's heap, the others inside the host's.
+        // Slot 7 holds no table.
+        let tables = [(1, 30), (2, 30), (3, 35), (4, 10)];
+        let d = check("past", &used, &[], &World::new(100, Some(40), &tables));
+        assert_eq!(d.fresh, vec![1u8, 3]);
+        // Slots 2, 4 and 7 are given from the title's own, in declaration order.
+        assert_eq!(d.direct, vec![used[1], used[3], used[5], used[7], used[8]]);
+        // No host heap: nothing is fresh for reaching past it.
+        let d = check("no host", &used, &[], &World::new(100, None, &tables));
+        assert!(d.fresh.is_empty());
+    }
+
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn below(&mut self, n: u32) -> u32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((self.0 >> 33) as u32) % n
+        }
+    }
+
+    #[test]
+    fn the_plan_decides_as_the_search_did_for_any_stage() {
+        const SLOTS: [u8; 9] = [0, 1, 2, 5, 63, 64, 127, 128, 255];
+        const KINDS: [ResourceType; 7] = [Srv, Srv, Srv, Uav, Sampler, ResourceType::Other(7), Cbv];
+        let mut rng = Lcg(1);
+        let mut reached = [0usize; 5];
+        for case in 0..5000 {
+            // Mostly a few low slots, so slots interleave and entries repeat;
+            // sometimes slots either side of the words of the set of them.
+            let reach = if rng.below(4) == 0 {
+                SLOTS.len() as u32
+            } else {
+                3
+            };
+            let used: Vec<UsedResource> = (0..rng.below(14))
+                .map(|_| {
+                    let root = match rng.below(8) {
+                        0 => RootType::Constants,
+                        1 => RootType::Descriptor,
+                        _ => RootType::Table,
+                    };
+                    let dword = if rng.below(8) == 0 {
+                        400 + rng.below(800)
+                    } else {
+                        rng.below(200)
+                    };
+                    resource(
+                        KINDS[rng.below(7) as usize],
+                        root,
+                        SLOTS[rng.below(reach) as usize],
+                        dword,
+                    )
+                })
+                .collect();
+            let indexed: Vec<RootIndexedView> = (0..rng.below(5))
+                .map(|_| {
+                    view(
+                        SLOTS[rng.below(reach) as usize],
+                        rng.below(40),
+                        rng.below(2000),
+                        rng.below(6) as u8,
+                    )
+                })
+                .collect();
+            let count = 1 + rng.below(120);
+            let host = if rng.below(6) == 0 {
+                None
+            } else {
+                Some(rng.below(count + 10))
+            };
+            let mut tables = Vec::new();
+            for &slot in &SLOTS {
+                if rng.below(5) != 0 {
+                    tables.push((slot, rng.below(count + 8)));
+                }
+            }
+            let world = World::new(count, host, &tables);
+            let d = check(&format!("case {case}"), &used, &indexed, &world);
+            // What the cases reach, so that the sweep cannot go green by
+            // never getting to the paths that matter.
+            let entries = |slot: u8| {
+                used.iter()
+                    .filter(move |u| u.root == RootType::Table && u.slot == slot)
+            };
+            let cbv = |slot: u8| entries(slot).any(|u| u.kind == Cbv);
+            let last = |slot: u8| {
+                entries(slot)
+                    .map(|u| u.table_offset_dwords)
+                    .max()
+                    .unwrap_or(0)
+            };
+            // A table made afresh for its reach (no constant buffer); for an
+            // entry before the last, which lies beyond the title's heap; a
+            // descriptor named twice by entries of different kinds.
+            let by_earlier = |slot: u8| !cbv(slot) && world.index_at(slot, last(slot)).is_none();
+            let twice = |slot: u8| {
+                let all: Vec<_> = entries(slot).collect();
+                all.iter().enumerate().any(|(i, a)| {
+                    all[..i].iter().any(|b| {
+                        a.table_offset_dwords / 8 == b.table_offset_dwords / 8 && a.kind != b.kind
+                    })
+                })
+            };
+            reached[0] += usize::from(d.fresh.iter().any(|&slot| !cbv(slot)));
+            reached[1] += usize::from(d.fresh.iter().any(|&slot| by_earlier(slot)));
+            reached[2] += usize::from(d.direct.windows(2).any(|w| w[0].slot > w[1].slot));
+            reached[3] += usize::from(d.made.iter().any(|m| !m.selected.is_empty()));
+            reached[4] += usize::from(d.fresh.iter().any(|&slot| twice(slot)));
+        }
+        println!(
+            "of 5000 stages: {reached:?} (fresh for reach, by an earlier entry, interleaved, indexed views, a descriptor twice)"
+        );
+        assert!(
+            reached.iter().all(|&n| n >= 100),
+            "paths the cases reach: {reached:?}"
+        );
     }
 }
