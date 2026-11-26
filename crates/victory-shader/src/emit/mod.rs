@@ -398,7 +398,21 @@ pub struct UserData {
 /// numbers they compute (`lower::with_mask_ops_on_numbers`), and only such
 /// a program: with that on for every program, 69 compute programs that
 /// already translated came out changed (`CS_RaytracingResolve`, ...).
+///
+/// A pixel program whose killed lanes, going on with their live quad
+/// ([`structure`]), reach a lane test of a constant mask the lowering cannot
+/// make is translated once more with them leaving at the kill, as before
+/// (`structure::without_live_quads`): 13 of the title's programs.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    match translate_retried(container) {
+        Err(ShaderError::Unsupported { what, .. }) if what == lower::CONSTANT_MASK => {
+            structure::without_live_quads(|| translate_retried(container))
+        }
+        other => other,
+    }
+}
+
+fn translate_retried(container: &[u8]) -> Result<HostShader, ShaderError> {
     match translate_plain(container) {
         Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF => {
             lower::with_first_half_pairs(|| translate_plain(container))

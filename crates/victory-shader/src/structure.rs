@@ -457,6 +457,22 @@ impl Structured {
     }
 }
 
+thread_local! {
+    /// Killed lanes of a live quad go on ([`without_live_quads`]).
+    static LIVE_QUADS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// `f` with a pixel program's killed lanes leaving where the wave's other lanes go on in
+/// whole-quad mode (each lane takes the branch "no lane is live" on its own bit), as before
+/// they went on: for a program that goes on to a lane test the lowering cannot make (a
+/// constant lane mask) and translated that way.
+pub fn without_live_quads<T>(f: impl FnOnce() -> T) -> T {
+    let was = LIVE_QUADS.replace(false);
+    let r = f();
+    LIVE_QUADS.set(was);
+    r
+}
+
 /// Builds the per-lane form of `program`.
 pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
     structure_wide(program, &HashSet::new())
@@ -1240,6 +1256,7 @@ impl<'a> Lanes<'a> {
                         // derivatives), so "no lane is set" is not its own bit's answer.
                         if let Some((k, _)) = r.dst
                             && self.quad_sources.contains(&k.0)
+                            && LIVE_QUADS.get()
                         {
                             let born = self.born(k.0);
                             let q = self.b.atom(Atom::Quad(k.0), born);
@@ -1738,6 +1755,13 @@ mod tests {
             let support = s.bools.support(when);
             let quad = support.iter().any(|a| matches!(a, Atom::Quad(_)));
             assert_eq!(quad, wqm, "s_wqm {wqm}");
+            // The second try of a program that does not translate so: the lane's own bit.
+            let s = without_live_quads(|| structure(&p)).unwrap();
+            let LaneExit::Branch { when, .. } = s.exits[0] else {
+                panic!()
+            };
+            let support = s.bools.support(when);
+            assert!(!support.iter().any(|a| matches!(a, Atom::Quad(_))));
         }
     }
 

@@ -644,7 +644,20 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
-                    match emit::emit_with_retries(container, &p, &program, &s, &i, &r) {
+                    let first = emit::emit_with_retries(container, &p, &program, &s, &i, &r);
+                    let emitted = match first {
+                        // (killed lanes leaving at the kill, as `emit::translate` tries next)
+                        Err(ShaderError::Unsupported { what, .. })
+                            if what == "a constant lane mask" =>
+                        {
+                            structure::without_live_quads(|| structure::structure(&program))
+                                .and_then(|s| {
+                                    emit::emit_with_retries(container, &p, &program, &s, &i, &r)
+                                })
+                        }
+                        other => other,
+                    };
+                    match emitted {
                         Ok(shader) => {
                             census_line(&label(), &p, &program, &shader);
                             *counter(t, p.stage, 1) += 1;

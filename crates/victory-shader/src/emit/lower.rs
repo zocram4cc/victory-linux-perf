@@ -428,6 +428,8 @@ enum MaskData {
 
 /// What a value holding a lane mask read as a number stops with.
 pub(super) const LANE_MASK: Why = "a lane mask read as data";
+/// A lane test of a constant mask where host lanes are not the console's.
+pub(super) const CONSTANT_MASK: Why = "a constant lane mask";
 /// A mask with lanes outside EXEC where it is written, read as a number where the lanes that
 /// run that block are not all of the wave.
 pub(super) const MASK_ELSEWHERE: Why = "a lane mask holding lanes elsewhere read as data";
@@ -4634,7 +4636,7 @@ impl<'a> Lower<'a> {
                 Ok(self.lane_bit(at, lo, Some(hi)))
             }
             Atom::Opaque(_) => Err("an opaque lane mask"),
-            Atom::Constant(_) => Err("a constant lane mask"),
+            Atom::Constant(_) => Err(CONSTANT_MASK),
         }
     }
 
