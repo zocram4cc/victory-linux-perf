@@ -1,4 +1,6 @@
-# VIctory on an RX 7900 XTX
+# victory-coolfox-linux
+
+codec_d's cool_fox build of [VIctory](https://github.com/Marvisak/VIctory), carried on for **Linux under Proton** (tested on an NVIDIA RTX 5080), with the Wine and NVIDIA fixes of the forks credited below and tooling to measure playtests. The Windows instructions and the upstream AMD fork's notes follow unchanged.
 
 ## Run the codec_d Windows build
 
