@@ -2739,7 +2739,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     for block in unsure {
         // One question for the blocks of a region.
         if block >= uncommitted_until {
-            uncommitted_until = uncommitted_end(block);
+            uncommitted_until = uncommitted_end_cached(block);
             #[cfg(feature = "diagnostics")]
             tally(9, 1);
         }
@@ -3232,6 +3232,50 @@ fn protect_views(g: &Guards, from: usize, to: usize) {
             }
         }
     }
+}
+
+/// Holes asked about (`VICTORY_HOLES_ONCE=<frames>`): each hole's
+/// [`uncommitted_end`] and the frame it was asked in. Under Wine every
+/// question walks the region page by page with the process's memory lock
+/// held, and the title's streaming pools leave ~8,000 holes that are asked
+/// about every frame (30 frames: frames 1.7 % shorter, RX 9070 XT under
+/// Proton). What the runtime maps or unmaps forgets them all; a commit it is
+/// not told of shows that many frames later at most.
+static HOLES_ASKED: Mutex<Option<std::collections::HashMap<usize, (usize, u64)>>> = Mutex::new(None);
+
+/// [`uncommitted_end`], or its answer from fewer than
+/// `VICTORY_HOLES_ONCE` frames ago.
+fn uncommitted_end_cached(block: usize) -> usize {
+    let frames = holes_once();
+    if frames == 0 {
+        return uncommitted_end(block);
+    }
+    let frame = crate::frame::current();
+    if let Some(&(end, at)) = HOLES_ASKED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&block))
+        && frame.saturating_sub(at) < frames
+    {
+        return end;
+    }
+    let end = uncommitted_end(block);
+    HOLES_ASKED.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(block, (end, frame));
+    end
+}
+
+/// How many frames a hole's answer stands (`VICTORY_HOLES_ONCE=<frames>`;
+/// unset or 0: asked every time, as before; with `VICTORY_AB` naming it,
+/// 30 frames in its phases).
+fn holes_once() -> u64 {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_HOLES_ONCE") {
+        return if on { 30 } else { 0 };
+    }
+    static FRAMES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FRAMES.get_or_init(|| std::env::var("VICTORY_HOLES_ONCE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
+/// What the runtime maps or unmaps: no hole's answer stands.
+fn forget_holes() {
+    *HOLES_ASKED.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 /// The end (exclusive) of the whole uncommitted blocks starting at `block`.
@@ -3753,6 +3797,7 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// neither guarded nor writable) and a kernel read into it fail, so the
 /// write access is given back.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    forget_holes();
     crate::texback::remapped(at, len);
     open(&title_memory_changed(at, len), at, at.saturating_add(len));
 }
@@ -3763,6 +3808,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 /// before the unmapping would leave the address guarded, clean and known by
 /// its bits ([`PUBLISHED`]) with no view behind it.
 pub fn title_memory_unmapping(at: usize, len: usize) {
+    forget_holes();
     crate::texback::remapped(at, len);
     forget_views(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     let mut g = title_memory_changed(at, len);
