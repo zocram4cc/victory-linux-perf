@@ -500,6 +500,89 @@ impl Module {
         self.blocks[block].term = Some(t);
     }
 
+    /// Gives every loop header one back edge: where several blocks branch
+    /// back to a header (an edge to a block not after them in reverse
+    /// postorder), they branch to a new latch instead, which branches to the
+    /// header; the header's phis take those blocks' values through phis of
+    /// the latch. DXC's loops always have one latch. vkd3d-proton's
+    /// dxil-spirv asserts on a header with two back edges (and without
+    /// asserts recursed without end), and under Proton the NVIDIA driver's
+    /// SPIR-V compiler died on the compute pipelines of such programs as the
+    /// title loaded into the world. From kroeeee-eeee/VIctory-Linux-Proton-
+    /// Wine-7900XT-XTX f5c30ef. (The new latch has two or more
+    /// predecessors, so `write`'s folding of empty latches leaves it be.)
+    pub fn single_latches(&mut self) {
+        let n = self.blocks.len();
+        if n == 0 {
+            return;
+        }
+        let succs = |m: &Self, b: usize| successors(m.blocks[b].term);
+        // Reverse postorder from the entry, as `write` lays blocks out.
+        let mut seen = vec![false; n];
+        let mut post = Vec::new();
+        let mut stack = vec![(0usize, 0usize)];
+        seen[0] = true;
+        while let Some(top) = stack.last_mut() {
+            let (b, k) = *top;
+            top.1 += 1;
+            match succs(self, b).get(k) {
+                Some(&s) if !seen[s] => {
+                    seen[s] = true;
+                    stack.push((s, 0));
+                }
+                Some(_) => {}
+                None => {
+                    post.push(b);
+                    stack.pop();
+                }
+            }
+        }
+        post.reverse();
+        let mut pos = vec![usize::MAX; n];
+        for (i, &b) in post.iter().enumerate() {
+            pos[b] = i;
+        }
+        // Each header's back-edge sources, in layout order.
+        let mut back: std::collections::BTreeMap<usize, Vec<usize>> = Default::default();
+        for &b in &post {
+            for &s in succs(self, b).iter() {
+                if pos[s] <= pos[b] && !back.get(&s).is_some_and(|v| v.contains(&b)) {
+                    back.entry(s).or_default().push(b);
+                }
+            }
+        }
+        for (header, sources) in back {
+            if sources.len() < 2 {
+                continue;
+            }
+            let latch = self.new_block();
+            for &src in &sources {
+                let swap = |t: usize| if t == header { latch } else { t };
+                self.blocks[src].term = match self.blocks[src].term {
+                    Some(Term::Br(t)) => Some(Term::Br(swap(t))),
+                    Some(Term::CondBr(c, t, f)) => Some(Term::CondBr(c, swap(t), swap(f))),
+                    other => other,
+                };
+            }
+            for phi in self.blocks[header].phis.clone() {
+                let ty = self.insts[phi as usize].ty;
+                let Op::Phi(incoming) = self.insts[phi as usize].op.clone() else {
+                    continue;
+                };
+                let (from_back, mut kept): (Vec<_>, Vec<_>) =
+                    incoming.into_iter().partition(|&(_, b)| sources.contains(&b));
+                if from_back.is_empty() {
+                    continue;
+                }
+                let joined = self.phi(latch, ty);
+                self.set_phi(joined, from_back);
+                kept.push((joined, latch));
+                self.insts[phi as usize].op = Op::Phi(kept);
+            }
+            self.blocks[latch].term = Some(Term::Br(header));
+        }
+    }
+
     pub fn md_str(&mut self, s: &str) -> Md {
         self.mds.push(MdDef::Str(s.into()));
         Md(self.mds.len() as u32 - 1)
@@ -1063,6 +1146,62 @@ mod tests {
         assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 1);
         assert_eq!(signed(-3), 7);
         assert_eq!(signed(2), 4);
+    }
+
+    /// A loop whose header two blocks branch back to gets one latch they both
+    /// branch to; the header's phi takes their values through the latch's
+    /// phi, and the module still writes. A loop with one latch is left as is.
+    #[test]
+    fn two_back_edges_share_one_latch() {
+        let mut m = Module::default();
+        let i32t = m.int(32);
+        let void = m.void();
+        let fty = m.func_ty(i32t, vec![i32t, i32t]);
+        let f = m.function("dx.op.synthetic", fty, Some(Attr::ReadNone), false);
+        let _ = void;
+        let (entry, head, body, left, right, exit) =
+            (m.new_block(), m.new_block(), m.new_block(), m.new_block(), m.new_block(), m.new_block());
+        let zero = m.i32(0);
+        let one = m.i32(1);
+        let two = m.i32(2);
+        let ten = m.i32(10);
+        m.terminate(entry, Term::Br(head));
+        let p = m.phi(head, i32t);
+        m.terminate(head, Term::Br(body));
+        let odd = m.cmp(body, pred::IULT, p, ten);
+        m.terminate(body, Term::CondBr(odd, left, right));
+        let x = m.bin(left, Bin::Add, p, one);
+        m.terminate(left, Term::Br(head));
+        let y = m.bin(right, Bin::Add, p, two);
+        let again = m.cmp(right, pred::IULT, y, ten);
+        m.terminate(right, Term::CondBr(again, head, exit));
+        m.set_phi(p, vec![(zero, entry), (x, left), (y, right)]);
+        let _ = m.call(exit, f, vec![y, p]);
+        m.terminate(exit, Term::Ret);
+
+        let blocks = m.blocks.len();
+        m.single_latches();
+        assert_eq!(m.blocks.len(), blocks + 1, "one latch added");
+        let latch = blocks;
+        let to_head: Vec<usize> =
+            (0..m.blocks.len()).filter(|&b| successors(m.blocks[b].term).contains(&head)).collect();
+        assert_eq!(to_head, vec![entry, latch], "the header's predecessors: the entry and the latch");
+        assert!(successors(m.blocks[left].term).contains(&latch));
+        assert!(successors(m.blocks[right].term).contains(&latch));
+        let V::Inst(pi) = p else { panic!() };
+        let Op::Phi(incoming) = &m.insts[pi as usize].op else { panic!() };
+        assert_eq!(incoming.len(), 2);
+        assert!(incoming.contains(&(zero, entry)));
+        let joined = incoming.iter().find(|&&(_, b)| b == latch).expect("a value from the latch").0;
+        let V::Inst(ji) = joined else { panic!() };
+        let Op::Phi(from_back) = &m.insts[ji as usize].op else { panic!("the latch's value is a phi") };
+        assert_eq!(from_back, &vec![(x, left), (y, right)]);
+        assert!(!m.write().is_empty());
+
+        let mut one_latch = synthetic(4, 2, 2);
+        let before = one_latch.blocks.len();
+        one_latch.single_latches();
+        assert_eq!(one_latch.blocks.len(), before, "a single-latch loop is not touched");
     }
 
     /// A structured shader's shape: `stages` if/else diamonds in a row, each
