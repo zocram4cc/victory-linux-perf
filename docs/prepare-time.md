@@ -83,6 +83,8 @@ switches off stays green; the switch is read once per process, so each runs on i
 cargo test -p victory-gpu --release --lib -- --ignored --exact port::tests::the_constants_heap_is_used_in_place_with_the_switch watch::port7_tests::an_asking_notes_its_pages_under_the_shared_lock_with_the_switch
 ```
 
+Repeated 3 rounds: off 0 passed / 2 failed every time, on 2 passed / 0 failed every time [fact].
+
 Counters per change: journal: the end-of-submission wait and the journal's note waits (above);
 constants: under-flights, card copies, planning steps and copy-back ms (above).
 
