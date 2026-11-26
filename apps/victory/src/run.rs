@@ -192,6 +192,17 @@ pub fn run(
         let patched = done.iter().filter(|d| **d == Hooked::Done).count();
         println!("renderer port 2: {patched} of {} descriptor record stores of the title patched", SITES.len());
         victory_hle::port_descriptors::hooked(image.base(), size, patched);
+        // And the frame allocator's table copies the six stores miss (its own
+        // memcpy, a 128-byte copy): without them thousands of slots a frame
+        // went on showing an older view (POPIN.md). VICTORY_PORT_COPIES=0: not.
+        if std::env::var("VICTORY_PORT_COPIES").map_or(true, |v| v.trim() != "0") {
+            use victory_loader::descriptor_sites::{TITLE_MEMCPY, apply_copies};
+            let hook = victory_hle::port_descriptors::title_copy_hook(image.base() + TITLE_MEMCPY);
+            // SAFETY: as above; the hook is a function of ours.
+            let done = unsafe { apply_copies(image.base(), size, victory_hle::port_descriptors::marks_address(), hook) };
+            let copies = done.iter().filter(|d| **d == Hooked::Done).count();
+            println!("renderer port 2: {copies} of {} table copies of the title patched", done.len());
+        }
     }
     // The frame rate (VICTORY_FRAME_INTERVAL_MS, off without it): our frame
     // clock ticks at that interval (victory-gpu), and the title is given
