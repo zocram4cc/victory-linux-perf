@@ -1,9 +1,12 @@
-# VIctory on an RX 7900 XTX
+# VIctory on an RX 7900 XTX, under Linux
 
-A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
-that runs an Xbox Series title natively on Windows from files the user supplies.
-This one is about **speed on AMD RDNA 3**: the world at 30 frames a second on
-one PC, without giving up the picture. It is not there yet.
+A fork of [avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX),
+itself a fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility
+layer that runs an Xbox Series title natively on Windows from files the user
+supplies. This one is about **running it on Linux through Proton, on AMD RDNA 3
+with Mesa's RADV**, and about speed there: the world at 30 frames a second,
+which is also the most the title asks for (it paces itself to 33.3 ms a frame).
+It is not there yet.
 
 **This repository contains no game files, code or assets.** You need your own
 copy of the game. It is not affiliated with or endorsed by the game's developer
@@ -11,32 +14,65 @@ or publisher.
 
 ## Where it stands (2026-11-25)
 
-Tested on one machine only: Windows 11, Intel i9-12900K, 64 GB RAM, Radeon
-RX 7900 XTX, 1440p, the Series X profile.
+Tested on one machine only: Linux 7.3 (CachyOS), Ryzen 9 9950X3D, 64 GB RAM,
+Radeon RX 7900 XTX with RADV, Proton Hotfix `hotfix-20261110` (vkd3d-proton
+3.2.0), the Series X profile at 1440p. Frame times are medians of five-second
+stretches of one play session on the release build, by how much there is to
+draw.
 
 | | |
 |---|---|
-| Menus, videos, loading screens | 30 fps |
-| Prologue, indoors | 50-75 ms a frame (13-20 fps) |
-| First mission with the boat | 46-53 ms (19-22 fps) |
-| Street chase with many cars and people | 100-165 ms (6-10 fps), single frames far longer |
-| Outdoors on foot, the camp | 60-90 ms |
-| Flying | 42-57 ms |
-| Longest session so far | 41 minutes, no crash |
-| Memory | 40-46 GB of private memory: **64 GB of RAM recommended** |
+| Menus, loading screens | 30 fps (the title's own cap) |
+| Open world, 1,000-2,500 draws a frame | 36 ms (28 fps) |
+| Open world, 2,500-4,000 draws | 42 ms (24 fps) |
+| Open world, 4,000-5,500 draws | 45 ms (22 fps) |
+| Open world, 5,500 draws and more | 47 ms (21 fps) |
+| From the start to the world | 16-27 s |
+| Shaders | 25,782 translate, 203 do not; 88,711 pipelines made ahead in 102 s |
+| Memory | about 14 GB of RAM and 11-12 GB of the card's 16 in use |
+| Longest session | 56 minutes with no crash on an unchanged Proton (see below) |
 
-It started at 280 ms a frame in the same scenes two days earlier.
+As it came, the fork this is made from ran the same scenes at 245-455 ms a
+frame under Proton and took 112 s to reach the world.
+
+Where a frame goes, and what does not help, is measured rather than guessed:
+[linux/README.md](linux/README.md) says how (switches flipped inside one run,
+a timeline of whole frames, a sampling profile). In short: the title's own
+work is about 26 ms of a 39 ms frame, and it waits the rest at each present
+for the one thread of ours that prepares its submissions; the card is idle
+about half of every frame behind that thread.
 
 What is known to be wrong:
 
-- Trees, plants and far buildings flicker outdoors in some places.
-- Rooms with little direct light are too dark without `-RayTracing`.
+- **The title crashes with the patched Wine server.** [linux/wine](linux/wine)
+  makes mapping calls ten times cheaper (150-200 us to 14-17 us with 20,000
+  views alive), which is what makes loading and streaming quick. With it the
+  title has crashed six times in about 28 runs, each time reading through a
+  null pointer in its own code, at another place; never in twenty-odd runs
+  without it. The cause is not found. Crash reports now say what the
+  registers point at and what was mapped there just before.
+- Trees, plants and far buildings flicker outdoors in some places. Four
+  switches that were suspected did not change it.
+- Large magenta bursts of light in some scenes. Three fixes from other forks
+  are in for it (`VICTORY_NAN_GUARD`, `VICTORY_AMBIENT_REFLECT`,
+  `VICTORY_RT_RESOLVE`); whether they help has not been seen.
+- Rooms with little direct light are too dark: the ray-tracing structure
+  builder is off here (under RADV it runs at over a second a frame or hangs),
+  and `VICTORY_AMBIENT` stands in for the light it would give.
 - Textures of what just came into view appear late while the title streams.
 - The first run with a new driver or a new build stutters while the driver makes
   pipelines (`victory warm` makes them ahead).
+- A Vulkan layer that hooks instance creation can leave the title without a
+  picture (white window, sound): `lsfg-vk` did when its profile matched the
+  process. `DISABLE_LSFGVK=1` in front of the launch turns that one off.
 - Recording a frame in the world makes the title's own watchdog end it.
 
 ## How to run it
+
+**On Linux:** [linux/README.md](linux/README.md). `linux/build.sh`
+cross-builds `victory.exe`, `linux/run.sh` and `linux/play.sh` run it under a
+Proton build through `umu-run`; the rest of this section is the Windows way,
+as the fork this comes from has it.
 
 You need Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader
 model 6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build
@@ -94,8 +130,11 @@ commits taken from elsewhere name the commit and its author.
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
   contributors: the loader, the runtime services, the Direct3D 12 back end and
   the shader recompiler.
+- **[avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)**:
+  the fork this one is made from; what the section "What is different here"
+  lists is its work.
 - **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)**: the fork
-  this one started from, and the people whose pull requests it carries.
+  that one started from, and the people whose pull requests it carries.
 - **[DexNom/VIctory](https://github.com/DexNom/VIctory)**: ray tracing fixes,
   cube gradients, sparse textures.
 - **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**:
