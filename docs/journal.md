@@ -4,6 +4,11 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**G.1 with barriers apart: ~9,700 indirect clamps a frame; barriers themselves are cheap; the clamps serialise every draw**
+- `bench/trials-…-gpu-census-barriers`: **our indirect clamps 37.1-37.5 ms a frame over 9,736-9,806 clamps**; after the title's barriers 0.0 ms (3-4), buffer barriers made global 0 (0), waits for groups (made a global UAV barrier) 2.3 ms (~900), our state transitions 2.6-2.9 ms (~800-900). 218 ms timed.
+- So the barriers we add are not the cost by themselves; the clamp pass around nearly every indirect draw is. Each clamp sits between two global UAV barriers: no two draws ever overlap, and each pays its full ramp-up and drain (mesh draws ~30 µs each). This is the same mechanism Neptune VI fixed (4.6 → 8.4 fps).
+- **Our base already has the fix half-built: `VICTORY_INDIRECT_WINDOW=1`** (off): clamps a window of up to 64 records in one pass, the following draws read them with no pass of ours. Its doc comment measured 14-16 µs for a near-empty shadow draw, 4,126 records a frame (run 79). To measure now with the census.
+
 **Not resolution: 1080p changes nothing. Neptune VI's numbers point at per-draw GPU overhead; our indirect clamps are the suspect**
 - `VICTORY_DISPLAY_MODE=1920x1080` with the census (`bench/trials-…-display1080`): GPU 267-274 ms, 469-475 ms a frame, the same as at 3840×2160. Not pixel-bound: ~260 ms over 13,000-15,000 draws is ~20 µs per draw.
 - **Neptune VI** (zm0kiemedia, the user found it; notes in [forks/neptune-vi.md](forks/neptune-vi.md)): open world ~6,500 draws, **90 ms a frame with the GPU 35 % busy (~30 ms)** on an RTX 5070 Ti. Their biggest win: indirect draws run on the title's own arguments, sanitised once after the GPU writer, 4.6 → 8.4 fps.
