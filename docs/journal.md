@@ -4,6 +4,12 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**Selective ceiling: black too. The hypothesis now: page-granular refreshes undo the GPU's bytes without the copy-back**
+- `VICTORY_ONE_COPY=2 VICTORY_BACK_CEILING=2` (only ranges another copy overlaps go back): the user, live: "veo esta prueba en negro". So neither the remaining overlaps nor textures are what needs the copy-back.
+- **Hypothesis:** title memory has to stay the merged truth because CPU writes are tracked by page. The title writes its own data into the same pages shaders write (its command memory shares the big GPU heap: `shadow.rs` `copy_back_with`'s comment). Without the copy-back, a CPU write of a few bytes marks a page dirty. The next refresh then copies the whole page from title memory into our copy, with **stale bytes where the GPU wrote**, and undoes the GPU's results in our own copy. The copy-back's byte merge (GPU's byte where the copy changed, else the title's) is what prevents it. That would explain a black picture with one copy and no overlaps.
+- **If it holds:** the copy-back cannot simply be skipped. The ways out are byte-exact CPU tracking (none on this platform) or no copies at all (phase 2: memory the GPU reads in place, ReBAR). 1.3 step 2 would then become "skip the copy-back only for pages no CPU write touches", and phase 2 rises in priority.
+- **To measure:** at refresh, the pages that are both dirty by the CPU and written by the GPU in the last submission.
+
 **Not textures: no written range lies over a title-filled texture**
 - `bench/trials-20261126-065834-texture-overlap` (`VICTORY_ONE_COPY=2`): **0 copy-back ranges over the memory of textures the title fills** (their staging), every frame. Overlaps with other buffer copies: 46-47 ranges, ~100 MB (big buffers across cells).
 - Left as suspects: (a) those ~46 overlaps; (b) title reads one frame or more later (the census lifted its guards at the next submission); (c) aliases (the same pages at another address). `VICTORY_BACK_CEILING=2` sends back only ranges another copy overlaps: if the picture holds, (a); if not, (b) or (c).
