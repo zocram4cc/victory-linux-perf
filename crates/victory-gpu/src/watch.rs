@@ -7900,6 +7900,35 @@ mod port7_tests {
     /// thread writing there (told with `wrote` or found by its asking), and
     /// other threads asking about that region meanwhile. Whoever wrote a page
     /// before asking is told of that write.
+    /// With `VICTORY_PORT_JOURNAL=1` (read from the environment, not this
+    /// thread's test switch) an asking notes the pages it found holding the
+    /// journal shared, the range's parts for writing, instead of the journal
+    /// alone; and the written page is told. Run on its own, with and without
+    /// the variable: `cargo test -p victory-gpu --lib -- --ignored
+    /// an_asking_notes_its_pages`.
+    #[test]
+    #[ignore = "needs VICTORY_PORT_JOURNAL=1 in the environment"]
+    fn an_asking_notes_its_pages_under_the_shared_lock_with_the_switch() {
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const PAGES: usize = 4;
+        // SAFETY: a reservation of our own, freed at the end.
+        let at = unsafe {
+            VirtualAlloc(std::ptr::null(), PAGES * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert!(at != 0);
+        let shared_before = PORT7[P7_SHARED_NOTES].load(Relaxed);
+        // SAFETY: committed memory of ours.
+        unsafe { ((at + 2 * PAGE + 8) as *mut u64).write_volatile(1) };
+        let (_, written) = writes(at, at + PAGES * PAGE, false).expect("write-watched");
+        assert!(written.iter().any(|w| w.0 == at / PAGE + 2), "the written page was not told");
+        assert!(
+            PORT7[P7_SHARED_NOTES].load(Relaxed) > shared_before,
+            "the asking took the journal alone to note its pages (not shared)"
+        );
+        // SAFETY: our own reservation.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+    }
+
     #[test]
     fn no_write_is_lost_with_port_7() {
         askers_and_a_submission(1);

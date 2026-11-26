@@ -346,6 +346,19 @@ pub(crate) fn log(frames: f64) {
 mod tests {
     use super::*;
 
+    /// With `VICTORY_PORT_CONSTANTS=1` the title's constants heap (the 174 MB
+    /// buffer at 0x34e10000 where its ring of constants lies) is used in
+    /// place instead of as a host copy that is tracked, sent up and fetched
+    /// back; memory above 4 GiB is not. The switch is read once per process,
+    /// so this runs on its own: `cargo test -p victory-gpu --lib --
+    /// --ignored the_constants_heap` with and without the variable.
+    #[test]
+    #[ignore = "needs VICTORY_PORT_CONSTANTS=1 in the environment"]
+    fn the_constants_heap_is_used_in_place_with_the_switch() {
+        assert!(wanted(0x34e1_0000, 0xae0_0000), "the title's constants heap is not used in place (a host copy is tracked)");
+        assert!(!wanted(0xe_1c80_0000, 0x1000), "memory above 4 GiB was taken in place");
+    }
+
     /// Only the title's 32-bit memory is asked for.
     #[test]
     fn only_memory_below_4_gib_is_wanted_with_the_switch() {

@@ -9,6 +9,9 @@
 //! Counters land when their work ends, so a frame's line holds what ended
 //! between its present and the one before.
 
+// The record is made in diagnostics builds only; its line format is tested in all.
+#![cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+
 use std::io::Write;
 use std::sync::Mutex;
 use std::sync::atomic::Ordering::Relaxed;

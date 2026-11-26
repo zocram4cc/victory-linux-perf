@@ -918,6 +918,7 @@ fn note_refresh_copies<'a>(spans: impl Iterator<Item = &'a std::sync::Arc<crate:
 
 /// Times `f` into counter `i` of [`REFRESH_SPLIT`] (diagnostics builds).
 #[inline]
+#[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
 fn refresh_timed<T>(i: usize, f: impl FnOnce() -> T) -> T {
     #[cfg(feature = "diagnostics")]
     {

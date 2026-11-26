@@ -49,6 +49,20 @@ $patterns = [ordered]@{
     ref_check        = 'threads. ([\d.]+) ms asking whether a span'
     ref_update       = 'nothing and ([\d.]+) ms updating the others'
     ref_spans        = 'the others; ([\d.]+) spans in'
+    kernel_asks      = 'all threads: (\d+) kernel askings over'
+    kernel_asks_mb   = 'kernel askings over (\d+) MB'
+    pages_written    = 'ms, (\d+) pages of 4 KiB found'
+    vq_queries       = '; (\d+) queries [\d.]+ ms, moves'
+    vq_ms            = '; \d+ queries ([\d.]+) ms, moves'
+    remap_moves_ms   = 'ms, moves ([\d.]+) ms'
+    page_faults      = 'MB unmapped; (\d+) page faults'
+    guard_faults     = 'fallbacks; (\d+) guard faults'
+    blocks_readonly  = 'block by block; (\d+) blocks made read-only'
+    host_lists_made  = 'ms; ([\d.]+) host lists made'
+    host_lists_ms    = 'host lists made ([\d.]+) ms'
+    record_calls     = 'recording per frame \(\d+ frames\): (\d+) list calls'
+    thin_calls_ms    = 'VICTORY_THIN\): \d+ in ([\d.]+) ms'
+    pipeline_wait    = 'threads\); ([\d.]+) ms waiting for pipelines'
     card_idle_behind = 'ms \(the card about \d+% busy by this count\), ([\d.]+) ms of that while the submitting thread'
 }
 $all = @()
@@ -70,4 +84,5 @@ foreach ($k in $patterns.Keys) {
     $xs = @($all | Where-Object { $_.ContainsKey($k) } | ForEach-Object { $_[$k] })
     if ($xs.Count) { '{0,-18} {1,9:N2}  (n {2})' -f $k, (($xs | Measure-Object -Average).Average), $xs.Count }
 }
+
 
