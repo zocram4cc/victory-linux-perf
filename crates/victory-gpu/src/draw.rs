@@ -802,6 +802,39 @@ fn bind_null_root(l: &ID3D12GraphicsCommandList, param: u32, compute: bool, srv:
     }
 }
 
+/// Whether a draw or dispatch whose program reads descriptor tables is
+/// dropped while no view heap of ours is set (`VICTORY_NO_HEAP_GUARD`, on
+/// under Wine; =0 off; never elsewhere). Its tables are offsets into a heap
+/// the list does not have: the shader reads descriptors at those offsets
+/// from address 0. One device loss in the owner's tree (reads at 0x0,
+/// 0x80000 and 0xbf000 at world entry, on the real screen only) had this
+/// among its two candidate causes; a later build of his dropped and logged
+/// such draws.
+fn no_heap_guard() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::wine::on_wine() && std::env::var_os("VICTORY_NO_HEAP_GUARD").is_none_or(|v| v != "0"))
+}
+
+/// [`no_heap_guard`]'s decision: a program that reads tables, and no view
+/// heap of ours set.
+fn drop_for_no_heap(reads_tables: bool, heap_set: bool) -> bool {
+    reads_tables && !heap_set
+}
+
+/// Draws and dispatches [`no_heap_guard`] dropped, since the start.
+pub(crate) static NO_HEAP_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Counts a drop of [`no_heap_guard`]; the first per pipeline is logged.
+fn no_heap_dropped(pipeline: &str) {
+    let n = NO_HEAP_DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
+    static SEEN: std::sync::Mutex<Option<std::collections::HashSet<String>>> = std::sync::Mutex::new(None);
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let seen = seen.get_or_insert_with(Default::default);
+    if seen.len() < 500 && seen.insert(pipeline.to_owned()) {
+        tracing::warn!(pipeline, count = n, "a program that reads descriptor tables with no view heap of ours set: dropped (VICTORY_NO_HEAP_GUARD)");
+    }
+}
+
 fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     let slot = slot as usize;
     if roots.len() <= slot {
@@ -1512,6 +1545,16 @@ impl State {
         {
             once!("a dispatch without a view heap that needs one gets the title's");
             self.heaps[0] = heap;
+        }
+        if no_heap_guard() {
+            let reads_tables = p.stages.iter().any(|s| {
+                s.translated().used.iter().any(|u| u.root == RootType::Table && u.kind != ResourceType::Sampler)
+            });
+            let heap_set = self.heaps[0] != 0 && crate::descriptor::heap(self.heaps[0] as This).host().is_some();
+            if drop_for_no_heap(reads_tables, heap_set) {
+                no_heap_dropped(&p.name);
+                return false;
+            }
         }
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -4493,6 +4536,14 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::staging_budget_per_frame;
+
+    /// A program that reads tables runs only with a view heap of ours set.
+    #[test]
+    fn tables_without_a_view_heap_are_dropped() {
+        assert!(super::drop_for_no_heap(true, false));
+        assert!(!super::drop_for_no_heap(true, true));
+        assert!(!super::drop_for_no_heap(false, false));
+    }
 
     /// A root view's host address below 1 MiB is a read near address 0.
     #[test]

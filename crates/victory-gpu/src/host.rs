@@ -8889,6 +8889,13 @@ impl Meter {
                         crate::descriptor::host::FLIPPED[0].load(Ordering::Relaxed)
                     );
                 }
+                if crate::wine::on_wine() {
+                    tracing::info!(
+                        "root views bound to zeros (VICTORY_NULL_ROOTS), draws without a view heap of ours dropped (VICTORY_NO_HEAP_GUARD), since the start: {}, {}",
+                        crate::draw::NULL_ROOTS.load(Ordering::Relaxed),
+                        crate::draw::NO_HEAP_DROPPED.load(Ordering::Relaxed)
+                    );
+                }
                 if crate::resource::held_only() {
                     let [copies, bytes, grown, whole] = [0, 1, 2, 3].map(|i| crate::resource::HELD[i].load(Ordering::Relaxed));
                     let [flipped, missed] = [0, 1].map(|i| crate::descriptor::host::FLIPPED[i].load(Ordering::Relaxed));
