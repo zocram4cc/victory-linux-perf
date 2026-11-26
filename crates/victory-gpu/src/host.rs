@@ -848,6 +848,10 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    /// G.1 (`VICTORY_GPU_CENSUS=1`): timestamps before each draw and
+    /// dispatch, and what each one was (a title pipeline, or one of ours).
+    census_stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    census_keys: Mutex<Vec<u64>>,
 }
 
 /// A list's prelude: an allocator and a closed list.
@@ -867,6 +871,50 @@ fn lazy_prelude() -> bool {
 /// Timestamps per list (diagnostics); commands past them are not timed.
 #[cfg(feature = "diagnostics")]
 const STAMPS: u32 = 4096;
+
+/// G.1: timestamps per list for the GPU census.
+const CENSUS_STAMPS: u32 = 8192;
+/// G.1 keys for work that is not a title pipeline's.
+pub(crate) const GPU_KEY_START: u64 = 1;
+pub(crate) const GPU_KEY_COMPARE: u64 = 2;
+pub(crate) const GPU_KEY_INDIRECT: u64 = 3;
+
+/// G.1 (`VICTORY_GPU_CENSUS=1`): GPU time per draw or dispatch, summed by
+/// title pipeline, on the frame line. Off by default.
+pub(crate) fn gpu_census_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_CENSUS").is_some_and(|v| v == "1"))
+}
+
+/// G.1: by key, microseconds and commands since the last frame line.
+static GPU_CENSUS: Mutex<Option<std::collections::HashMap<u64, (u64, u64)>>> = Mutex::new(None);
+
+/// G.1's frame line: the total, our own passes, and the costliest title
+/// pipelines (address as in the "first bind" lines, which give their shaders).
+fn gpu_census_line(frames: f64) {
+    if !gpu_census_on() {
+        return;
+    }
+    let Some(census) = GPU_CENSUS.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
+    let total: u64 = census.values().map(|v| v.0).sum();
+    let own = |k: u64| census.get(&k).map_or(0.0, |v| v.0 as f64 / 1e3 / frames);
+    let mut top: Vec<(u64, (u64, u64))> = census.iter().filter(|(k, _)| **k > 16).map(|(k, v)| (*k, *v)).collect();
+    top.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+    let list: Vec<String> = top
+        .iter()
+        .take(20)
+        .map(|(k, (us, n))| format!("{k:#x} {:.1} ms ({:.0}x)", *us as f64 / 1e3 / frames, *n as f64 / frames))
+        .collect();
+    tracing::info!(
+        "GPU census per frame (G.1): {:.1} ms timed; before the first draw of lists {:.1}, our compares {:.1}, our indirect passes {:.1}; {} title pipelines; costliest: {}",
+        total as f64 / 1e3 / frames,
+        own(GPU_KEY_START),
+        own(GPU_KEY_COMPARE),
+        own(GPU_KEY_INDIRECT),
+        top.len(),
+        list.join(", ")
+    );
+}
 
 /// A marker's text and the host range its command reads (diagnostics).
 #[cfg(feature = "diagnostics")]
@@ -3023,6 +3071,8 @@ impl Host {
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
+                census_stamps: OnceLock::new(),
+                census_keys: Mutex::default(),
             })
         }
     }
@@ -4323,7 +4373,14 @@ impl Host {
             add(C::NothingBackUs, gpu.as_micros() as u64);
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let frequency = if gpu_census_on() {
+            // SAFETY: a plain query.
+            unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1)
+        } else {
+            1
+        };
         for list in runs {
+            list.gpu_census_collect(frequency);
             // Read backs first: a value written at the bottom of the pipe
             // may be what tells the title that they are there.
             read_backs(list);
@@ -4525,6 +4582,119 @@ impl Host {
 }
 
 impl HostList {
+    /// G.1: a timestamp before the next command, which `key` names (a title
+    /// pipeline's address, or one of `GPU_KEY_*`): the GPU time up to the
+    /// next mark is counted for it once the list has run.
+    pub(crate) fn gpu_mark(&self, key: u64) {
+        if !gpu_census_on() {
+            return;
+        }
+        let Some((heap, _)) = self.census_heap() else { return };
+        let mut keys = self.census_keys.lock().unwrap_or_else(|e| e.into_inner());
+        if keys.is_empty() && key != GPU_KEY_START {
+            // What the list records before its first draw (barriers,
+            // uploads, copies) is counted apart.
+            // SAFETY: an open list and our query heap.
+            unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0) };
+            keys.push(GPU_KEY_START);
+        }
+        if keys.len() as u32 >= CENSUS_STAMPS - 1 {
+            return;
+        }
+        // SAFETY: an open list and our query heap.
+        unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, keys.len() as u32) };
+        keys.push(key);
+    }
+
+    fn census_heap(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
+        self.census_stamps
+            .get_or_init(|| {
+                let device = &host()?.device;
+                let mut heap: Option<ID3D12QueryHeap> = None;
+                let mut back: Option<ID3D12Resource> = None;
+                let readback = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: pad_buffer(u64::from(CENSUS_STAMPS) * 8),
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    ..Default::default()
+                };
+                // SAFETY: plain object creation.
+                unsafe {
+                    device
+                        .CreateQueryHeap(
+                            &D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: CENSUS_STAMPS, NodeMask: 0 },
+                            &mut heap,
+                        )
+                        .ok()?;
+                    device
+                        .CreateCommittedResource(&readback, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut back)
+                        .ok()?;
+                    crate::host::pin(&back);
+                }
+                Some((heap?, back?))
+            })
+            .as_ref()
+    }
+
+    /// At close: the last timestamp, and all of them resolved.
+    fn gpu_census_close(&self) {
+        if !gpu_census_on() {
+            return;
+        }
+        let keys = self.census_keys.lock().unwrap_or_else(|e| e.into_inner());
+        if keys.is_empty() {
+            return;
+        }
+        let Some((heap, back)) = self.census_heap() else { return };
+        let n = keys.len() as u32;
+        // SAFETY: an open list, our heap and read-back buffer.
+        unsafe {
+            self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, n);
+            self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, n + 1, back, 0);
+        }
+    }
+
+    /// After the list ran: its GPU time by key, into the census.
+    pub(crate) fn gpu_census_collect(&self, frequency: u64) {
+        if !gpu_census_on() {
+            return;
+        }
+        let keys = std::mem::take(&mut *self.census_keys.lock().unwrap_or_else(|e| e.into_inner()));
+        if keys.is_empty() {
+            return;
+        }
+        let Some((_, back)) = self.census_heap() else { return };
+        let n = keys.len();
+        let range = D3D12_RANGE { Begin: 0, End: (n + 1) * 8 };
+        let mut data = std::ptr::null_mut();
+        // SAFETY: a read-back buffer the finished list resolved into.
+        let stamps: Vec<u64> = unsafe {
+            if back.Map(0, Some(&range), Some(&mut data)).is_err() {
+                return;
+            }
+            let s = std::slice::from_raw_parts(data.cast::<u64>(), n + 1).to_vec();
+            back.Unmap(0, None);
+            s
+        };
+        let mut census = GPU_CENSUS.lock().unwrap_or_else(|e| e.into_inner());
+        let census = census.get_or_insert_with(Default::default);
+        for (i, key) in keys.into_iter().enumerate() {
+            let ticks = stamps[i + 1].saturating_sub(stamps[i]);
+            // A timestamp out of order (another queue, a reset): skipped.
+            if ticks > frequency {
+                continue;
+            }
+            let entry = census.entry(key).or_insert((0, 0));
+            entry.0 += ticks * 1_000_000 / frequency.max(1);
+            entry.1 += 1;
+        }
+    }
+
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
     #[cfg(feature = "diagnostics")]
     fn stamps(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
@@ -4604,6 +4774,7 @@ impl HostList {
 
     pub(crate) fn close(&self) {
         self.twins_to_depth();
+        self.gpu_census_close();
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -4633,6 +4804,7 @@ impl HostList {
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.census_keys.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
@@ -5941,6 +6113,7 @@ impl Meter {
         crate::resource::textures_made_line(frames);
         crate::pool::pool_line(frames);
         crate::census::census_line(frames);
+        gpu_census_line(frames);
         let shared = crate::shadow::ONE_COPY.swap(0, Ordering::Relaxed);
         if shared > 0 {
             tracing::info!("buffer asks that took a window's copy per frame (M.1, VICTORY_ONE_COPY): {:.0}", shared as f64 / frames);

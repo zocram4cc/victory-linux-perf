@@ -1862,6 +1862,7 @@ impl State {
             return;
         }
         list.serial(crate::host::SERIAL_DISPATCH);
+        list.gpu_mark(self.pipeline as u64);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         match group_base(p) {
@@ -1977,6 +1978,7 @@ impl State {
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
                     list.serial(crate::host::SERIAL_DRAW);
+        list.gpu_mark(self.pipeline as u64);
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     self.mesh_scissor(list, true);
@@ -2308,6 +2310,7 @@ impl State {
                 (vertices, first)
             };
             list.serial(crate::host::SERIAL_DRAW);
+        list.gpu_mark(self.pipeline as u64);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
             // SAFETY: an open list with everything set.
@@ -2410,6 +2413,7 @@ impl State {
         let ran = !lost && self.prepare(list, true);
         if ran {
             list.serial(crate::host::SERIAL_DRAW);
+        list.gpu_mark(self.pipeline as u64);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
             // SAFETY: an open list with everything set.
@@ -2624,6 +2628,7 @@ impl State {
             return false;
         }
         list.serial(crate::host::SERIAL_INDIRECT);
+        list.gpu_mark(self.pipeline as u64);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
