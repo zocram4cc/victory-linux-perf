@@ -4,6 +4,16 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**Where the CPU goes, by our own counters (diagnostics build); the sampling profiles were misleading**
+- `perf` profiles put ~15 % of the process in `std::sync::Mutex` functions (`unlock` 8.8 %), as on 25 Nov. Attribution failed every way tried: branch records (the spin loop fills the 16 records), frame pointers (std has none; a std rebuilt with them through `RUSTC_BOOTSTRAP=1 -Zbuild-std` did not change it), and the callers named were impossible (`now_ms` and `add_ref` take no lock). The release build folds identical functions (lld-link ICF), so a tiny hot function may carry `Mutex::unlock`'s name; with `/OPT:NOICF` the script no longer found the image base (8 candidates). **The mutex diagnosis is not trusted.**
+- `bench.sh` fixes found on the way: `perf report | head` under `set -o pipefail` and `set -e` ended the script before it closed the game, so **every `--perf` run left the game open** (the user found one); fixed, plus a kill by pid as a last resort. `perf-symbols.py` took a profile for branch records when the header listed `BRANCH_STACK` among missing features; fixed.
+- **The diagnostics build's own counters** (`bench/trials-20261126-111527-diag-breakdown`, the open world, ~425 ms; the run closed by itself after the window):
+  - **The title's recording threads: 5 threads, each ~310 ms a frame in ~15,000-18,000 list calls** (our translation of their command-list calls, done on their threads). They are close to full. This is what cool_fox's `VICTORY_THIN` moves off them: calls written down on the title's thread, translated by threads of ours.
+  - **The submitting thread: 41 submissions a frame, 124 ms user and 58 ms kernel time in them** (system calls through Wine: write watch, protections, maps), 26 ms between them.
+  - **Compares for the copy-back: the 174 MB heap compared twice a frame (365 MB) for 4.6 MB written back**; 470 MB snapshotted a frame in 464 ranges.
+  - Windows: 3,632 MB of copies over 3,116 MB of title memory (memory in more than one window is copied once for each).
+- Next for the CPU side: (1) `THIN`-like recording (the title's threads write calls down; translation on spare cores: the 9900X has 24 threads and the title uses ~2.4 cores); (2) the submitting thread's kernel time and its 41 submissions a frame; (3) the double compare of the big heap.
+
 **Buffers in place, what is ruled out and what is left (end of the 26 Nov sessions on M.2)**
 - With the directory bias fixed, `VICTORY_INPLACE=2` (windows and buffers) still breaks (the user: "se ve igual de roto"), and so does `=3`.
 - **Ruled out:** shader writes into memory in place under copies (**0 shader writes are declared on buffers in place**, `…-inplace3-texcensus`); title buffer copies (0 touch it); host-import failures (`VKD3D_DEBUG=warn`, `…-inplace3-warn`: none, only the usual alignment notes); the directory offset (fixed, not the whole cause).
