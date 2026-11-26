@@ -2759,6 +2759,10 @@ fn placeholder(block: usize) -> bool {
     // (Class 3 answers with the kind of memory in that word, not the flags.)
     const MEMORY_REGION_INFORMATION_EX: u32 = 7;
     const PLACEHOLDER_RESERVATION: u32 = 1 << 8;
+    // (Under Wine, a reservation that stands for one.)
+    if in_view_space(block * BLOCK) {
+        return true;
+    }
     let mut region = Region::default();
     // SAFETY: the answer's room and its size.
     let status = unsafe {
@@ -3669,6 +3673,48 @@ fn protect_run(g: &Guards, from: usize, to: usize, claims: &mut Claims) {
     cover(g, from, to, Some(claims));
 }
 
+/// Reservations of the title's in which memory comes to be only as its
+/// physical pages shown there, and which the host does not call views: under
+/// Wine the runtime shows those pages with the host kernel's `mmap` in plain
+/// reservations (`victory-hle`'s `wine_map`, `VICTORY_WINE_MAP=1`), and a
+/// query says "private" of them. Start and end, in order; none otherwise.
+static VIEW_SPACE: RwLock<Vec<(usize, usize)>> = RwLock::new(Vec::new());
+static VIEW_SPACE_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The runtime made (`there`) or gave up such a reservation, or part of one,
+/// at `[at, at + len)` ([`VIEW_SPACE`]).
+pub fn title_view_space(at: usize, len: usize, there: bool) {
+    let (start, end) = (at, at.saturating_add(len));
+    let mut spaces = VIEW_SPACE.write().unwrap_or_else(|e| e.into_inner());
+    // What was known of the range goes; what lies beside it stays.
+    let mut now: Vec<(usize, usize)> = Vec::with_capacity(spaces.len() + 2);
+    for &(a, b) in spaces.iter() {
+        if a < start.min(b) {
+            now.push((a, start.min(b)));
+        }
+        if end.max(a) < b {
+            now.push((end.max(a), b));
+        }
+    }
+    if there && start < end {
+        now.push((start, end));
+    }
+    now.sort_unstable();
+    *spaces = now;
+    VIEW_SPACE_ANY.store(!spaces.is_empty(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether `at` lies in a reservation of [`VIEW_SPACE`]: what is committed
+/// there is a view of the title's pages, whatever the host calls it.
+pub(crate) fn in_view_space(at: usize) -> bool {
+    if !VIEW_SPACE_ANY.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    let spaces = VIEW_SPACE.read().unwrap_or_else(|e| e.into_inner());
+    let n = spaces.partition_point(|s| s.0 <= at);
+    n > 0 && at < spaces[n - 1].1
+}
+
 /// Whether `[start, end)` is view memory. The title's views lie in
 /// placeholders, mapped and unmapped block by block as it streams, so a
 /// range can begin in a block that is not mapped right now: the first
@@ -3697,7 +3743,7 @@ fn is_view(start: usize, end: usize) -> bool {
         if n == 0 {
             return false;
         }
-        if info.Type == MEM_MAPPED {
+        if info.Type == MEM_MAPPED || (info.State == MEM_COMMIT && in_view_space(at)) {
             return true;
         }
         // Committed memory that is no view (the title's heaps, ours), or
@@ -4560,7 +4606,7 @@ fn readable_view(at: usize) -> bool {
     let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
     n != 0
         && info.State == MEM_COMMIT
-        && info.Type == MEM_MAPPED
+        && (info.Type == MEM_MAPPED || in_view_space(at))
         && matches!(info.Protect, PAGE_READONLY | PAGE_READWRITE)
 }
 
