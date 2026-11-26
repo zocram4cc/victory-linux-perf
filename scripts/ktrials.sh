@@ -80,6 +80,9 @@ for ((r = 1; r <= RUNS; r++)); do
     fi
     if [[ $result == ok ]]; then
         say "in the world after ${entry} s; settling ${SETTLE} s, measuring ${SECS} s"
+        from0=$(wc -l <"$log")
+        # K_EARLY_SHOT=1: a screenshot right at world entry (what streaming in looks like).
+        [[ ${K_EARLY_SHOT:-0} == 1 ]] && shoot "$OUT/run-$r-entry.png"
         sleep "$SETTLE"
         from=$(wc -l <"$log")
         # K_PERF=1: a profile of the game and the wineserver over the window,
@@ -92,6 +95,8 @@ for ((r = 1; r <= RUNS; r++)); do
             sleep "$SECS"
         fi
         shoot "$OUT/run-$r.png"
+        # K_SHOTS=N: N more screenshots, 5 s apart, after the window.
+        for ((k = 1; k <= ${K_SHOTS:-0}; k++)); do sleep 5; shoot "$OUT/run-$r-$k.png"; done
         running || result=closed
         tail -n +"$((from + 1))" "$log" | sed 's/\x1b\[[0-9;]*m//g' >"$OUT/run-$r.log"
     fi
