@@ -4,6 +4,12 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**1.3 census, private memory: the title reads none of what is copied back there**
+- First runs (`bench/trials-…-census`): all three ended with an unhandled `0x80000001` (guard page) in title code. `lift()` took the pages out of its set before taking their guards off, so a title thread that met a guard in between found no page and its fault went on to the title. Fixed (`b4cfe43`): pages leave the set only after their guards are off.
+- Again (`bench/trials-20261126-053943-census2`): two runs in the world, 468-485 ms. **Per frame, 1,790-1,940 private pages written back and guarded (6.1-6.7 MB); the title touched 0-0.3 of them before the next submission** (one page, read). The third run ended in an access violation in title code during the load (`+0x4fd71ae`, reading a read-write page), with the census on; whether the census caused it is not known. The census stays off by default.
+- **8,400-9,000 pages a frame are skipped** (~35 MB): not private read-write memory. Most of the copy-back (40-42 MB a frame here) goes to them. `VICTORY_BACK_CENSUS=2` now guards read-write view memory too (a lower bound: reads through another view of the same pages are not seen), and the skipped count is split by reason.
+- **So far, for private memory, the hypothesis of the design holds:** what is copied back there is not read by the CPU before the GPU writes it again.
+
 **P.1: with the library made, the world-entry freeze is gone (9.5 s → 0.63 s)**
 - `bench/trials-20261126-053012-pipelib`, Jason save, two runs in a row after `c436241`:
   - run 1 (empty library): the frame the world appears in takes **9,487 ms** (1,378 pipelines made in those 5 s), then ~460-480 ms;
