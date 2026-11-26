@@ -4,6 +4,11 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**Not resolution: 1080p changes nothing. Neptune VI's numbers point at per-draw GPU overhead; our indirect clamps are the suspect**
+- `VICTORY_DISPLAY_MODE=1920x1080` with the census (`bench/trials-…-display1080`): GPU 267-274 ms, 469-475 ms a frame, the same as at 3840×2160. Not pixel-bound: ~260 ms over 13,000-15,000 draws is ~20 µs per draw.
+- **Neptune VI** (zm0kiemedia, the user found it; notes in [forks/neptune-vi.md](forks/neptune-vi.md)): open world ~6,500 draws, **90 ms a frame with the GPU 35 % busy (~30 ms)** on an RTX 5070 Ti. Their biggest win: indirect draws run on the title's own arguments, sanitised once after the GPU writer, 4.6 → 8.4 fps.
+- **Ours clamps every indirect draw** (`indirect.rs` `record_clamp_as`): a compute dispatch between **two global UAV barriers**, ~1,000 a frame. That drains the GPU each time. G.1 now counts the clamps apart (`GPU_KEY_INDIRECT`).
+
 **G.1: the GPU's time is spread over ~1,400 pipelines; the costliest are all mesh shaders. The title renders for 4K**
 - `VICTORY_GPU_CENSUS=1` (`bench/trials-20261126-070908-gpu-census`, 481-509 ms, GPU 260 ms on the frame line): **209-212 ms timed** across 1,394-1,402 title pipelines a frame. **No single culprit**: the costliest is 12 ms (353 draws), the top 20 sum to ~115 ms.
 - **The top 8 are all mesh pipelines** (shaders `adc5c689…` 22.9 KB, `0a2ea81c…` twice, `b7a81f5b…`, `903776ba…` 21.7 KB, `cf43bdbf…`, `8f690b0f…`, `db875f50…`): the console's geometry, translated. The interval between two marks counts the draw's whole work, pixels included.
