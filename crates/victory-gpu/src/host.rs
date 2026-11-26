@@ -9437,7 +9437,7 @@ impl Meter {
                     let native = [0, 1, 2].map(|i| crate::device::NATIVE_COMPUTE[i].load(Ordering::Relaxed));
                     if native.iter().any(|&n| n > 0) {
                         tracing::info!(
-                            "P.4: 0x218 compute pipelines from their pieces so far (VICTORY_NATIVE_COMPUTE): {} made, {} refused, {} not understood",
+                            "P.4: 0x218 compute pipelines from their pieces so far (VICTORY_NATIVE_COMPUTE): {} made, {} refused, {} left without (not understood or not translating)",
                             native[0], native[1], native[2]
                         );
                     }

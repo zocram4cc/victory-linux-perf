@@ -419,6 +419,15 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
             return E_NOTIMPL;
         }
         if let Some(container) = native_compute(desc as usize) {
+            // Only a program that translates gets a pipeline: one whose
+            // dispatches are then dropped makes the title believe the pass
+            // ran and use what it did not write (the picture went white or
+            // black with untranslatable programs made, 26 Nov). Without a
+            // pipeline the title goes its own way round, as before.
+            if victory_shader::emit::translate(&container).is_err() {
+                NATIVE_COMPUTE[2].fetch_add(1, Ordering::Relaxed);
+                return E_NOTIMPL;
+            }
             let hr = crate::pipeline::create_compute_from(&container, _iid, out);
             NATIVE_COMPUTE[usize::from(hr < 0)].fetch_add(1, Ordering::Relaxed);
             if NATIVE_COMPUTE[0].load(Ordering::Relaxed) == 1 && hr >= 0 {
@@ -432,7 +441,7 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
 }
 
 /// P.4 (`VICTORY_NATIVE_COMPUTE=1`): 0x218 pipelines made, refused by the
-/// host, and descriptions not understood.
+/// host, and left without one (not understood or not translating).
 pub(crate) static NATIVE_COMPUTE: [std::sync::atomic::AtomicU32; 3] = [const { std::sync::atomic::AtomicU32::new(0) }; 3];
 
 /// `VICTORY_NATIVE_COMPUTE_MAX=N`: only the first N calls of 0x218 are made
