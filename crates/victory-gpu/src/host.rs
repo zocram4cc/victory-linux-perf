@@ -6210,6 +6210,12 @@ impl Meter {
                 bytes_n / 1e6,
                 bytes_mixed / 1e6
             );
+            let [w, wb, wt, wtb] = [0, 1, 2, 3].map(|i| crate::shadow::PLACED_WRITES[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            tracing::info!(
+                "shader writes into memory in place per frame: {w:.0} ({:.1} MB declared); over textures the title fills: {wt:.0} textures ({:.1} MB), which the write watch does not see change",
+                wb / 1e6,
+                wtb / 1e6
+            );
             let mut big = crate::shadow::big_in_place();
             big.sort_by_key(|b| std::cmp::Reverse(b.1));
             let written = big.iter().filter(|b| b.2 > 0).count();

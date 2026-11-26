@@ -1830,6 +1830,15 @@ impl Shadow {
             if self.len >= 1 << 20 {
                 self.unsized_asks.fetch_add(1 << 32, Ordering::Relaxed);
             }
+            if overlap_census() {
+                let (textures, bytes) = crate::texture::staged_overlapping(address as u64, (address + len) as u64);
+                PLACED_WRITES[0].fetch_add(1, Ordering::Relaxed);
+                PLACED_WRITES[1].fetch_add(len as u64, Ordering::Relaxed);
+                if textures > 0 {
+                    PLACED_WRITES[2].fetch_add(textures, Ordering::Relaxed);
+                    PLACED_WRITES[3].fetch_add(bytes, Ordering::Relaxed);
+                }
+            }
             return;
         }
         let range = (address, address + len);
@@ -2885,6 +2894,10 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     }
     n
 }
+
+/// M.2 census: shader writes declared on memory in place, their bytes, and
+/// the textures the title fills whose memory they overlap, with the bytes.
+pub(crate) static PLACED_WRITES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// M.2: the title buffers of 1 MiB or more in place, with the shader
 /// writes declared on them since the start: (start, bytes, writes).
