@@ -402,6 +402,19 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
     }
     #[cfg(windows)]
     if SLOT == 0x218 && native_compute_on() && calls <= native_compute_max() {
+        // `VICTORY_NATIVE_COMPUTE_LOG=a-b`: which program calls a to b are
+        // (their code address: the dump's directory name, `218_<address>`).
+        if let Some((a, b)) = std::env::var("VICTORY_NATIVE_COMPUTE_LOG").ok().and_then(|v| {
+            let (a, b) = v.split_once('-')?;
+            Some((a.parse::<u32>().ok()?, b.parse::<u32>().ok()?))
+        }) && (a..=b).contains(&calls)
+        {
+            let mut w = [0u8; 0x30];
+            if crate::host::read_into(desc as *const u8, &mut w) {
+                let code = u64::from_le_bytes(w[0x28..0x30].try_into().unwrap_or([0; 8]));
+                tracing::info!(call = calls, code = format_args!("{code:016x}"), "P.4: 0x218 call");
+            }
+        }
         if let Some(container) = native_compute(desc as usize) {
             let hr = crate::pipeline::create_compute_from(&container, _iid, out);
             NATIVE_COMPUTE[usize::from(hr < 0)].fetch_add(1, Ordering::Relaxed);
