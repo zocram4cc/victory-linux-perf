@@ -118,7 +118,9 @@ def callers(a, base, tstart, tend):
     stacks = []
     branches = []
     lbr = subprocess.run(["perf", "report", "-i", a.perf_data, "--header-only"], capture_output=True, text=True).stdout
-    if "BRANCH_STACK" in lbr:
+    # Branch records are in the samples' type (the header also lists
+    # BRANCH_STACK among "missing features" when there are none).
+    if any("sample_type" in line and "BRANCH_STACK" in line for line in lbr.splitlines()):
         # One line per sample: the ip, then from/to/... pairs, newest first.
         # The "stack" is the ip followed by the call sites (the froms).
         out = subprocess.run(["perf", "script", "-i", a.perf_data, "-F", "ip,brstack"], capture_output=True, text=True).stdout

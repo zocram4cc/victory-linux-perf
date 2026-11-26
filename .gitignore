@@ -80,3 +80,4 @@ Thumbs.db
 # resultados locales de scripts/bench.sh (capturas y logs, nunca se suben)
 /bench/
 /target-fp
+/target-fpstd
