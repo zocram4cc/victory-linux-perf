@@ -236,6 +236,18 @@ if (( avail_gb < 20 )); then
   echo "note: ${avail_gb} GB of RAM is free; the title wants about 20 GB in the world, so closing other programs first cuts its swapping and stutter." >&2
 fi
 
+# The title fills about 15 GB of a 16 GB card. A program holding GPU memory
+# of its own makes the driver page the title's: a dictation model's 4.9 GB
+# took the opening from 24 to 3 frames a second (runs 20261126-225925,
+# -231332), the card busy all the time.
+if command -v nvidia-smi >/dev/null; then
+  others=$(timeout 10 nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader,nounits 2>/dev/null \
+    | awk -F', ' '$3 >= 1024 {printf "  %s (pid %s): %d MB\n", $2, $1, $3}')
+  if [[ -n "$others" ]]; then
+    printf 'warning: other programs hold GPU memory the title needs; quit them for full speed:\n%s\n' "$others" >&2
+  fi
+fi
+
 # The title's shaders translated, and the pipelines earlier runs drew made,
 # before the first frame: once per build and set of VICTORY_* switches. On a
 # cold cache a first run otherwise drew a black screen for minutes while
