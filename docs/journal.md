@@ -4,6 +4,10 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**M.1: the overlaps come from two names for the same memory**
+- `bench/trials-20261126-063417-lookup-miss`: **~87,000 asks a frame take a window, and every one of them because no title buffer held the address then** (0 missed by the 64-start search, 0 running past a buffer's end). The title reaches the same memory both through buffer objects and by raw address (descriptors, root views), and each name got its own copy. (The census's scan per ask is O(buffers): that run's second window was 747 ms; it is for counting only.)
+- **`VICTORY_ONE_COPY=1` (`M.1 step 2`):** a buffer ask that a window holds whole takes the window's copy, so both names share one copy. A buffer copy made before any window, or an ask bigger than a window, still has its own. To measure: overlaps (`VICTORY_BACK_OVERLAP`), frame, picture.
+
 **M.1: the windows under buffers are in use**
 - `bench/trials-20261126-063055-window-use`: of 272-301 windows met under written buffer copies a frame, **250-290 were used in the last two frames, ~100 were asked for in the very bytes the buffer covers**. They are live copies the GPU reads, not leftovers: retiring them alone would only make them again.
 - Next measurement: why an ask inside a buffer takes a window (`lookup` searches only the 64 buffers starting below the address; or the ask runs past the buffer's end; or no buffer holds it).
