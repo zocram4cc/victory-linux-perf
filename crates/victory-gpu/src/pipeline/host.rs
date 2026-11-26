@@ -150,6 +150,15 @@ fn host_blend(blend: &D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D1
     host
 }
 
+/// `VICTORY_CULL_NONE=1`: every pipeline draws both faces. Under Proton the
+/// characters' head and hair meshes are culled away as if wound the other
+/// way (meeyao/victory-8gb-linux, patch 8); drawing both faces brings them
+/// back at some fill cost. Read once.
+fn cull_none() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_CULL_NONE").is_ok_and(|v| v == "1"))
+}
+
 impl GraphicsState {
     /// Whether the draws are a pass over the screen: no vertex input, no
     /// depth or stencil, a target. Such passes fill tables once; their shaders
@@ -174,7 +183,12 @@ impl GraphicsState {
             match kind {
                 8 => self.blend = data.cast::<D3D12_BLEND_DESC>().read_unaligned(),
                 9 => self.sample_mask = data.cast::<u32>().read_unaligned(),
-                10 => self.rasterizer = data.cast::<D3D12_RASTERIZER_DESC>().read_unaligned(),
+                10 => {
+                    self.rasterizer = data.cast::<D3D12_RASTERIZER_DESC>().read_unaligned();
+                    if cull_none() {
+                        self.rasterizer.CullMode = D3D12_CULL_MODE_NONE;
+                    }
+                }
                 11 => {
                     self.depth = data.cast::<D3D12_DEPTH_STENCIL_DESC>().read_unaligned();
                     self.depth_bounds = false;

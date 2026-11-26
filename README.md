@@ -13,6 +13,32 @@ The launcher selects Series S and the RTX-tested residency settings. It builds i
 
 To build from this checkout, install the pinned Rust toolchain and the MSVC C++ build tools with a Windows SDK, then run `cargo build --release --locked -p victory`. The same launcher finds `target\release\victory.exe`. The sections below describe the upstream AMD fork and its separate launcher.
 
+## Run on Linux (Proton)
+
+The Windows build runs under Proton-GE through [umu-launcher](https://github.com/Open-Wine-Components/umu-launcher), with vkd3d-proton turning Direct3D 12 into Vulkan. Tested so far on Fedora 45 with an RTX 5080 (build and launch only; see the plan's status before expecting a picture).
+
+You need rustup, clang, lld and llvm (`sudo dnf install rustup clang lld llvm` on Fedora), `umu-run` on your PATH (on Fedora 45 use the release's zipapp, the RPMs are built for older Python), and Proton-GE in `~/.local/share/Steam/compatibilitytools.d/Proton-GE Latest` (or set `PROTONPATH`).
+
+Cross-compile with [cargo-xwin](https://github.com/rust-cross/cargo-xwin); it downloads Microsoft's CRT and Windows SDK, whose licence you accept with `XWIN_ACCEPT_LICENSE=1`:
+
+```sh
+rustup-init -y --default-toolchain none --no-modify-path
+export PATH="$HOME/.cargo/bin:$PATH"
+rustup toolchain install 1.98.1 --target x86_64-pc-windows-msvc
+cargo install --locked cargo-xwin
+XWIN_ARCH=x86_64 XWIN_ACCEPT_LICENSE=1 cargo xwin build --release --locked -p victory --target x86_64-pc-windows-msvc
+```
+
+Put `dxcompiler.dll` and `dxil.dll` from the x64 folder of Microsoft's [DirectXShaderCompiler release](https://github.com/microsoft/DirectXShaderCompiler/releases) in `~/.local/share/victory/dxc` (or set `VICTORY_DXC_DIR`); the launcher copies them beside `victory.exe`. Under Wine the system shader compiler refuses the indirect-draw clamp and the card compare, and without DXC there is no 3D.
+
+```sh
+VICTORY_GAME_DIR=~/Games/MyDump scripts/play-linux.sh pareto-residency
+scripts/play-linux.sh shaders <the shader archives>   # translate every shader ahead of time
+scripts/play-linux.sh warm --used                     # pipelines earlier runs drew with
+```
+
+The launcher uses its own prefix (`~/.local/share/victory/prefix`), keeps caches in `~/.cache/victory/`, sets the same defaults as `Play-VIctory.cmd` plus `VICTORY_CULL_NONE=1` and meeyao's vkd3d settings, and takes `--safe` and `--ray-tracing` like `scripts/play.ps1`. Every variable can be overridden from the environment. The Wine-specific fixes come from [meeyao/victory-8gb-linux](https://github.com/meeyao/victory-8gb-linux).
+
 A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
 that runs an Xbox Series title natively on Windows from files the user supplies.
 This one is about **speed on AMD RDNA 3**: the world at 30 frames a second on

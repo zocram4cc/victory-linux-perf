@@ -457,14 +457,40 @@ fn library() -> Option<&'static Library> {
         .as_ref()
 }
 
+/// `CreatePipelineLibrary` with a null blob for an empty library. The safe
+/// wrapper passes `[].as_ptr()`, a dangling non-null pointer, and
+/// vkd3d-proton (Wine/Proton) answers `E_INVALIDARG` for a non-null blob of
+/// length zero, so no library was ever made there and no pipeline was kept.
+/// From viyourmom/victory-8gb-linux-lowram `69cca8a`, via meeyao/victory-8gb-linux.
+///
+/// # Safety
+/// `bytes` must outlive the library.
+unsafe fn create_library(device: &ID3D12Device1, bytes: &[u8]) -> windows::core::Result<ID3D12PipelineLibrary1> {
+    use windows::core::Interface;
+    let blob = if bytes.is_empty() { std::ptr::null() } else { bytes.as_ptr().cast() };
+    let mut raw = std::ptr::null_mut();
+    // SAFETY: the device's own vtable; the blob is read during the call and
+    // `raw` receives one owning reference of the IID asked for.
+    unsafe {
+        (Interface::vtable(device).CreatePipelineLibrary)(
+            Interface::as_raw(device),
+            blob,
+            bytes.len(),
+            &ID3D12PipelineLibrary1::IID,
+            &mut raw,
+        )
+        .ok()?;
+        Ok(ID3D12PipelineLibrary1::from_raw(raw))
+    }
+}
+
 /// The library in `blob`, or an empty one if the host rejects the blob (an
 /// adapter or driver change, damage).
 fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
-        // SAFETY: the bytes outlive the library (kept beside it).
-        unsafe {
-            device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
-        }
+        // SAFETY: the bytes outlive the library (kept beside it); the empty
+        // one passes none.
+        unsafe { create_library(device, bytes) }
     };
     if !blob.bytes().is_empty() {
         match make(blob.bytes()) {

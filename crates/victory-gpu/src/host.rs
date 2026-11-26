@@ -1353,6 +1353,12 @@ fn plane_pass() -> Option<&'static PlanePass> {
 
 /// Compiles function `entry` of `source` for `target` with the system's
 /// compiler, as the indirect-argument clamp is (`crate::indirect`).
+///
+/// When the system's compiler refuses it, `dxcompiler.dll` (DXC, found
+/// beside the executable first) compiles it for shader model 6.0 instead.
+/// Under Wine, `d3dcompiler_47` rejects `InterlockedAdd`/`InterlockedOr` and
+/// `Load4` on a `RWByteAddressBuffer` (E5005), which loses the argument clamp
+/// (every indirect draw dropped, no 3D) and the card compare.
 pub(crate) fn compile(
     source: &str,
     entry: windows::core::PCSTR,
@@ -1387,9 +1393,23 @@ pub(crate) fn compile(
                     errors.GetBufferSize(),
                 )
             };
-            tracing::warn!("a shader of ours: {}", String::from_utf8_lossy(text));
+            tracing::warn!("a shader of ours: {}", String::from_utf8_lossy(text).trim());
         }
-        return Err(e);
+        // SAFETY: both names are NUL-terminated literals of the caller's.
+        let (entry, target) = unsafe { (entry.to_string(), target.to_string()) };
+        let (Ok(entry), Ok(target)) = (entry, target) else {
+            return Err(e);
+        };
+        return match dxc_compile(source, &entry, &target) {
+            Ok(bytes) => {
+                tracing::info!(%entry, %target, "the system compiler refused a shader of ours; DXC compiled it");
+                Ok(bytes)
+            }
+            Err(dxc) => {
+                tracing::warn!(error = %dxc, "DXC could not compile it either (is dxcompiler.dll beside victory.exe?)");
+                Err(e)
+            }
+        };
     }
     let code = code.ok_or_else(windows::core::Error::empty)?;
     // SAFETY: the blob's own bytes.
@@ -1397,6 +1417,54 @@ pub(crate) fn compile(
         std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
     };
     Ok(bytes.to_vec())
+}
+
+/// Compiles function `entry` of `source` with DXC from `dxcompiler.dll`, for
+/// `target`'s stage at shader model 6.0 (`cs_5_1` becomes `cs_6_0`). The
+/// root signature stays inside the shader as with the system's compiler.
+/// Loaded once; `dxil.dll` beside it signs the result when present.
+fn dxc_compile(source: &str, entry: &str, target: &str) -> windows::core::Result<Vec<u8>> {
+    use windows::Win32::Graphics::Direct3D::Dxc::{
+        CLSID_DxcCompiler, DXC_CP_UTF8, DxcBuffer, IDxcCompiler3, IDxcResult,
+    };
+    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    use windows::core::{GUID, HRESULT, Interface, PCWSTR};
+    type Create = unsafe extern "system" fn(*const GUID, *const GUID, *mut *mut std::ffi::c_void) -> HRESULT;
+    static CREATE: std::sync::OnceLock<Option<Create>> = std::sync::OnceLock::new();
+    let create = CREATE.get_or_init(|| {
+        // SAFETY: a NUL-terminated literal; the module is never freed, so
+        // the entry point stays valid for the process.
+        unsafe {
+            let module = LoadLibraryW(windows::core::w!("dxcompiler.dll")).ok()?;
+            let entry = GetProcAddress(module, windows::core::s!("DxcCreateInstance"))?;
+            Some(std::mem::transmute::<unsafe extern "system" fn() -> isize, Create>(entry))
+        }
+    });
+    let create = create.ok_or_else(|| windows::core::Error::new(windows::core::HRESULT(0x8007_007E_u32 as i32), "dxcompiler.dll not found"))?;
+    let stage = target.split('_').next().unwrap_or(target);
+    let profile = format!("{stage}_6_0");
+    let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
+    let owned = [wide("-T"), wide(&profile), wide("-E"), wide(entry), wide("-O3")];
+    let arguments: Vec<PCWSTR> = owned.iter().map(|a| PCWSTR(a.as_ptr())).collect();
+    // SAFETY: DXC's documented entry point with out pointers of ours; the
+    // source and the arguments outlive the calls.
+    unsafe {
+        let mut raw = std::ptr::null_mut();
+        create(&CLSID_DxcCompiler, &IDxcCompiler3::IID, &mut raw).ok()?;
+        let compiler = IDxcCompiler3::from_raw(raw);
+        let buffer = DxcBuffer { Ptr: source.as_ptr().cast(), Size: source.len(), Encoding: DXC_CP_UTF8.0 };
+        let result: IDxcResult = compiler.Compile(&buffer, Some(&arguments), None)?;
+        let status = result.GetStatus()?;
+        if status.is_err() {
+            if let Ok(errors) = result.GetErrorBuffer() {
+                let text = std::slice::from_raw_parts(errors.GetBufferPointer().cast::<u8>(), errors.GetBufferSize());
+                tracing::warn!("DXC: {}", String::from_utf8_lossy(text).trim());
+            }
+            return Err(status.into());
+        }
+        let blob = result.GetResult()?;
+        Ok(std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize()).to_vec())
+    }
 }
 
 impl PlanePass {
@@ -4176,27 +4244,9 @@ impl Host {
     }
 
     fn make_card_work(&self) -> windows::core::Result<CardWork> {
-        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-        use windows::Win32::Graphics::Direct3D::ID3DBlob;
-        let mut code: Option<ID3DBlob> = None;
-        // SAFETY: the source and names live through the call; the out
-        // pointer is ours.
-        unsafe {
-            D3DCompile(
-                CARD_COMPARE.as_ptr().cast(),
-                CARD_COMPARE.len(),
-                windows::core::s!("card compare"),
-                None,
-                None,
-                windows::core::s!("main"),
-                windows::core::s!("cs_5_1"),
-                0,
-                0,
-                &mut code,
-                None,
-            )?;
-        }
-        let code = code.ok_or_else(windows::core::Error::empty)?;
+        // The system's compiler, else DXC: Wine's refuses the compare's
+        // `Load4`, and without it every frame snapshots the title's memory.
+        let code = compile(CARD_COMPARE, windows::core::s!("main"), windows::core::s!("cs_5_1"))?;
         let list = || self.make_prelude().ok_or_else(windows::core::Error::empty);
         // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
         // in one submission.
@@ -4206,7 +4256,7 @@ impl Host {
         // SAFETY: the blob's own bytes; the root signature is inside the
         // shader.
         unsafe {
-            let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+            let bytes = code.as_slice();
             let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;
             let pso: ID3D12PipelineState = self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
