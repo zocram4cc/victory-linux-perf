@@ -1,4 +1,4 @@
-> **victory-royale (private), branch `k7900`:** this tree plus our pieces. The plan, what carries over and in what order: [docs/royale/PLAN.md](docs/royale/PLAN.md).
+> **victory-royale (private), branch `k7900`:** this tree plus our pieces. The plan, what carries over and in what order: [docs/royale/PLAN.md](docs/royale/PLAN.md); where things stand and how every piece works: [docs/royale/STATUS.md](docs/royale/STATUS.md).
 
 > **Linux / Proton fork.** This is avatarmanz/VIctory-7900XTX with the changes it
 > takes to run under Proton on AMD (RADV): ~16-17 fps in the open world on an

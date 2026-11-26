@@ -1,5 +1,7 @@
 # victory-royale on kroeeee's tree: plan
 
+> **Current state, setup and tools: [STATUS.md](STATUS.md)** (26 Nov evening: 17-19 fps with the view-tree wineserver; P.4 in progress).
+
 Copied from the README of this repository's `main` (section 0). The documents it links are under `docs/royale/` here: `forks/`, `design/`, the journal, baseline and memory notes, and the M.2 patches (`patches/`).
 
 ## New base: moving to kroeeee's tree (decided 26 Nov 2026)
