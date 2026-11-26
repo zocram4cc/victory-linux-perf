@@ -153,6 +153,56 @@ fn write_skip() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WRITE_SKIP").is_none_or(|v| v != "0"))
 }
 
+/// Whether what a list brought up to date for its draws (a table's entries,
+/// a view its tables hold, the bound targets' states) stays so over another
+/// texture's first use in the list (`VICTORY_READY_FINE=0`: every first use
+/// counts as a change, as before).
+///
+/// A list's first use of a texture gives the list a state for it and moves
+/// nothing it knew before, but it changed the list's number
+/// ([`HostList::epoch`]) all the same: in a pass whose draws each bring a
+/// texture or two of their own, every view the draws share went through
+/// [`readable`] again at every draw (its placed texture found, its host copy,
+/// its upload, twin and state asked for, under the locks all recording
+/// threads share). [`HostList::moved`] is the number that changes only when
+/// a texture the list knows moves, a twin's sides change or the list writes
+/// title memory.
+fn ready_fine() -> bool {
+    crate::toggled!("VICTORY_READY_FINE")
+}
+
+/// The number that says nothing a list brought up to date has changed since
+/// ([`ready_fine`]).
+fn stamp(list: &HostList) -> u64 {
+    if ready_fine() { list.moved() } else { list.epoch() }
+}
+
+/// Whether a draw leaves its targets' states alone when the draw before it
+/// in the list asked for the same ones and nothing in the list has moved
+/// since (`VICTORY_TARGETS_ONCE=0`: asked for at every draw, as before: per
+/// target the resource's own lock, which every thread that draws into the
+/// same targets takes, and the list's).
+fn targets_once() -> bool {
+    crate::toggled!("VICTORY_TARGETS_ONCE")
+}
+
+/// How many dynamic descriptor slots a list takes at a time for its tables
+/// (`VICTORY_DYNAMIC_CHUNK`, 64; 0 or 1: each table its own run, as before).
+///
+/// Every table made afresh took its run under the heap's one lock, searched
+/// from where the last search of any thread ended (17,000 tables a frame, 9
+/// ms of the recording threads searching and waiting), and gave it back under
+/// that lock, run by run. A list now takes a run of this many and cuts its
+/// tables from it; what is left over when the list has run goes back with
+/// the rest. Tables of that many slots or more, and all tables while less
+/// than half of the slots are free, are taken one by one.
+fn dynamic_chunk() -> u32 {
+    static CHUNK: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CHUNK.get_or_init(|| {
+        std::env::var("VICTORY_DYNAMIC_CHUNK").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(64u32).min(4096)
+    })
+}
+
 /// A run of indirect records clamped in one pass ([`windows`]): the host
 /// copy they came from (its number), their kind and stride, the offset of
 /// the first in that copy, how many, and the list's scratch buffer that
@@ -349,6 +399,18 @@ pub(crate) struct State {
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
+    /// Entries of the title's own tables that the list has brought up to
+    /// date ([`entry_ready`]), by where their record is (empty until the
+    /// first, then 256).
+    entries_ready: Vec<Option<EntryReady>>,
+    /// Dynamic slots taken and not yet a table's ([`dynamic_chunk`]): title
+    /// heap, the next one, how many are left. They are part of a run in
+    /// `dynamic`.
+    reserve: (usize, u32, u32),
+    /// The list's number ([`HostList::moved`]) and the depth state asked for
+    /// when the bound targets' states were last asked for ([`targets_once`];
+    /// 0: not since the targets were set).
+    targets_ready: (u64, u32),
     /// This recording, for [`crate::descriptor::host::HostHeap::make_listed`]
     /// (0: it has none yet).
     recording: u64,
@@ -381,6 +443,7 @@ impl State {
         for (heap, first, n) in self.dynamic.drain(..) {
             crate::descriptor::release_dynamic(heap, first, n);
         }
+        self.reserve = (0, 0, 0);
         self.fresh_tables.clear();
         self.recording = 0;
         self.root_srv_slots.clear();
@@ -1015,6 +1078,7 @@ impl State {
         self.depth_handle = depth;
         self.targets_set = true;
         self.targets.clear();
+        self.targets_ready = (0, 0);
         let mut views = Vec::with_capacity(handles.len());
         let mut keys = Vec::with_capacity(handles.len());
         for &h in handles {
@@ -1315,6 +1379,31 @@ impl State {
         crate::memory::ready(list, heap, &addresses, &written, &constants, use_, t.threads)
     }
 
+    /// `n` dynamic slots of `host` (the host heap of the title heap at
+    /// `heap`) in a row, the list's until it has run: the first's index. Cut
+    /// from the run the list took last while that has room
+    /// ([`dynamic_chunk`]), else a new run.
+    fn take_dynamic(&mut self, heap: usize, host: &crate::descriptor::host::HostHeap, n: u32) -> Option<u32> {
+        let chunk = dynamic_chunk();
+        if chunk > 1 && n > 0 && n < chunk {
+            let (of, next, left) = self.reserve;
+            if of == heap && left >= n {
+                self.reserve = (of, next + n, left - n);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::DynamicAsked, 1);
+                return Some(next);
+            }
+            if let Some(first) = host.dynamic_chunk(chunk) {
+                self.dynamic.push((heap, first, chunk));
+                self.reserve = (heap, first + n, chunk - n);
+                return Some(first);
+            }
+        }
+        let first = host.dynamic(n)?;
+        self.dynamic.push((heap, first, n));
+        Some(first)
+    }
+
     /// The bound heap holding `handle`.
     fn heap_of(&self, handle: u64) -> Option<&'static crate::descriptor::Heap> {
         self.heaps
@@ -1393,29 +1482,39 @@ impl State {
             unsafe { l.IASetIndexBuffer(Some(&view)) };
         }
         const RENDER_TARGET: u32 = 0x4;
+        // A view that writes neither plane keeps the texture readable:
+        // the depth read state, together with the shader read states
+        // if this draw's shaders read the same texture (the write state
+        // put it out of the state those views need, and a move to it
+        // and back for every such draw).
+        let depth_state = if self.depth == 0 {
+            0
+        } else if self.depth_state == DEPTH_READ {
+            let (tested, read) = TESTED_DEPTH.get();
+            if read && tested == self.depth {
+                DEPTH_READ | SHADER_RESOURCE
+            } else {
+                DEPTH_READ
+            }
+        } else {
+            DEPTH_WRITE
+        };
+        // The draw before asked for the same, and no texture or twin of the
+        // list has moved since ([`targets_once`]).
+        if targets_once() && self.targets_ready == (list.moved(), depth_state) {
+            return true;
+        }
         for &t in &self.targets {
             crate::list::ensure_state(list, t as This, RENDER_TARGET);
         }
         if self.depth != 0 {
             // A depth texture shaders also write: what they wrote, first.
             list.twin_use(self.depth as This, false, true);
-            // A view that writes neither plane keeps the texture readable:
-            // the depth read state, together with the shader read states
-            // if this draw's shaders read the same texture (the write state
-            // put it out of the state those views need, and a move to it
-            // and back for every such draw).
-            let state = if self.depth_state == DEPTH_READ {
-                let (tested, read) = TESTED_DEPTH.get();
-                if read && tested == self.depth {
-                    DEPTH_READ | SHADER_RESOURCE
-                } else {
-                    DEPTH_READ
-                }
-            } else {
-                DEPTH_WRITE
-            };
-            crate::list::ensure_state(list, self.depth as This, state);
+            crate::list::ensure_state(list, self.depth as This, depth_state);
         }
+        // (The number as it is now: what this moved itself it need not do
+        // again.)
+        self.targets_ready = (list.moved(), depth_state);
         true
     }
 
@@ -1428,6 +1527,8 @@ impl State {
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
+        // What the slots made here let go of is buried together.
+        let _retiring = crate::descriptor::host::retire_scope();
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
         if crate::host::walls_trace() {
@@ -1713,12 +1814,14 @@ impl State {
             }
             Some(s)
         };
+        #[cfg(feature = "diagnostics")]
+        let pipeline = self.pipeline;
         let ready = |a: u64, s: &std::sync::Arc<crate::shadow::Shadow>| {
             let len = s.left(a).min(limit);
             s.refresh(list, a, len);
             if writes {
                 #[cfg(feature = "diagnostics")]
-                crate::host::wide_write(a, len, self.pipeline);
+                crate::host::wide_write(a, len, pipeline);
                 s.gpu_writes(list, a, len);
             }
         };
@@ -1755,10 +1858,9 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1) else {
+                let Some(index) = self.take_dynamic(key.0, host, 1) else {
                     return false;
                 };
-                self.dynamic.push((key.0, index, 1));
                 if let Some((a, s)) = &shadow {
                     // SAFETY: a live buffer.
                     let base = unsafe { s.buffer.GetGPUVirtualAddress() };
@@ -1826,10 +1928,9 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1) else {
+                let Some(index) = self.take_dynamic(key.0, host, 1) else {
                     return false;
                 };
-                self.dynamic.push((key.0, index, 1));
                 self.root_srv_slots
                     .insert(key, (index, shadow.as_ref().map(|(_, s)| s.clone())));
                 match &shadow {
@@ -1961,7 +2062,9 @@ impl State {
         // frame has several, and together they get `bake_ms`.
         static BAKED_MS: AtomicU64 = AtomicU64::new(0);
         let frame = crate::frame::current();
-        let first = FRAME.swap(frame, Ordering::Relaxed) != frame;
+        // (Read first: every draw of every recording thread comes by here,
+        // and a store takes the line from the others.)
+        let first = FRAME.load(Ordering::Relaxed) != frame && FRAME.swap(frame, Ordering::Relaxed) != frame;
         if first {
             BAKED_MS.store(0, Ordering::Relaxed);
         }
@@ -2623,6 +2726,13 @@ impl State {
             }
             return;
         }
+        // `VICTORY_RT_RESOLVE=0`: no hit to shade without the structures.
+        if crate::pipeline::shades_hits_left_out(self.pipeline as This) {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why("shades ray-tracing hits, left out (VICTORY_RT_RESOLVE=0)".to_owned());
+            return;
+        }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),
@@ -2689,7 +2799,7 @@ impl State {
     /// The stand-in for the indirect light after a dispatch of `p`
     /// (`crate::ambient`). Whether it recorded anything.
     fn ambient(&self, list: &HostList, p: &HostPipeline, role: crate::ambient::Role) -> bool {
-        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, Role, Views};
+        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, REFLECTIONS, Role, Views};
         let Some(t) = p.stages.first().map(|s| s.translated()) else {
             return false;
         };
@@ -2721,18 +2831,19 @@ impl State {
             Role::Resolve => LIGHT,
             Role::Radiance => RADIANCE,
             Role::Air => AIR,
+            Role::Reflect => REFLECTIONS,
         };
         let image = entry(ResourceType::Uav, at);
         let depth = match role {
             Role::Resolve => entry(ResourceType::Srv, DEPTH),
-            Role::Radiance | Role::Air => image,
+            Role::Radiance | Role::Air | Role::Reflect => image,
         };
         let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
             once!(?role, "no stand-in for the indirect light: other tables");
             return false;
         };
         // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT.)
-        let format = if role == Role::Resolve { 42 } else { 26 };
+        let format = if matches!(role, Role::Resolve | Role::Reflect) { 42 } else { 26 };
         let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         if of.Format.0 != format || (seen.Width, seen.Height) != (of.Width, of.Height) || volume != (role == Role::Air) {
             once!(?role, format = of.Format.0, "no stand-in for the indirect light: another image");
@@ -3112,8 +3223,8 @@ impl State {
         }
     }
 
-    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
-        let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
+    fn table_entry(&mut self, list: &HostList, u: &UsedResource, compute: bool) {
+        let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
         };
         let handle = table + u64::from(u.table_offset_dwords) * 4;
@@ -3123,14 +3234,55 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
-        if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u.kind, &view);
+        // Brought up to date by an earlier draw of the list, and nothing it
+        // went by has changed ([`entry_ready`]).
+        let once = entry_ready() && u.kind != ResourceType::Uav;
+        let at = ((handle >> 4).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as usize;
+        let before = TESTED_DEPTH.get();
+        let record = |handle: u64| crate::descriptor::record_at(handle).map_or(0, |w| u64::from(w[2]) << 32 | u64::from(w[1]));
+        let now = |list: &HostList| (stamp(list), crate::descriptor::views_freed(), crate::frame::current());
+        if once
+            && let Some(Some(known)) = self.entries_ready.get(at)
+            && known.handle == handle
+            && known.key == record(handle)
+            && known.key == host.quick_key(index)
+            && known.now == now(list)
+            && known.reader == (u.kind, STORES.get(), before.0)
+        {
+            if known.depth {
+                TESTED_DEPTH.set((before.0, true));
+            }
+            return;
+        }
+        TESTED_DEPTH.set((before.0, false));
+        let view = host.mirror(index, handle, true);
+        if let Some(view) = &view {
+            readable(list, u.kind, view);
             // Up to date by this draw: not the texture pass's to make.
-            if crate::descriptor::host::is_texture_view(&view) {
+            if crate::descriptor::host::is_texture_view(view) {
                 host.texture_slot_tabled(index, true);
             } else {
                 host.slot_tabled(index);
             }
+        }
+        let depth = TESTED_DEPTH.get().1;
+        TESTED_DEPTH.set((before.0, before.1 || depth));
+        if once {
+            // (Only a slot made from the record as it is now, and the list's
+            // number as it is now: what this changed itself it need not do
+            // again.)
+            let key = host.quick_key(index);
+            let ready = (view.is_some() && key != 0 && key == record(handle)).then(|| EntryReady {
+                handle,
+                key,
+                now: now(list),
+                reader: (u.kind, STORES.get(), before.0),
+                depth,
+            });
+            if self.entries_ready.is_empty() {
+                self.entries_ready.resize(256, None);
+            }
+            self.entries_ready[at] = ready;
         }
     }
 
@@ -3253,7 +3405,7 @@ impl State {
                 // list changed since: nothing to do again.
                 let once = ready_once() && selected.is_empty() && entries().all(|u| u.kind != ResourceType::Uav);
                 if once
-                    && known.epoch == list.epoch()
+                    && known.epoch == stamp(list)
                     && let Some((_, depth)) = known.ready.iter().find(|(r, _)| *r == reader)
                 {
                     if *depth {
@@ -3286,7 +3438,7 @@ impl State {
                 if once && let Some(known) = self.fresh_tables.get_mut(&key) {
                     // (The epoch as it is now: what this changed itself it
                     // need not do again.)
-                    let epoch = list.epoch();
+                    let epoch = stamp(list);
                     if known.epoch != epoch {
                         known.epoch = epoch;
                         known.ready.clear();
@@ -3298,15 +3450,13 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            let Some(first) = host.dynamic(n) else {
+            let Some(first) = self.take_dynamic(std::ptr::from_ref(heap) as usize, host, n) else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
                 made.push((slot, u32::MAX));
                 continue;
             };
             self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
@@ -3341,7 +3491,7 @@ impl State {
                     let was = (listed.ready, listed.tabled);
                     if let Some(kind) = kind {
                         let tested = TESTED_DEPTH.get();
-                        if kind == ResourceType::Srv && listed.ready.0 == list.epoch() && listed.ready.1 == tested.0 {
+                        if kind == ResourceType::Srv && listed.ready.0 == stamp(list) && listed.ready.1 == tested.0 {
                             if listed.ready.2 {
                                 TESTED_DEPTH.set((tested.0, true));
                             }
@@ -3351,7 +3501,7 @@ impl State {
                             let depth = TESTED_DEPTH.get().1;
                             TESTED_DEPTH.set((tested.0, tested.1 || depth));
                             if kind == ResourceType::Srv {
-                                listed.ready = (list.epoch(), tested.0, depth);
+                                listed.ready = (stamp(list), tested.0, depth);
                             }
                         }
                     }
@@ -3714,6 +3864,12 @@ impl State {
             return false;
         }
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+            return false;
+        }
+        // `VICTORY_RT_RESOLVE=0`, as in `dispatch`.
+        if crate::pipeline::shades_hits_left_out(self.pipeline as This) {
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why("shades ray-tracing hits, left out (VICTORY_RT_RESOLVE=0)".to_owned());
             return false;
         }
         const DRAW: u32 = 0;
@@ -4082,6 +4238,35 @@ impl<T, const N: usize> std::ops::DerefMut for Few<T, N> {
     fn deref_mut(&mut self) -> &mut [T] {
         if self.many.is_empty() { &mut self.few[..self.len] } else { &mut self.many }
     }
+}
+
+/// Whether an entry of one of the title's own tables that a list reads
+/// again, with nothing changed since, is left as it is
+/// (`VICTORY_ENTRY_READY=0`: looked up, checked and brought up to date at
+/// every draw, as before). As [`ready_once`] for the tables made afresh:
+/// the tables without a constant buffer (samplers, textures alone) are read
+/// in place, entry by entry, by every draw that has them bound.
+fn entry_ready() -> bool {
+    crate::toggled!("VICTORY_ENTRY_READY")
+}
+
+/// An entry of a table of the title's own that a draw of the list read and
+/// brought up to date ([`State::table_entry`]).
+#[derive(Clone, Copy)]
+struct EntryReady {
+    /// Where the entry's record is, and the record: the title's slot there
+    /// was made from it and is still (`HostHeap::quick_key`).
+    handle: u64,
+    key: u64,
+    /// The list's number ([`stamp`]), the number of views gone stale
+    /// (`crate::descriptor::views_freed`) and the frame (a slot is noted as
+    /// a table's once a frame) it was done at.
+    now: (u64, u64, u64),
+    /// As what it was read, by a shader that stores to buffers or not, with
+    /// which depth target tested.
+    reader: (ResourceType, bool, usize),
+    /// Whether it is a view of that depth target.
+    depth: bool,
 }
 
 /// A table made afresh in dynamic slots, in a list ([`State::tables`]).

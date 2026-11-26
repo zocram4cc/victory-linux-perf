@@ -159,6 +159,7 @@ fork's constant.
 | `VICTORY_AMBIENT=constant:<level>` | the same light everywhere |
 | `VICTORY_AMBIENT_SHADE=<strength>,<metres>` | the creases (1,0.6) |
 | `VICTORY_AMBIENT_AIR=<multiple>` | what the air scatters is bounded by a multiple of the light around (off: the brown veil in the day room stays with it, light-14) |
+| `VICTORY_AMBIENT_REFLECT=<part>` | the reflections image (`CS_UpdateHistory`) is held to that part of the light around (0.5; `0`: the title's own). beloooo's 44dcd437; not yet seen running on this tree |
 
 It is off while the builder runs.
 

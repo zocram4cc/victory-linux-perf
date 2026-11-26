@@ -24,6 +24,8 @@
 #[cfg(windows)]
 mod console_insn;
 mod crash;
+#[cfg(windows)]
+mod hooks;
 pub mod prepare;
 pub(crate) mod publish;
 pub mod resolve;

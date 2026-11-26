@@ -147,7 +147,11 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
-                let done = translate(&self.container);
+                // On a large stack: the first use is often on a thread the
+                // title made (1 MiB), and a shader that is not in the cache
+                // is translated here, deep in recursion
+                // (`make::on_a_large_stack`).
+                let done = make::on_a_large_stack(|| translate(&self.container));
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
                 if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
@@ -310,6 +314,22 @@ pub(crate) fn is_builder(this: This) -> bool {
     !this.is_null() && pipeline(this).builder
 }
 
+/// Whether a dispatch of the title's pipeline `this` is left out: it only
+/// shades what the console's ray-tracing structures were hit by
+/// (`CS_RaytracingResolve`), the structure builder is not asked for, and
+/// `VICTORY_RT_RESOLVE` is `0` (DexNom's switch, [`make::without_structures`],
+/// which then does not make the pipeline either). Unset, they run as before.
+/// Named in `VICTORY_AB` and itself unset, the pipelines are made and their
+/// dispatches come and go while the title runs.
+#[cfg(windows)]
+pub(crate) fn shades_hits_left_out(this: This) -> bool {
+    static BUILDER: OnceLock<bool> = OnceLock::new();
+    !this.is_null()
+        && pipeline(this).shades_hits
+        && !crate::toggled!("VICTORY_RT_RESOLVE")
+        && !*BUILDER.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"))
+}
+
 /// A stage of the builder was dropped after all: none runs for the rest of
 /// this frame and the next (what it fed is not there).
 #[cfg(windows)]
@@ -418,6 +438,9 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// It only shades what rays hit ([`shades_hits_left_out`]).
+    #[cfg(windows)]
+    shades_hits: bool,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -585,6 +608,8 @@ fn hand_out(
         host,
         #[cfg(windows)]
         builder,
+        #[cfg(windows)]
+        shades_hits: make::named(&shaders, make::SHADES_HITS),
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });

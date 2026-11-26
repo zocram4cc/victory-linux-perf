@@ -1103,6 +1103,33 @@ thread_local! {
     pub(super) static TEST_F16_NEAREST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// `VICTORY_NAN_GUARD`'s value ([`Lower::nan_guard`]): 0 off (`0`), 2 typed stores as well
+/// (`stores`), 1 colour exports only (unset, or anything else). Pure, for testing.
+fn parse_nan_guard(value: Option<&str>) -> u8 {
+    match value {
+        Some("0") => 0,
+        Some("stores") => 2,
+        _ => 1,
+    }
+}
+
+/// What [`Lower::nan_guard`] guards. Part of the translation: the shader cache keys on it
+/// (`victory-gpu`'s `shader_cache` lists the switch).
+fn nan_guard_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = TEST_NAN_GUARD.get() {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| parse_nan_guard(std::env::var("VICTORY_NAN_GUARD").ok().as_deref()))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`nan_guard_mode`], for its thread only.
+    pub(super) static TEST_NAN_GUARD: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+}
+
 /// `VICTORY_WAVE_OWN_BITS=0`: a wave OR where not every lane runs is refused as before
 /// ([`super::own_bits`]).
 fn own_bits_on() -> bool {
@@ -3934,6 +3961,46 @@ impl<'a> Lower<'a> {
         let hi = self.s.m.bin(c, Bin::LShr, m, k32);
         self.s.flags |= flags::INT64;
         self.s.m.cast(c, Cast::Trunc, hi, self.s.t.i32)
+    }
+
+    /// `VICTORY_NAN_GUARD` (on unless `0`): a float a pixel program exports to a colour
+    /// target (and, with `stores`, a store writes to a typed image or buffer), with NaN made 0 and an infinity
+    /// ±65504, so one bad pixel does not stay in a history the title blends into each frame.
+    /// `strict` (float targets): every NaN. Otherwise (typed stores, only with
+    /// `VICTORY_NAN_GUARD=stores`) only the NaNs the GPU makes (0x7FC00000, either sign) and
+    /// infinities. Typed stores go out as `.f32` whatever the view's format, so on that path
+    /// the integer words 0x7F800000, 0xFF800000, 0x7FC00000 and 0xFFC00000 change too
+    /// (0xFF800000 is an opaque blue as packed RGBA8): it stays opt-in until the view's
+    /// format is known here.
+    /// Ported from fxceless/victory-fork PR 837 by PastiiJay (from KLBF Lab,
+    /// PastiiJay/klbf-lab 0e5f4b2); the mode is read in [`nan_guard_mode`] here.
+    // shortcut: raw buffer stores are left as they are (no type to go by).
+    fn nan_guard(&mut self, f: V, strict: bool) -> V {
+        // 0: off; unset: colour exports only; `stores`: typed stores as well.
+        let mode = nan_guard_mode();
+        if mode == 0 || (!strict && mode < 2) {
+            return f;
+        }
+        let c = self.cur;
+        let bits = self.as_int(f);
+        let mag = self.s.m.i32(0x7FFF_FFFF);
+        let abs = self.s.m.bin(c, Bin::And, bits, mag);
+        let inf_bits = self.s.m.i32(0x7F80_0000);
+        let nan = if strict {
+            self.s.m.cmp(c, pred::IUGT, abs, inf_bits)
+        } else {
+            let quiet = self.s.m.i32(0x7FC0_0000);
+            self.s.m.cmp(c, pred::EQ, abs, quiet)
+        };
+        let inf = self.s.m.cmp(c, pred::EQ, abs, inf_bits);
+        let sign_bit = self.s.m.i32(0x8000_0000);
+        let sign = self.s.m.bin(c, Bin::And, bits, sign_bit);
+        let big = self.s.m.i32(65504f32.to_bits());
+        let big = self.s.m.bin(c, Bin::Or, sign, big);
+        let zero = self.s.m.i32(0);
+        let r = self.s.m.select(c, inf, big, bits);
+        let r = self.s.m.select(c, nan, zero, r);
+        self.as_float(r)
     }
 
     /// `0 × anything = 0`, as in D3D9.
@@ -10932,6 +10999,7 @@ impl<'a> Lower<'a> {
                     self.float_of(v)?
                 });
             }
+            let vals: Vec<V> = vals.into_iter().map(|v| self.nan_guard(v, false)).collect();
             let h = self.handle(site, src, false, props)?;
             let at = self.begin_guarded(guard);
             let mut args = vec![h];
@@ -11903,7 +11971,8 @@ impl<'a> Lower<'a> {
                 args.push(self.handle(site, src, false, (10 | u, 0x409))?);
                 args.extend([index.unwrap_or(self.s.m.i32(0)), iu]);
                 for x in vals {
-                    args.push(self.as_float(x));
+                    let f = self.as_float(x);
+                    args.push(self.nan_guard(f, false));
                 }
                 (69, "bufferStore.f32")
             } else {
@@ -12262,9 +12331,12 @@ impl<'a> Lower<'a> {
                     .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
                 x = self.as_int(f);
             }
+            let pixel = self.s.pixel;
             let el = &mut elements(self, primitive)[id];
             el.usage |= 1 << col;
-            let (suffix, x) = match el.comp {
+            let (kind, comp) = (el.kind, el.comp);
+            let target = !mesh && pixel && kind == 16 && comp == 9;
+            let (suffix, x) = match comp {
                 9 if half.is_some() => (".f32", self.as_float(x)),
                 9 => {
                     let f = match self.floats.get(&value) {
@@ -12275,6 +12347,7 @@ impl<'a> Lower<'a> {
                 }
                 _ => (".i32", x),
             };
+            let x = if target { self.nan_guard(x, true) } else { x };
             let mut args = vec![
                 self.s.m.i32(id as u32),
                 self.s.m.i32(0),
@@ -12717,6 +12790,15 @@ mod tests {
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    #[test]
+    fn nan_guard_is_on_unless_zero_and_guards_stores_when_asked() {
+        assert_eq!(super::parse_nan_guard(None), 1);
+        assert_eq!(super::parse_nan_guard(Some("1")), 1);
+        assert_eq!(super::parse_nan_guard(Some("")), 1);
+        assert_eq!(super::parse_nan_guard(Some("0")), 0);
+        assert_eq!(super::parse_nan_guard(Some("stores")), 2);
+    }
 
     #[test]
     fn packed_pixel_inputs_find_their_second_row() {

@@ -77,14 +77,126 @@ impl Pending {
 
     fn make(&self) {
         self.made.get_or_init(|| {
+            if listed_out(&self.shaders) {
+                tracing::info!(shaders = ?self.shaders, "listed in VICTORY_LEAVE_OUT: no host pipeline made");
+                return None;
+            }
+            if without_structures(&self.shaders) {
+                tracing::debug!(shaders = ?self.shaders, "shades ray-tracing hits, left out (VICTORY_RT_RESOLVE=0)");
+                return None;
+            }
             let began = Instant::now();
-            let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+            let made = on_a_large_stack(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
             made
         });
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
+    }
+}
+
+/// Whether a shader is one the user names in
+/// `VICTORY_LEAVE_OUT=<hash>,...` (the 16 digits the log names it by): for
+/// programs the host cannot compile at all, whose pipeline is then not
+/// made and whose draws and dispatches are left out. Under vkd3d-proton
+/// 3.2.0 three compute programs of the title recursed without end while
+/// their DXIL was made SPIR-V, on the stack of the thread that asked: that
+/// thread was lost, with a run's pipeline "being made" for good.
+pub(super) fn listed_out(shaders: &[Arc<Shader>]) -> bool {
+    static OUT: OnceLock<Vec<String>> = OnceLock::new();
+    let out = OUT.get_or_init(|| {
+        std::env::var("VICTORY_LEAVE_OUT")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect()
+    });
+    !out.is_empty() && shaders.iter().any(|s| out.iter().any(|h| *h == s.hash))
+}
+
+/// Whether some compute shader of `shaders` holds `name`.
+pub(super) fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
+    shaders
+        .iter()
+        .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
+}
+
+/// The start of the name of the programs [`without_structures`] is about.
+pub(super) const SHADES_HITS: &[u8] = b"CS_RaytracingResolve";
+
+/// Whether a shader only shades what the console's ray-tracing structures
+/// were hit by: about 1,000 compute programs of the title
+/// (`CS_RaytracingResolve`, the `raytracingresolve_dispatch` pass of each
+/// material), all bound at the world's first frame, each 5 to 9 s of AMD's
+/// compiler. They stood in the queue before the passes that make the
+/// picture, and with the structure builder off there is no hit to shade.
+/// Made by default, the picture before loading time (with the builder on
+/// they shade what reflections and indirect light hit);
+/// `VICTORY_RT_RESOLVE=0` leaves them out while the builder is off.
+/// Ported from DexNom's fork of VIctory (its `pipeline/make.rs`,
+/// `without_structures`). Their dispatches are left out as well, and by
+/// `VICTORY_AB` in a running title ([`super::shades_hits_left_out`]).
+pub(super) fn without_structures(shaders: &[Arc<Shader>]) -> bool {
+    static OUT: OnceLock<bool> = OnceLock::new();
+    let out = *OUT.get_or_init(|| {
+        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
+        std::env::var_os("VICTORY_RT_RESOLVE").is_some_and(|v| v == "0") && !builder
+    });
+    out && named(shaders, SHADES_HITS)
+}
+
+thread_local! {
+    /// Whether this thread has a stack made for pipelines (a worker's).
+    static LARGE_STACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether what goes deep is run on a stack made for it
+/// ([`on_a_large_stack`]): `VICTORY_LARGE_STACK`, `1` or `0`; unset, under
+/// Wine only (where it was needed, and tested).
+fn large_stacks() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_LARGE_STACK").ok().as_deref() {
+        Some("1") => true,
+        Some("0") => false,
+        _ => crate::host::on_wine(),
+    })
+}
+
+/// Runs `make` (a host pipeline's making, a shader's translation) on a
+/// stack large enough for it: here if this is a worker (or
+/// [`large_stacks`] says no), else on a thread of its own, waited for.
+///
+/// The host converts a pipeline's code on the thread that asks, deep into
+/// its control flow (`victory_shader::emit::PIPELINE_STACK`), and the
+/// translator goes as deep. A thread of the title's that makes a pipeline
+/// itself ([`now`], or a first use that finds no worker) has the stack the
+/// title gave it, 1 MiB by default: under Wine the overflow does not end
+/// the process, the thread stands still, and a world's loading stood so at
+/// 59 s; or a guard fault taken on a nearly full stack faults again inside
+/// the fault handler and the process dies with SIGSEGV, with no exception
+/// for anyone to log. (A larger default for every thread is no way: at
+/// 64 MiB the title stops at its start.)
+pub(crate) fn on_a_large_stack<T: Send>(make: impl FnOnce() -> T + Send) -> T {
+    if LARGE_STACK.with(|l| l.get()) || !large_stacks() {
+        return make();
+    }
+    let mut make = Some(make);
+    let made = std::thread::scope(|s| {
+        let spawned = std::thread::Builder::new()
+            .name("victory-pipeline-now".into())
+            .stack_size(victory_shader::emit::PIPELINE_STACK)
+            .spawn_scoped(s, || {
+                LARGE_STACK.with(|l| l.set(true));
+                (make.take().expect("taken once"))()
+            });
+        spawned.ok().and_then(|thread| thread.join().ok())
+    });
+    match made {
+        Some(made) => made,
+        // No thread to be had: here after all.
+        None => (make.take().expect("not run on a thread"))(),
     }
 }
 
@@ -423,7 +535,11 @@ fn workers() -> bool {
             let screens_only = i >= workers;
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
+                // Pipeline creation converts DXIL on this thread (under
+                // vkd3d-proton, on its stack).
+                .stack_size(victory_shader::emit::PIPELINE_STACK)
                 .spawn(move || {
+                    LARGE_STACK.with(|l| l.set(true));
                     // Below the title's own threads (loading, recording),
                     // and the streaming one, which is below normal itself
                     // (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before).

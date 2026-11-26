@@ -31,6 +31,20 @@ impl Slots {
         }
     }
 
+    #[cfg(test)]
+    fn has(&self, slot: u32) -> bool {
+        self.0
+            .get(slot as usize / 64)
+            .is_some_and(|bits| bits.load(std::sync::atomic::Ordering::Acquire) & 1 << (slot % 64) != 0)
+    }
+
+    /// [`Slots::has`], or the set has no bit for `slot` (and cannot say).
+    fn may_have(&self, slot: u32) -> bool {
+        self.0
+            .get(slot as usize / 64)
+            .is_none_or(|bits| bits.load(std::sync::atomic::Ordering::Acquire) & 1 << (slot % 64) != 0)
+    }
+
     /// Whether it was there.
     fn remove(&self, slot: u32) -> bool {
         use std::sync::atomic::Ordering::{AcqRel, Acquire};
@@ -192,6 +206,10 @@ pub(crate) struct HostHeap {
     /// table; one a shader picks by a computed index is brought up to date
     /// from here ([`HostHeap::texture_slots_due`]).
     textures: Mutex<TextureQueue>,
+    /// The slots `textures` holds, a bit each, changed under its lock
+    /// ([`TextureQueue::queued`]): a slot that is not there need not be taken
+    /// out ([`queue_quick`]).
+    queued: std::sync::Arc<Slots>,
     /// Per title slot, the frame (plus one; 0: never) in which a draw last
     /// read it through a table, or made a table it lies in (with
     /// [`TABLED_READ`] set if the draw read it). The draw that
@@ -210,6 +228,9 @@ pub(crate) struct HostHeap {
     /// other memory there makes stale, and which to look at again when the
     /// runtime maps, unmaps or writes memory ([`remapped`]).
     placed: std::sync::Arc<Mutex<Spans>>,
+    /// The slots `placed` knows something of, a bit each, changed under its
+    /// lock ([`Spans::known`]; [`queue_quick`]).
+    spanned: std::sync::Arc<Slots>,
 }
 
 /// The spans of every view heap made ([`HostHeap::placed`]), for the
@@ -519,6 +540,10 @@ pub(crate) struct Spans {
     /// out once for each (a title writes the views of a few thousand
     /// descriptions, thousands of times a frame).
     sizes: std::collections::HashMap<[u32; 14], Option<u64>>,
+    /// The slots `by_slot` or `first` know, a bit each, for those who would
+    /// take the lock only to forget a slot nothing is known of (none: nobody
+    /// asks).
+    known: Option<std::sync::Arc<Slots>>,
 }
 
 /// When a view the title writes makes an older view of other memory stale.
@@ -629,6 +654,9 @@ impl Spans {
         }
         self.by_start.entry(start).or_insert_with(|| (end, Default::default())).1.insert(index);
         self.by_slot.insert(index, start);
+        if let Some(known) = &self.known {
+            known.put(index);
+        }
         stale
     }
 
@@ -636,6 +664,9 @@ impl Spans {
     /// memory of that and the smaller levels ends at `end`.
     fn shows(&mut self, index: u32, first: u32, end: u64) {
         self.first.insert(index, (first, end));
+        if let Some(known) = &self.known {
+            known.put(index);
+        }
     }
 
     /// Whether slot `index`'s view is read from memory at or past `start`.
@@ -662,6 +693,9 @@ impl Spans {
     /// Slot `index` holds no placed texture view any more.
     fn forget(&mut self, index: u32) {
         self.first.remove(&index);
+        if let Some(known) = &self.known {
+            known.remove(index);
+        }
         let Some(start) = self.by_slot.remove(&index) else {
             return;
         };
@@ -862,6 +896,19 @@ const TABLED_READ: u32 = 1 << 31;
 pub(crate) static TABLED_WRITES: [std::sync::atomic::AtomicU64; 2] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// Whether the queue of textures picked by index is left alone, lock and
+/// all, by whoever would only take out of it a slot that is not in it
+/// (`VICTORY_QUEUE_QUICK=0`: its lock is taken to find that out, as before).
+///
+/// Every texture slot of a table a draw reads is taken out of the queue by
+/// that draw, and once more when the draw makes the title's slot in place:
+/// the slots of the tables a title writes for each draw are hardly ever in
+/// it, and all recording threads met at the queue's lock twice a slot, with
+/// the passes that go through all of it under that lock.
+fn queue_quick() -> bool {
+    crate::toggled!("VICTORY_QUEUE_QUICK")
+}
+
 /// Whether slots draws read through tables leave the queue of textures
 /// picked by index; `VICTORY_TABLED_TEXTURES=1` keeps them in it as
 /// before.
@@ -904,9 +951,28 @@ pub(crate) struct TextureQueue {
     /// they need ([`TextureQueue::hold`]), each with the write it was
     /// held as.
     held: std::collections::BTreeMap<u32, u64>,
+    /// The slots of `slots`, a bit each, for those who would take the queue's
+    /// lock only to take out a slot that is not in it (none: nobody asks).
+    queued: Option<std::sync::Arc<Slots>>,
 }
 
 impl TextureQueue {
+    /// Slot `index` is in `slots` from here on.
+    fn mark(&self, index: u32) {
+        if let Some(queued) = &self.queued {
+            queued.put(index);
+        }
+    }
+
+    /// Takes slot `index` out; whether it was there.
+    fn take(&mut self, index: u32) -> bool {
+        let was = self.slots.remove(&index).is_some();
+        if was && let Some(queued) = &self.queued {
+            queued.remove(index);
+        }
+        was
+    }
+
     /// A texture view was written into slot `index` in `frame`, due from
     /// frame `due`. `seen`: it was not written, a draw or the pass made
     /// the host slot from a view the queue may hold already, which then
@@ -918,10 +984,11 @@ impl TextureQueue {
         self.writes += 1;
         let write = self.writes;
         self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
+        self.mark(index);
     }
 
     fn remove(&mut self, index: u32) {
-        self.slots.remove(&index);
+        self.take(index);
     }
 
     /// Up to `max` slots due at `frame`, each with its write number, in
@@ -967,7 +1034,7 @@ impl TextureQueue {
     /// Slot `index` is up to date: out of the queue until written again.
     fn done(&mut self, index: u32, write: u64) {
         if self.same(index, write).is_some() {
-            self.slots.remove(&index);
+            self.take(index);
         }
     }
 
@@ -1046,6 +1113,7 @@ impl TextureQueue {
         let write = self.writes;
         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
         self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
+        self.mark(index);
     }
 
     /// Bytes of slot `index`'s memory that were mapped at its last upload
@@ -1523,6 +1591,8 @@ impl HostHeap {
                 Some((buffer, gpu, data as usize))
             })
             .flatten();
+        let queued = std::sync::Arc::new(Slots::new(if sampler { 0 } else { count as usize }));
+        let spanned = std::sync::Arc::new(Slots::new(if sampler { 0 } else { count as usize }));
         let h = HostHeap {
             heap,
             cpu,
@@ -1548,12 +1618,13 @@ impl HostHeap {
             strides,
             buffers: Slots::new(count as usize),
             changed: Slots::new(count as usize),
-            textures: Mutex::default(),
+            textures: Mutex::new(TextureQueue { queued: Some(queued.clone()), ..Default::default() }),
+            queued,
             tabled: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
             placed: {
-                let spans = std::sync::Arc::<Mutex<Spans>>::default();
+                let spans = std::sync::Arc::new(Mutex::new(Spans { known: Some(spanned.clone()), ..Default::default() }));
                 if !sampler {
                     PLACED_SPANS
                         .lock()
@@ -1562,6 +1633,7 @@ impl HostHeap {
                 }
                 spans
             },
+            spanned,
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -1703,6 +1775,18 @@ impl HostHeap {
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
         *next = ((first + n) % end) as u32;
         Some(self.count + first as u32)
+    }
+
+    /// [`HostHeap::dynamic`] for a run a list cuts its tables from
+    /// (`crate::draw` `dynamic_chunk`): only while half of the dynamic slots
+    /// are free, and such a run may still be there. With fewer, what a list
+    /// would leave over of its last run is what another list's table needs.
+    pub(crate) fn dynamic_chunk(&self, chunk: u32) -> Option<u32> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.free.load(Relaxed) < self.dynamic / 2 || chunk >= self.too_long.load(Relaxed) {
+            return None;
+        }
+        self.dynamic(chunk)
     }
 
     /// The title slots this heap has host slots for; fewer than the title's
@@ -2351,9 +2435,9 @@ impl HostHeap {
         // Once per slot and frame: tables are read by every draw.
         if old != now | TABLED_READ {
             stamp.store(now | TABLED_READ, Relaxed);
-            if tabled_out() {
+            if tabled_out() && (self.queued.may_have(index) || !queue_quick()) {
                 let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-                if textures.slots.remove(&index).is_some() {
+                if textures.take(index) {
                     TABLED_WRITES[1].fetch_add(1, Relaxed);
                 }
             }
@@ -2388,6 +2472,10 @@ impl HostHeap {
         // Made now by a draw of this frame that read it through a table:
         // up to date.
         let read_now = seen && stamp == now | TABLED_READ;
+        // Only to be taken out, and not there ([`queue_quick`]).
+        if !(texture && !read_now) && !self.queued.may_have(index) && queue_quick() {
+            return;
+        }
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         if texture && !read_now {
             let due = if lately && !seen {
@@ -2472,7 +2560,11 @@ impl HostHeap {
             }
             _ => None,
         };
-        let stale = {
+        // No placed texture view of its own to note, and nothing known of
+        // the slot to forget: the spans are left alone ([`queue_quick`]).
+        let stale = if placed_view.is_none() && !self.spanned.may_have(index) && queue_quick() {
+            Vec::new()
+        } else {
             use std::sync::atomic::Ordering::Relaxed;
             let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
             let span = placed_view.and_then(|(resource, start, first, held)| {
@@ -2671,7 +2763,7 @@ impl HostHeap {
         // A running submission may still read the old resource through
         // this slot.
         if let Some(old) = old {
-            crate::host::retire_resource(old);
+            retire_kept(old);
         }
     }
 
@@ -3084,6 +3176,13 @@ impl HostHeap {
 
     /// Slot `index` is made from record `key` and stays so (0: not). Under
     /// the lock of `made`.
+    /// The record (its words as one number) title slot `index` is made from
+    /// and stays made from until it is made again; 0: none, or not known
+    /// without the slot's lock.
+    pub(crate) fn quick_key(&self, index: u32) -> u64 {
+        self.quick.get(index as usize).map_or(0, |quick| quick.load(std::sync::atomic::Ordering::Acquire))
+    }
+
     fn quick_is(&self, index: u32, key: u64) {
         if let Some(quick) = self.quick.get(index as usize) {
             quick.store(key, std::sync::atomic::Ordering::Release);
@@ -3224,6 +3323,88 @@ fn staged(sampler: bool, which: u32) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
     Some(D3D12_CPU_DESCRIPTOR_HANDLE {
         ptr: stage.starts[kind] + (2 * place + which) as usize * stage.steps[kind],
     })
+}
+
+/// Whether the host resources slots let go of while a list is recorded are
+/// handed over for their burial some at a time (`VICTORY_RETIRE_BATCH=0`:
+/// one by one, as before: each under the one lock of all that is buried,
+/// some 70,000 times a frame from all recording threads).
+fn retire_batch() -> bool {
+    crate::toggled!("VICTORY_RETIRE_BATCH")
+}
+
+/// What this thread's slots let go of inside a [`retire_scope`], not handed
+/// over yet, and how deep in such scopes the thread is.
+struct Retiring {
+    depth: std::cell::Cell<u32>,
+    held: std::cell::RefCell<Vec<ID3D12Resource>>,
+}
+
+impl Retiring {
+    /// The most held back: more are handed over inside the scope.
+    const MOST: usize = 256;
+
+    fn hand_over(&self) {
+        let held = std::mem::take(&mut *self.held.borrow_mut());
+        if !held.is_empty() {
+            crate::host::retire_resources(held);
+        }
+    }
+}
+
+impl Drop for Retiring {
+    fn drop(&mut self) {
+        self.hand_over();
+    }
+}
+
+thread_local! {
+    static RETIRING: Retiring = const { Retiring { depth: std::cell::Cell::new(0), held: std::cell::RefCell::new(Vec::new()) } };
+}
+
+/// While it lives, what this thread's slots let go of is handed over for
+/// burial together, at the latest when the outermost one ends: no later than
+/// one by one would number it, and under the lock once ([`retire_batch`]).
+pub(crate) struct RetireScope(());
+
+/// See [`RetireScope`].
+pub(crate) fn retire_scope() -> RetireScope {
+    let _ = RETIRING.try_with(|r| r.depth.set(r.depth.get() + 1));
+    RetireScope(())
+}
+
+impl Drop for RetireScope {
+    fn drop(&mut self) {
+        let _ = RETIRING.try_with(|r| {
+            let depth = r.depth.get().saturating_sub(1);
+            r.depth.set(depth);
+            if depth == 0 && !r.held.borrow().is_empty() {
+                r.hand_over();
+            }
+        });
+    }
+}
+
+/// A slot let go of `old`, which a running submission may still read
+/// through it.
+fn retire_kept(old: ID3D12Resource) {
+    let mut old = Some(old);
+    if retire_batch() {
+        let _ = RETIRING.try_with(|r| {
+            if r.depth.get() == 0 {
+                return;
+            }
+            let mut held = r.held.borrow_mut();
+            held.extend(old.take());
+            if held.len() >= Retiring::MOST {
+                drop(held);
+                r.hand_over();
+            }
+        });
+    }
+    if let Some(old) = old {
+        crate::host::retire_resource(old);
+    }
 }
 
 /// Logs `what` the first time it happens.
@@ -5028,6 +5209,44 @@ mod tests {
             // SAFETY: a live buffer.
             assert_eq!(width(&v), unsafe { copy.buffer.GetDesc() }.Width);
         }
+    }
+
+    /// The bits that say which slots the queue of textures and the spans of
+    /// placed textures know follow them: whoever would only take a slot out
+    /// goes by the bit, without their locks ([`queue_quick`]).
+    #[test]
+    fn the_bits_of_the_queue_and_the_spans_follow_them() {
+        let bits = std::sync::Arc::new(Slots::new(256));
+        let mut q = TextureQueue { queued: Some(bits.clone()), ..Default::default() };
+        q.written(7, 1, 0, false);
+        q.changed(9, 1, 2);
+        assert!(bits.has(7) && bits.has(9) && !bits.has(8));
+        let write = q.due(u64::MAX, 8).iter().find(|d| d.0 == 7).unwrap().1;
+        // Not the write the queue holds: it stays, and so does its bit.
+        q.done(7, write + 100);
+        assert!(bits.has(7));
+        q.done(7, write);
+        q.remove(9);
+        assert!(!q.take(9) && !bits.has(7) && !bits.has(9));
+        q.written(7, 2, 0, true);
+        assert!(bits.has(7) && q.take(7) && !bits.has(7));
+
+        let bits = std::sync::Arc::new(Slots::new(256));
+        let mut spans = Spans { known: Some(bits.clone()), ..Default::default() };
+        let at = 0x7fee_0000_0000u64;
+        assert!(spans.note(1, at, at + 0x1000, true).is_empty());
+        spans.shows(1, 0, at + 0x1000);
+        spans.shows(2, 3, at + 0x9000);
+        assert!(bits.has(1) && bits.has(2) && !bits.has(3));
+        // Made stale by a newer view of other memory there: no span any
+        // more, but what its view showed is still known.
+        assert_eq!(spans.note(3, at, at + 0x8000, true), [1]);
+        assert!(bits.has(1) && bits.has(3));
+        for slot in [1, 2, 3] {
+            spans.forget(slot);
+            assert!(!bits.has(slot) && !spans.first.contains_key(&slot) && !spans.by_slot.contains_key(&slot));
+        }
+        assert!(spans.by_start.is_empty());
     }
 
     /// The queue of textures picked by index serves the slots looked at

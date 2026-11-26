@@ -243,7 +243,15 @@ impl Recording {
                 (chunk, inner.back as This)
             };
             let began = std::time::Instant::now();
-            let (calls, closed) = translate(back, &chunk, || self.abandoned.load(Acquire));
+            #[cfg(feature = "diagnostics")]
+            let batched = super::batch_begin();
+            let (calls, closed) = {
+                // What slots let go of meanwhile is buried together.
+                let _retiring = crate::descriptor::host::retire_scope();
+                translate(back, &chunk, || self.abandoned.load(Acquire))
+            };
+            #[cfg(feature = "diagnostics")]
+            super::batch_end(batched, began);
             STATS[0].fetch_add(calls, Relaxed);
             STATS[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
             let mut inner = held(&self.inner);

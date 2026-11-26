@@ -151,13 +151,53 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 #[cfg(windows)]
 fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
     let Some(list) = host_list(this) else { return };
+    // (Counted only, while a thread of ours makes a stream's calls:
+    // `batch_begin`.)
     #[cfg(feature = "diagnostics")]
-    let started = std::time::Instant::now();
+    let started = match BATCH.get() {
+        Some(calls) => {
+            BATCH.set(Some(calls + 1));
+            None
+        }
+        None => Some(std::time::Instant::now()),
+    };
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
     #[cfg(feature = "diagnostics")]
-    crate::copystat::recorded(started);
+    if let Some(started) = started {
+        crate::copystat::recorded(started);
+    }
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+thread_local! {
+    /// While a thread of ours makes the calls of a stream ([`thin`]): how
+    /// many of them came by [`with_state`] so far.
+    static BATCH: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// A thread of ours begins the calls of a stream: they are counted, and
+/// their time is taken once for all of them ([`batch_end`]), not with two
+/// readings of the clock and the per-thread sums at each of some 57,000 a
+/// frame. Not while a timeline is written, which wants each call, nor with
+/// `VICTORY_RECORD_BATCH=0`. Whether it is so.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn batch_begin() -> bool {
+    let on = crate::toggled!("VICTORY_RECORD_BATCH") && !crate::timeline::on();
+    if on {
+        BATCH.set(Some(0));
+    }
+    on
+}
+
+/// The calls of a stream begun at `started` are made ([`batch_begin`] said
+/// `on`): the time between them is in their sum now, which it was not.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn batch_end(on: bool, started: std::time::Instant) {
+    if on && let Some(calls) = BATCH.replace(None) {
+        crate::copystat::recorded_many(started, calls);
+    }
 }
 
 /// The submission of `lists` has run: each gives its descriptor tables'

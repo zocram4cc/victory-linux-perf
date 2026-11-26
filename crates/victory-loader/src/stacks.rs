@@ -24,6 +24,7 @@ use crate::crash::{MAX_FRAMES, locate, unwind_into};
 /// Reads `VICTORY_STACKS` and, if set, starts a thread that prints every
 /// thread's stack at each listed time (seconds from now).
 pub fn dump_stacks_on_schedule() {
+    sample_on_schedule();
     let Ok(list) = std::env::var("VICTORY_STACKS") else {
         return;
     };
@@ -35,6 +36,189 @@ pub fn dump_stacks_on_schedule() {
             dump_stacks();
         }
     });
+}
+
+/// How many return addresses a sample keeps, and how many words of the stack
+/// above the stack pointer are looked through for them.
+const SAMPLE_DEPTH: usize = 10;
+const SAMPLE_WORDS: usize = 8192;
+
+/// `VICTORY_SAMPLE=<start s>,<seconds>,<interval ms>,<name>[|<name>...]`: a
+/// sampling profile of the threads whose names begin with one of the names
+/// (`*`: of every thread),
+/// printed when the time is over. [`dump_stacks`] unwinds every thread with
+/// `RtlVirtualUnwind`, which under Wine faulted inside ntdll on the first
+/// dump of a running title; this reads only the instruction pointer and the
+/// words of the stack that are return addresses into this executable (a call
+/// instruction ends right before them), so it calls nothing while a thread
+/// is suspended. Words a frame has not written yet may be return addresses
+/// of earlier calls: the chains are approximate, the instruction pointers
+/// exact. A line is `sample <count> <thread> <where> <- <rva> <rva> ...`,
+/// the rvas of this executable, innermost first.
+fn sample_on_schedule() {
+    let Ok(spec) = std::env::var("VICTORY_SAMPLE") else {
+        return;
+    };
+    let mut parts = spec.splitn(4, ',');
+    let mut number = || parts.next().and_then(|t| t.trim().parse::<f64>().ok()).filter(|t| t.is_finite() && *t >= 0.0);
+    let (Some(start), Some(length), Some(every)) = (number(), number(), number()) else {
+        return;
+    };
+    let Some(names) = parts.next() else {
+        return;
+    };
+    let names: Vec<String> = names.split('|').map(|n| n.trim().to_owned()).filter(|n| !n.is_empty()).collect();
+    let _ = std::thread::Builder::new().name("victory-sampler".into()).spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs_f64(start));
+        sample(
+            std::time::Duration::from_secs_f64(length),
+            std::time::Duration::from_secs_f64(every / 1000.0),
+            &names,
+        );
+    });
+}
+
+/// Whether a call instruction ends at `at` (inside this executable): a
+/// relative call, or an indirect one of two to seven bytes.
+///
+/// # Safety
+/// `at - 7 .. at` must be readable.
+unsafe fn after_a_call(at: usize) -> bool {
+    // SAFETY: the caller's.
+    let byte = |back: usize| unsafe { ((at - back) as *const u8).read() };
+    if byte(5) == 0xe8 {
+        return true;
+    }
+    [2usize, 3, 4, 6, 7].iter().any(|&back| byte(back) == 0xff && byte(back - 1) & 0x38 == 0x10)
+}
+
+fn sample(length: std::time::Duration, every: std::time::Duration, names: &[String]) {
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    // SAFETY: this executable's own headers: `e_lfanew` at 0x3c, and in the
+    // PE32+ optional header `SizeOfImage` 0x50 past the signature.
+    let (base, size) = unsafe {
+        let base = GetModuleHandleW(std::ptr::null()) as usize;
+        let nt = base + ((base + 0x3c) as *const u32).read() as usize;
+        (base, ((nt + 0x50) as *const u32).read() as usize)
+    };
+    // The threads asked for: name, handle, the high end of the stack.
+    let mut threads = Vec::new();
+    for id in other_threads() {
+        // SAFETY: opens a thread of our own process.
+        let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, 0, id) };
+        if thread.is_null() {
+            continue;
+        }
+        let name = name_of(thread);
+        let mut info = BasicInfo {
+            exit_status: 0,
+            teb: std::ptr::null(),
+            client_id: [0; 2],
+            affinity: 0,
+            priority: 0,
+            base_priority: 0,
+        };
+        // SAFETY: writes `info`, whose layout and size are the system's.
+        let status = unsafe {
+            NtQueryInformationThread(
+                thread,
+                ThreadBasicInformation,
+                (&raw mut info).cast(),
+                size_of::<BasicInfo>() as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        if status != 0 || info.teb.is_null() || !names.iter().any(|n| n == "*" || name.starts_with(n.as_str())) {
+            // SAFETY: we opened it.
+            unsafe { CloseHandle(thread) };
+            continue;
+        }
+        // SAFETY: the TEB of a thread of this process that lives as long as
+        // the process (the threads sampled are the layer's own workers).
+        let high = unsafe { info.teb.add(1).read() };
+        threads.push((name, thread, high));
+    }
+    eprintln!(
+        "VIctory: sampling {} threads every {:.1} ms for {:.0} s (executable at {base:#x}+{size:#x})",
+        threads.len(),
+        every.as_secs_f64() * 1000.0,
+        length.as_secs_f64()
+    );
+    let mut counts: std::collections::HashMap<(usize, u64, [u32; SAMPLE_DEPTH]), u32> = std::collections::HashMap::new();
+    let mut words = vec![0usize; SAMPLE_WORDS];
+    // SAFETY: zeroed is a valid CONTEXT.
+    let mut context = Aligned(unsafe { std::mem::zeroed() });
+    let (mut taken, mut missed) = (0u64, 0u64);
+    let end = std::time::Instant::now() + length;
+    while std::time::Instant::now() < end {
+        for (i, &(_, thread, high)) in threads.iter().enumerate() {
+            // SAFETY: a thread of this process that is not this one.
+            if unsafe { SuspendThread(thread) } == u32::MAX {
+                missed += 1;
+                continue;
+            }
+            context.0.ContextFlags = CONTEXT_FULL_AMD64;
+            // Nothing between the suspension and the resume allocates or
+            // takes a lock: the words go into a buffer made beforehand.
+            // SAFETY: the context is ours; the stack between the suspended
+            // thread's stack pointer and its high end is committed.
+            let (ok, n) = unsafe {
+                let ok = GetThreadContext(thread, &mut context.0) != 0;
+                let rsp = context.0.Rsp as usize;
+                // Not the thread's own stack end: work run on a stack of
+                // its own (a large one for pipelines) is outside it. The
+                // query takes no lock a suspended thread can hold.
+                let mut region: windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+                let asked = ok
+                    && rsp != 0
+                    && rsp % 8 == 0
+                    && windows_sys::Win32::System::Memory::VirtualQuery(rsp as *const c_void, &mut region, size_of_val(&region)) != 0
+                    && region.State == windows_sys::Win32::System::Memory::MEM_COMMIT
+                    && region.Protect & (windows_sys::Win32::System::Memory::PAGE_READWRITE | windows_sys::Win32::System::Memory::PAGE_READONLY) != 0
+                    && region.Protect & windows_sys::Win32::System::Memory::PAGE_GUARD == 0;
+                let _ = high;
+                let n = if asked {
+                    ((region.BaseAddress as usize + region.RegionSize).saturating_sub(rsp) / 8).min(SAMPLE_WORDS)
+                } else {
+                    0
+                };
+                std::ptr::copy_nonoverlapping(rsp as *const usize, words.as_mut_ptr(), n);
+                ResumeThread(thread);
+                (ok, n)
+            };
+            if !ok {
+                missed += 1;
+                continue;
+            }
+            let mut key = [0u32; SAMPLE_DEPTH];
+            let mut k = 0;
+            for &word in &words[..n] {
+                // SAFETY: inside this executable, past its headers.
+                if word >= base + 0x1000 && word < base + size && unsafe { after_a_call(word) } {
+                    key[k] = (word - base) as u32;
+                    k += 1;
+                    if k == SAMPLE_DEPTH {
+                        break;
+                    }
+                }
+            }
+            *counts.entry((i, context.0.Rip, key)).or_default() += 1;
+            taken += 1;
+        }
+        std::thread::sleep(every);
+    }
+    let mut lines: Vec<_> = counts.into_iter().collect();
+    lines.sort_by(|a, b| b.1.cmp(&a.1));
+    eprintln!("VIctory: {taken} samples taken, {missed} missed, {} different", lines.len());
+    for ((i, rip, key), n) in lines {
+        let chain: Vec<String> = key.iter().take_while(|&&rva| rva != 0).map(|rva| format!("{rva:#x}")).collect();
+        let name = if threads[i].0.is_empty() { "unnamed" } else { threads[i].0.as_str() };
+        eprintln!("  sample {n} {name}#{i} {} <- {}", locate(rip as usize), chain.join(" "));
+    }
+    for (_, thread, _) in threads {
+        // SAFETY: we opened it.
+        unsafe { CloseHandle(thread) };
+    }
 }
 
 /// The times in a `VICTORY_STACKS` list (seconds, comma-separated), in

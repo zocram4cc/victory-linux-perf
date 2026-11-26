@@ -732,6 +732,40 @@ pub(crate) fn send_copied(dst: usize, len: usize) {
     }
 }
 
+/// Whether a refresh that goes around ranges shaders are writing takes what
+/// its gaps hold together, behind the last gap (`VICTORY_GAPS_TOGETHER=0`:
+/// each gap's as it is found, as before).
+///
+/// The title's 174 MB heap is refreshed by 12.6 submissions a frame, around
+/// the ranges flights declared in it: 0.46 ms each time, 5.8 ms of the frame,
+/// on the one thread that has that copy, and a flush is not over before its
+/// longest copy is (run av5: "copied from 0xaf710000+0xae00000 ... 5.78
+/// ms/frame" of 13.5 ms of refreshes). A megabyte or more to take goes over
+/// several threads ([`Shadow::take_all`]), but that is counted gap by gap.
+/// Taken together it is counted once, and from half a megabyte on. (Not
+/// measured: how the heap's megabyte or two a refresh lie over its gaps.)
+///
+/// What is the same: the pages found, their notes, the bytes taken (the gaps
+/// lie apart, and each run is cut to its gap), the note of each gap's range,
+/// made when its bytes are in. What differs: the lock on the pages' notes is
+/// not held while the bytes are taken. It keeps out a landing's note
+/// ([`Shadow::landed`]) and the title's bytes going in under flights' writes
+/// (`merge_under_writes`), and both look only at pages that hold a declared
+/// range, which no gap holds whole and so none notes.
+fn gaps_together() -> bool {
+    crate::toggled!("VICTORY_GAPS_TOGETHER")
+}
+
+/// For [`gaps_together`]: the runs to take (from, to, known), the ranges to
+/// note as taken whole (from, to, the asking), and the ranges to check
+/// (`Shadow::refresh_check`).
+#[derive(Default)]
+struct Later {
+    runs: Vec<(usize, usize, bool)>,
+    ranged: Vec<(usize, usize, u64)>,
+    checks: Vec<(usize, usize)>,
+}
+
 /// The copies in the card's memory (diagnostics: `crate::host::upcheck`).
 pub(crate) fn carded_copies() -> Vec<Arc<Shadow>> {
     CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(std::sync::Weak::upgrade).collect()
@@ -1461,6 +1495,8 @@ type Job = Box<dyn FnOnce() + Send>;
 struct Workers {
     jobs: Mutex<std::collections::VecDeque<Job>>,
     more: std::sync::Condvar,
+    /// Where the second half of the threads waits ([`wide_more`]).
+    spare: std::sync::Condvar,
     /// How many jobs there are, for [`spin`].
     there: std::sync::atomic::AtomicUsize,
 }
@@ -1482,7 +1518,37 @@ fn spin(there: impl Fn() -> bool) {
     }
 }
 
-/// How many threads are kept for [`wide`].
+/// Whether as many threads again take [`wide`]'s jobs (`VICTORY_WIDE_MORE=1`;
+/// off by default): a flush has some eleven copies and the big heap's parts
+/// besides, for six threads and the caller (timeline tl.85: 35 ms of
+/// refreshes a frame took 13 ms).
+fn wide_more() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_WIDE_MORE") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_MORE").is_some_and(|v| v == "1"))
+}
+
+/// Whether what a refresh takes goes to several threads from 256 KiB on, in
+/// parts of 64 KiB (`VICTORY_TAKE_FINE=1`; off by default: from 1 MiB, in
+/// parts of 256 KiB).
+fn take_fine() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_TAKE_FINE") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TAKE_FINE").is_some_and(|v| v == "1"))
+}
+
+/// How many threads take [`wide`]'s jobs now.
+fn wide_active() -> usize {
+    if wide_more() { wide_threads() * 2 } else { wide_threads() }
+}
+
+/// How many threads are kept for [`wide`] at the least.
 fn wide_threads() -> usize {
     std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
 }
@@ -1493,10 +1559,13 @@ fn workers() -> &'static Workers {
     let workers = WORKERS.get_or_init(|| Workers {
         jobs: Mutex::new(std::collections::VecDeque::new()),
         more: std::sync::Condvar::new(),
+        spare: std::sync::Condvar::new(),
         there: std::sync::atomic::AtomicUsize::new(0),
     });
     STARTED.call_once(|| {
-        for i in 0..wide_threads() {
+        let base = wide_threads();
+        for i in 0..base * 2 {
+            let spare = i >= base;
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 crate::cores::keep_helper_on_fast_cores("victory-wide");
                 let workers = WORKERS.get().expect("made above");
@@ -1506,12 +1575,18 @@ fn workers() -> &'static Workers {
                         // within microseconds more often than not.
                         spin(|| workers.there.load(Ordering::Acquire) > 0);
                         let mut jobs = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
+                        // (One of the second half takes nothing while it is
+                        // not to, and waits at a word of its own: it takes
+                        // no wake-up from the first half.)
+                        let word = if spare { &workers.spare } else { &workers.more };
                         loop {
-                            if let Some(job) = jobs.pop_front() {
+                            if !(spare && !wide_more())
+                                && let Some(job) = jobs.pop_front()
+                            {
                                 workers.there.fetch_sub(1, Ordering::AcqRel);
                                 break job;
                             }
-                            jobs = workers.more.wait(jobs).unwrap_or_else(|e| e.into_inner());
+                            jobs = word.wait(jobs).unwrap_or_else(|e| e.into_inner());
                         }
                     };
                     let _working = crate::timeline::span("a job for another thread");
@@ -1551,6 +1626,9 @@ fn wide(jobs: Vec<Job>) {
         }
     }
     workers.more.notify_all();
+    if wide_more() {
+        workers.spare.notify_all();
+    }
     loop {
         let job = workers.jobs.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
         match job {
@@ -1561,11 +1639,32 @@ fn wide(jobs: Vec<Job>) {
             None => break,
         }
     }
+    #[cfg(feature = "diagnostics")]
+    let waiting = std::time::Instant::now();
     spin(|| left.0.try_lock().is_ok_and(|n| *n == 0));
     let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
     while *n > 0 {
         n = left.1.wait(n).unwrap_or_else(|e| e.into_inner());
     }
+    #[cfg(feature = "diagnostics")]
+    WIDE_WAITED.with(|w| {
+        let [times, ns] = w.get();
+        w.set([times + 1, ns + waiting.elapsed().as_nanos() as u64]);
+    });
+}
+
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    /// What this thread spread over the kept threads so far ([`wide`]): how
+    /// often, and the nanoseconds it then stood with nothing left to take,
+    /// until the others were done with theirs.
+    static WIDE_WAITED: std::cell::Cell<[u64; 2]> = const { std::cell::Cell::new([0; 2]) };
+}
+
+/// [`WIDE_WAITED`] of the calling thread.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn wide_waited() -> [u64; 2] {
+    WIDE_WAITED.with(std::cell::Cell::get)
 }
 
 /// [`wide`], for the host's own work on host copies (a submission's
@@ -1580,7 +1679,7 @@ pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
 pub(crate) fn wide_each(n: usize, work: impl Fn(usize) + Send + Sync + 'static) {
     let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let work = Arc::new(work);
-    let threads = (wide_threads() + 1).min(n);
+    let threads = (wide_active() + 1).min(n);
     let jobs = (0..threads)
         .map(|_| {
             let (next, work) = (next.clone(), work.clone());
@@ -1601,6 +1700,20 @@ pub(crate) fn wide_each(n: usize, work: impl Fn(usize) + Send + Sync + 'static) 
 /// About this many bytes to a piece of work for [`wide`].
 const WIDE_JOB: usize = 1 << 20;
 
+/// Times declared ranges were being done with ([`Shadow::copy_back_done`]):
+/// begun, and over. A range leaves a copy's declared ones only there, on
+/// whatever thread lands flights; they are added only by the thread that
+/// prepares a submission.
+static DONE_WITH: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// [`DONE_WITH`]: begun, over. If as many were begun at the end of a stretch
+/// of time as were over at its start, no declared range left any copy in it:
+/// whoever looked at a copy's declared ranges later in the stretch found
+/// every range an earlier look found.
+pub(crate) fn ranges_done_with() -> [u64; 2] {
+    [0, 1].map(|i| DONE_WITH[i].load(Ordering::SeqCst))
+}
+
 /// With [`wide_back`]: the snapshots noted while a submission is prepared
 /// (from, to, bytes), taken by [`take_snapshots`].
 static SNAPS: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
@@ -1609,7 +1722,20 @@ static SNAPS: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
 /// its lists go to the card: takes the snapshots [`Shadow::writing`] noted.
 /// Nothing to do without the switch.
 pub(crate) fn take_snapshots() {
-    let snaps = std::mem::take(&mut *SNAPS.lock().unwrap_or_else(|e| e.into_inner()));
+    take_noted(noted_snapshots());
+}
+
+/// The snapshots noted so far, for [`take_noted`]: what is noted from here on
+/// is the next taking's.
+pub(crate) fn noted_snapshots() -> Vec<(usize, usize, usize)> {
+    std::mem::take(&mut *SNAPS.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// [`take_snapshots`] of `snaps` ([`noted_snapshots`]), on whatever thread:
+/// each is a copy from a declared range of a host copy, which nothing but the
+/// card writes from its declaring on, into that copy's snapshot at the same
+/// place, which nobody reads before the range's flight has landed.
+pub(crate) fn take_noted(snaps: Vec<(usize, usize, usize)>) {
     if snaps.is_empty() {
         return;
     }
@@ -2075,6 +2201,171 @@ pub(crate) fn send_stats() -> [u64; 4] {
     [0, 1, 2, 3].map(|i| SEND[i].swap(0, Ordering::Relaxed))
 }
 
+/// Whether a page the title wrote again is taken into a copy in the card's
+/// memory by what changed in it (on by default; `VICTORY_CARD_FINE=0`: copied
+/// and sent up whole, as before).
+///
+/// A refresh copied every part of a page that counts as written into the
+/// copy's CPU side and noted all of it for the card: it went up, and every
+/// 64 KiB piece it touched was hashed again there. Most of that is not a
+/// change: the title wrote what stood there already, or a few bytes of it,
+/// or it was we who wrote (what shaders wrote, put into title memory and
+/// into the CPU's side alike, [`land_echo`]). With the switch the part is
+/// read from title memory once and compared with the CPU's side, 256 bytes
+/// at a time ([`fine_runs`]): only the runs that differ go into the CPU's
+/// side and are noted for the card. A part with more of them than go up
+/// apiece ([`FINE_RUNS`] of a page), or that differs in most of its bytes,
+/// goes whole as before, and so does one that cannot be read. A part that is
+/// the same costs no store, no send and no hash.
+///
+/// What it rests on is what [`send_changed`] and [`land_echo`] rest on:
+/// outside the ranges shaders may be writing (no refresh touches those, they
+/// are [`Shadow::merge_under_writes`]'), the card's side holds what the CPU's
+/// side holds, but for what is noted for the card and not sent yet. Both
+/// sides begin as zeros (no buffer of ours is made unzeroed), and only what
+/// the copy held before is compared: a page never taken goes up whole
+/// ([`Shadow::copy_stale`]'s `known`), so both sides are the same bytes from
+/// the first send on. Runs of 256 bytes, not dwords as [`send_changed`]: a
+/// page is a few copies of their own bytes on the card, not thousands.
+///
+/// What changes with it: where the card's side is not the CPU's (a shader
+/// wrote through a view nobody declared, or a fetch came down torn,
+/// `crate::host::torn`), the next write of the title into the page put the
+/// CPU side's bytes over the card's. Now the card's stay until the title
+/// changes those very 256 bytes; a value the title writes over the same
+/// value is not known to be a write. ([`send_changed`], which rests on the
+/// same and broke a scene in run tile1-0, is not known to have failed for
+/// this; not run yet with the title: a scene that is wrong with it and right
+/// with `=0` is this.) The title's own buffer copies go up whatever the
+/// CPU's side held ([`send_copied`]), as before.
+pub(crate) fn card_fine() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if crate::copystat::mode() != 0 {
+        return false;
+    }
+    // Asked for only (`VICTORY_CARD_FINE=1`): `send_changed`, which rests on
+    // the same comparison, broke a scene, and this has not run with the
+    // title yet.
+    std::env::var_os("VICTORY_CARD_FINE").is_some() && crate::toggled!("VICTORY_CARD_FINE")
+}
+
+/// The step [`fine_runs`] compares in, and the most equal bytes between two
+/// runs that go up as one.
+const FINE_STEP: usize = 256;
+/// The most runs of one page that go up apiece ([`card_fine`]): each is a
+/// copy of its own on the card. Of a part of a page, as many as its share of
+/// the page (one at least).
+const FINE_RUNS: usize = 8;
+/// With more runs than that, those up to so many bytes apart are joined
+/// before the part is given up and goes whole.
+const FINE_GAP: usize = 4096;
+
+/// Since the last frame-rate line, of [`card_fine`]: parts of pages compared,
+/// those found the same, those sent whole, the runs sent of the others, the
+/// bytes noted for the card in all, and the bytes compared.
+static FINE: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// [`FINE`], taken.
+pub(crate) fn fine_stats() -> [u64; 6] {
+    [0, 1, 2, 3, 4, 5].map(|i| FINE[i].swap(0, Ordering::Relaxed))
+}
+
+/// Where `now` differs from `was` (of one length), as (offset, bytes) in
+/// order, in steps of [`FINE_STEP`] from the start: every differing byte is
+/// in a run, a run begins and ends on a step (or at the end), and two runs
+/// with one equal step or none between them are one. More than
+/// [`FINE_RUNS`] of them for a page (for less, its share) are joined over up
+/// to [`FINE_GAP`] equal bytes. `None` if that is still more, or if the runs
+/// hold three quarters of the bytes or more: then the whole goes.
+fn fine_runs(now: &[u8], was: &[u8]) -> Option<Vec<(usize, usize)>> {
+    let n = now.len().min(was.len());
+    let mut runs = fine_steps(&now[..n], &was[..n]);
+    if runs.is_empty() {
+        return Some(runs);
+    }
+    let most = (n / (PAGE / FINE_RUNS)).clamp(1, FINE_RUNS);
+    let mut gap = FINE_STEP;
+    while runs.len() > most && gap < FINE_GAP {
+        gap *= 4;
+        let mut kept = 0;
+        for i in 1..runs.len() {
+            let (at, len) = runs[i];
+            let last = &mut runs[kept];
+            if at <= last.0 + last.1 + gap {
+                last.1 = at + len - last.0;
+            } else {
+                kept += 1;
+                runs[kept] = (at, len);
+            }
+        }
+        runs.truncate(kept + 1);
+    }
+    let bytes: usize = runs.iter().map(|r| r.1).sum();
+    (runs.len() <= most && bytes * 4 < n * 3).then_some(runs)
+}
+
+/// Of [`fine_runs`]: the step `[at, end)` differs, the steps before it are
+/// in `runs`.
+#[inline]
+fn fine_step(runs: &mut Vec<(usize, usize)>, at: usize, end: usize) {
+    match runs.last_mut() {
+        Some(last) if at <= last.0 + last.1 + FINE_STEP => last.1 = end - last.0,
+        _ => runs.push((at, end - at)),
+    }
+}
+
+/// Of [`fine_runs`]: the steps of two slices of one length that differ, as
+/// runs.
+fn fine_steps(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: the processor has AVX2, and the lengths are the same.
+        return unsafe { fine_steps_avx2(now, was) };
+    }
+    let mut runs = Vec::new();
+    let mut at = 0;
+    while at < now.len() {
+        let end = (at + FINE_STEP).min(now.len());
+        if now[at..end] != was[at..end] {
+            fine_step(&mut runs, at, end);
+        }
+        at = end;
+    }
+    runs
+}
+
+/// # Safety
+/// AVX2, and two slices of one length.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn fine_steps_avx2(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    use std::arch::x86_64::*;
+    let n = now.len();
+    let mut runs = Vec::new();
+    let mut at = 0;
+    while at + FINE_STEP <= n {
+        let mut any = _mm256_setzero_si256();
+        for k in 0..FINE_STEP / 32 {
+            // SAFETY: inside both slices (`at + FINE_STEP <= n`).
+            let (a, b) = unsafe {
+                (
+                    _mm256_loadu_si256(now.as_ptr().add(at + 32 * k).cast()),
+                    _mm256_loadu_si256(was.as_ptr().add(at + 32 * k).cast()),
+                )
+            };
+            any = _mm256_or_si256(any, _mm256_xor_si256(a, b));
+        }
+        if _mm256_testz_si256(any, any) == 0 {
+            fine_step(&mut runs, at, at + FINE_STEP);
+        }
+        at += FINE_STEP;
+    }
+    if at < n && now[at..] != was[at..] {
+        fine_step(&mut runs, at, n);
+    }
+    runs
+}
+
 /// Whether what shaders wrote goes into title memory run by run
 /// ([`put_changed`]; on by default, `VICTORY_EXACT_BACK=0` writes the whole
 /// stretch from the first changed byte to the last, as before).
@@ -2469,6 +2760,92 @@ mod merge_tests {
     }
 }
 
+#[cfg(test)]
+mod fine_tests {
+    use super::{FINE_GAP, FINE_RUNS, FINE_STEP, PAGE, fine_runs};
+
+    /// `was` with the bytes at `changes` made other ones.
+    fn changed(was: &[u8], changes: &[usize]) -> Vec<u8> {
+        let mut now = was.to_vec();
+        for &at in changes {
+            now[at] ^= 0x41;
+        }
+        now
+    }
+
+    #[test]
+    fn fine_runs_are_the_steps_that_differ() {
+        const S: usize = FINE_STEP;
+        let was: Vec<u8> = (0..PAGE as u32).map(|i| (i * 13 + 5) as u8).collect();
+        let runs = |changes: &[usize]| fine_runs(&changed(&was, changes), &was);
+        assert_eq!(runs(&[]), Some(vec![]));
+        assert_eq!(runs(&[S + 44]), Some(vec![(S, S)]));
+        assert_eq!(runs(&[PAGE - 1]), Some(vec![(PAGE - S, S)]));
+        // One equal step between two that differ: one run. Two: two runs.
+        assert_eq!(runs(&[0, 2 * S + 7]), Some(vec![(0, 3 * S)]));
+        assert_eq!(runs(&[S - 1, 3 * S]), Some(vec![(0, S), (3 * S, S)]));
+        // A part of a page that ends within a step.
+        let n = 5 * S + 100;
+        assert_eq!(fine_runs(&changed(&was[..n], &[n - 1]), &was[..n]), Some(vec![(5 * S, 100)]));
+        // As many as go up apiece.
+        let apart: Vec<usize> = (0..FINE_RUNS).map(|i| i * 2 * FINE_GAP).collect();
+        assert_eq!(runs(&apart), Some(apart.iter().map(|&at| (at, S)).collect()));
+        // One more, near one another: joined.
+        let near: Vec<usize> = (0..=FINE_RUNS).map(|i| i * 4 * S).collect();
+        assert_eq!(runs(&near), Some(vec![(0, FINE_RUNS * 4 * S + S)]));
+        // More, far from one another: the whole goes.
+        let far: Vec<usize> = (0..FINE_RUNS + 4).map(|i| i * (FINE_GAP + 4 * S)).collect();
+        assert!(far[far.len() - 1] < PAGE);
+        assert_eq!(runs(&far), None);
+        // Of a part of a page, its share: of an eighth one run.
+        let n = PAGE / FINE_RUNS;
+        assert_eq!(fine_runs(&changed(&was[..n], &[0, 8 * S]), &was[..n]), Some(vec![(0, 9 * S)]));
+        assert_eq!(fine_runs(&changed(&was[..n], &[0, n - 1]), &was[..n]), None);
+        assert_eq!(fine_runs(&changed(&was[..2 * n], &[0, n - 1]), &was[..2 * n]), Some(vec![(0, S), (n - S, S)]));
+        // So it does where most of it differs.
+        let most: Vec<usize> = (0..PAGE / FINE_GAP).map(|i| i * FINE_GAP).collect();
+        assert_eq!(runs(&most), None);
+        assert_eq!(runs(&(0..PAGE).step_by(S).collect::<Vec<_>>()), None);
+        assert_eq!(fine_runs(&changed(&was[..100], &[3]), &was[..100]), None);
+        assert_eq!(fine_runs(&[], &[]), Some(vec![]));
+    }
+
+    #[test]
+    fn fine_runs_hold_every_byte_that_differs() {
+        let mut seed = 0x1357_9BDF_0246_8ACEu64;
+        let mut random = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed as usize
+        };
+        for round in 0..400 {
+            let n = if round % 3 == 0 { PAGE } else { 1 + random() % PAGE };
+            let was: Vec<u8> = (0..n).map(|_| random() as u8).collect();
+            let mut now = was.clone();
+            for _ in 0..random() % 12 {
+                let at = random() % n;
+                let len = (random() % 700).min(n - at);
+                for b in &mut now[at..at + len] {
+                    *b = random() as u8;
+                }
+            }
+            let Some(runs) = fine_runs(&now, &was) else {
+                continue;
+            };
+            assert!(runs.len() <= (n * FINE_RUNS / PAGE).clamp(1, FINE_RUNS), "round {round}");
+            let mut put = was.clone();
+            for &(at, len) in &runs {
+                assert!(len > 0 && at % FINE_STEP == 0 && (at + len == n || (at + len) % FINE_STEP == 0), "round {round}");
+                put[at..at + len].copy_from_slice(&now[at..at + len]);
+            }
+            assert!(put == now, "round {round}");
+            // In order, and more than a step apart.
+            assert!(runs.windows(2).all(|w| w[0].0 + w[0].1 + FINE_STEP < w[1].0), "round {round}");
+        }
+    }
+}
+
 /// Host copies alive (also those only a list, a descriptor pass or a
 /// snapshot still holds) and the bytes of title memory they copy.
 static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
@@ -2477,7 +2854,7 @@ impl Drop for Shadow {
     fn drop(&mut self) {
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
-            crate::inplace::gone(self.window, self.len);
+            crate::inplace::gone(self.window, self.start, self.len);
             return;
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
@@ -3355,6 +3732,7 @@ impl Shadow {
         if self.place.is_some() {
             return;
         }
+        DONE_WITH[0].fetch_add(1, Ordering::SeqCst);
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         if relay() {
             let free = self.flights.lock().unwrap_or_else(|e| e.into_inner()).done(ranges);
@@ -3362,6 +3740,8 @@ impl Shadow {
         } else {
             pending.retain(|r| !ranges.contains(r));
         }
+        // (Under the lock: who finds a range gone finds this counted.)
+        DONE_WITH[1].fetch_add(1, Ordering::SeqCst);
         if !pending.is_empty() || self.card.is_some() {
             return;
         }
@@ -3695,19 +4075,45 @@ impl Shadow {
             // (in the world most submissions have such ranges; copying the
             // gaps whole cost ~1 s per frame).
             busy.sort_unstable();
+            // What the gaps have to take, taken together behind the last.
+            let mut later = gaps_together().then(Later::default);
             let (mut at, mut bytes) = (from, 0);
             for (a, e) in busy {
                 if a > at {
-                    bytes += self.update_free(at, a);
+                    bytes += self.update_gap(at, a, later.as_mut());
                 }
                 at = at.max(e);
             }
             if at < to {
-                bytes += self.update_free(at, to);
+                bytes += self.update_gap(at, to, later.as_mut());
+            }
+            if let Some(later) = later {
+                self.take_later(later);
             }
             return bytes;
         }
         self.update_free(from, to)
+    }
+
+    /// What [`Shadow::update_gap`] left for when all of a refresh's gaps are
+    /// looked at.
+    fn take_later(&self, later: Later) {
+        // (From half a megabyte on, in smaller pieces: the threads that had
+        // the flush's other copies are free by now, and this copy is what
+        // the flush waits for.)
+        self.take_parts(later.runs, 512 << 10, 128 << 10);
+        if !later.ranged.is_empty() {
+            let mut ranged = self.ranged.lock().unwrap_or_else(|e| e.into_inner());
+            for (from, to, now) in later.ranged {
+                ranged[0] = (from, to, now);
+                if to - from >= ranged[1].1 - ranged[1].0 {
+                    ranged[1] = (from, to, now);
+                }
+            }
+        }
+        for (from, to) in later.checks {
+            self.refresh_check(from, to);
+        }
     }
 
     /// Whether [`Shadow::update`] of `[address, address + len)` would copy
@@ -3750,13 +4156,22 @@ impl Shadow {
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
+        self.update_gap(from, to, None)
+    }
+
+    /// [`Shadow::update_free`]; with `later`, what it finds to take is left
+    /// there for [`Shadow::take_later`] ([`gaps_together`]).
+    fn update_gap(&self, from: usize, to: usize, mut later: Option<&mut Later>) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 // (A range whose blocks rest after a write has no guard now.)
                 let guarded = crate::watch::guarded(from, to) || self.watched.load(Ordering::Relaxed) == GUARDED;
                 self.watched.store(if guarded { GUARDED } else { 1 }, Ordering::Relaxed);
-                let copied = self.copy_stale(from, to, now, &written);
-                self.refresh_check(from, to);
+                let copied = self.copy_stale(from, to, now, &written, later.as_deref_mut());
+                match later {
+                    Some(later) => later.checks.push((from, to)),
+                    None => self.refresh_check(from, to),
+                }
                 #[cfg(feature = "diagnostics")]
                 {
                     use crate::copystat::{C, add};
@@ -3837,7 +4252,7 @@ impl Shadow {
     /// Copies the pages of `[from, to)` written after their last copy
     /// (`written`: last writes by page, in page order; `now`: this
     /// asking), whole pages within the buffer.
-    fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
+    fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)], later: Option<&mut Later>) -> usize {
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
@@ -3889,6 +4304,16 @@ impl Shadow {
             runs.push(((first * PAGE).max(from), ((last + 1) * PAGE).min(to), known));
         }
         let runs = by_parts(runs, &again_at, &crate::watch::parts_written(&again_at));
+        if let Some(later) = later {
+            // The pages are noted as taken, as they are below before a byte
+            // of them is: the taking follows, and the note of the range.
+            let bytes = runs.iter().map(|r| r.1 - r.0).sum();
+            later.runs.extend(runs);
+            if crate::watch::light() {
+                later.ranged.push((from, to, now));
+            }
+            return bytes;
+        }
         let bytes = self.take_all(runs);
         if crate::watch::light() {
             // All of the range is in the copy as of this asking.
@@ -3905,21 +4330,28 @@ impl Shadow {
     /// they are long: the big heap's copy has some 4 MB of them in each of
     /// 14 refreshes a frame, on one thread while the others had nothing.
     fn take_all(&self, runs: Vec<(usize, usize, bool)>) -> usize {
-        const LONG: usize = 1 << 20;
-        const PART: usize = 256 << 10;
+        if take_fine() {
+            return self.take_parts(runs, 256 << 10, 64 << 10);
+        }
+        self.take_parts(runs, 1 << 20, 256 << 10)
+    }
+
+    /// [`Shadow::take_all`]: on several threads from `long` bytes on, `part`
+    /// bytes (whole pages) to each piece of work.
+    fn take_parts(&self, runs: Vec<(usize, usize, bool)>, long: usize, part: usize) -> usize {
         let bytes = runs.iter().map(|r| r.1 - r.0).sum();
-        if bytes < LONG || !crate::watch::light() {
+        if bytes < long || !crate::watch::light() {
             for (from, to, known) in runs {
                 self.take(from, to, known);
             }
             return bytes;
         }
-        let mut parts = Vec::with_capacity(bytes / PART + runs.len());
+        let mut parts = Vec::with_capacity(bytes / part + runs.len());
         for (from, to, known) in runs {
             let mut at = from;
             while at < to {
                 // Whole pages to a part.
-                let next = ((at / PAGE) * PAGE + PART).min(to);
+                let next = ((at / PAGE) * PAGE + part).min(to);
                 parts.push((at, next, known));
                 at = next;
             }
@@ -4020,6 +4452,9 @@ impl Shadow {
             static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
         let Some(card) = self.card.as_ref().filter(|_| self.changes_only.load(Ordering::Relaxed) || send_changed()) else {
+            if known && self.card.is_some() && card_fine() {
+                return self.take_fine(from, to);
+            }
             if known && self.card.is_some() && self.landing.load(Ordering::Acquire) && land_echo() && !crate::host::upcheck::on() {
                 return self.take_landed(from, to);
             }
@@ -4059,6 +4494,81 @@ impl Shadow {
                 at += n;
             }
         });
+        to - from
+    }
+
+    /// [`Shadow::take`] of `[from, to)` (inside the buffer), which a copy in
+    /// the card's memory held before, with [`card_fine`]: the bytes that
+    /// differ from the CPU's side go into it and are noted for the card, the
+    /// others are left as they are, on both sides. By page of title memory,
+    /// each read once, and only within the range: next to it shaders may be
+    /// writing the copy, and there the card's side is the newer one. Returns
+    /// the bytes looked at, as [`Shadow::copy`] returns the bytes it took.
+    fn take_fine(&self, from: usize, to: usize) -> usize {
+        thread_local! {
+            /// A page of title memory, as read.
+            static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let start = self.start as usize;
+        let check = crate::host::upcheck::on();
+        // (Summed, and added once: the parts of a refresh run on several
+        // threads.)
+        let mut stats = [0u64; 6];
+        TITLE.with_borrow_mut(|title| {
+            title.resize(PAGE, 0);
+            let mut at = from;
+            while at < to {
+                let n = (PAGE - at % PAGE).min(to - at);
+                let (lo, off) = (at, at - start);
+                at += n;
+                stats[0] += 1;
+                let title = &mut title[..n];
+                if !crate::host::read_into(lo as *const u8, title) {
+                    // A page of it is not there: as before (zeros for what
+                    // cannot be read), and whole.
+                    self.copy(lo, lo + n);
+                    stats[2] += 1;
+                    stats[4] += n as u64;
+                    continue;
+                }
+                stats[5] += n as u64;
+                // SAFETY: inside the mapping of the copy's CPU side, which
+                // nothing else reads or writes there (the card copies from
+                // it): no shader's range holds it, and the parts of a
+                // refresh lie apart.
+                let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(off), n) };
+                let runs = fine_runs(title, held);
+                if runs.as_ref().is_some_and(Vec::is_empty) {
+                    stats[1] += 1;
+                    continue;
+                }
+                let was = check.then(|| held.to_vec());
+                match runs {
+                    Some(runs) => {
+                        for &(r, m) in &runs {
+                            held[r..r + m].copy_from_slice(&title[r..r + m]);
+                            self.changed(off + r, off + r + m);
+                        }
+                        self.card_changed_runs(runs.iter().map(|&(r, m)| (off + r, off + r + m)));
+                        stats[3] += runs.len() as u64;
+                        stats[4] += runs.iter().map(|r| r.1 as u64).sum::<u64>();
+                    }
+                    None => {
+                        held.copy_from_slice(title);
+                        self.changed(off, off + n);
+                        self.card_changed(off, off + n);
+                        stats[2] += 1;
+                        stats[4] += n as u64;
+                    }
+                }
+                if let Some(was) = was {
+                    crate::host::upcheck::note(self.id, off, &was, held);
+                }
+            }
+        });
+        for (i, n) in stats.into_iter().enumerate().filter(|s| s.1 != 0) {
+            FINE[i].fetch_add(n, Ordering::Relaxed);
+        }
         to - from
     }
 

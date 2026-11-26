@@ -770,7 +770,9 @@ fn log_memory() {
          fills: {} alive {:.0} MB ({} of them placed), {} let go {:.0} MB and {} made again \
          {:.0} MB since the start; {} host copies made in all; passes that made none for lack of \
          room: {}; the card: {:.0} MB in use of a budget of {:.0} MB, {:.0} MB of the PC's memory \
-         shared with it in use",
+         shared with it in use; of the copies let go to bring the card under its line, {} {:.0} MB \
+         were of title memory that was gone and {} {:.0} MB of memory still there \
+         (VICTORY_SWEEP_GONE_FIRST=0: the longest idle first whatever their memory)",
         census[2],
         mb(census[3]),
         census[0],
@@ -787,6 +789,10 @@ fn log_memory() {
         mb(card[1]),
         mb(card[0]),
         mb(card[3]),
+        crate::resource::LIMITED[0].load(Relaxed),
+        mb(crate::resource::LIMITED[1].load(Relaxed)),
+        crate::resource::LIMITED[2].load(Relaxed),
+        mb(crate::resource::LIMITED[3].load(Relaxed)),
     );
     {
         let [textures, staging] = crate::pool::memory();
@@ -1024,18 +1030,27 @@ fn submitter(all: &mut Vec<(u32, Submitter)>, id: u32) -> &mut Submitter {
 
 /// A list call on this thread that began at `started` has returned.
 pub(crate) fn recorded(started: std::time::Instant) {
+    recorded_many(started, 1);
+}
+
+/// [`recorded`] for `calls` list calls a thread made one after another from
+/// `started` on (`crate::list` `batch_begin`).
+pub(crate) fn recorded_many(started: std::time::Instant, calls: u64) {
+    if calls == 0 {
+        return;
+    }
     let took = started.elapsed();
     let ns = took.as_nanos() as u64;
     crate::timeline::called(took);
-    add(C::RecordCalls, 1);
+    add(C::RecordCalls, calls);
     add(C::RecordNs, ns);
     if !RECORDED_SINCE.load(Relaxed) && !RECORDED_SINCE.swap(true, Relaxed) {
         let began = now_us().saturating_sub(ns / 1000);
         add(C::UntilRecordUs, began.saturating_sub(PRESENTED_AT.load(Relaxed)));
     }
     OURS.with(|o| o.set(o.get() + ns));
-    let (unsent, calls) = UNSENT.with(|u| u.get());
-    let (unsent, calls) = (unsent + ns, calls + 1);
+    let (unsent, sent) = UNSENT.with(|u| u.get());
+    let (unsent, calls) = (unsent + ns, sent + calls);
     // By thread, a couple of milliseconds at a time.
     if unsent < 2_000_000 {
         UNSENT.with(|u| u.set((unsent, calls)));

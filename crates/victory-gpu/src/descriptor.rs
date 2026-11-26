@@ -975,12 +975,7 @@ impl Views {
     fn placed_of(&self, i: u32, generation: u32) -> Option<View> {
         let payload = payload(i, generation);
         let address = payload & ((1 << PLACED_ADDRESS_BITS) - 1);
-        let &(unordered, resource, rest) = self.shapes.get((payload >> PLACED_ADDRESS_BITS) as usize)?;
-        let mut desc = [0u32; 16];
-        desc[..10].copy_from_slice(&rest[..10]);
-        (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
-        desc[12..].copy_from_slice(&rest[10..]);
-        Some(View::Placed(unordered, resource, desc))
+        Some(placed_view(self.shapes.get((payload >> PLACED_ADDRESS_BITS) as usize)?, address))
     }
 
     /// The record words of `view` as a table entry, if it has one.
@@ -1231,6 +1226,7 @@ pub(crate) fn forget(resource: usize) {
     let Some(entries) = views.by_resource.remove(&resource) else {
         return;
     };
+    VIEWS_FREED.fetch_add(1, std::sync::atomic::Ordering::Release);
     for i in entries {
         let (view, generation) = views.list[i as usize].clone();
         // Entries freed through a view's other resource may hold another
@@ -1247,6 +1243,17 @@ pub(crate) fn forget(resource: usize) {
     }
 }
 
+/// How often views went stale with their resource ([`forget`]).
+static VIEWS_FREED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A number that stays the same while no record that named a view has
+/// stopped naming one ([`forget`]): what [`view`] said of a record then, it
+/// says still.
+#[cfg(windows)]
+pub(crate) fn views_freed() -> u64 {
+    VIEWS_FREED.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// The view the record words `i` and `generation` name: the one they hold
 /// whole, or the view of entry `i` if `generation` is still its own.
 fn view_at(i: u32, generation: u32) -> Option<View> {
@@ -1257,9 +1264,51 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
             (*current == generation).then(|| view.clone())
         }
         CONSTANT => Some(constant_of(i, generation)),
+        #[cfg(windows)]
+        PLACED if crate::toggled!("VICTORY_PLACED_QUICK") => placed_quick(i, generation),
         PLACED => views_read().placed_of(i, generation),
         _ => None,
     }
+}
+
+/// [`Views::placed_of`] with the shape as this thread found it last: a shape
+/// keeps its number and never changes, and every record of a placed view a
+/// draw reads was looked up under the lock of all views, by all recording
+/// threads at once (`VICTORY_PLACED_QUICK=0`: under it each time, as before).
+#[cfg(windows)]
+fn placed_quick(i: u32, generation: u32) -> Option<View> {
+    const MOST: usize = 1024;
+    thread_local! {
+        /// A shape's number plus one (0: none), and the shape.
+        static SHAPES: std::cell::RefCell<Vec<(u32, Shape)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let number = (payload(i, generation) >> PLACED_ADDRESS_BITS) as u32;
+    let at = number as usize % MOST;
+    let known = SHAPES.try_with(|shapes| shapes.borrow().get(at).filter(|s| s.0 == number + 1).map(|s| s.1));
+    let shape = match known {
+        Ok(Some(shape)) => shape,
+        _ => {
+            let shape = *views_read().shapes.get(number as usize)?;
+            let _ = SHAPES.try_with(|shapes| {
+                let mut shapes = shapes.borrow_mut();
+                if shapes.is_empty() {
+                    shapes.resize(MOST, (0, (false, [0; 14], [0; 14])));
+                }
+                shapes[at] = (number + 1, shape);
+            });
+            shape
+        }
+    };
+    Some(placed_view(&shape, payload(i, generation) & ((1 << PLACED_ADDRESS_BITS) - 1)))
+}
+
+/// The view of placed memory at `address` with the shape `shape`.
+fn placed_view(&(unordered, resource, rest): &Shape, address: u64) -> View {
+    let mut desc = [0u32; 16];
+    desc[..10].copy_from_slice(&rest[..10]);
+    (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+    desc[12..].copy_from_slice(&rest[10..]);
+    View::Placed(unordered, resource, desc)
 }
 
 /// The words of the record at `handle`, if they are a view's.

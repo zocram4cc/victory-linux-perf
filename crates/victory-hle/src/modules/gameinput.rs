@@ -1205,6 +1205,14 @@ mod host {
                     }
                 }
             }
+            // So too `VICTORY_SKIP_INTRO`'s Enter, in every build.
+            if slot == 0 {
+                for vk in skipping() {
+                    if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
+                        pad.buttons |= button;
+                    }
+                }
+            }
             Some(pad)
         }
 
@@ -1213,6 +1221,11 @@ mod host {
             let mut down = scripted();
             #[cfg(not(feature = "diagnostics"))]
             let mut down = Vec::new();
+            for vk in skipping() {
+                if !down.contains(&vk) {
+                    down.push(vk);
+                }
+            }
             if focused() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
@@ -1243,6 +1256,22 @@ mod host {
             // SAFETY: a valid vibration; an empty slot just fails.
             unsafe { XInputSetState(slot as u32, &speeds) };
         }
+    }
+
+    /// `VICTORY_SKIP_INTRO=<seconds>`: Enter (the pad's A) is held for 0.2 s
+    /// every 2 s, from 4 s after input starts until that many seconds after
+    /// it, with or without focus: the title's first screens, its intro
+    /// video and its start screen pass with no one at the keys (a title has
+    /// no switch for it that we know of). In every build; unset or 0, no key
+    /// is pressed.
+    fn skipping() -> Vec<u8> {
+        static SKIP: std::sync::OnceLock<(Instant, f64)> = std::sync::OnceLock::new();
+        let (start, until) = SKIP.get_or_init(|| {
+            let seconds = std::env::var("VICTORY_SKIP_INTRO").ok().and_then(|v| v.trim().parse::<f64>().ok());
+            (Instant::now(), seconds.filter(|s| s.is_finite() && *s > 0.0).unwrap_or(0.0))
+        });
+        let at = start.elapsed().as_secs_f64();
+        if at >= 4.0 && at < *until && at % 2.0 < 0.2 { vec![0x0D] } else { Vec::new() }
     }
 
     /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for

@@ -126,6 +126,14 @@ pub use shader::{
     raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
 
+/// The stack for threads that make host pipelines from translated shaders.
+/// vkd3d-proton converts DXIL on the calling thread, recursively over its
+/// control flow: a large traversal program (the ray-tracing shadow passes)
+/// overflows the default 2 MiB, and under Wine the overflow hangs the
+/// thread instead of failing. Only reserved: pages are committed as they
+/// are used.
+pub const PIPELINE_STACK: usize = 256 << 20;
+
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 
@@ -2705,6 +2713,26 @@ mod barycentric_tests {
         let shader = first_half_pixel(true);
         assert_eq!(texcoord_mode(&shader), 1);
         validate(&shader);
+    }
+
+    /// `VICTORY_NAN_GUARD`: a float exported to a colour target goes through the guard (its
+    /// compares and selects are in the program), and the program is still one the host takes.
+    #[test]
+    fn a_colour_export_is_guarded_unless_the_switch_is_off() {
+        let [e0, e1] = exp_mrt0(2);
+        // v_interp_p1_f32 v2, v0, attr0.x; exp mrt0 v2, v2, v2, v2
+        let words = [0xC808_0000, e0, e1, 0xBF81_0000];
+        let with = |mode: u8| {
+            let was = lower::TEST_NAN_GUARD.replace(Some(mode));
+            let shader = pixel(&words, PERSP_CENTER);
+            lower::TEST_NAN_GUARD.set(was);
+            shader.unwrap()
+        };
+        let (off, on, stores) = (with(0), with(1), with(2));
+        assert!(on.dxil.len() > off.dxil.len(), "{} against {}", on.dxil.len(), off.dxil.len());
+        // Typed stores as well: nothing more in a program without one.
+        assert_eq!(stores.dxil.len(), on.dxil.len());
+        validate(&on);
     }
 
     fn first_half_pixel(paired: bool) -> HostShader {

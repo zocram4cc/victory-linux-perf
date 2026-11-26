@@ -418,15 +418,38 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
 /// Textures made in the last second ([`fresh`]), and when.
 static RECENT: Mutex<VecDeque<(usize, u64)>> = Mutex::new(VecDeque::new());
 
+/// When a texture was last made whose address falls here ([`made_lately`]),
+/// noted before the texture is among [`RECENT`].
+static MADE_AT: [AtomicU64; 16384] = [const { AtomicU64::new(0) }; 16384];
+
+/// Where in [`MADE_AT`] the texture at `raw` is noted.
+fn made_at(raw: usize) -> &'static AtomicU64 {
+    &MADE_AT[((raw as u64 >> 4).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 50) as usize]
+}
+
+/// Whether a texture at `raw` may have been made since `since`: if not,
+/// [`RECENT`] need not be gone through under its lock. Every texture slot of
+/// a table a draw has made asks [`fresh`] (with `VICTORY_SHOW_AFTER=1`), of
+/// textures made long ago nearly always: all recording threads stood at that
+/// lock, each going through the textures of the last second under it.
+/// `VICTORY_FRESH_QUICK=0`: always gone through, as before.
+fn made_lately(raw: usize, since: u64) -> bool {
+    made_at(raw).load(Ordering::Acquire) >= since || !crate::toggled!("VICTORY_FRESH_QUICK")
+}
+
 /// Whether `texture` was made in a block in the last second.
 pub(crate) fn fresh(texture: &ID3D12Resource) -> bool {
     let raw = texture.as_raw() as usize;
     let since = now().saturating_sub(1000);
+    if !made_lately(raw, since) {
+        return false;
+    }
     RECENT.lock().unwrap_or_else(|e| e.into_inner()).iter().rev().take_while(|r| r.1 >= since).any(|r| r.0 == raw)
 }
 
 fn made_now(texture: &ID3D12Resource) {
     let now = now();
+    made_at(texture.as_raw() as usize).fetch_max(now, Ordering::AcqRel);
     let mut recent = RECENT.lock().unwrap_or_else(|e| e.into_inner());
     while recent.front().is_some_and(|r| r.1 + 1000 < now) {
         recent.pop_front();

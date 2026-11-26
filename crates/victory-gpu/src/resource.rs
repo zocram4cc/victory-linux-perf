@@ -1393,6 +1393,20 @@ fn textures() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize
 static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+/// A bit for every address a texture was ever put into [`TARGETS_AT`] at,
+/// set before it is put there and never cleared: where none is set there is
+/// nothing in the table, and [`alias_of`] (asked for every placed texture a
+/// draw reads) need not take the table's lock to be told so.
+#[cfg(windows)]
+static TARGETS_SEEN: [std::sync::atomic::AtomicU64; 1024] = [const { std::sync::atomic::AtomicU64::new(0) }; 1024];
+
+/// The word and the bit of `address` in [`TARGETS_SEEN`].
+#[cfg(windows)]
+fn target_seen(address: u64) -> (&'static std::sync::atomic::AtomicU64, u64) {
+    let bit = (address >> 12).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 48;
+    (&TARGETS_SEEN[(bit >> 6) as usize], 1 << (bit & 63))
+}
+
 /// For `this`, a texture made for a view the title placed in memory
 /// ([`texture_at`]): the title texture the host writes that lies in the
 /// same memory, if there is one of the same size, levels and layers with
@@ -1435,6 +1449,12 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
             && d.sample_count <= 1
     };
     if !r.host.placed.load(Relaxed) || !fills(&r.desc) || !one(&r.desc) {
+        return None;
+    }
+    // No texture was ever in the table at this address
+    // (`VICTORY_PLACED_QUICK=0`: the table is asked, as before).
+    let (seen, bit) = target_seen(r.data() as u64);
+    if seen.load(std::sync::atomic::Ordering::SeqCst) & bit == 0 && crate::toggled!("VICTORY_PLACED_QUICK") {
         return None;
     }
     // Under the table's lock: a texture leaves it before it is freed.
@@ -2040,7 +2060,7 @@ pub(crate) fn let_go_idle() {
             let used = used.saturating_sub(crate::pool::texture_room())
                 + crate::shadow::card_room_kept()
                 + targets_room_kept();
-            crate::host::vram_keep(budget, used)
+            crate::host::vram_keep(budget, sweep_used(budget, used))
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
     };
@@ -2048,15 +2068,17 @@ pub(crate) fn let_go_idle() {
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
     let all = textures();
-    // With a limit, the longest idle first.
-    let mut by_age: Vec<(u64, usize)> = Vec::new();
+    // With a limit, the longest idle first; before all of them the copies
+    // whose title memory is gone ([`gone_first`]), the longest idle first too.
+    let mut by_age: Vec<(bool, u64, usize)> = Vec::new();
     if most != u64::MAX {
+        let gone_first = gone_first();
         for &at in all.iter() {
             // SAFETY: as below.
             let r = unsafe { &*(at as *const Resource) };
             let used = r.host.used.load(Relaxed);
             if used != 0 && fills(&r.desc) && crate::host::long_ago(used, idle_ms, IDLE_FRAMES) {
-                by_age.push((used & 0xffff_ffff, at));
+                by_age.push((!(gone_first && memory_gone(r)), used & 0xffff_ffff, at));
             }
         }
         by_age.sort_unstable();
@@ -2078,7 +2100,9 @@ pub(crate) fn let_go_idle() {
     let from = if part == PART { FROM.load(Relaxed) } else { 0 };
     let mut looked = 0;
     let began = std::time::Instant::now();
-    for at in all.range(from..).take(part).copied().chain(by_age.iter().map(|&(_, at)| at)) {
+    // (With the limit: whether the copy's title memory is still there.)
+    let limited = by_age.iter().map(|&(there, _, at)| (at, Some(there)));
+    for (at, there) in all.range(from..).take(part).map(|&at| (at, None)).chain(limited) {
         if bytes >= most {
             break;
         }
@@ -2115,6 +2139,10 @@ pub(crate) fn let_go_idle() {
             r.host.gone.store(true, Relaxed);
             KINDS[2].fetch_add(1, Relaxed);
             KINDS[3].fetch_add(host.bytes, Relaxed);
+            if let Some(there) = there {
+                LIMITED[2 * usize::from(there)].fetch_add(1, Relaxed);
+                LIMITED[2 * usize::from(there) + 1].fetch_add(host.bytes, Relaxed);
+            }
             went += 1;
             bytes += host.bytes;
             if first.is_none() {
@@ -2136,6 +2164,74 @@ pub(crate) fn let_go_idle() {
         });
     }
 }
+
+/// What [`let_go_idle`] counts as in use of the card where the line up to
+/// which host copies are made is not the default one ([`room_percent`], 90):
+/// as much less (or more) as that line is higher (or lower), so that the
+/// sweep's own lines (88 % and 85 % of the budget, `crate::host::vram_keep`)
+/// stand as far under it as they do by default. At 90 nothing changes.
+/// `VICTORY_SWEEP_FOLLOWS_ROOM=0`: the sweep's lines where they were.
+///
+/// With the sweep's lines fixed, `VICTORY_TEXTURE_ROOM_PERCENT` above 88 said
+/// nothing: the sweep let go at 88 % whatever it was, and in a 56-minute play
+/// (play-prologue) what was in use never passed 88 % of the budget (the free
+/// room of our blocks left out), the line at 90 was met twice, and 9.7 GB of
+/// the 29.7 GB of copies let go were made and uploaded again.
+#[cfg(windows)]
+fn sweep_used(budget: u64, used: u64) -> u64 {
+    if !crate::toggled!("VICTORY_SWEEP_FOLLOWS_ROOM") {
+        return used;
+    }
+    let percent = room_percent();
+    let shift = budget / 100 * percent.abs_diff(90);
+    if percent >= 90 { used.saturating_sub(shift) } else { used.saturating_add(shift) }
+}
+
+/// Whether, of the host copies [`let_go_idle`] may let go to bring the card
+/// under its line, those whose title memory is gone go before the others
+/// (`VICTORY_SWEEP_GONE_FIRST=0`: the longest idle first whatever their
+/// memory, as before).
+///
+/// The sweep lets go as many bytes as bring the card down to 85 % of its
+/// budget, and the card stood at that line for all of a 56-minute play
+/// (play-prologue: about 85 % at the median and never over 88, the free
+/// room of our blocks left out as the sweep leaves it out): 483,000 copies
+/// went (29.7 GB) and 139,000 of them were made and uploaded again (9.7 GB;
+/// in the second half 101,000 of 238,000), each shown late and as the
+/// neutral texture meanwhile. All that time some 700 MB of the 4,260 MB of
+/// such copies (250 to 1,530 in nine blocks of ten) were of placed textures
+/// whose memory the title had unmapped: nothing can show those again before
+/// the title has streamed them in again, which uploads them anew in any
+/// case, while a copy whose memory is still there is shown again as soon as
+/// a view of it is written. By age alone a copy of either kind went.
+#[cfg(windows)]
+fn gone_first() -> bool {
+    crate::toggled!("VICTORY_SWEEP_GONE_FIRST")
+}
+
+/// Whether `r` is a texture placed in the views of the title's physical
+/// pages whose first page no view shows now (its smallest levels lie there,
+/// mapped first and unmapped last). By the runtime's word of what it mapped
+/// (`crate::inplace::shown_bytes`): no question to the host, which the sweep
+/// would ask for thousands of textures on the thread that submits.
+#[cfg(windows)]
+fn memory_gone(r: &Resource) -> bool {
+    // (Most of the idle ones have no host copy: nothing to ask about.)
+    if !r.host.placed.load(std::sync::atomic::Ordering::Relaxed)
+        || r.host.made.lock().unwrap_or_else(|e| e.into_inner()).is_none()
+    {
+        return false;
+    }
+    let at = r.data() as usize;
+    let shown = || crate::inplace::shown_bytes(at, 1).unwrap_or(0);
+    at != 0 && crate::watch::in_placeholder(at) && shown() == 0
+}
+
+/// Since the start, of the host copies [`let_go_idle`] let go under a limit
+/// of bytes: those whose title memory was gone and their bytes, the others
+/// and their bytes ([`gone_first`]).
+#[cfg(windows)]
+pub(crate) static LIMITED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// Since the start: looks of [`let_go_idle`], their microseconds, and the
 /// longest one's.
@@ -2692,6 +2788,8 @@ fn hand_out_resource(
         textures().insert(at);
         crate::texback::replaced(resource.data() as usize);
         if !fills(&desc) {
+            let (seen, bit) = target_seen(resource.data() as u64);
+            seen.fetch_or(bit, std::sync::atomic::Ordering::SeqCst);
             TARGETS_AT
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -3018,6 +3116,46 @@ pub(crate) fn texture_held(resource: This) -> Option<(u32, crate::texture::Diges
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]
 pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
+    // This thread's last answers. A placed texture's resource is never
+    // taken out of the table below, so an answer stays the answer; and every
+    // view of a placed texture that a draw reads, and every slot made for
+    // one, asked under the table's lock (and under that of the filler count),
+    // from all recording threads at once. `VICTORY_PLACED_QUICK=0`: asked
+    // there each time, as before.
+    const MOST: usize = 2048;
+    type Found = (u64, [u32; 14], usize);
+    thread_local! {
+        static FOUND: std::cell::RefCell<Vec<Found>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    if !crate::toggled!("VICTORY_PLACED_QUICK") {
+        return texture_at_asked(address, desc);
+    }
+    let mut hash = address.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    for pair in desc.chunks_exact(2) {
+        hash = (hash ^ (u64::from(pair[0]) << 32 | u64::from(pair[1]))).rotate_left(23).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+    let at = (hash >> 40) as usize % MOST;
+    let known = FOUND.try_with(|found| {
+        let found = found.borrow();
+        found.get(at).filter(|f| f.2 != 0 && f.0 == address && f.1 == *desc).map(|f| f.2)
+    });
+    if let Ok(Some(known)) = known {
+        return Some(known as This);
+    }
+    let asked = texture_at_asked(address, desc)?;
+    let _ = FOUND.try_with(|found| {
+        let mut found = found.borrow_mut();
+        if found.is_empty() {
+            found.resize(MOST, (0, [0; 14], 0));
+        }
+        found[at] = (address, *desc, asked as usize);
+    });
+    Some(asked)
+}
+
+/// [`texture_at`], from the table of all of them.
+#[cfg(windows)]
+fn texture_at_asked(address: u64, desc: &[u32; 14]) -> Option<This> {
     // Words 1 and 13 of the description are the filler of its layout
     // (after the dimension, and at the end): the title leaves there what
     // its stack held, and two views of one texture that differed only in

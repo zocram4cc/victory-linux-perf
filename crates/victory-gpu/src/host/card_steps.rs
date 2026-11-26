@@ -358,17 +358,21 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
         let writes = w.0 < w.1;
         let mut level = 0;
         // Behind what writes what this reads or writes, and, if this
-        // writes, behind what reads it.
-        let ahead: Box<dyn Iterator<Item = usize>> =
-            if writes { Box::new(0..out.len()) } else { Box::new(copies.iter().copied()) };
-        for k in ahead {
+        // writes, behind what reads it. (No iterator of either kind in a
+        // box: that was an allocation for each of 5,700 fills a frame.)
+        let mut behind_of = |k: usize| {
             let (j, at): (usize, u32) = out[k];
             let Some((jr, jw)) = reads_writes(&does[j]) else {
-                continue;
+                return;
             };
             if at >= level && (meet(jw, r) || meet(jw, w) || meet(jr, w)) {
                 level = at + 1;
             }
+        };
+        if writes {
+            (0..out.len()).for_each(&mut behind_of);
+        } else {
+            copies.iter().copied().for_each(&mut behind_of);
         }
         if writes {
             copies.push(out.len());
