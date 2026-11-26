@@ -898,13 +898,15 @@ static NULL_ROOT_SEEN: std::sync::Mutex<Option<std::collections::HashSet<(String
 /// side and cause is logged once, with the count so far. The bind goes
 /// through `sets::Sets`, as the title's own root binds do: zeros the list
 /// holds already are not given again, and a view bound at the parameter
-/// later is not taken for them.
-fn bind_null_root(sets: &mut sets::Sets, l: &ID3D12GraphicsCommandList, param: u32, compute: bool, srv: bool, pipeline: &str, why: NullRoot) {
+/// later is not taken for them. True when the list holds the zeros there
+/// after the call; false, with nothing bound, with the switch off or
+/// without the zeros.
+fn bind_null_root(sets: &mut sets::Sets, l: &ID3D12GraphicsCommandList, param: u32, compute: bool, srv: bool, pipeline: &str, why: NullRoot) -> bool {
     if !null_roots_on() {
-        return;
+        return false;
     }
     let Some(gpu) = crate::descriptor::host::zero_buffer_gpu() else {
-        return;
+        return false;
     };
     let n = NULL_ROOTS.fetch_add(1, Ordering::Relaxed) + 1;
     {
@@ -926,6 +928,7 @@ fn bind_null_root(sets: &mut sets::Sets, l: &ID3D12GraphicsCommandList, param: u
             }
         }
     }
+    true
 }
 
 fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
@@ -1874,8 +1877,8 @@ impl State {
                             None,
                         ));
                     }
-                    if null_roots_on() && !root_address_ok(gpu) {
-                        bind_null_root(&mut self.sets, l, param, compute, srv, &p.name, NullRoot::NearZero);
+                    // (Bound as before if the zeros are not there.)
+                    if !root_address_ok(gpu) && bind_null_root(&mut self.sets, l, param, compute, srv, &p.name, NullRoot::NearZero) {
                         continue;
                     }
                     let bound = if srv { Bound::Srv(gpu) } else { Bound::Cbv(gpu) };
