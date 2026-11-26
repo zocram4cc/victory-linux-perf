@@ -283,6 +283,16 @@ run() {
             "$LAUNCHER" kill >/dev/null 2>&1 || true
             sleep 3
         done
+        # Still there (it happened after --perf runs: the launcher's kill
+        # did not reach it, and the user found the game open later): the
+        # process itself, gently and then not.
+        local pid
+        for sig in TERM KILL; do
+            pid=$(game_pid)
+            [[ -z $pid ]] && break
+            kill -s "$sig" "$pid" 2>/dev/null || true
+            sleep 3
+        done
         [[ -z $(game_pid) ]] || say "WARNING: the game is still running; close it with: $LAUNCHER kill"
         wait "$launcher" 2>/dev/null || true
     fi
