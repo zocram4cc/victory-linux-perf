@@ -2993,6 +2993,18 @@ impl HostHeap {
     /// nothing: reads give zeros, writes are dropped.
     pub(crate) fn null_raw_uav_at(&self, index: u32) {
         let Some(host) = host() else { return };
+        // Under Wine a view of real zeros ([`null_buffer_zeros`]): the
+        // title-memory run's slots, slot 0 (pages without a copy, address 0)
+        // among them, and root UAVs with nothing behind them.
+        if let Some(z) = zero_buffers() {
+            // SAFETY: a slot of our heap; a live buffer of ours (writes land
+            // there and are never read back).
+            unsafe { host.device.CreateUnorderedAccessView(&z[1], None::<&ID3D12Resource>, Some(&zero_uav_desc()), self.at(index)) };
+            self.put(index);
+            self.clear_twin(index);
+            self.keep(index, None);
+            return;
+        }
         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
@@ -4772,12 +4784,24 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
             return null_like(desc[..10].try_into().unwrap_or(&[0; 10]), at);
         }
         View::Constant(..) => {
-            let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
-            // SAFETY: a slot of our heap; a zero location makes a null view.
+            // Under Wine 64 KiB of real zeros ([`null_buffer_zeros`]), not
+            // location 0.
+            let desc = match zero_buffer_gpu() {
+                Some(gpu) => D3D12_CONSTANT_BUFFER_VIEW_DESC { BufferLocation: gpu, SizeInBytes: 64 << 10 },
+                None => D3D12_CONSTANT_BUFFER_VIEW_DESC::default(),
+            };
+            // SAFETY: a slot of our heap; zeros of ours, or a zero location
+            // (a null view).
             return unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
         }
         _ => return null_view(at),
     };
+    if buffer && let Some(z) = zero_buffers() {
+        // SAFETY: a slot of our heap; a live buffer of ours (writes land
+        // there and are never read back).
+        unsafe { host.device.CreateUnorderedAccessView(&z[1], None::<&ID3D12Resource>, Some(&zero_uav_desc()), at) };
+        return;
+    }
     let desc = if buffer {
         D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_UINT,
@@ -4842,6 +4866,23 @@ fn null_uav_desc(dimension: Option<u32>) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
 /// buffers).
 fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let Some(host) = host() else { return };
+    if let Some(z) = zero_buffers() {
+        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    NumElements: (ZERO_BYTES / 4) as u32,
+                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                    ..Default::default()
+                },
+            },
+        };
+        // SAFETY: a slot of our heap; a live buffer of ours.
+        unsafe { host.device.CreateShaderResourceView(&z[0], Some(&desc), at) };
+        return;
+    }
     let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
         Format: DXGI_FORMAT_R32_TYPELESS,
         ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
@@ -4859,6 +4900,95 @@ fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         host.device
             .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
     };
+}
+
+/// Whether views of buffers that read nothing are views of real buffers of
+/// zeros (`VICTORY_NULL_BUFFER_ZEROS`, on under Wine; =0 off; never
+/// elsewhere): 64 MiB to read, and another 64 MiB for unordered views to
+/// write into, never read back.
+///
+/// Why: the owner's run play-va2 (2026-11-25) lost the device on scalar
+/// data reads (amdgpu "SQC (data)") at GPU addresses 0x0, 0x10000, 0x3f000
+/// ... 0xc4000: a buffer read through a view whose base address is 0, at
+/// the offsets the shader computed. A null buffer view gives no memory and,
+/// on vkd3d-proton's path for such views, no bound the load is held to; a
+/// view of real zeros reads zeros at any offset within its size. The
+/// title-memory run's slot 0, which pages without a copy (address 0, where
+/// ray-tracing passes run with ray tracing off are handed a structure that
+/// is not there) read through, is such a view (`crate::memory`,
+/// `VICTORY_MEMORY_RUN_FIRST` in the owner's tree).
+fn null_buffer_zeros() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| zeros_on(crate::wine::on_wine(), std::env::var_os("VICTORY_NULL_BUFFER_ZEROS").as_deref()))
+}
+
+/// [`null_buffer_zeros`]'s decision: under Wine unless the switch is `0`.
+fn zeros_on(wine: bool, switch: Option<&std::ffi::OsStr>) -> bool {
+    wine && switch.is_none_or(|v| v != "0")
+}
+
+/// The bytes of each buffer of [`null_buffer_zeros`].
+const ZERO_BYTES: u64 = 64 << 20;
+
+/// A raw unordered access view of the whole buffer to write into
+/// ([`zero_buffers`]).
+fn zero_uav_desc() -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+    D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: DXGI_FORMAT_R32_TYPELESS,
+        ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+        Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+            Buffer: D3D12_BUFFER_UAV {
+                NumElements: (ZERO_BYTES / 4) as u32,
+                Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                ..Default::default()
+            },
+        },
+    }
+}
+
+/// The buffers of [`null_buffer_zeros`]: to read (0) and to write (1);
+/// `None` when it is off or the host refused them.
+fn zero_buffers() -> Option<&'static [ID3D12Resource; 2]> {
+    if !null_buffer_zeros() {
+        return None;
+    }
+    static MADE: std::sync::OnceLock<Option<[ID3D12Resource; 2]>> = std::sync::OnceLock::new();
+    MADE.get_or_init(|| {
+        let host = host()?;
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+        let make = || -> Option<ID3D12Resource> {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: ZERO_BYTES,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_UNKNOWN,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            let mut r: Option<ID3D12Resource> = None;
+            // SAFETY: plain creation; committed resources start zeroed.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut r)
+                    .ok()?;
+            }
+            r
+        };
+        let made = [make()?, make()?];
+        tracing::info!(mb = ZERO_BYTES >> 20, "views of buffers that read nothing read real zeros (VICTORY_NULL_BUFFER_ZEROS)");
+        Some(made)
+    })
+    .as_ref()
+}
+
+/// The GPU address of the buffer of zeros to read ([`null_buffer_zeros`]).
+pub(crate) fn zero_buffer_gpu() -> Option<u64> {
+    // SAFETY: a live buffer.
+    zero_buffers().map(|b| unsafe { b[0].GetGPUVirtualAddress() })
 }
 
 /// A texture view that reads zeros with the dimension (and mip and array
@@ -4924,6 +5054,18 @@ mod tests {
         assert_eq!(ahead_after(true, Some(7)), 7);
         assert_eq!(ahead_after(true, None), 0);
         assert_eq!(ahead_after(false, Some(7)), 0);
+    }
+
+    /// Null buffer views read real zeros only under Wine, unless switched
+    /// off.
+    #[test]
+    fn null_buffers_read_zeros_only_under_wine() {
+        use std::ffi::OsStr;
+        assert!(zeros_on(true, None));
+        assert!(zeros_on(true, Some(OsStr::new("1"))));
+        assert!(!zeros_on(true, Some(OsStr::new("0"))));
+        assert!(!zeros_on(false, None));
+        assert!(!zeros_on(false, Some(OsStr::new("1"))));
     }
 
     /// A view of a host copy that begins at a later level shows the same
