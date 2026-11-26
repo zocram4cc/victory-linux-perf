@@ -43,7 +43,7 @@ close_game() {
 shoot() {
     local g
     g=$(hyprctl clients -j 2>/dev/null | python3 -c 'import json, sys
-c = [c for c in json.load(sys.stdin) if "VIctory" in c.get("title", "") and c.get("class") == "steam_proton"]
+c = [c for c in json.load(sys.stdin) if c.get("class") == "steam_proton" and "cmd.exe" not in c.get("title", "")]
 if c:
     x, y = c[0]["at"]; w, h = c[0]["size"]; x2 = max(x, 0)
     print("%d,%d %dx%d" % (x2, y, w - (x2 - x), h))') || true

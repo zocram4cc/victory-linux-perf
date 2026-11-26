@@ -30,3 +30,5 @@ Seen: the intro flickers before the loading screen (the author lists it as known
 - New P.4 census line (release): work dropped with no pipeline set (slots 0x1c8/0x218) against a pipeline set but not made.
 
 **Belobug/VIctory-Belobug-AMD (read 26 Nov):** the same base as kroeeee's (`c9c932c`) plus three commits: FSR 4.1.2 to 4K, **texture uploads in the submission prelude "to fix frame-order & flickering"** (`5d6bd84`, a candidate for the flicker while streaming), and an RX 9070 XT set with a guard for AMD's compiler crashing in `amdxc64.dll` (a `warm-bad.txt` list of pipelines left out). No 0x1c8/0x218.
+
+- P.4 bisect, user live: with `VICTORY_NATIVE_COMPUTE_MAX=675` the picture was **all white, Jason's hair and beard black** (other broken runs: black). At least two bad programs: one blowing the picture out (exposure/lighting?), one emptying the scene (draws ~9,000 → ~5,900 below call 1,350, → ~4,000 from call 1,352).
