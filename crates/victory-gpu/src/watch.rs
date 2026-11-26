@@ -1814,7 +1814,20 @@ fn placeholder(block: usize) -> bool {
             std::ptr::null_mut(),
         )
     };
-    status >= 0 && region.region_type & PLACEHOLDER_RESERVATION != 0
+    if status >= 0 {
+        return region.region_type & PLACEHOLDER_RESERVATION != 0;
+    }
+    // Wine answers no class 7 (STATUS_INVALID_INFO_CLASS) and never sets the
+    // flag: without this every hole was asked about at every asking, ~13,000
+    // VirtualQuery a frame contending on Wine's one virtual_mutex. A plain
+    // reservation in title memory is committed only through the runtime,
+    // which tells (`title_memory_allocated`), and `look_at_holes` checks.
+    use windows_sys::Win32::System::Memory::{MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
+    n != 0 && info.State == MEM_RESERVE
 }
 
 /// The runtime gave the title memory at `[at, at + len)`, allocated or
