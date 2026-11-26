@@ -269,6 +269,8 @@ pub(crate) fn bound(
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    // G.1: the clamp and its barriers counted apart.
+    list.gpu_mark(crate::host::GPU_KEY_INDIRECT);
     record_clamp(c, &list.list, &dst, budget, src, count, spec).then_some(dst)
 }
 
@@ -289,6 +291,8 @@ pub(crate) fn bound_ahead(
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    // G.1: the clamp and its barriers counted apart.
+    list.gpu_mark(crate::host::GPU_KEY_INDIRECT);
     record_clamp_as(c, &list.list, &dst, budget, src, None, spec, AHEAD).then_some(dst)
 }
 
@@ -311,6 +315,8 @@ pub(crate) fn bound_split(list: &HostList, src: (&ID3D12Resource, u64)) -> Optio
     validate_layout(spec, src.1, None)?;
     let (c, budget) = (clamp()?, list.budget()?);
     let dst = list.indirect_scratch(u64::from(SPLIT) * PART_BYTES)?;
+    // G.1: the clamp and its barriers counted apart.
+    list.gpu_mark(crate::host::GPU_KEY_INDIRECT);
     record_clamp_as(c, &list.list, &dst, budget, src, None, spec, IN_PARTS).then_some(dst)
 }
 
