@@ -4,6 +4,10 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**`VICTORY_INPLACE=2` on today's base: no overlaps left, the picture still breaks; GPU 244 ms**
+- `bench/trials-20261126-102344-inplace2` and `…-inplace2-copies`: 78 windows (368 MB) and ~3,300 title buffers (188 MB) in place; **3,372 ranges in place, 4 under any host copy, 0.0 MB of overlap**. Frame 454-457 ms, **GPU 244 ms** (187 with copies: the GPU reads system memory over PCIe, as on 25 Nov). One of three runs closed before the world.
+- **The picture breaks the same way** (`shot-2.png`: the house dark, the dock and the water cut and bent, debris over the water). So it is not copies over in-place memory: in-place memory itself loses or mistimes something. Next, by halves: windows only (`=1`), then buffers by kind.
+
 **Summary of 26 Nov (written at the user's request)**
 
 *Gains, on by default, picture right:*
