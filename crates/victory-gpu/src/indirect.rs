@@ -25,6 +25,8 @@ use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::s;
 
+use std::sync::atomic::Ordering;
+
 use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
@@ -318,6 +320,101 @@ pub(crate) fn bound_split(list: &HostList, src: (&ID3D12Resource, u64)) -> Optio
     // G.1: the clamp and its barriers counted apart.
     list.gpu_mark(crate::host::GPU_KEY_INDIRECT);
     record_clamp_as(c, &list.list, &dst, budget, src, None, spec, IN_PARTS).then_some(dst)
+}
+
+/// `VICTORY_INDIRECT_BATCH=1` (I.1): single indirect records whose
+/// arguments no shader of the list writes before them are clamped in the
+/// list's prelude, all in one run of dispatches with no wait between them,
+/// each into a slot of its own; the draws then run back to back with no
+/// pass of ours between them. Without it, every record was clamped right
+/// before its draw into the one scratch buffer the list has, between two
+/// waits for every shader write (~9,700 a frame in the open world, the
+/// draws never overlapping: G.1, 26 Nov). Off until measured.
+pub(crate) fn batch_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_INDIRECT_BATCH").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("VICTORY_INDIRECT_BATCH=1: indirect records clamped in the list's prelude, in one run");
+        }
+        on
+    })
+}
+
+/// A clamp left for the list's prelude ([`batch_on`]).
+#[derive(Clone)]
+pub(crate) struct Batched {
+    pub(crate) src: ID3D12Resource,
+    pub(crate) src_offset: u64,
+    pub(crate) spec: (u32, u32, u32),
+    pub(crate) dst: ID3D12Resource,
+    pub(crate) dst_offset: u64,
+}
+
+/// I.1: the clamp of `src`'s records `spec` left for the prelude; the
+/// buffer and offset the draw reads them at (in `INDIRECT_ARGUMENT` when
+/// the list runs). `None` if the clamp or the layout does not allow it.
+pub(crate) fn bound_later(
+    list: &HostList,
+    (src, src_offset): (&ID3D12Resource, u64),
+    spec: (u32, u32, u32),
+) -> Option<(ID3D12Resource, u64)> {
+    let bytes = validate_layout(spec, src_offset, None)?;
+    clamp()?;
+    list.budget()?;
+    let (dst, dst_offset) = list.batch_slot(bytes)?;
+    list.defer_clamp(Batched { src: src.clone(), src_offset, spec, dst: dst.clone(), dst_offset });
+    BATCHED.fetch_add(1, Ordering::Relaxed);
+    Some((dst, dst_offset))
+}
+
+/// Records clamped in preludes since the last frame line.
+pub(crate) static BATCHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// I.1, in a list's prelude: every clamp left for it, one dispatch each with
+/// no wait between them (each writes its own slot), after one wait for
+/// shader writes of lists run before, and the slots moved to
+/// `INDIRECT_ARGUMENT` at the end.
+pub(crate) fn record_batch(l: &ID3D12GraphicsCommandList, budget: u64, clamps: &[Batched]) {
+    let Some(c) = clamp() else { return };
+    let mut buffers: Vec<&ID3D12Resource> = Vec::new();
+    for b in clamps {
+        if !buffers.iter().any(|d| *d == &b.dst) {
+            buffers.push(&b.dst);
+        }
+    }
+    let mut first = vec![uav_barrier()];
+    first.extend(buffers.iter().map(|d| transition(d, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)));
+    let mut last = vec![uav_barrier()];
+    last.extend(buffers.iter().map(|d| transition(d, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT)));
+    // SAFETY: an open list; our root signature and pipeline; live buffers
+    // (the list keeps them until it is reset).
+    unsafe {
+        l.ResourceBarrier(&first);
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.pso);
+        for b in clamps {
+            let (kind, stride, records) = b.spec;
+            let Some(bytes) = validate_layout(b.spec, b.src_offset, None) else { continue };
+            let src_base = b.src.GetGPUVirtualAddress();
+            let dst_gpu = b.dst.GetGPUVirtualAddress() + b.dst_offset;
+            let (src_gpu, args_offset) = match b.src_offset.checked_add(bytes).filter(|&e| e <= u64::from(u32::MAX)) {
+                Some(_) => (src_base, b.src_offset as u32),
+                None => (src_base + b.src_offset, 0),
+            };
+            if records == 0 || !src_base.is_multiple_of(4) || !dst_gpu.is_multiple_of(4) {
+                continue;
+            }
+            let constants = [kind, stride, records, args_offset, 0u32, 0u32];
+            l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+            l.SetComputeRootShaderResourceView(1, src_gpu);
+            l.SetComputeRootShaderResourceView(2, src_gpu);
+            l.SetComputeRootUnorderedAccessView(3, dst_gpu);
+            l.SetComputeRootUnorderedAccessView(4, budget);
+            l.Dispatch(records.div_ceil(64), 1, 1);
+        }
+        l.ResourceBarrier(&last);
+    }
 }
 
 /// Bits of the clamp's `has_count`.

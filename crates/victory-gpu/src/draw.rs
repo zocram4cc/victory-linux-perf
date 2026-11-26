@@ -2556,9 +2556,28 @@ impl State {
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
             .map(|w| (w.scratch.clone(), offset - w.base));
-        let (bounded, at) = match hit {
-            Some(hit) => hit,
-            None => {
+        // I.1 (`VICTORY_INDIRECT_BATCH`): a single record no shader of the
+        // list wrote before it is clamped in the list's prelude, into a slot
+        // of its own: no pass of ours and no wait here.
+        let batched = hit.is_none()
+            && crate::indirect::batch_on()
+            && parts.is_none()
+            && !windowed
+            && max == 1
+            && count.is_none()
+            && !args.carded()
+            && !list.gpu_writes(arguments as usize, len as usize);
+        let later = if batched {
+            args.refresh(list, arguments, len);
+            crate::indirect::bound_later(list, (&args.buffer, offset), (kind, stride, 1))
+        } else {
+            None
+        };
+        let batched = later.is_some();
+        let (bounded, at) = match (later, hit) {
+            (Some(later), _) => later,
+            (None, Some(hit)) => hit,
+            (None, None) => {
                 // A record a short step after the last window's last one
                 // (the same step as that window's, if it had one): the
                 // title walks the buffer, so the ones that step apart
@@ -2623,7 +2642,9 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &bounded);
+            if !batched {
+                crate::indirect::done(list, &bounded);
+            }
             why("prepare failed");
             return false;
         }
@@ -2660,7 +2681,11 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
-        crate::indirect::done(list, &bounded);
+        // A batched slot stays as the prelude left it for the list's other
+        // draws (each has its own).
+        if !batched {
+            crate::indirect::done(list, &bounded);
+        }
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {

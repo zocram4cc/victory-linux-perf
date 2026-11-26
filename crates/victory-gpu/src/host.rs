@@ -852,6 +852,10 @@ pub(crate) struct HostList {
     /// dispatch, and what each one was (a title pipeline, or one of ours).
     census_stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
     census_keys: Mutex<Vec<u64>>,
+    /// I.1 (`VICTORY_INDIRECT_BATCH`): clamps left for the prelude, and the
+    /// buffer their slots are in with the bytes used of it.
+    batch_clamps: Mutex<Vec<crate::indirect::Batched>>,
+    batch_args: Mutex<Option<(ID3D12Resource, u64, u64)>>,
 }
 
 /// A list's prelude: an allocator and a closed list.
@@ -3086,6 +3090,8 @@ impl Host {
                 stamps: OnceLock::new(),
                 census_stamps: OnceLock::new(),
                 census_keys: Mutex::default(),
+                batch_clamps: Mutex::default(),
+                batch_args: Mutex::default(),
             })
         }
     }
@@ -4818,6 +4824,10 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.census_keys.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.batch_clamps.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        if let Some(args) = self.batch_args.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            args.2 = 0;
+        }
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
@@ -5124,7 +5134,10 @@ impl HostList {
             (real != *first)
                 .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
         }));
-        if barriers.is_empty() && syncs.is_empty() {
+        // Kept until the reset: a list run again clamps them again.
+        let clamps = self.batch_clamps.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let budget = if clamps.is_empty() { None } else { self.budget() };
+        if barriers.is_empty() && syncs.is_empty() && clamps.is_empty() {
             return None;
         }
         let Some((allocator, list)) = self
@@ -5147,6 +5160,9 @@ impl HostList {
                 }
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
+                }
+                if let Some(budget) = budget {
+                    crate::indirect::record_batch(list, budget, &clamps);
                 }
                 list.Close()
             })
@@ -5443,6 +5459,44 @@ impl HostList {
     /// clamped indirect arguments, reused across executions and resets of the
     /// list. Smaller buffers replaced mid-list stay alive until
     /// [`HostList::reset`].
+    /// I.1: a slot of `size` bytes for clamped records of its own (256-byte
+    /// aligned), in a buffer the list keeps; a bigger buffer replaces a full
+    /// one (the old one stays alive until the reset).
+    pub(crate) fn batch_slot(&self, size: u64) -> Option<(ID3D12Resource, u64)> {
+        let size = size.next_multiple_of(256);
+        let mut slot = self.batch_args.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((buffer, cap, used)) = slot.as_mut()
+            && *used + size <= *cap
+        {
+            let at = *used;
+            *used += size;
+            return Some((buffer.clone(), at));
+        }
+        let prev = slot.as_ref().map_or(0, |s| s.1);
+        let cap = prev.saturating_mul(2).max(size).max(1 << 20).next_multiple_of(64 << 10);
+        let buffer = host()?.uav_buffer(cap)?;
+        name(&buffer, || format!("batched indirect arguments {cap:#x}"));
+        if let Some((old, _, _)) = slot.replace((buffer.clone(), cap, size)) {
+            self.keep(&old);
+        }
+        self.keep(&buffer);
+        Some((buffer, 0))
+    }
+
+    /// I.1: a clamp for the prelude to record.
+    pub(crate) fn defer_clamp(&self, clamp: crate::indirect::Batched) {
+        self.batch_clamps.lock().unwrap_or_else(|e| e.into_inner()).push(clamp);
+    }
+
+    /// Whether a shader of this list writes `[address, address + len)` in a
+    /// range recorded so far.
+    pub(crate) fn gpu_writes(&self, address: usize, len: usize) -> bool {
+        self.deferred().copies.iter().any(|step| match step {
+            Step::GpuWrite(_, at, n) => *at < address + len && address < at + n,
+            _ => false,
+        })
+    }
+
     pub(crate) fn indirect_scratch(&self, size: u64) -> Option<ID3D12Resource> {
         let needed = size.max(64 << 10);
         let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
