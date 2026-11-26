@@ -4,6 +4,11 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**1.3: more than half of the ranges written back have another host copy over them; A.1: detiling is not the texture cost**
+- `VICTORY_BACK_OVERLAP=1` (`bench/trials-20261126-060513-back-overlap`, 487-488 ms): **per frame, ~465 written ranges declared (1.07-1.16 GB of views), 253-263 of them overlapped by ~267 other host copies (buffer copies or windows), 66-85 MB of overlap**. Aliases (other addresses of the same pages) are not counted, so this is a lower bound. It confirms the ceiling's reading: what one copy's shaders write reaches the others through title memory.
+- **So 1.3 becomes a piece-M question first:** one host copy per title range (nested buffers and windows resolved to the outermost copy, with views at offsets), or GPU→GPU copies between overlapping copies at the end of a submission. Either removes the hub; then the CPU side is the census's ~1 page a frame, fetched on demand.
+- **A.1, detiling:** `textures detiled per frame: 9-139 textures, 0.6-6.8 MB, 0.0-0.4 ms` on all threads. Detiling is not what `heap_textures` spends its 6-115 ms on: that is making host textures, view mirrors and the mapped-page queries per slot. A.2's first target is then texture creation (the pool already pre-maps memory) and the per-slot queries, not a copy queue.
+
 **1.3 ceiling: −22 % frame without copy-back, but the picture goes black; title memory is the hub between host copies**
 - `VICTORY_BACK_CEILING=1` (`bench/trials-20261126-055937-back-ceiling`, measurement only): **362-374 ms against 477-486** (windows marked invalid: the draw count swings). Frame line: preparing ~50 ms (119 before), copying back 9 ms / 8.5 MB (72 ms / 46 MB; what is left is the card copies), GPU ~228 ms (265); the card idle behind us **~60 ms a frame (173-228 before)**.
 - **The picture is almost all black** (`shot-*.png`): only faint UI outlines. Yet the census saw the title's CPU read about one page a frame of what goes back.
