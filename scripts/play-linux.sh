@@ -21,8 +21,9 @@
 #                   record from just after the terms of service were accepted)
 #   --levels-on-demand  texture mip levels as draws need them
 #                   (VICTORY_LEVELS_ON_DEMAND=1; off by default since it used more memory)
-#   --no-texture-waits  the title's shorter waits for textures in the first frames and
-#                   the first cutscene (VICTORY_EARLY_TEXTURES_MS=12, VICTORY_BAKE_TEXTURES_MS=1500)
+#   --texture-waits wait longer for textures in the first frames and the first cutscene
+#                   (VICTORY_EARLY_TEXTURES_MS=40, VICTORY_BAKE_TEXTURES_MS=10000, the willy
+#                   build's; fewer faces popping in, a slower and darker start)
 #   --stock-wineserver  Proton-GE Latest as it is, even where the view-tree copy is
 #                   installed (by default the launcher uses that copy when it is there:
 #                   ~/.local/share/victory/proton/GE-Proton11-14-viewtree, GE-Proton11-14
@@ -61,9 +62,10 @@ while (( $# )); do
     --proton-log) proton_log=1 ;;
     --new-game) new_game=1 ;;
     --levels-on-demand) export VICTORY_LEVELS_ON_DEMAND="${VICTORY_LEVELS_ON_DEMAND:-1}" ;;
-    --no-texture-waits)
-      export VICTORY_EARLY_TEXTURES_MS="${VICTORY_EARLY_TEXTURES_MS:-12}"
-      export VICTORY_BAKE_TEXTURES_MS="${VICTORY_BAKE_TEXTURES_MS:-1500}" ;;
+    --texture-waits)
+      export VICTORY_EARLY_TEXTURES_MS="${VICTORY_EARLY_TEXTURES_MS:-40}"
+      export VICTORY_BAKE_TEXTURES_MS="${VICTORY_BAKE_TEXTURES_MS:-10000}" ;;
+    --no-texture-waits) ;; # the default now
     --skip-intro) export VICTORY_KEYS="${VICTORY_KEYS-12:Enter,16:Enter,20:A,25:Enter,30:A,35:Enter,40:A,50:Enter}" ;;
     --stock-wineserver) stock_wineserver=1 ;;
     --view-tree) ;; # the default where the copy is installed
@@ -214,12 +216,11 @@ fi
 # 11.2 -> 9.7 GB, 99th percentile frame 802 -> 578 ms); the willy build's
 # setting. --levels-on-demand turns it back on.
 d VICTORY_LEVELS_ON_DEMAND 0
-# Longer waits for textures in the first frames and the first cutscene (the
-# willy build's): with them run 20261126-221648 reached 305 s of the intro
-# with clothes and faces lit right and a lower memory peak than without
-# (-221207). --no-texture-waits: the shorter waits.
-d VICTORY_EARLY_TEXTURES_MS 40
-d VICTORY_BAKE_TEXTURES_MS 10000
+# The title's own short waits for textures in the first frames and the first
+# cutscene: with the willy build's longer ones (--texture-waits) the first
+# 20 s of the world were slow and the first car scene dark; without them the
+# start was black for about 5 s and faces popped in soon after (runs
+# 20261126-232829 against -233440).
 d VICTORY_CARD_BUFFERS_MIN_KB 64
 # Both faces: under Proton character heads and hair are culled away otherwise.
 d VICTORY_CULL_NONE 1
