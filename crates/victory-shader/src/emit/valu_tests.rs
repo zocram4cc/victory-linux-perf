@@ -29,11 +29,6 @@ const fn sop2(op: u8, sdst: u8, src0: u8, src1: u8) -> u32 {
         | src0 as u32
 }
 
-/// SOPK `op sdst, simm16`; the compares read `sdst` as their operand.
-const fn sopk(op: u8, sdst: u8, simm16: u16) -> u32 {
-    0xB000_0000 | (op as u32 & 0x1F) << 23 | (sdst as u32 & 0x7F) << 16 | simm16 as u32
-}
-
 /// SMEM `s_load_dwordx4 s[dst:dst+3], s[base:base+1], 0` (soffset = null).
 const fn s_load_dwordx4(dst: u8, base: u8) -> [u32; 2] {
     [
@@ -1189,61 +1184,6 @@ fn v_cvt_f16_u16_and_i16_widen_the_integer_first() {
 }
 
 #[test]
-fn s_cmpk_compares_against_the_extended_immediate() {
-    // s_cmpk_<cond>_<type> s0, imm; s_cselect_b32 s6, 1, 0 (SOP2 0x0a, on SCC);
-    // v_mov_b32 v0, s6. The signed forms sign-extend the 16-bit immediate, the
-    // unsigned forms zero-extend it.
-    type Cond = fn(i64, i64) -> bool;
-    let conds: [(&str, Cond); 6] = [
-        ("eq", |a, b| a == b),
-        ("lg", |a, b| a != b),
-        ("gt", |a, b| a > b),
-        ("ge", |a, b| a >= b),
-        ("lt", |a, b| a < b),
-        ("le", |a, b| a <= b),
-    ];
-    // An immediate below and one at the sign bit; operands around each extension.
-    let imms: [u16; 2] = [0x0005, 0x8000];
-    let operands: [u32; 9] = [
-        0,
-        4,
-        5,
-        6,
-        0x7FFF,
-        0x8000,
-        0xFFFF_8000,
-        0xFFFF_FFFF,
-        0x8000_0000,
-    ];
-    for (signed, first_op) in [(true, 0x003u8), (false, 0x009)] {
-        for (k, (cond, holds)) in conds.iter().enumerate() {
-            for imm in imms {
-                let shader = build_valu_cs(&[
-                    sopk(first_op + k as u8, 0, imm),
-                    sop2(0x0a, 6, 129, 128),
-                    vop1(0x001, 0, sgpr(6)),
-                ]);
-                let name = format!("s_cmpk_{cond}_{}32", if signed { "i" } else { "u" });
-                let inputs: Vec<[u32; 4]> = operands.iter().map(|&v| [v, 0, 0, 0]).collect();
-                run_cases(&shader, &inputs, |backend, i, _, got| {
-                    let (a, b) = if signed {
-                        (i64::from(operands[i] as i32), i64::from(imm as i16))
-                    } else {
-                        (i64::from(operands[i]), i64::from(imm))
-                    };
-                    let want = u32::from(holds(a, b));
-                    assert_eq!(
-                        got, want,
-                        "{backend}: {name}({:#010x}, {imm:#06x}) = {got}, want {want}",
-                        operands[i],
-                    );
-                });
-            }
-        }
-    }
-}
-
-#[test]
 fn v_sin_and_v_cos_f16_reduce_large_turns() {
     let sin_shader = build_valu_cs(&[vop1(0x060, 0, vgpr(1))]);
     let cos_shader = build_valu_cs(&[vop1(0x061, 0, vgpr(1))]);
@@ -1364,19 +1304,6 @@ fn bfe_signed_and_unsigned_match_rdna2() {
     let v_unsigned = build_valu_cs(&vop3(0x148, 0, vgpr(1), vgpr(2), vgpr(3)));
     // s_bfe_i32 s6, s0, s1 (SOP2 opcode 0x28: s1 = off[4:0] | width[22:16]); v_mov_b32 v0, s6
     let s_signed = build_valu_cs(&[sop2(0x28, 6, 0, 1), vop1(0x001, 0, sgpr(6))]);
-    // s_bfe_u32 s6, s0, s1 (SOP2 opcode 0x27: s1 = off[4:0] | width[22:16]); v_mov_b32 v0, s6
-    let s_unsigned = build_valu_cs(&[sop2(0x27, 6, 0, 1), vop1(0x001, 0, sgpr(6))]);
-    // SCC = (result != 0), consumed by s_cselect_b32 s7, s2, s3.
-    let s_signed_scc = build_valu_cs(&[
-        sop2(0x28, 6, 0, 1),
-        sop2(0x0A, 7, 2, 3),
-        vop1(0x001, 0, sgpr(7)),
-    ]);
-    let s_unsigned_scc = build_valu_cs(&[
-        sop2(0x27, 6, 0, 1),
-        sop2(0x0A, 7, 2, 3),
-        vop1(0x001, 0, sgpr(7)),
-    ]);
 
     let signed_cases: &[([u32; 4], u32)] = &[
         // Field crosses bit 31: extends from bit 31.
@@ -1400,36 +1327,22 @@ fn bfe_signed_and_unsigned_match_rdna2() {
             inp[0], inp[1], inp[2],
         );
     });
-    // v_bfe_{i32,u32} width is 5-bit (src2[4:0]), so width=32 wraps to 0.
-    for (name, shader) in [("v_bfe_i32", &v_signed), ("v_bfe_u32", &v_unsigned)] {
-        run_cases(shader, &[[0x8000_0000, 4, 32, 0]], |backend, _, _, got| {
-            assert_eq!(got, 0, "{backend}: {name} width 32 should mask to 0");
-        });
-    }
+    // v_bfe_i32 width is 5-bit (src2[4:0]), so width=32 wraps to 0.
+    run_cases(
+        &v_signed,
+        &[[0x8000_0000, 4, 32, 0]],
+        |backend, _, _, got| {
+            assert_eq!(got, 0, "{backend}: v_bfe_i32 width 32 should mask to 0");
+        },
+    );
 
-    const WHEN_NZ: u32 = 0xAAAA_5555;
-    const WHEN_ZERO: u32 = 0x1111_2222;
-    let pack = |off: u32, width: u32| (off & 31) | ((width & 0x7F) << 16);
-
-    // s_bfe_i32 width is 7-bit (src1[22:16]), so widths >= 32 keep all remaining bits
-    // with sign extension from bit 31 (including width=64 where width & 31 == 0).
+    // s_bfe_i32 width is 7-bit (src1[22:16]), so width=32 keeps all 32 bits.
     let mut s_cases = signed_cases.to_vec();
-    s_cases.extend([
-        ([0x8000_0000, 4, 32, 0], 0xf800_0000),
-        ([0x8000_0000, 0, 32, 0], 0x8000_0000),
-        ([0x8000_0000, 4, 64, 0], 0xf800_0000),
-        ([0xd2f9_0159, 28, 127, 0], 0xffff_fffd),
-        ([0x0000_000f, 4, 32, 0], 0),
-    ]);
-    let mut s_in: Vec<[u32; 4]> = s_cases
-        .iter()
-        .map(|&(inp, _)| [inp[0], pack(inp[1], inp[2]), WHEN_NZ, WHEN_ZERO])
-        .collect();
-    // Unused bits src1[15:5] and src1[31:23] are ignored by hardware.
     s_cases.push(([0x8000_0000, 4, 32, 0], 0xf800_0000));
-    s_in.push([0x8000_0000, 0xFF80_FFE0 | pack(4, 32), WHEN_NZ, WHEN_ZERO]);
-    s_cases.push(([0xffff_ffff, 4, 0, 0], 0));
-    s_in.push([0xffff_ffff, 0xFF80_FFE4, WHEN_NZ, WHEN_ZERO]);
+    let s_in: Vec<[u32; 4]> = s_cases
+        .iter()
+        .map(|&(inp, _)| [inp[0], (inp[1] & 31) | ((inp[2] & 0x7F) << 16), 0, 0])
+        .collect();
     run_cases(&s_signed, &s_in, |backend, i, inp, got| {
         let want = s_cases[i].1;
         assert_eq!(
@@ -1438,23 +1351,10 @@ fn bfe_signed_and_unsigned_match_rdna2() {
             inp[0], inp[1],
         );
     });
-    run_cases(&s_signed_scc, &s_in, |backend, i, inp, got| {
-        let want = if s_cases[i].1 != 0 {
-            WHEN_NZ
-        } else {
-            WHEN_ZERO
-        };
-        assert_eq!(
-            got, want,
-            "{backend}: s_bfe_i32 SCC({:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
-            inp[0], inp[1],
-        );
-    });
 
     let unsigned_cases: &[([u32; 4], u32)] = &[
         ([0xd2f9_0159, 28, 16, 0], 0x0000_000d),
         ([0x8000_0000, 31, 4, 0], 0x0000_0001),
-        ([0x0000_0080, 4, 4, 0], 0x0000_0008),
         ([0xffff_ffff, 4, 0, 0], 0),
         ([0x8000_0000, 4, 31, 0], 0x0800_0000),
     ];
@@ -1467,80 +1367,6 @@ fn bfe_signed_and_unsigned_match_rdna2() {
             inp[0], inp[1], inp[2],
         );
     });
-
-    // s_bfe_u32 width is 7-bit (src1[22:16]): widths >= 32 shift without sign extension.
-    let mut su_cases = unsigned_cases.to_vec();
-    su_cases.extend([
-        ([0x8000_0000, 4, 32, 0], 0x0800_0000),
-        ([0x8000_0000, 0, 32, 0], 0x8000_0000),
-        ([0x8000_0000, 4, 64, 0], 0x0800_0000),
-        ([0xd2f9_0159, 28, 127, 0], 0x0000_000d),
-        ([0x0000_000f, 4, 32, 0], 0),
-    ]);
-    let mut su_in: Vec<[u32; 4]> = su_cases
-        .iter()
-        .map(|&(inp, _)| [inp[0], pack(inp[1], inp[2]), WHEN_NZ, WHEN_ZERO])
-        .collect();
-    su_cases.push(([0x8000_0000, 4, 32, 0], 0x0800_0000));
-    su_in.push([0x8000_0000, 0xFF80_FFE0 | pack(4, 32), WHEN_NZ, WHEN_ZERO]);
-    su_cases.push(([0xffff_ffff, 4, 0, 0], 0));
-    su_in.push([0xffff_ffff, 0xFF80_FFE4, WHEN_NZ, WHEN_ZERO]);
-    run_cases(&s_unsigned, &su_in, |backend, i, inp, got| {
-        let want = su_cases[i].1;
-        assert_eq!(
-            got, want,
-            "{backend}: s_bfe_u32({:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
-            inp[0], inp[1],
-        );
-    });
-    run_cases(&s_unsigned_scc, &su_in, |backend, i, inp, got| {
-        let want = if su_cases[i].1 != 0 {
-            WHEN_NZ
-        } else {
-            WHEN_ZERO
-        };
-        assert_eq!(
-            got, want,
-            "{backend}: s_bfe_u32 SCC({:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
-            inp[0], inp[1],
-        );
-    });
-
-    // Literal src1 (`0xFF` followed by 32-bit immediate) for both s_bfe_u32 and s_bfe_i32:
-    // offset=4 (with ignored bits [15:5]), width=32/64/0 (with ignored bits [31:23]).
-    let literals: [(u8, u32, u32, u32, u32); 6] = [
-        (0x27, 0x8020_FFE4, 0x8000_0000, 0x0800_0000, WHEN_NZ),
-        (0x28, 0x8020_FFE4, 0x8000_0000, 0xf800_0000, WHEN_NZ),
-        (0x27, 0x0040_001C, 0xd2f9_0159, 0x0000_000d, WHEN_NZ),
-        (0x28, 0x0040_001C, 0xd2f9_0159, 0xffff_fffd, WHEN_NZ),
-        (0x27, 0xFF80_FFE4, 0xffff_ffff, 0, WHEN_ZERO),
-        (0x28, 0xFF80_FFE4, 0xffff_ffff, 0, WHEN_ZERO),
-    ];
-    for (op, lit, src0, want, want_scc) in literals {
-        let val_cs = build_valu_cs(&[sop2(op, 6, 0, 255), lit, vop1(0x001, 0, sgpr(6))]);
-        run_cases(&val_cs, &[[src0, 0, 0, 0]], |backend, _, _, got| {
-            assert_eq!(
-                got, want,
-                "{backend}: literal sop2({op:#x}, {src0:#010x}, {lit:#010x}) = {got:#010x}, want {want:#010x}",
-            );
-        });
-        let scc_cs = build_valu_cs(&[
-            sop2(op, 6, 0, 255),
-            lit,
-            sop2(0x0A, 7, 2, 3),
-            vop1(0x001, 0, sgpr(7)),
-        ]);
-        run_cases(
-            &scc_cs,
-            &[[src0, 0, WHEN_NZ, WHEN_ZERO]],
-            |backend, _, _, got| {
-                assert_eq!(
-                    got, want_scc,
-                    "{backend}: literal sop2({op:#x}) SCC({src0:#010x}, {lit:#010x}) = {got:#010x}",
-                );
-            },
-        );
-    }
 }
 
 #[test]

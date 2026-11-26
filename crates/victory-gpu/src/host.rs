@@ -1014,7 +1014,7 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            device = Some(victory_shader::emit::host::create_preferred_device()?);
+            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             // Whether a GPU hang ends the run or freezes the PC (#1054).
             crate::tdr::log();
         }
@@ -2226,6 +2226,134 @@ void main(uint3 id : SV_GroupID, uint thread : SV_GroupIndex) {
 }
 "#;
 
+/// Whether [`CARD_COMPARE_PAGES`] tracks changed 4 KiB sub-pages per 64 KiB
+/// piece (`VICTORY_CARD_PAGE_MASK=1`; off by default; disabled when
+/// `VICTORY_FETCH_CHECK=1` needs the 31-bit torn-fetch hash in `differs`).
+pub(crate) fn card_page_mask() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_CARD_PAGE_MASK").is_some_and(|v| v == "1") && !torn::on()
+    })
+}
+
+/// 4 KiB sub-page variant of [`CARD_COMPARE`]: the same 64-thread group hashes
+/// the 16 sub-pages of a 64 KiB title-memory piece (4 threads per 4 KiB page),
+/// compares each against its 16-byte hash in `hashes` (256 bytes per piece),
+/// and writes `(mask << 1) | (mask != 0)` into `differs` so bit 0 stays the
+/// piece-changed flag while bits 1..16 name the changed 4 KiB pages.
+pub(crate) const CARD_COMPARE_PAGES: &str = r#"
+#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
+cbuffer Span : register(b0) {
+    uint first;    // the first piece
+    uint skew;     // where the copy starts in its piece 0
+    uint size;     // the copy's buffer, in bytes (a multiple of 16)
+    uint pieces;
+    uint out_at;   // the first piece's dword in `differs`, in bytes
+    uint compare;  // 0: the hashes are stored; else compared with those stored (2: and then stored)
+};
+ByteAddressBuffer now : register(t0);
+// 16 bytes per 4 KiB sub-page (256 bytes per 64 KiB piece).
+RWByteAddressBuffer hashes : register(u0);
+RWByteAddressBuffer differs : register(u1);
+groupshared uint4 parts[64];
+groupshared uint masks[16];
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_GroupID, uint thread : SV_GroupIndex) {
+    uint piece = first + id.x;
+    uint sub = thread >> 2u;
+    uint lane = thread & 3u;
+    uint page_start = piece * 65536u + sub * 4096u;
+    uint page_end = page_start + 4096u;
+    uint end_all = skew + size;
+    bool valid = (page_end > skew) && (page_start < end_all);
+    uint plo = 0u;
+    uint phi = 0u;
+    if (valid) {
+        plo = page_start > skew ? page_start - skew : 0u;
+        phi = min(page_end - skew, size);
+        plo = plo & ~15u;
+        phi = (phi + 15u) & ~15u;
+        valid = plo < phi;
+    }
+    uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu) + thread;
+    if (valid) {
+        uint at = plo + lane * 16u;
+        [loop]
+        for (; at + 448u < phi; at += 512u) {
+            uint4 v0 = now.Load4(at + 0u);
+            uint4 v1 = now.Load4(at + 64u);
+            uint4 v2 = now.Load4(at + 128u);
+            uint4 v3 = now.Load4(at + 192u);
+            uint4 v4 = now.Load4(at + 256u);
+            uint4 v5 = now.Load4(at + 320u);
+            uint4 v6 = now.Load4(at + 384u);
+            uint4 v7 = now.Load4(at + 448u);
+            h = (h ^ v0) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+            h = h.yzwx ^ (h >> 15);
+            h = (h ^ v1) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+            h = h.yzwx ^ (h >> 15);
+            h = (h ^ v2) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+            h = h.yzwx ^ (h >> 15);
+            h = (h ^ v3) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+            h = h.yzwx ^ (h >> 15);
+            h = (h ^ v4) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+            h = h.yzwx ^ (h >> 15);
+            h = (h ^ v5) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+            h = h.yzwx ^ (h >> 15);
+            h = (h ^ v6) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+            h = h.yzwx ^ (h >> 15);
+            h = (h ^ v7) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+            h = h.yzwx ^ (h >> 15);
+        }
+        [loop]
+        for (; at < phi; at += 64u) {
+            h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+            h = h.yzwx ^ (h >> 15);
+        }
+    }
+    parts[thread] = h;
+    GroupMemoryBarrierWithGroupSync();
+    uint bit = 0u;
+    if (lane == 0u && valid) {
+        uint4 h0 = parts[sub * 4u + 0u];
+        uint4 h1 = parts[sub * 4u + 1u];
+        uint4 h2 = parts[sub * 4u + 2u];
+        uint4 h3 = parts[sub * 4u + 3u];
+        h0 = (h0 ^ h1) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+        h0 = h0.yzwx ^ (h0 >> 15);
+        h0 = (h0 ^ h2) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+        h0 = h0.yzwx ^ (h0 >> 15);
+        h0 = (h0 ^ h3) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+        h0 = h0.yzwx ^ (h0 >> 15);
+        uint hash_at = (piece * 16u + sub) * 16u;
+        if (compare != 0u) {
+            if (any(h0 != hashes.Load4(hash_at))) {
+                bit = 1u << sub;
+                if (compare == 2u) {
+                    hashes.Store4(hash_at, h0);
+                }
+            }
+        } else {
+            hashes.Store4(hash_at, h0);
+        }
+    }
+    if (compare != 0u) {
+        if (lane == 0u) {
+            masks[sub] = bit;
+        }
+        GroupMemoryBarrierWithGroupSync();
+        if (thread == 0u) {
+            uint mask = masks[0] | masks[1] | masks[2] | masks[3]
+                      | masks[4] | masks[5] | masks[6] | masks[7]
+                      | masks[8] | masks[9] | masks[10] | masks[11]
+                      | masks[12] | masks[13] | masks[14] | masks[15];
+            differs.Store(out_at + id.x * 4u, (mask << 1u) | (mask != 0u ? 1u : 0u));
+        }
+    }
+}
+"#;
+
 /// The hash [`CARD_COMPARE`] gives of a piece with its flag.
 #[cfg(test)]
 pub(crate) fn piece_hash(bytes: &[u8]) -> u32 {
@@ -2672,9 +2800,67 @@ fn flagged_pieces(flags: &[(usize, u32, bool)]) -> Vec<(usize, u32)> {
     pieces
 }
 
+/// [`flagged_pieces`] with 16-bit 4 KiB page masks (`card_page_mask`): masks
+/// from multiple ranges in one plan touching the same 64 KiB piece are ORed so
+/// a second range sees pages whose hashes were already updated by the first.
+fn flagged_page_masks(flags: &[(usize, u32, u16)]) -> Vec<((usize, u32), u16)> {
+    let mut masks: Vec<((usize, u32), u16)> =
+        flags.iter().filter(|f| f.2 != 0).map(|f| ((f.0, f.1), f.2)).collect();
+    masks.sort_unstable_by_key(|m| m.0);
+    let mut out: Vec<((usize, u32), u16)> = Vec::with_capacity(masks.len());
+    for (key, mask) in masks {
+        match out.last_mut() {
+            Some((last_key, last_mask)) if *last_key == key => *last_mask |= mask,
+            _ => out.push((key, mask)),
+        }
+    }
+    out
+}
+
+/// Contiguous buffer-offset runs within `[lo, hi)` (inside one 64 KiB piece of
+/// title memory for a copy starting at `start`) covered by set 4 KiB sub-page
+/// bits in `mask`. At most 8 disjoint runs can exist in 16 bits.
+fn card_page_runs(start: usize, lo: usize, hi: usize, mask: u16) -> ([(usize, usize); 8], usize) {
+    const PAGE: usize = 4096;
+    const BLOCK: usize = 64 << 10;
+    let mut out = [(0usize, 0usize); 8];
+    let mut count = 0usize;
+    if lo >= hi || mask == 0 {
+        return (out, 0);
+    }
+    if mask == u16::MAX {
+        out[0] = (lo, hi);
+        return (out, 1);
+    }
+    let title_lo = start + lo;
+    let title_hi = start + hi;
+    let block_base = title_lo & !(BLOCK - 1);
+    for sub in 0..16usize {
+        if (mask & (1u16 << sub)) == 0 {
+            continue;
+        }
+        let page_lo = block_base + sub * PAGE;
+        let page_hi = page_lo + PAGE;
+        let a = page_lo.max(title_lo);
+        let b = page_hi.min(title_hi);
+        if a >= b {
+            continue;
+        }
+        let rlo = a - start;
+        let rhi = b - start;
+        if count > 0 && out[count - 1].1 == rlo {
+            out[count - 1].1 = rhi;
+        } else {
+            out[count] = (rlo, rhi);
+            count += 1;
+        }
+    }
+    (out, count)
+}
+
 #[cfg(test)]
 mod relay_tests {
-    use super::{flagged_pieces, landable};
+    use super::{card_page_runs, flagged_page_masks, flagged_pieces, landable};
 
     /// Two flights and what follows each: nothing of the second lands
     /// before the card has run it, and nothing behind a flight lands
@@ -2710,6 +2896,33 @@ mod relay_tests {
         assert!(!fetch.contains(&(b, 3)));
         assert!(fetch.contains(&(b, 9)));
         assert_eq!(fetch.len(), 2);
+    }
+
+    #[test]
+    fn page_masks_or_across_ranges_and_clip_to_subpages() {
+        let (a, b) = (0x1000usize, 0x2000usize);
+        let masks = flagged_page_masks(&[(a, 3, 0x0005), (a, 4, 0), (a, 3, 0x0010), (b, 3, 0), (b, 9, 0x8000)]);
+        assert_eq!(masks, vec![((a, 3), 0x0015), ((b, 9), 0x8000)]);
+
+        // Aligned piece: adjacent bits merge, disjoint bits split.
+        let (runs, n) = card_page_runs(0x10000, 0, 0x10000, 0b0000_0000_0010_0111);
+        assert_eq!(&runs[..n], &[(0x0000, 0x3000), (0x5000, 0x6000)]);
+
+        // Skewed copy start (0x10080): sub-page 0 is [0, 0xF80), sub-page 1 is [0xF80, 0x1F80).
+        let (runs, n) = card_page_runs(0x10080, 0, 0xFF80, 0b0000_0000_0000_0101);
+        assert_eq!(&runs[..n], &[(0x0000, 0x0F80), (0x1F80, 0x2F80)]);
+
+        // Partial declared range inside piece clips out-of-range flagged pages.
+        let (runs, n) = card_page_runs(0x10000, 0x2200, 0x3800, 0b0000_0000_0000_0101);
+        assert_eq!(&runs[..n], &[(0x2200, 0x3000)]);
+        let (_, n) = card_page_runs(0x10000, 0x2200, 0x3800, 0b0000_0000_0000_0001);
+        assert_eq!(n, 0);
+
+        // Worst-case alternating mask (8 disjoint runs) fits in stack buffer.
+        let (runs, n) = card_page_runs(0x20000, 0, 0x10000, 0xAAAA);
+        assert_eq!(n, 8);
+        assert_eq!(runs[0], (0x1000, 0x2000));
+        assert_eq!(runs[7], (0xF000, 0x10000));
     }
 }
 
@@ -4341,13 +4554,15 @@ impl Host {
     fn make_card_work(&self) -> windows::core::Result<CardWork> {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        let page_mask = card_page_mask();
+        let source = if page_mask { CARD_COMPARE_PAGES } else { CARD_COMPARE };
         let mut code: Option<ID3DBlob> = None;
         // SAFETY: the source and names live through the call; the out
         // pointer is ours.
         unsafe {
             D3DCompile(
-                CARD_COMPARE.as_ptr().cast(),
-                CARD_COMPARE.len(),
+                source.as_ptr().cast(),
+                source.len(),
                 windows::core::s!("card compare"),
                 None,
                 None,
@@ -4359,6 +4574,7 @@ impl Host {
                 None,
             )?;
         }
+        tracing::info!(page_mask, "card compare shader initialized");
         let code = code.ok_or_else(windows::core::Error::empty)?;
         let list = || self.make_prelude().ok_or_else(windows::core::Error::empty);
         // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
@@ -4810,8 +5026,64 @@ impl Host {
             // Pieces caught while a later flight was at them (`torn`).
             let suspects = fetch.as_ref().map(|f| &f.suspects);
             let mut seen = std::collections::HashSet::new();
+            let page_mask = card_page_mask();
             for &(plan, behind) in plans {
                 plan.picked_found(differs);
+                if page_mask {
+                    let flags: Vec<(usize, u32, u16)> = plan
+                        .ranges
+                        .iter()
+                        .filter(|r| !r.picked)
+                        .flat_map(|r| {
+                            (0..r.span.pieces).map(move |p| {
+                                let mask = if !r.compared {
+                                    u16::MAX
+                                } else {
+                                    differs
+                                        .get((r.at + p) as usize)
+                                        .map_or(u16::MAX, |&d| ((d >> 1) & 0xFFFF) as u16)
+                                };
+                                (std::sync::Arc::as_ptr(&r.shadow) as usize, r.span.first + p, mask)
+                            })
+                        })
+                        .collect();
+                    let fetched = flagged_page_masks(&flags);
+                    for r in plan.ranges.iter().filter(|r| !r.picked) {
+                        let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
+                        let start = r.shadow.span().0 as usize;
+                        if upcheck::on() {
+                            upcheck::declared(r.shadow.id(), r.span.from as usize, r.span.to as usize);
+                        }
+                        for p in 0..r.span.pieces {
+                            let Ok(idx) = fetched.binary_search_by_key(&(copy, r.span.first + p), |x| x.0) else {
+                                continue;
+                            };
+                            let mask = fetched[idx].1;
+                            let (lo, hi) = r.shadow.card_piece(&r.span, p);
+                            let (runs, count) = card_page_runs(start, lo, hi, mask);
+                            for &(rlo, rhi) in &runs[..count] {
+                                if !seen.contains(&(copy, rlo, rhi)) {
+                                    let key = (r.shadow.id(), start + rlo, rhi - rlo);
+                                    if fetch.as_ref().is_some_and(|f| f.had.holds(behind, key)) {
+                                        land::count(land::stat::HAD, 1);
+                                        land::count(land::stat::HAD_BYTES, (rhi - rlo) as u64);
+                                        if land::skip_on() {
+                                            continue;
+                                        }
+                                    }
+                                    if upcheck::on() {
+                                        upcheck::fetched(r.shadow.id(), rlo);
+                                    }
+                                    seen.insert((copy, rlo, rhi));
+                                    pieces.push((r.shadow.clone(), rlo, rhi, total));
+                                    total += (rhi - rlo) as u64;
+                                }
+                            }
+                        }
+                        crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
+                    }
+                    continue;
+                }
                 let flags: Vec<(usize, u32, bool)> = plan
                     .ranges
                     .iter()
@@ -5203,8 +5475,29 @@ impl Host {
         let mut pieces: Vec<(usize, usize, usize, u64)> = Vec::new();
         let mut total = 0u64;
         plan.picked_found(differs);
+        let page_mask = card_page_mask();
         for (i, r) in plan.ranges.iter().enumerate().filter(|(_, r)| !r.picked) {
+            let start = r.shadow.span().0 as usize;
             for p in 0..r.span.pieces {
+                if page_mask {
+                    let mask = if r.compared {
+                        ((differs[(r.at + p) as usize] >> 1) & 0xFFFF) as u16
+                    } else {
+                        u16::MAX
+                    };
+                    if mask == 0 {
+                        continue;
+                    }
+                    let (lo, hi) = r.shadow.card_piece(&r.span, p);
+                    let (runs, count) = card_page_runs(start, lo, hi, mask);
+                    for &(rlo, rhi) in &runs[..count] {
+                        if seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, rlo, rhi)) {
+                            pieces.push((i, rlo, rhi, total));
+                            total += (rhi - rlo) as u64;
+                        }
+                    }
+                    continue;
+                }
                 if r.compared && !torn::flagged(differs[(r.at + p) as usize]) {
                     continue;
                 }
@@ -9785,6 +10078,7 @@ impl Host {
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
             let status = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            crate::present_observer::shown(frame, width, height, status.0);
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
             if status == windows::Win32::Foundation::S_OK {

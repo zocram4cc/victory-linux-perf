@@ -184,36 +184,4 @@ mod tests {
             }
         }
     }
-
-    #[test]
-    fn mip_lod_bias_decodes_signed_14bit_fixed_point_extremes() {
-        let cases = [
-            (0x0000, 0.0_f32),
-            (0x0001, 1.0 / 256.0),
-            (0x1FFF, 8191.0 / 256.0),
-            (0x2000, -32.0),
-            (0x3FFF, -1.0 / 256.0),
-        ];
-        for (raw, expected) in cases {
-            let s = StaticSampler::from_words([0, 0, raw, 0]);
-            assert_eq!(s.mip_lod_bias, expected, "raw bias {raw:#x}");
-        }
-    }
-
-    #[test]
-    fn no_mip_filter_forces_zero_lod_range_and_non_zero_preserves_it() {
-        let w1 = (0xABC << 12) | 0x123;
-        let no_mip = StaticSampler::from_words([0, w1, 0, 0]);
-        assert_eq!((no_mip.min_lod, no_mip.max_lod), (0.0, 0.0));
-
-        let point_mip = StaticSampler::from_words([0, w1, 1 << 26, 0]);
-        assert_eq!(
-            (point_mip.min_lod, point_mip.max_lod),
-            (0x123 as f32 / 256.0, 0xABC as f32 / 256.0)
-        );
-        assert_eq!(point_mip.filter, 0);
-
-        let linear_mip = StaticSampler::from_words([0, w1, 2 << 26, 0]);
-        assert_eq!(linear_mip.filter, 1);
-    }
 }

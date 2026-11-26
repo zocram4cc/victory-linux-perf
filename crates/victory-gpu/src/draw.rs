@@ -2880,7 +2880,11 @@ impl State {
     /// The stand-in for the indirect light after a dispatch of `p`
     /// (`crate::ambient`). Whether it recorded anything.
     fn ambient(&self, list: &HostList, p: &HostPipeline, role: crate::ambient::Role) -> bool {
-        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, Role, Views};
+        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, REFLECTIONS, Role, Views};
+        if role == Role::Reflected {
+            static SEEN: std::sync::Once = std::sync::Once::new();
+            SEEN.call_once(|| tracing::info!(translated = p.stages.first().is_some(), "the title's last reflection program was dispatched"));
+        }
         let Some(t) = p.stages.first().map(|s| s.translated()) else {
             return false;
         };
@@ -2889,18 +2893,19 @@ impl State {
             Role::Resolve => LIGHT,
             Role::Radiance => RADIANCE,
             Role::Air => AIR,
+            Role::Reflected => REFLECTIONS,
         };
         let image = entry(ResourceType::Uav, at);
         let depth = match role {
             Role::Resolve => entry(ResourceType::Srv, DEPTH),
-            Role::Radiance | Role::Air => image,
+            Role::Radiance | Role::Air | Role::Reflected => image,
         };
         let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
             once!(?role, "no stand-in for the indirect light: other tables");
             return false;
         };
         // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT.)
-        let format = if role == Role::Resolve { 42 } else { 26 };
+        let format = if matches!(role, Role::Resolve | Role::Reflected) { 42 } else { 26 };
         let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         if of.Format.0 != format || (seen.Width, seen.Height) != (of.Width, of.Height) || volume != (role == Role::Air) {
             once!(?role, format = of.Format.0, "no stand-in for the indirect light: another image");
@@ -4177,6 +4182,15 @@ impl State {
         // back (`crate::indirect`).
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            // The stand-in's passes after a program dispatched through
+            // arguments too (the title's last reflection program is).
+            if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
+                && crate::ambient::on()
+                && self.ambient(list, p, role)
+            {
+                self.host_pipeline = 0;
+                self.host_roots[1] = 0;
+            }
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }

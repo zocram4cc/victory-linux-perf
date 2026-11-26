@@ -1529,6 +1529,7 @@ const UNCAPPED_VIEWS: u32 = 1 << 21;
 
 /// Where the raw twins of the title's slots start in a heap that has them
 /// ([`raw_twins`]): past every slot a title's heap and the dynamic ones take.
+const COMPACT_RAW_TWINS: u32 = 3 << 20;
 const RAW_TWINS: u32 = 1 << 21;
 
 /// Whether view heaps keep a raw twin of every buffer view of the title's
@@ -1571,13 +1572,20 @@ pub(crate) fn probe_view_limit() {
             };
             made.is_ok()
         };
-        let twins = raw_twins() && fits(2 * RAW_TWINS);
+        let twin_base = if raw_twins() && crate::switch::on("VICTORY_COMPACT_VIEW_HEAP") && fits(2 * COMPACT_RAW_TWINS) {
+            COMPACT_RAW_TWINS
+        } else if raw_twins() && fits(2 * RAW_TWINS) {
+            RAW_TWINS
+        } else {
+            0
+        };
+        let twins = twin_base != 0;
         if twins {
-            victory_shader::emit::set_raw_views(RAW_TWINS);
+            victory_shader::emit::set_raw_views(twin_base);
         }
         // (The twins lie past the null slot.)
         let views = if twins {
-            RAW_TWINS
+            twin_base
         } else if fits(UNCAPPED_VIEWS) {
             UNCAPPED_VIEWS
         } else {
@@ -1717,7 +1725,8 @@ impl HostHeap {
             .then(|| {
                 // The strides, then the views' title addresses
                 // (`victory_shader::emit::VIEW_ADDRESSES`).
-                let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_BYTES);
+                let bytes = u64::from(victory_shader::emit::SLOT_VIEW_ADDRESS_OFFSET)
+                    + u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * 8;
                 let (buffer, data) = host.upload_buffer(bytes)?;
                 // SAFETY: the buffer's whole mapping; a live buffer.
                 let gpu = unsafe {
@@ -2848,7 +2857,7 @@ impl HostHeap {
             } else {
                 self.clear_twin(index);
             }
-            self.keep(index, made.kept.clone());
+            self.keep_ref(index, made.kept.as_ref());
             Some(made.listed)
         })
     }
@@ -2897,6 +2906,7 @@ impl HostHeap {
     /// The raw twin of slot `index` is a null view again.
     fn clear_twin(&self, index: u32) {
         if let Some(made) = self.twins.get(index as usize)
+            && made.load(std::sync::atomic::Ordering::Relaxed)
             && made.swap(false, std::sync::atomic::Ordering::Relaxed)
         {
             null_buffer_view(self.at(self.raw + index));
@@ -2920,6 +2930,26 @@ impl HostHeap {
         };
         // A running submission may still read the old resource through
         // this slot.
+        if let Some(old) = old {
+            crate::host::retire_resource(old);
+        }
+    }
+
+    /// [`Self::keep`] taking a reference so callers avoid `AddRef`/`Release`
+    /// contention on `d3d12core.dll` when the slot already holds the same
+    /// resource.
+    fn keep_ref(&self, index: u32, resource: Option<&ID3D12Resource>) {
+        let Some(slot) = self.kept.get(index as usize) else {
+            return;
+        };
+        let old = {
+            use windows::core::Interface;
+            let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+            if slot.as_ref().map(Interface::as_raw) == resource.map(Interface::as_raw) {
+                return;
+            }
+            std::mem::replace(&mut *slot, resource.cloned())
+        };
         if let Some(old) = old {
             crate::host::retire_resource(old);
         }
@@ -2958,7 +2988,7 @@ impl HostHeap {
         self.put(index);
         // (Bound by its handle, not read by index.)
         self.clear_twin(index);
-        self.keep(index, Some(buffer.clone()));
+        self.keep_ref(index, Some(buffer));
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view that reads
@@ -3001,7 +3031,7 @@ impl HostHeap {
         };
         self.put(index);
         self.clear_twin(index);
-        self.keep(index, Some(buffer.clone()));
+        self.keep_ref(index, Some(buffer));
     }
 
     /// Makes slot `index` (a dynamic one) a raw unordered access view of
@@ -3089,7 +3119,7 @@ impl HostHeap {
         self.twin_made(index, twin.is_some());
         // After the descriptor: what it showed is let go when nothing shows
         // it any more.
-        self.keep(index, holds.then(|| buffer.clone()));
+        self.keep_ref(index, holds.then_some(buffer));
     }
 
     /// Renderer port 5 (`crate::port_cbv`): makes slot `index` (a dynamic
@@ -3137,7 +3167,7 @@ impl HostHeap {
             host.device.CreateShaderResourceView(buffer, Some(&raw), twin);
         }
         self.twin_made(index, true);
-        self.keep(index, Some(buffer.clone()));
+        self.keep_ref(index, Some(buffer));
         true
     }
 
@@ -3664,7 +3694,7 @@ pub(crate) fn view_address(view: &View) -> Option<u64> {
 /// (`victory_shader::emit::VIEW_ADDRESSES`): shaders that pick a view at a
 /// computed index and read its address as a pointer read it there.
 fn write_view_address(data: usize, index: u32, view: Option<&View>) {
-    use victory_shader::emit::{SLOT_STRIDES_COUNT, VIEW_ADDRESSES};
+    use victory_shader::emit::{SLOT_STRIDES_COUNT, SLOT_VIEW_ADDRESS_OFFSET as VIEW_ADDRESSES};
     if index >= SLOT_STRIDES_COUNT {
         return;
     }

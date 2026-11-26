@@ -138,6 +138,50 @@ const COUNT: &[u32] = &[
     0xBE85_0380, // s_mov_b32 s5, 0
 ];
 
+/// The guest word in s11 has no host representation. The forward EXECZ
+/// edge is impossible with entry EXEC, and every executing lane writes s11.
+#[test]
+fn an_impossible_descriptor_edge_preserves_the_live_scalar_word() {
+    use super::USER_VIEW_ADDRESS;
+    use super::host::{Dispatch, Host, Root};
+
+    let branch = [
+        0xF408_0201, // s_load_dwordx4 s[8:11], s[2:3], 0
+        0xFA00_0000,
+        0xBF88_0001, // s_cbranch_execz past the overwrite
+        0xBE8B_03AA, // s_mov_b32 s11, 42
+        0x8704_FF0B, // s_and_b32 s4, s11, 0x1fffff
+        0x001F_FFFF,
+        0x8804_FF04, // s_or_b32 s4, s4, 0x80000000
+        0x8000_0000,
+        0xBE85_0380, // s_mov_b32 s5, 0
+    ];
+    let shader = build(&[TABLE, &branch, STORE].concat(), (4, 4)).expect("translates");
+    let mut users = vec![0; shader.user_data_dwords() as usize];
+    let guest_address = 0x24_1020_0000u64;
+    for arg in &shader.user_data {
+        users[arg.index as usize] = match arg.root {
+            RootType::Table => 0,
+            RootType::Other(code) if code == USER_VIEW_ADDRESS => guest_address as u32,
+            RootType::Other(code) if code == USER_VIEW_ADDRESS + 1 => (guest_address >> 32) as u32,
+            _ => panic!("unexpected fixture metadata {arg:?}"),
+        };
+    }
+    let raw = || View::Buffer { data: &[0], stride: Stride::Raw };
+    let views = [raw(), raw(), View::RawUav(2)];
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let host = Host::new(false).expect("hardware SM 6.6 device");
+    let (root, pipeline) = host.compute_pipeline(&shader).expect("hardware pipeline");
+    let output = host.dispatch(&root, &pipeline, &Dispatch {
+        roots: vec![(0, Root::Constants(users))],
+        views: &views,
+        samplers: &[],
+        groups: [1; 3],
+    }).expect("dispatch descriptor join fixture");
+    assert_eq!(output, [vec![0x8000_002a, 0]]);
+    eprintln!("hardware readback {:08x?}", output[0]);
+}
+
 /// A puddle pass of the title picks three textures from the view heap,
 /// reads the first one's size and samples the other two.
 #[test]
@@ -336,11 +380,18 @@ fn a_picked_buffer_is_read_at_its_raw_twin() {
             raw(&last),
         ]
     };
-    for (first, at, expected) in [(0, 32, 2), (4, 32, 6), (4, 32 * 1000, 10)] {
+    let other = || View::Texture(1, 1, &texel);
+    let compact = [
+        other(), other(), other(), raw(&title), other(),
+        other(), other(), View::RawUav(2), raw(&twin), raw(&last),
+    ];
+    for (first, at, expected) in [(0, 32, 2), (4, 32, 6), (4, 32 * 1000, 10), (5, 96, 6), (5, 32 * 1000, 10)] {
         super::shader::RAW_VIEWS_HERE.set(Some(first));
         let shader = build(&program(at), (8, 0)).expect("translates");
         super::shader::RAW_VIEWS_HERE.set(None);
-        for (label, got) in run(&shader, &views(first != 0)) {
+        let standard = views(first != 0);
+        let selected: &[View<'_>] = if first == 5 { &compact } else { &standard };
+        for (label, got) in run(&shader, selected) {
             assert_eq!(got[..2], [0, expected], "{label}: twins from {first}, byte {at}");
         }
     }
@@ -367,5 +418,62 @@ fn a_tables_raw_buffer_is_read_at_its_raw_twin() {
     let views = [raw(&title), other(), other(), other(), raw(&twin), other(), View::RawUav(2)];
     for (label, got) in run(&shader, &views) {
         assert_eq!(got[..2], [0, 6], "{label}");
+    }
+}
+
+/// Use a scalar buffer value as an actual dynamic byte offset. The guest
+/// reads a buffer descriptor's address words, then stores them for comparison.
+#[test]
+fn dynamic_scalar_heap_buffer_address() {
+    use super::host::{Dispatch, Host, Root};
+    use super::{SLOT_STRIDES, SLOT_VIEW_ADDRESS_OFFSET};
+    let fetch = [
+        0xF408_0201, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[2:3], 0
+        0xF420_0304, 0xFA00_0000, // s_buffer_load_dword s12, s[8:11], 0
+        0xBE86_0301, // s_mov_b32 s6, s1
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0x8F0C_850C, // s_lshl_b32 s12, s12, 5
+        0xF408_0203, 0x1800_0000, // s_load_dwordx4 s[8:11], s[6:7], s12
+        0xBE84_0308, // s_mov_b32 s4, s8
+        0x8705_FF09, 0x0000_FFFF, // s_and_b32 s5, s9, 0xffff
+    ];
+    let words = [TABLE, &fetch, STORE].concat();
+    let shader = build(&words, (4, 0)).expect("aligned scalar selection translates");
+    assert_eq!(shader.root_srvs, [SLOT_STRIDES]);
+    let mut wrong = fetch;
+    wrong[6] = 0x8F0C_840C; // shift by 4 cannot prove a whole heap slot
+    assert!(build(&[TABLE, &wrong, STORE].concat(), (4, 0)).is_err());
+    wrong = fetch;
+    wrong[11] = 0xFFFF_FFFF; // dword 1's other fields were not provided
+    assert!(build(&[TABLE, &wrong, STORE].concat(), (4, 0)).is_err());
+
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let host = Host::new(false).expect("fixture needs a hardware SM 6.6 device");
+    let (root, pipeline) = host.compute_pipeline(&shader).expect("hardware pipeline");
+    let mut users = vec![0; shader.user_data_dwords() as usize];
+    for arg in &shader.user_data {
+        assert_eq!(arg.root, RootType::Table);
+        users[arg.index as usize] = 0;
+    }
+    let mut metadata = vec![0; SLOT_VIEW_ADDRESS_OFFSET as usize / 4 + 12];
+    let words = [(1, [0x1cc1_4321, 0x24]), (3, [0xfee1_d086, 0x7b])];
+    for (slot, value) in words {
+        let i = SLOT_VIEW_ADDRESS_OFFSET as usize / 4 + 2 * slot;
+        metadata[i..i + 2].copy_from_slice(&value);
+    }
+    for (slot, expected) in words {
+        let index = [slot as u32];
+        let views = [
+            View::Buffer { data: &index, stride: Stride::Raw },
+            View::Buffer { data: &[0], stride: Stride::Raw },
+            View::RawUav(2),
+        ];
+        let output = host.dispatch(&root, &pipeline, &Dispatch {
+            roots: vec![(0, Root::Constants(users.clone())), (1, Root::View { srv: true, data: metadata.clone() })],
+            views: &views,
+            samplers: &[],
+            groups: [1; 3],
+        }).expect("dispatch indexed guest address lookup");
+        assert_eq!(output, [expected.to_vec()]);
     }
 }

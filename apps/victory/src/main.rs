@@ -216,17 +216,12 @@ fn main() -> Result<()> {
             if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
                 victory_shader::emit::set_view_heap_limit(n);
             }
-            let wave = translate::host_wave::select(
-                std::env::var("VICTORY_HOST_WAVE").ok().as_deref(),
-                std::env::var("VICTORY_HOST_MAX_WAVE").ok().as_deref(),
-                |message| eprintln!("{message}"),
-            );
             if let Some(file) = warm {
-                return translate::warm(paths, &file, jobs, wave);
+                return translate::warm(paths, &file, jobs);
             }
-            translate::run(paths, validate, pipelines, list, jobs, wave)
+            translate::run(paths, validate, pipelines, list, jobs)
         }
-        Command::Shaders { paths, jobs, list } => translate::precompile(paths, jobs, list),
+        Command::Shaders { paths, jobs, list: _ } => translate::precompile(paths, jobs),
         #[cfg(windows)]
         Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
         Command::Run {

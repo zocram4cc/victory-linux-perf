@@ -2030,10 +2030,43 @@ fn known_holes() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_KNOWN_HOLES").is_none_or(|v| v != "0") && light())
 }
 
+fn wine_free_placeholder(block: usize) -> Option<bool> {
+    #[link(name = "ntdll", kind = "raw-dylib")]
+    unsafe extern "system" {
+        fn NtQueryVirtualMemory(
+            process: *mut std::ffi::c_void,
+            at: *const std::ffi::c_void,
+            class: u32,
+            out: *mut std::ffi::c_void,
+            len: usize,
+            returned: *mut usize,
+        ) -> i32;
+    }
+    let mut value = 0u32;
+    let mut returned = 0;
+    let status = unsafe {
+        NtQueryVirtualMemory(
+            windows_sys::Win32::System::Threading::GetCurrentProcess(),
+            (block * BLOCK) as *const _,
+            0x56494350,
+            (&raw mut value).cast(),
+            size_of::<u32>(),
+            &mut returned,
+        )
+    };
+    (status == 0 && returned == size_of::<u32>() && value < 2).then_some(value == 1)
+}
+
 /// Whether `block` lies in a placeholder: a reservation in which pages come
 /// to be only by mapping a view (or an allocation) in its place, which an
 /// ordinary commit cannot do.
 fn placeholder(block: usize) -> bool {
+    static USE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *USE.get_or_init(|| crate::switch::on("VICTORY_WINE_FREE_PLACEHOLDERS")) {
+        if let Some(free) = wine_free_placeholder(block) {
+            return free;
+        }
+    }
     /// `MEMORY_REGION_INFORMATION` (ntddk).
     #[repr(C)]
     #[derive(Default)]

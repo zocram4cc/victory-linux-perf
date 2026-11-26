@@ -391,6 +391,18 @@ impl Module {
         self.blocks.len() - 1
     }
 
+    #[cfg(test)]
+    pub fn successors(&self) -> Vec<Vec<usize>> {
+        self.blocks
+            .iter()
+            .map(|block| match block.term {
+                Some(Term::Br(target)) => vec![target],
+                Some(Term::CondBr(_, taken, not_taken)) => vec![taken, not_taken],
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
     pub fn type_of(&self, v: V) -> Ty {
         match v {
             V::Global(i) => self.globals[i as usize].ptr,

@@ -961,6 +961,86 @@ void main() {
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
     }
 
+    #[test]
+    fn warp_card_compare_pages_tracks_4k_page_masks() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE_PAGES)
+            .expect("the 4 KiB page-mask card compare must compile on WARP");
+        const PIECE: usize = 64 << 10;
+        const PAGE: usize = 4096;
+        const PIECES: u32 = 3;
+        let size = PIECE * PIECES as usize;
+        let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
+        let (_hashes, _, hashes_gpu) = warp.shared_buffer(256 * u64::from(PIECES));
+        let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
+        let content: Vec<u8> = (0..size).map(|i| (i * 31 + i / 251) as u8).collect();
+        // SAFETY: the mapping holds `size` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
+
+        let run = |warp: &mut WarpHarness, skew: u32, len: u32, mode: u32| -> [u32; 3] {
+            unsafe {
+                for piece in 0..PIECES as usize {
+                    differs_ptr.cast::<u32>().add(piece).write_volatile(0xdead);
+                }
+                warp.list.SetComputeRootSignature(&compare.root);
+                warp.list.SetPipelineState(&compare.pso);
+                let constants = [0u32, skew, len, PIECES, 0, mode];
+                warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                warp.list.Dispatch(PIECES, 1, 1);
+            }
+            warp.submit_and_wait();
+            [0, 1, 2].map(|piece| unsafe { differs_ptr.cast::<u32>().add(piece).read_volatile() })
+        };
+
+        // Case 1: aligned (skew = 0).
+        assert_eq!(run(&mut warp, 0, size as u32, 0), [0xdead, 0xdead, 0xdead]);
+        assert_eq!(run(&mut warp, 0, size as u32, 1), [0, 0, 0]);
+
+        // Flip 1 byte in piece 1 sub-pages 0 and 15, and piece 2 sub-page 7.
+        let p1_0 = PIECE + 123;
+        let p1_15 = PIECE + 15 * PAGE + 4095;
+        let p2_7 = 2 * PIECE + 7 * PAGE + 512;
+        unsafe {
+            now_ptr.add(p1_0).write_volatile(content[p1_0] ^ 0x40);
+            now_ptr.add(p1_15).write_volatile(content[p1_15] ^ 0x01);
+            now_ptr.add(p2_7).write_volatile(content[p2_7] ^ 0x80);
+        }
+        let m1 = (1u32 << 0) | (1u32 << 15);
+        let m2 = 1u32 << 7;
+        let want = [0, (m1 << 1) | 1, (m2 << 1) | 1];
+        assert_eq!(run(&mut warp, 0, size as u32, 1), want);
+        // Mode 2 reports the exact same masks and stores the new hashes.
+        assert_eq!(run(&mut warp, 0, size as u32, 2), want);
+        assert_eq!(run(&mut warp, 0, size as u32, 2), [0, 0, 0]);
+        // Flipping piece 1 sub-page 15 back flags ONLY bit 15.
+        unsafe { now_ptr.add(p1_15).write_volatile(content[p1_15]) };
+        assert_eq!(run(&mut warp, 0, size as u32, 2), [0, ((1u32 << 15) << 1) | 1, 0]);
+        assert_eq!(run(&mut warp, 0, size as u32, 2), [0, 0, 0]);
+
+        // Case 2: non-zero skew (0x1080 -> piece 0 starts inside sub-page 1 at +0x80).
+        let skew = 0x1080u32;
+        let len = (2 * PIECE) as u32;
+        assert_eq!(run(&mut warp, skew, len, 0), [0xdead, 0xdead, 0xdead]);
+        assert_eq!(run(&mut warp, skew, len, 2), [0, 0, 0]);
+        // Buffer offset 0 lies in piece 0 sub-page 1.
+        // Buffer offset (0x1000 - 0x80) = 0xF80 lies in piece 0 sub-page 2.
+        // Buffer offset (0x10000 - 0x1080) = 0xEF80 lies in piece 1 sub-page 0.
+        unsafe {
+            now_ptr.add(0).write_volatile(content[0] ^ 0x11);
+            now_ptr.add(0xEF80).write_volatile(content[0xEF80] ^ 0x22);
+        }
+        assert_eq!(
+            run(&mut warp, skew, len, 2),
+            [((1u32 << 1) << 1) | 1, ((1u32 << 0) << 1) | 1, 0]
+        );
+        assert_eq!(run(&mut warp, skew, len, 2), [0, 0, 0]);
+    }
+
     /// What the passes over copies in the card's memory cost on the card
     /// (ignored: a measurement): rounds of a few passes of some pieces and a
     /// wait, as a frame has them. `VICTORY_BENCH_CS=<file>` times another

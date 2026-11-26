@@ -113,6 +113,10 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .or_insert_with(|| {
             KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            #[cfg(windows)]
+            if stage == "compute" && crate::ambient::role(bytes) == Some(crate::ambient::Role::Reflected) {
+                tracing::info!(hash = &full.to_hex()[..16], size = bytes.len(), "the title's last reflection program is loaded");
+            }
             Arc::new(Shader {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),

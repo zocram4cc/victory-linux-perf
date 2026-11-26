@@ -68,6 +68,23 @@ const LOW: u64 = 1 << 32;
 /// while the heap stands.
 const MOST: u64 = 512 << 20;
 
+/// `VICTORY_PORT_BELOW_GB` (4): title memory below this many GiB may be
+/// ported. Above 4 the title's other graphics memory is asked for too
+/// (an experiment: most of it is scattered pages and is turned down as
+/// "not one stretch of a section").
+fn low() -> u64 {
+    static AT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    // Read once, here.
+    *AT.get_or_init(|| std::env::var("VICTORY_PORT_BELOW_GB").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(LOW, |gb| gb.saturating_mul(1 << 30).max(LOW)))
+}
+
+/// `VICTORY_PORT_REGION_MB` (512): the most bytes of one region.
+fn most() -> u64 {
+    static AT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    // Read once, here.
+    *AT.get_or_init(|| std::env::var("VICTORY_PORT_REGION_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(MOST, |mb| mb << 20))
+}
+
 /// `VICTORY_PORT_CONSTANTS`: `1` turns renderer port #1 on (title buffers
 /// and windows of title memory in the title's 32-bit graphics memory, view
 /// memory that is one stretch of a section, used in place); unset or
@@ -105,7 +122,7 @@ static STATS: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
 /// Whether `[at, at + len)` may be ported: in the title's 32-bit graphics
 /// memory.
 pub(crate) fn wanted(at: u64, len: u64) -> bool {
-    on() && at.checked_add(len).is_some_and(|end| end <= LOW && len > 0)
+    on() && at.checked_add(len).is_some_and(|end| end <= low() && len > 0)
 }
 
 /// Title memory `[start, start + len)` in place, if [`wanted`] and the
@@ -176,15 +193,15 @@ fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usiz
     // The whole stretch, kept to what may be ported: the next buffer in it
     // finds the region made.
     let (mut first, mut bytes, mut offset) = (first as u64, bytes as u64, offset);
-    if first < LOW && first + bytes > LOW {
-        bytes = LOW.saturating_sub(first);
+    if first < low() && first + bytes > low() {
+        bytes = low().saturating_sub(first);
     }
-    if bytes > MOST {
+    if bytes > most() {
         // Only what was asked for.
         offset += at - first;
         (first, bytes) = (at, end - at);
     }
-    if bytes > MOST {
+    if bytes > most() {
         return Err((3, format!("{bytes:#x} bytes, over the most of a region")));
     }
     if first > at || first + bytes < end || offset % K64 != 0 {

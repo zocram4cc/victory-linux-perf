@@ -63,6 +63,8 @@ pub mod list;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
+mod present_observer;
+#[cfg(windows)]
 mod picked;
 #[cfg(windows)]
 mod pool;

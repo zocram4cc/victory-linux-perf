@@ -63,7 +63,6 @@
 //! Rows are registers of the container's signature parts (`ISG1`, `OSG1`).
 //! Merged stages keep their stage data in another layout (not read).
 //!
-//! Kind 0x0c holds the same `FSSM` blob unpacked.
 //! Other kinds seen: 0x07 program header + bitcode (or a stub when stripped),
 //! 0x0a `xbop` (compiler options), 0x0e a table not decoded yet, 0x10 and
 //! 0x12 16-byte blobs (0x10 is the shader hash).
@@ -75,9 +74,6 @@ use crate::dxbc::{u32_at, u64_at};
 const XDAT_OFFSET: usize = 0x18;
 const MAX_XDAT_ENTRIES: usize = 64;
 const KIND_NATIVE: u32 = 0x0d;
-/// The same `FSSM` blob stored as is, without the `XBCH` wrapper (the
-/// executable's own debug-text shaders carry it so).
-const KIND_NATIVE_RAW: u32 = 0x0c;
 const XBCH_VERSION: u32 = 3;
 const XBCH_HEADER: usize = 0x18;
 const FSSM_VERSION: u32 = 0x101;
@@ -441,18 +437,13 @@ pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
     let mut out = Vec::new();
     for i in 0..count {
         let at = XDAT_OFFSET + 12 + 12 * i;
-        let kind = u32_at(part, at)?;
-        if kind != KIND_NATIVE && kind != KIND_NATIVE_RAW {
+        if u32_at(part, at)? != KIND_NATIVE {
             continue;
         }
         let offset = u32_at(part, at + 4)?.into();
         let size = u32_at(part, at + 8)?.into();
         let blob = bytes(part, offset, size).ok_or(Malformed("XDAT entry out of bounds"))?;
-        if kind == KIND_NATIVE_RAW {
-            out.extend(programs(blob)?);
-        } else {
-            out.extend(programs(&unpack(blob)?)?);
-        }
+        out.extend(programs(&unpack(blob)?)?);
     }
     Ok(out)
 }
@@ -995,17 +986,6 @@ mod tests {
                 },
             ]
         );
-    }
-
-    #[test]
-    fn finds_programs_stored_without_xbch() {
-        let blob = fssm(&[(HwStage::Vs, &VS_CODE), (HwStage::Ps, &PS_CODE)]);
-        let raw = native_programs(&part(&[(0x12, &[0; 16]), (KIND_NATIVE_RAW, &blob)])).unwrap();
-        let packed = native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).unwrap();
-        assert_eq!(raw.len(), 2);
-        assert_eq!(raw, packed);
-        // A damaged raw blob is an error, not an empty container.
-        assert!(native_programs(&part(&[(KIND_NATIVE_RAW, &blob[..blob.len() - 1])])).is_err());
     }
 
     #[test]

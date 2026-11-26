@@ -462,9 +462,24 @@ fn library() -> Option<&'static Library> {
 /// adapter or driver change, damage).
 fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
-        // SAFETY: the bytes outlive the library (kept beside it).
+        if !bytes.is_empty() {
+            // SAFETY: the bytes outlive the library (kept beside it).
+            return unsafe { device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast() };
+        }
+        // vkd3d-proton rejects a dangling slice pointer even with length zero.
+        let mut result = std::ptr::null_mut();
+        // SAFETY: an empty library has no blob.
         unsafe {
-            device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
+            (device.vtable().CreatePipelineLibrary)(
+                device.as_raw(),
+                std::ptr::null(),
+                0,
+                &ID3D12PipelineLibrary::IID,
+                &mut result,
+            )
+            .ok()?;
+            let library: ID3D12PipelineLibrary = windows::core::Type::from_abi(result)?;
+            library.cast()
         }
     };
     if !blob.bytes().is_empty() {

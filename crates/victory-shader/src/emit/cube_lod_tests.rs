@@ -1,11 +1,14 @@
-//! Cube samples with gradients select their level by the footprint (after
-//! DexNom/VIctory 921d8d3b).
+//! Texture level-of-detail selection and query tests.
 
+use super::container::{self, SigElement};
 use super::host::{Dispatch, Host, Root, View};
 use super::intersect_tests::build_compute_shader;
+use super::validator::Validator;
+use crate::dxbc::{Container, FourCC};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
+use crate::{io, ir, resource, structure};
 use windows::Win32::Graphics::Direct3D12::*;
 
 /// The level is the red channel on all six faces so every sample returns
@@ -136,4 +139,97 @@ fn guest_cube_gradient_selects_mip_by_footprint() {
         let expected = cases.map(|(_, _, _, mip)| mip);
         assert_eq!(levels.as_slice(), expected, "{name}");
     }
+}
+
+#[test]
+fn lod_query_validates_for_1d_array() {
+    validate_array_lod_query(0xF180_0320);
+}
+
+#[test]
+fn lod_query_validates_for_2d_array() {
+    validate_array_lod_query(0xF180_0328);
+}
+
+fn validate_array_lod_query(image_op: u32) {
+    let output = SigElement {
+        name: "SV_Target".into(),
+        index: 0,
+        kind: 16,
+        comp: 9,
+        interp: 0,
+        row: Some(0),
+        col: 0,
+        cols: 4,
+        usage: 15,
+        half: false,
+    };
+    let osg1 = container::signature(&[output], false);
+    let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+    let container = Container::parse(&bytes).unwrap();
+    let path = Validator::default_path();
+    let mut validator = match Validator::load(path.as_deref()) {
+        Ok(validator) => validator,
+        Err(error) if path.is_none() => {
+            eprintln!("{error}; skipped");
+            return;
+        }
+        Err(error) => panic!("{error}"),
+    };
+
+    let words = [
+        0xBE81_0380u32, // s1 = 0 (upper half of table address)
+        0xF40C_0000,
+        0xFA00_0000, // load SRV into s[0:7]
+        0xBE88_0380,
+        0xBE89_0380,
+        0xBE8A_0380,
+        0xBE8B_0380, // static sampler
+        0x7E00_02F0, // v0 = 0.5 (u)
+        0x7E02_02F2, // v1 = 1.0 (1D slice or 2D v)
+        0x7E04_02F2, // v2 = 1.0 (2D slice)
+        0xBF8C_0070, // s_waitcnt vmcnt(0) lgkmcnt(0)
+        image_op,
+        0x0040_0300, // image_get_lod v[3:4], dmask:3
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xF800_180F,
+        0x0403_0403, // exp mrt0, v3, v4, v3, v4 done vm
+        0xBF81_0000, // s_endpgm
+    ];
+    let native = NativeProgram {
+        stage: HwStage::Ps,
+        wave64: false,
+        vgprs: 5,
+        layout: vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: vec![UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 0,
+            slot: 0,
+        }],
+        io: StageIo::Ps {
+            inputs: vec![],
+            input_addr: 0,
+            db_shader_control: 0,
+            patches: vec![],
+        },
+        code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
+    };
+    let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    let mut shader = super::emit(&container, &native, &p, &st, &io, &res).unwrap();
+    validator.validate(&mut shader.dxil).unwrap();
 }

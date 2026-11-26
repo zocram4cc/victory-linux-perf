@@ -338,10 +338,12 @@ pub(crate) fn card_stats() -> [u64; 10] {
 }
 
 /// The bytes of the hashes kept on the card for a copy of `size` bytes: 16
-/// for each 64 KiB piece (a copy that does not start on a piece boundary
+/// for each 64 KiB piece, or 16 for each 4 KiB sub-page (256 per piece) when
+/// `VICTORY_CARD_PAGE_MASK=1` (a copy that does not start on a piece boundary
 /// has one piece more).
 pub(crate) fn card_hash_bytes(size: u64) -> u64 {
-    (size / PIECE as u64 + 2) * 16
+    let per_piece = if crate::host::card_page_mask() { 256 } else { 16 };
+    (size / PIECE as u64 + 2) * per_piece
 }
 
 /// A buffer of `size` bytes in the card's memory for a title buffer's
