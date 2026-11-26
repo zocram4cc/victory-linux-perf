@@ -65,6 +65,9 @@ pub(crate) fn begin(work: impl FnOnce() -> Vec<Refresh> + Send + 'static) -> std
         let (send, jobs) = std::sync::mpsc::channel::<Job>();
         std::thread::Builder::new()
             .name("victory-aside".into())
+            // Under Wine a fault's exception frames go on this stack; 2 MiB
+            // overflowed (Wine: "stack overflow ... victory-aside").
+            .stack_size(16 << 20)
             .spawn(move || {
                 crate::cores::keep_on_fast_cores("victory-aside");
                 jobs.into_iter().for_each(|job| job())
