@@ -4,6 +4,11 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**G.2: getting a RADV thread trace (not yet)**
+- RGP 2.7.1 is installed (`/opt/radeon-gpu-profiler`, GUI only). `MESA_VK_TRACE=rgp` with `MESA_VK_TRACE_TRIGGER` (and a 256 MiB buffer): tracing is enabled (`radv: Thread trace support is enabled`) but touching the trigger in the world made no capture; RADV checks it at present, so our present path may not reach its hook.
+- **Do not use `MESA_VK_TRACE_PER_SUBMIT=1`:** it ignored the trigger, wrote one `.rgp` per submission into `/tmp` (a 16 GB tmpfs here) until it was full, and the start screen ran at 2 fps.
+- To try next: `MESA_VK_TRACE_FRAME=<n>`, or a per-submit capture limited to one submission with captures written to disk; otherwise G.1's own timestamps between draws.
+
 **C.1 closed: the recording threads' waits are off the frame's critical path**
 - With the dynamic ring at 1 << 20 (`…-ring-1m`, `VICTORY_ALL_FRESH=1 VICTORY_DYNAMIC_NO_WAIT=1`): **no table refused**, picture better (the user), bind 340-410 ms a frame (was ~1,300-1,550 with the full wait), **but frame 365-386 ms against ~395**: −2 to −7 %.
 - So ~1 s a frame of the title's recording threads was mostly parallel slack: the frame is set by the serial chain **prepare (~115-140 ms) → GPU (~165-180 ms) → copy-back (~55-65 ms)**, with ~2 of 12 cores and the card ~41 % busy. C.1 is parked (`ALL_FRESH`, `DYNAMIC_NO_WAIT`, the 1 << 20 ring: not default; ring back at 1 << 18).
