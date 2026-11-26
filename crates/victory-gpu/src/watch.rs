@@ -561,9 +561,15 @@ fn waited<T>(what: usize, f: impl FnOnce() -> T) -> T {
     let began = std::time::Instant::now();
     let got = f();
     WAITS[what][0].fetch_add(1, Relaxed);
-    WAITS[what][1].fetch_add(began.elapsed().as_nanos() as u64, Relaxed);
+    let ns = began.elapsed().as_nanos() as u64;
+    WAITS[what][1].fetch_add(ns, Relaxed);
+    WAIT_NS_TOTAL[what].fetch_add(ns, Relaxed);
     got
 }
+
+/// [`WAITS`]' nanoseconds since the start, never taken (the per-frame record).
+#[cfg(feature = "diagnostics")]
+pub(crate) static WAIT_NS_TOTAL: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 #[cfg(not(feature = "diagnostics"))]
 fn waited<T>(_: usize, f: impl FnOnce() -> T) -> T {

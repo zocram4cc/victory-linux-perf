@@ -865,6 +865,30 @@ pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
+/// [`SUBMISSION_US`], [`PREPARING`] and [`COPY_BACK`] since the start, never
+/// taken: the per-frame record ([`framecsv`]) reads differences of these.
+pub(crate) static TOTAL_SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+pub(crate) static TOTAL_PREPARING: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+pub(crate) static TOTAL_COPY_BACK: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Adds `v` to counter `i` of `line` (taken by the frame-rate line) and of
+/// `total` (kept since the start).
+fn tally(
+    line: &[std::sync::atomic::AtomicU64],
+    total: &[std::sync::atomic::AtomicU64],
+    i: usize,
+    v: u64,
+    order: Ordering,
+) {
+    line[i].fetch_add(v, order);
+    total[i].fetch_add(v, Ordering::Relaxed);
+}
+
+/// [`tally`] of [`PREPARING`], for texture refreshes.
+pub(crate) fn tally_preparing(i: usize, v: u64) {
+    tally(&PREPARING, &TOTAL_PREPARING, i, v, Ordering::Relaxed);
+}
+
 /// Host buffers made since the start, as (count, bytes): in the upload heap
 /// (staging, list scratch), shared with the processor (host copies of title
 /// memory) and the graphics card's own (indirect arguments, twins' copies).
@@ -3663,7 +3687,7 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     let us = waiting.elapsed().as_micros() as u64;
     LATE_STATS[12].fetch_add(us, Ordering::Relaxed);
     LATE_WAITED[why.min(10)].fetch_add(us, Ordering::Relaxed);
-    SUBMISSION_US[1].fetch_add(us, Ordering::Relaxed);
+    tally(&SUBMISSION_US, &TOTAL_SUBMISSION_US, 1, us, Ordering::Relaxed);
     #[cfg(feature = "diagnostics")]
     blamed(why, us);
 }
@@ -3849,7 +3873,7 @@ impl RelayBack {
         }
         land::spent(land::stat::BACK, merging);
         for ((_, from, to), written) in self.work.iter().zip(written) {
-            COPY_BACK[1].fetch_add(written, Ordering::Relaxed);
+            tally(&COPY_BACK, &TOTAL_COPY_BACK, 1, written, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             crate::copystat::compared(*from, to - from, written as usize);
             let _ = (from, to);
@@ -3988,6 +4012,7 @@ fn late_line(frames: f64) {
 
 pub(crate) mod aside;
 pub(crate) mod awake;
+pub(crate) mod framecsv;
 mod card_steps;
 #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) mod indirects;
@@ -4221,7 +4246,7 @@ fn hand_back(back: &[Declared]) {
         crate::copystat::add(crate::copystat::C::BackScanUs, scanning.elapsed().as_micros() as u64);
         for ((shadow, from, to), found) in work.iter().zip(found) {
             let written = shadow.copy_back_with(*from, to - from, Some(found));
-            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+            tally(&COPY_BACK, &TOTAL_COPY_BACK, 1, written as u64, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             crate::copystat::compared(*from, to - from, written);
         }
@@ -4253,7 +4278,7 @@ fn hand_back(back: &[Declared]) {
         }
         for (from, to) in spans {
             let written = shadow.copy_back(from, to - from);
-            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+            tally(&COPY_BACK, &TOTAL_COPY_BACK, 1, written as u64, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             crate::copystat::compared(from, to - from, written);
         }
@@ -5167,7 +5192,7 @@ impl Host {
             }
         }
         land::spent(land::stat::CARD, merging);
-        COPY_BACK[1].fetch_add(written, Ordering::Relaxed);
+        tally(&COPY_BACK, &TOTAL_COPY_BACK, 1, written, Ordering::Relaxed);
         if let Some(f) = fetch.as_mut() {
             if let Some(check) = &check {
                 check.done(&mut f.suspects);
@@ -5243,7 +5268,7 @@ impl Host {
                     }
                 }
                 crate::land::spent(crate::land::stat::DONE, finishing);
-                COPY_BACK[0].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
+                tally(&COPY_BACK, &TOTAL_COPY_BACK, 0, landing.elapsed().as_micros() as u64, Ordering::Relaxed);
                 RELAY_STATS[0].fetch_add(1, Ordering::Relaxed);
                 RELAY_STATS[1].fetch_add(flights.len() as u64, Ordering::Relaxed);
             }
@@ -5452,7 +5477,7 @@ impl Host {
             }
         }
         for (r, written) in plan.ranges.iter().zip(written) {
-            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+            tally(&COPY_BACK, &TOTAL_COPY_BACK, 1, written as u64, Ordering::Relaxed);
             let (from, to) = r.declared;
             #[cfg(feature = "diagnostics")]
             crate::copystat::compared(from, to - from, written);
@@ -5671,7 +5696,7 @@ impl Host {
                 let gpu = waiting.elapsed();
                 LATE_STATS[12].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
                 LATE_WAITED[why.min(10)].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
-                SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
+                tally(&SUBMISSION_US, &TOTAL_SUBMISSION_US, 1, gpu.as_micros() as u64, Ordering::Relaxed);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::card_waited(gpu.as_micros() as u64, || {
                     format!("{flights} submissions sent ahead, settled together")
@@ -5718,7 +5743,7 @@ impl Host {
                     }
                 }
                 hand_back(&back);
-                COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+                tally(&COPY_BACK, &TOTAL_COPY_BACK, 0, copying.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
             // In the order given: what tells the title the card is done.
             let mut last = 0;
@@ -6098,7 +6123,7 @@ impl Host {
                 texture_back_ranges.extend(list.deferred().texture_backs.iter().map(crate::texback::Back::range));
             }
             let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
-            SUBMISSION_US[0].fetch_add((prepared - started).saturating_sub(settled).as_micros() as u64, Ordering::Relaxed);
+            tally(&SUBMISSION_US, &TOTAL_SUBMISSION_US, 0, (prepared - started).saturating_sub(settled).as_micros() as u64, Ordering::Relaxed);
             submitting(0, 0);
             #[cfg(feature = "diagnostics")]
             crate::copystat::submission_ends(lock);
@@ -6194,8 +6219,8 @@ impl Host {
         FINISHED.store(this_submission, Ordering::Release);
         bury(this_submission);
         let gpu = prepared.elapsed();
-        SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
-        SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
+        tally(&SUBMISSION_US, &TOTAL_SUBMISSION_US, 0, (prepared - started).as_micros() as u64, Ordering::Relaxed);
+        tally(&SUBMISSION_US, &TOTAL_SUBMISSION_US, 1, gpu.as_micros() as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         crate::copystat::card_waited(gpu.as_micros() as u64, || {
             let pipelines: std::collections::BTreeSet<String> = runs
@@ -6252,7 +6277,7 @@ impl Host {
             add(C::NothingBack, 1);
             add(C::NothingBackUs, gpu.as_micros() as u64);
         }
-        COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+        tally(&COPY_BACK, &TOTAL_COPY_BACK, 0, copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         for list in runs {
             // Read backs first: a value written at the bottom of the pipe
             // may be what tells the title that they are there.
@@ -7797,8 +7822,8 @@ impl HostList {
             us += started.elapsed();
             bytes += copied as u64;
         }
-        PREPARING[0].fetch_add(us.as_micros() as u64, Ordering::Relaxed);
-        PREPARING[1].fetch_add(bytes, Ordering::Relaxed);
+        tally(&PREPARING, &TOTAL_PREPARING, 0, us.as_micros() as u64, Ordering::Relaxed);
+        tally(&PREPARING, &TOTAL_PREPARING, 1, bytes, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         {
             add(C::Copies, copies);
@@ -8602,8 +8627,8 @@ impl Batch {
         let us = started.elapsed().as_micros() as u64;
         #[cfg(feature = "diagnostics")]
         crate::copystat::range(from, to - from, us, 0);
-        PREPARING[0].fetch_add(us, Ordering::Relaxed);
-        PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+        tally(&PREPARING, &TOTAL_PREPARING, 0, us, Ordering::Relaxed);
+        tally(&PREPARING, &TOTAL_PREPARING, 1, copied as u64, Ordering::Relaxed);
     }
 
     /// Whether `staging` is still to be refreshed in this submission (and
@@ -8785,7 +8810,7 @@ impl Batch {
         let summed = [0, 2].map(|i| PREPARING[i].load(Ordering::Relaxed)).iter().zip(before).map(|(now, was)| now.saturating_sub(was)).collect::<Vec<_>>();
         PREPARING[2].fetch_sub(summed[1], Ordering::Relaxed);
         PREPARING[0].fetch_sub(summed[0], Ordering::Relaxed);
-        PREPARING[0].fetch_add(took, Ordering::Relaxed);
+        tally(&PREPARING, &TOTAL_PREPARING, 0, took, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         SPLIT[6].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
@@ -8860,7 +8885,7 @@ impl Batch {
             });
         }
         let took = started.elapsed();
-        PREPARING[0].fetch_add(took.as_micros() as u64, Ordering::Relaxed);
+        tally(&PREPARING, &TOTAL_PREPARING, 0, took.as_micros() as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         SPLIT[7].fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
     }
@@ -8926,7 +8951,7 @@ impl Batch {
             #[cfg(feature = "diagnostics")]
             let all = self.refreshes.len();
             self.refreshes.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
-            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            tally(&PREPARING, &TOTAL_PREPARING, 0, started.elapsed().as_micros() as u64, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);
         }
@@ -8942,7 +8967,7 @@ impl Batch {
                 .map(|r| (r.1, r.2))
                 .collect();
             crate::watch::ask_ahead(&ranges);
-            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            tally(&PREPARING, &TOTAL_PREPARING, 0, started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         if wide_refresh() && self.refreshes.len() >= 4 {
             // Each copy on its own, several at a time: a copy's refresh
@@ -9504,6 +9529,8 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
         crate::frametime::tick();
+        #[cfg(feature = "diagnostics")]
+        framecsv::presented();
         self.frames += 1;
         #[cfg(feature = "diagnostics")]
         {

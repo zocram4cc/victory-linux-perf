@@ -63,6 +63,10 @@ fn package_bytes() -> u64 {
     }
     static BYTES: OnceLock<u64> = OnceLock::new();
     *BYTES.get_or_init(|| {
+        // `VICTORY_TITLE_DIR`: the package, when the executable is kept outside it.
+        if let Some(dir) = std::env::var_os("VICTORY_TITLE_DIR").filter(|d| !d.is_empty()) {
+            return size(Path::new(&dir));
+        }
         let exe = runtime::main_image().and_then(runtime::image_path);
         exe.as_deref().and_then(Path::parent).map_or(0, size)
     })

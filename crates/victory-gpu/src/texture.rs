@@ -1369,14 +1369,12 @@ impl Staging {
     /// Detiles the texture memory into the staging buffer if it changed
     /// since the last time (and is mapped at all).
     pub(crate) fn refresh(&self) {
-        use std::sync::atomic::Ordering::Relaxed;
         let _asker = crate::watch::asker(crate::watch::Asker::Texture);
         let started = std::time::Instant::now();
         let _texture = crate::timeline::span("a texture's refresh");
         let read = self.refresh_now();
-        let preparing = &crate::host::PREPARING;
-        preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
-        preparing[3].fetch_add(read as u64, Relaxed);
+        crate::host::tally_preparing(2, started.elapsed().as_micros() as u64);
+        crate::host::tally_preparing(3, read as u64);
     }
 
     /// Returns the bytes of title memory read.
