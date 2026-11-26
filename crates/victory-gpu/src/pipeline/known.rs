@@ -198,14 +198,40 @@ pub fn keys(dir: &Path) -> Vec<String> {
 }
 
 /// What a driver's cached pipelines depend on besides the title's: the
-/// translator with its settings, and the driver.
+/// translator with its settings, the driver, and the switches that change a
+/// host pipeline's own state (cull mode, target formats, root signature).
+/// Without the last, `warm` counted pipelines made with `VICTORY_CULL_NONE=1`
+/// as made for a run with it off, and that run made them all again while
+/// it drew.
 pub fn fingerprint() -> String {
     let mut h = blake3::Hasher::new();
     h.update(&crate::shader_cache::translation());
     if let Some(host) = crate::host::host() {
         h.update(&host.driver().to_le_bytes());
     }
+    for name in STATE_SWITCHES {
+        h.update(name.as_bytes());
+        h.update(std::env::var(name).unwrap_or_default().as_bytes());
+        h.update(&[0]);
+    }
     h.finalize().to_hex()[..16].to_owned()
+}
+
+/// The switches read where host pipelines are made that change what is
+/// made ([`fingerprint`]).
+const STATE_SWITCHES: [&str; 3] = ["VICTORY_CULL_NONE", "VICTORY_E5_TARGETS", "VICTORY_ROOT_SRV_DIRECT"];
+
+#[cfg(test)]
+#[test]
+fn the_fingerprint_follows_the_pipeline_state_switches() {
+    // SAFETY: tests that read these switches do not run at the same time
+    // as this one (none reads them while the fingerprint is taken).
+    let before = fingerprint();
+    unsafe { std::env::set_var("VICTORY_CULL_NONE", "test-value") };
+    let after = fingerprint();
+    unsafe { std::env::remove_var("VICTORY_CULL_NONE") };
+    assert_ne!(before, after);
+    assert_eq!(before, fingerprint());
 }
 
 /// The translations of earlier runs are in `dir` (the pipeline library is
