@@ -851,6 +851,83 @@ macro_rules! once {
     }};
 }
 
+/// Root constant and shader views bound to zeros ([`bind_null_root`]),
+/// since the start.
+pub(crate) static NULL_ROOTS: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a root constant or shader view with no host copy behind it is
+/// bound to a buffer of zeros (`VICTORY_NULL_ROOTS`, on under Wine with
+/// `VICTORY_NULL_BUFFER_ZEROS`; =0 off; never elsewhere).
+///
+/// Why: left unset, a host root view is whatever the list held, at first
+/// address 0: the shader's scalar loads read GPU address 0 plus their
+/// offset. The owner's runs grave-10 and ports/run1 (2026-11-25) lost the
+/// device on reads by the scalar cache (amdgpu "SQC (data)") at 0x0 and
+/// 0xb000.
+pub(crate) fn null_roots_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::wine::on_wine() && std::env::var_os("VICTORY_NULL_ROOTS").is_none_or(|v| v != "0"))
+}
+
+/// What a root view bound to zeros ([`bind_null_root`]) lacked.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum NullRoot {
+    /// The title set no view at that slot.
+    NeverSet,
+    /// The title's address has no host copy.
+    NoCopy,
+    /// The host address came out below 1 MiB.
+    NearZero,
+    /// Our own view (the stride table) was not there.
+    Ours,
+}
+
+/// Whether host address `gpu` is one a root view may be given: below 1 MiB
+/// it is a read near address 0 ([`NullRoot::NearZero`]).
+pub(crate) fn root_address_ok(gpu: u64) -> bool {
+    gpu >= 1 << 20
+}
+
+/// The first such binding per pipeline, parameter, side and cause, logged.
+static NULL_ROOT_SEEN: std::sync::Mutex<Option<std::collections::HashSet<(String, u32, bool, NullRoot)>>> =
+    std::sync::Mutex::new(None);
+
+/// A root constant (`srv` false) or shader view `param` of pipeline
+/// `pipeline` that would read nothing of ours (`why`) reads zeros instead
+/// of whatever the list held ([`null_roots_on`]). Each pipeline, parameter,
+/// side and cause is logged once, with the count so far. The bind goes
+/// through `sets::Sets`, as the title's own root binds do: zeros the list
+/// holds already are not given again, and a view bound at the parameter
+/// later is not taken for them.
+fn bind_null_root(sets: &mut sets::Sets, l: &ID3D12GraphicsCommandList, param: u32, compute: bool, srv: bool, pipeline: &str, why: NullRoot) {
+    if !null_roots_on() {
+        return;
+    }
+    let Some(gpu) = crate::descriptor::host::zero_buffer_gpu() else {
+        return;
+    };
+    let n = NULL_ROOTS.fetch_add(1, Ordering::Relaxed) + 1;
+    {
+        let mut seen = NULL_ROOT_SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let seen = seen.get_or_insert_with(Default::default);
+        if seen.len() < 500 && seen.insert((pipeline.to_owned(), param, compute, why)) {
+            tracing::warn!(pipeline, param, srv, compute, ?why, count = n, "a root view that would read nothing of ours reads zeros (VICTORY_NULL_ROOTS)");
+        }
+    }
+    let bound = if srv { Bound::Srv(gpu) } else { Bound::Cbv(gpu) };
+    if sets.root(compute, param, bound) {
+        // SAFETY: an open list; a live buffer of ours.
+        unsafe {
+            match (compute, srv) {
+                (false, false) => l.SetGraphicsRootConstantBufferView(param, gpu),
+                (false, true) => l.SetGraphicsRootShaderResourceView(param, gpu),
+                (true, false) => l.SetComputeRootConstantBufferView(param, gpu),
+                (true, true) => l.SetComputeRootShaderResourceView(param, gpu),
+            }
+        }
+    }
+}
+
 fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     let slot = slot as usize;
     if roots.len() <= slot {
@@ -1752,7 +1829,10 @@ impl State {
                                     }
                                 }
                             }
-                            None => once!("a shader picks buffers from a view heap that is not set"),
+                            None => {
+                                once!("a shader picks buffers from a view heap that is not set");
+                                bind_null_root(&mut self.sets, l, param, compute, true, &p.name, NullRoot::Ours);
+                            }
                         }
                         continue;
                     }
@@ -1763,6 +1843,9 @@ impl State {
                         // A table left unset is undefined: a null view.
                         if tabled && !self.root_srv_table(list, None, param, compute, false) {
                             return false;
+                        }
+                        if !tabled {
+                            bind_null_root(&mut self.sets, l, param, compute, srv, &p.name, NullRoot::NeverSet);
                         }
                         continue;
                     };
@@ -1779,6 +1862,7 @@ impl State {
                         continue;
                     }
                     let Some(mut gpu) = root_view(list, address, srv) else {
+                        bind_null_root(&mut self.sets, l, param, compute, srv, &p.name, NullRoot::NoCopy);
                         continue;
                     };
                     if biased {
@@ -1789,6 +1873,10 @@ impl State {
                             0,
                             None,
                         ));
+                    }
+                    if null_roots_on() && !root_address_ok(gpu) {
+                        bind_null_root(&mut self.sets, l, param, compute, srv, &p.name, NullRoot::NearZero);
+                        continue;
                     }
                     let bound = if srv { Bound::Srv(gpu) } else { Bound::Cbv(gpu) };
                     if self.sets.root(compute, param, bound) {
@@ -4751,6 +4839,15 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::staging_budget_per_frame;
+
+    /// A root view's host address below 1 MiB is a read near address 0.
+    #[test]
+    fn root_views_near_address_zero_are_refused() {
+        assert!(!super::root_address_ok(0));
+        assert!(!super::root_address_ok(0xbf000));
+        assert!(super::root_address_ok(1 << 20));
+        assert!(super::root_address_ok(0x8_0000_0000));
+    }
 
     #[test]
     fn staging_budget_scales_with_vram_budget() {
