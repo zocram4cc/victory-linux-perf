@@ -2000,9 +2000,9 @@ fn view_guard() -> bool {
 pub(crate) static ALIASES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// Whether the guards change the protection of a run of blocks with one call
-/// where one call can (`VICTORY_GUARD_RUNS=0`: block by block when they give
-/// write access back and when they guard a page's other views, and a range
-/// across views is first asked for whole, as before).
+/// where one call can (`VICTORY_GUARD_RUNS=1`; unset or `0`: block by block
+/// when they give write access back and when they guard a page's other views,
+/// and a range is asked for whole only when it is one alike region).
 ///
 /// A change of protection is a call into the kernel that ends with every
 /// processor dropping what it knew of the pages (under Wine an `mprotect`),
@@ -2017,7 +2017,8 @@ fn guard_runs() -> bool {
     if let Some(on) = RUNS_IN_TEST.get() {
         return on;
     }
-    crate::toggled!("VICTORY_GUARD_RUNS")
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_GUARD_RUNS"))
 }
 
 #[cfg(test)]
@@ -2065,7 +2066,7 @@ pub(crate) fn protects_line() {
     let c: [f64; 6] = std::array::from_fn(|i| PROTECTS[i].swap(0, Relaxed) as f64 / frames as f64);
     tracing::info!(
         target: "victory_gpu::host",
-        "the guards' changes of protection per frame over {frames} frames (VICTORY_GUARD_RUNS=0: block by block, now {}): \
+        "the guards' changes of protection per frame over {frames} frames (VICTORY_GUARD_RUNS=1: in runs, now {}): \
          giving write access back {:.1} calls for {:.1} blocks ({:.2} refused); making read-only {:.1} calls for {:.1} blocks \
          ({:.2} refused)",
         if guard_runs() { "in runs" } else { "block by block" },
