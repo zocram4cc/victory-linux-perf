@@ -4,6 +4,11 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**Windows alone in place: the picture is right; buffers in place are what breaks it. Windows over PCIe cost the GPU 2×**
+- `VICTORY_INPLACE=1` (`bench/trials-20261126-102825-inplace1`): 78 windows, 360 MB in place, no buffers. **The picture is right** (`shot-1.png`: the house in colour, the dock and the water whole, Jason on the deck), better than with copies. But **GPU 379 ms** (187 with copies) and 582 ms a frame: the windows' 360 MB read over PCIe, as on 25 Nov.
+- So **buffers in place break the picture, not memory in place as such**, and not copies over them (none left under `=2`). Something about how a title buffer is opened in place (`inplace::place_part`: the 64 KiB-aligned heap around it, the bias, its length, or its retirement when the title releases the buffer object while its memory lives on) is wrong. That is the next thing to find, by halves (by size, by kind of use).
+- For M.2 this means: windows can be in place and correct; to be fast they must be in VRAM, and windows are where the title's CPU reads (63 of 70 IBS samples), so windows need the per-page split (CPU-read pages in RAM, the rest in VRAM).
+
 **`VICTORY_INPLACE=2` on today's base: no overlaps left, the picture still breaks; GPU 244 ms**
 - `bench/trials-20261126-102344-inplace2` and `…-inplace2-copies`: 78 windows (368 MB) and ~3,300 title buffers (188 MB) in place; **3,372 ranges in place, 4 under any host copy, 0.0 MB of overlap**. Frame 454-457 ms, **GPU 244 ms** (187 with copies: the GPU reads system memory over PCIe, as on 25 Nov). One of three runs closed before the world.
 - **The picture breaks the same way** (`shot-2.png`: the house dark, the dock and the water cut and bent, debris over the water). So it is not copies over in-place memory: in-place memory itself loses or mistimes something. Next, by halves: windows only (`=1`), then buffers by kind.
