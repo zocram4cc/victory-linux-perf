@@ -1,5 +1,11 @@
 # VIctory on an RX 7900 XTX
 
+> **This is VIctory-proton's `linux-v2` branch**, for running VIctory on Linux
+> with Proton: [Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)
+> plus Proton fixes, our Proton build as a submodule and a few opt-in switches;
+> see [docs/linux-proton.md](docs/linux-proton.md) for what it adds, how to
+> build and run it. Everything below is that fork's README.
+
 A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
 that runs an Xbox Series title natively on Windows from files the user supplies.
 

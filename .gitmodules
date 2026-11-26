@@ -1,0 +1,4 @@
+[submodule "proton-ge"]
+	path = proton-ge
+	url = https://github.com/crashbashash/proton-ge-victory.git
+	branch = victory
