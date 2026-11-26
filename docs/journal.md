@@ -4,6 +4,10 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**M.2 step 1, the Linux side works: VRAM at a chosen address, and aliased through a dma-buf**
+- `tools/rebar-bench/placed-alias.c` (native Vulkan, RADV, 7900 XT): `memoryMapPlaced 1`, `memoryUnmapReserve 1`, alignment 4 KiB. A 64 MiB ReBAR allocation (type 3, VRAM, host-visible, coherent; exported as a dma-buf) **mapped by `vkMapMemory2` at the address asked for** (`0x7e0000000000`, a range reserved first, as Wine reserves the title's), **mapped again through its dma-buf at a second address**, and **one 64 KiB page of it at a third address from a 5 MiB offset** (a scattered alias, as the page pool does). CPU writes through any of the three read back through the others, and a GPU copy reads them all. Everything the console model needs from the driver is there.
+- Next: the vkd3d-proton side (a heap whose memory is such an allocation, placed resources in it), built for Wine. It needs mingw-w64 (the user is installing it).
+
 **Milestone (the user, watching the prologue gate):** "es la primera vez que veo las cinemáticas sin estar totalmente bugeadas, no es perfecto pero todo carga a tiempo más o menos". The first build where the intro cutscenes play nearly whole and load in time: the pipeline library that now exists (`c436241`: pipelines made before they are needed), with the indirect clamps out of the draws' way (I.1, I.2).
 
 **Gates passed: `VICTORY_INDIRECT_BATCH` and `VICTORY_INDIRECT_WINDOW` on by default**
