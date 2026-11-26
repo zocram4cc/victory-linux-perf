@@ -265,7 +265,8 @@ run() {
     rm -f "$DATA/perfiles/$PROFILE/cache/frametime.csv"
     mkdir -p "$OUT_ROOT"
     say "launching profile $PROFILE${EXTRA[*]:+ with ${EXTRA[*]}}"
-    "$LAUNCHER" -p "$PROFILE" run --no-update >"$OUT_ROOT/.launcher.out" 2>&1 &
+    # BENCH_RUN_ARGS: more arguments for `victory run` (e.g. `--console series-s`).
+    "$LAUNCHER" -p "$PROFILE" run --no-update ${BENCH_RUN_ARGS:-} >"$OUT_ROOT/.launcher.out" 2>&1 &
     local launcher=$!
     local i; for ((i = 0; i < 120; i++)); do [[ -n $(game_pid) ]] && break; sleep 1; done
     [[ -n $(game_pid) ]] || { tail -n 20 "$OUT_ROOT/.launcher.out" >&2; die "the game did not start"; }
