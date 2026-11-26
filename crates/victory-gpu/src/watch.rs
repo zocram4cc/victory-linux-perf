@@ -2078,6 +2078,7 @@ fn placeholder(block: usize) -> bool {
 /// The runtime gave the title memory at `[at, at + len)`, allocated or
 /// committed: what was known of holes there is asked again.
 pub fn title_memory_allocated(at: usize, len: usize) {
+    forget_holes(at, len);
     if len == 0 || !known_holes() {
         return;
     }
@@ -3234,30 +3235,35 @@ fn protect_views(g: &Guards, from: usize, to: usize) {
     }
 }
 
-/// Holes asked about (`VICTORY_HOLES_ONCE=<frames>`): each hole's
-/// [`uncommitted_end`] and the frame it was asked in. Under Wine every
-/// question walks the region page by page with the process's memory lock
-/// held, and the title's streaming pools leave ~8,000 holes that are asked
-/// about every frame (30 frames: frames 1.7 % shorter, RX 9070 XT under
-/// Proton). What the runtime maps or unmaps forgets them all; a commit it is
-/// not told of shows that many frames later at most.
-static HOLES_ASKED: Mutex<Option<std::collections::HashMap<usize, (usize, u64)>>> = Mutex::new(None);
+/// Holes asked about (`VICTORY_HOLES_ONCE=<frames>`): by first block, the
+/// hole's end ([`uncommitted_end`]) and the frame it was asked in; no two
+/// overlap. Under Wine every question walks the region page by page with the
+/// process's memory lock held, and the title's streaming pools leave holes
+/// that refreshes ask about thousands of times a frame. What the runtime
+/// maps, unmaps or commits forgets the holes it touches; a commit it is not
+/// told of shows that many frames later at most.
+static HOLES_ASKED: Mutex<std::collections::BTreeMap<usize, (usize, u64)>> = Mutex::new(std::collections::BTreeMap::new());
 
-/// [`uncommitted_end`], or its answer from fewer than
-/// `VICTORY_HOLES_ONCE` frames ago.
+/// [`uncommitted_end`], or the answer for the hole holding `block` from fewer
+/// than `VICTORY_HOLES_ONCE` frames ago.
 fn uncommitted_end_cached(block: usize) -> usize {
     let frames = holes_once();
     if frames == 0 {
         return uncommitted_end(block);
     }
     let frame = crate::frame::current();
-    if let Some(&(end, at)) = HOLES_ASKED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&block))
+    if let Some((_, &(end, at))) = HOLES_ASKED.lock().unwrap_or_else(|e| e.into_inner()).range(..=block).next_back()
+        && block < end
         && frame.saturating_sub(at) < frames
     {
         return end;
     }
     let end = uncommitted_end(block);
-    HOLES_ASKED.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(block, (end, frame));
+    if end > block {
+        let mut holes = HOLES_ASKED.lock().unwrap_or_else(|e| e.into_inner());
+        forget_holes_in(&mut holes, block, end);
+        holes.insert(block, (end, frame));
+    }
     end
 }
 
@@ -3273,9 +3279,19 @@ fn holes_once() -> u64 {
     *FRAMES.get_or_init(|| std::env::var("VICTORY_HOLES_ONCE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
 }
 
-/// What the runtime maps or unmaps: no hole's answer stands.
-fn forget_holes() {
-    *HOLES_ASKED.lock().unwrap_or_else(|e| e.into_inner()) = None;
+/// What the runtime maps, unmaps or commits at `[at, at + len)`: the answers
+/// for holes there no longer stand.
+fn forget_holes(at: usize, len: usize) {
+    forget_holes_in(&mut HOLES_ASKED.lock().unwrap_or_else(|e| e.into_inner()), at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+}
+
+/// Takes the holes overlapping blocks `[first, last)` out of `holes`.
+fn forget_holes_in(holes: &mut std::collections::BTreeMap<usize, (usize, u64)>, first: usize, last: usize) {
+    let before = holes.range(..first).next_back().filter(|(_, (end, _))| *end > first).map(|(&start, _)| start);
+    let inside: Vec<usize> = holes.range(first..last).map(|(&start, _)| start).collect();
+    for start in before.into_iter().chain(inside) {
+        holes.remove(&start);
+    }
 }
 
 /// The end (exclusive) of the whole uncommitted blocks starting at `block`.
@@ -3797,7 +3813,7 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// neither guarded nor writable) and a kernel read into it fail, so the
 /// write access is given back.
 pub fn title_memory_remapped(at: usize, len: usize) {
-    forget_holes();
+    forget_holes(at, len);
     crate::texback::remapped(at, len);
     open(&title_memory_changed(at, len), at, at.saturating_add(len));
 }
@@ -3808,7 +3824,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 /// before the unmapping would leave the address guarded, clean and known by
 /// its bits ([`PUBLISHED`]) with no view behind it.
 pub fn title_memory_unmapping(at: usize, len: usize) {
-    forget_holes();
+    forget_holes(at, len);
     crate::texback::remapped(at, len);
     forget_views(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     let mut g = title_memory_changed(at, len);
@@ -4138,6 +4154,17 @@ mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    #[test]
+    fn forgetting_takes_only_the_holes_touched() {
+        let mut holes: std::collections::BTreeMap<usize, (usize, u64)> = [(10, (20, 0)), (30, (40, 0)), (50, (60, 0))].into();
+        forget_holes_in(&mut holes, 15, 16);
+        assert_eq!(holes.keys().copied().collect::<Vec<_>>(), [30, 50]);
+        forget_holes_in(&mut holes, 40, 50);
+        assert_eq!(holes.keys().copied().collect::<Vec<_>>(), [30, 50]);
+        forget_holes_in(&mut holes, 39, 51);
+        assert!(holes.is_empty());
+    }
 
     #[test]
     fn written_pages_are_reported_to_every_asker() {
