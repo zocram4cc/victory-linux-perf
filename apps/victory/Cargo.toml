@@ -33,6 +33,10 @@ diagnostics = [
     "victory-loader/diagnostics",
     "victory-shader/diagnostics",
 ]
+# Only what a scripted run needs that every build does not have
+# (`VICTORY_STEP_OVER`; `VICTORY_KEYS` is in every build), none of the rest of
+# `diagnostics`.
+scripted = ["victory-loader/scripted"]
 
 [lints]
 workspace = true
