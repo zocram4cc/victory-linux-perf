@@ -191,12 +191,12 @@ PY
     if ((PERF)) && [[ -f $dir/perf.data ]]; then
         {
             echo "== game, by module"
-            perf report -q -i "$dir/perf.data" --stdio --sort dso 2>/dev/null | head -25
+            perf report -q -i "$dir/perf.data" --stdio --sort dso 2>/dev/null | head -25 || true
             echo; echo "== game, by symbol"
-            perf report -q -i "$dir/perf.data" --stdio --sort dso,sym 2>/dev/null | head -60
+            perf report -q -i "$dir/perf.data" --stdio --sort dso,sym 2>/dev/null | head -60 || true
             if [[ -f $dir/perf-wineserver.data ]]; then
                 echo; echo "== wineserver, by symbol"
-                perf report -q -i "$dir/perf-wineserver.data" --stdio --sort sym 2>/dev/null | head -25
+                perf report -q -i "$dir/perf-wineserver.data" --stdio --sort sym 2>/dev/null | head -25 || true
             fi
         } >"$dir/perf.txt"
         say "profile: $dir/perf.txt"
