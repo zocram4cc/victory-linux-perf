@@ -2,25 +2,57 @@
 # Linux launcher: runs the Windows build under Proton-GE through umu-launcher,
 # with the same settings as Play-VIctory.cmd (pareto-residency, Series S).
 #
-#   VICTORY_GAME_DIR=~/Games/MyDump scripts/play-linux.sh [pareto-residency] [--safe] [--ray-tracing]
-#   scripts/play-linux.sh shaders <the shader archives>   # translate every shader ahead of time
-#   scripts/play-linux.sh warm --used                     # make pipelines earlier runs drew with
-#   scripts/play-linux.sh exe <args...>                   # any other victory.exe command
+#   VICTORY_GAME_DIR=~/Games/MyDump scripts/play-linux.sh [pareto-residency] [options]
+#   scripts/play-linux.sh [--diag] shaders <the shader archives>   # translate every shader ahead of time
+#   scripts/play-linux.sh [--diag] warm --used                     # make pipelines earlier runs drew with
+#   scripts/play-linux.sh [--diag] exe <args...>                   # any other victory.exe command
+#
+# Options for a game run:
+#   --diag          the diagnostics build (scripts/build-linux.sh --diag)
+#   --safe          without the newest, faster ways (scripts/play.ps1 -Safe)
+#   --ray-tracing   the title's ray-traced indirect light
+#   --bench <route> a scripted run: keys from scripts/bench/<route>.keys, stopped when it ends
+#   --proton-log    Wine's own log into the run folder (large)
+#   --no-mangohud   without MangoHud's frame log
+#
+# Every game run leaves a folder in ~/.local/share/victory/runs/ (VICTORY_RUNS_DIR):
+# run.json, victory.log, frames.csv, mangohud.csv, system.csv, marks.csv, marks/.
+# scripts/victory-report.py summarises one; scripts/victory-mark.sh marks a moment.
+# Ctrl-C stops the title cleanly (SIGTERM, never SIGKILL: killing it with its
+# mappings live can wedge the NVIDIA driver until a reboot).
 #
 # Every VICTORY_* default below can be overridden from the environment.
 # Runner settings (overridable):
 #   PROTONPATH      Proton build to use (default: Proton-GE Latest from Steam's compatibilitytools.d)
 #   WINEPREFIX      prefix for VIctory alone (default: ~/.local/share/victory/prefix)
-#   VICTORY_EXE     victory.exe to run (default: the cross-built release, then a release exe beside this repo)
+#   VICTORY_EXE     victory.exe to run (default: the cross-built build, then a release exe beside this repo)
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+target="$repo/target/x86_64-pc-windows-msvc"
 
 # Linux path -> path Wine sees (its Z: drive is the Linux root).
 winpath() { local p; p="$(realpath -m -- "$1")"; printf 'Z:%s' "${p//\//\\}"; }
+usage() { sed -n '2,8p' "$0" >&2; exit 2; }
 
-command -v umu-run >/dev/null || { echo "umu-run not found: sudo dnf install umu-launcher" >&2; exit 2; }
+# Options that apply to every command, taken out first.
+profile=release safe=0 bench="" proton_log=0 mangohud=1 args=()
+while (( $# )); do
+  case "$1" in
+    --diag) profile=diag ;;
+    --safe) safe=1 ;;
+    --ray-tracing) export VICTORY_BVH_BUILDER="${VICTORY_BVH_BUILDER:-1}" ;;
+    --bench) shift; bench="${1:?--bench needs a route name}" ;;
+    --proton-log) proton_log=1 ;;
+    --no-mangohud) mangohud=0 ;;
+    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+    *) args+=("$1") ;;
+  esac
+  shift
+done
+set -- "${args[@]+"${args[@]}"}"
 
+command -v umu-run >/dev/null || { echo "umu-run not found (README: install the umu-launcher zipapp)" >&2; exit 2; }
 export PROTONPATH="${PROTONPATH:-$HOME/.local/share/Steam/compatibilitytools.d/Proton-GE Latest}"
 export WINEPREFIX="${WINEPREFIX:-$HOME/.local/share/victory/prefix}"
 export GAMEID="${GAMEID:-umu-0}"
@@ -29,14 +61,14 @@ mkdir -p "$WINEPREFIX"
 
 exe="${VICTORY_EXE:-}"
 if [[ -z "$exe" ]]; then
-  for c in "$repo/victory-3d-rtx-pareto-residency.exe" \
-           "$repo/target/x86_64-pc-windows-msvc/release/victory.exe" \
+  for c in "$target/$profile/victory.exe" \
+           "$repo/victory-3d-rtx-pareto-residency.exe" \
            "$repo/target/release/victory.exe"; do
     [[ -f "$c" ]] && { exe="$c"; break; }
   done
 fi
 [[ -n "$exe" && -f "$exe" ]] || {
-  echo "No victory.exe. Build it: cargo xwin build --release --locked -p victory --target x86_64-pc-windows-msvc" >&2
+  echo "No victory.exe for the $profile build. Build it: scripts/build-linux.sh$([[ $profile == diag ]] && echo ' --diag')" >&2
   exit 2
 }
 
@@ -49,9 +81,9 @@ export VICTORY_CACHE_DIR="$(winpath "$cache")"
 export VICTORY_DATA_DIR="$(winpath "$data")"
 if [[ -n "${VICTORY_CONFIG:-}" ]]; then export VICTORY_CONFIG="$(winpath "$VICTORY_CONFIG")"; fi
 
-# Microsoft's DXC (dxcompiler.dll, dxil.dll) beside the exe: under Wine the
-# indirect-draw clamp and card compare only compile with it (no 3D without).
-# Copied in from VICTORY_DXC_DIR when missing, so a rebuild keeps working.
+# Microsoft's DXC (dxcompiler.dll, dxil.dll) beside the exe: under Wine our
+# shaders only compile with it (no 3D without). Copied in from
+# VICTORY_DXC_DIR when missing, so a rebuild keeps working.
 dxc_dir="${VICTORY_DXC_DIR:-$HOME/.local/share/victory/dxc}"
 for dll in dxcompiler.dll dxil.dll; do
   [[ -f "$(dirname "$exe")/$dll" ]] || { [[ -f "$dxc_dir/$dll" ]] && cp -f "$dxc_dir/$dll" "$(dirname "$exe")/"; } || true
@@ -77,15 +109,8 @@ case "${1:-}" in
   shaders|warm) exec umu-run "$win_exe" "$@" ;;
   exe) shift; exec umu-run "$win_exe" "$@" ;;
 esac
-
-safe=0
 for a in "$@"; do
-  case "$a" in
-    pareto-residency) ;;
-    --safe) safe=1 ;;
-    --ray-tracing) export VICTORY_BVH_BUILDER="${VICTORY_BVH_BUILDER:-1}" ;;
-    *) echo "Usage: $0 [pareto-residency] [--safe] [--ray-tracing] | shaders ... | warm ... | exe ..." >&2; exit 2 ;;
-  esac
+  [[ "$a" == pareto-residency ]] || usage
 done
 
 game="${VICTORY_GAME_DIR:-}"
@@ -123,6 +148,88 @@ d VICTORY_LEVELS_ON_DEMAND 1
 d VICTORY_CARD_BUFFERS_MIN_KB 64
 # Both faces: under Proton character heads and hair are culled away otherwise.
 d VICTORY_CULL_NONE 1
-[[ -n "${VICTORY_LOG:-}${RUST_LOG:-}" ]] || export VICTORY_LOG=warn
+# Game memory in the card's memory through Resizable BAR (Zarina35's RTX 5080
+# numbers; 0 turns either off). vkd3d-proton has the GPU upload heap this needs.
+d VICTORY_WINDOWS_BAR_MB 2048
+d VICTORY_CARD_WINDOWS_MB 1024
+# Remember the pipelines a run used, so `warm --used` can make them ahead.
+d VICTORY_PIPELINE_BOOK 1
+[[ -n "${VICTORY_LOG:-}${RUST_LOG:-}" ]] || export VICTORY_LOG=warn,victory_gpu=info
 
-exec umu-run "$win_exe" run "$(winpath "$game/game_scarlett_master.exe")" --console series-s --execute
+# A scripted run: the route's keys, and how long it lasts.
+bench_secs=0
+if [[ -n "$bench" ]]; then
+  route="$repo/scripts/bench/$bench.keys"
+  [[ -f "$route" ]] || { echo "No route $route" >&2; exit 2; }
+  keys=$(grep -vE '^[[:space:]]*(#|$)' "$route" | grep -v '^duration=' | tr -d ' ' | paste -sd, -)
+  bench_secs=$(sed -n 's/^duration=\([0-9]*\).*/\1/p' "$route" | head -1)
+  [[ -n "$bench_secs" ]] || { echo "$route has no duration=<seconds> line" >&2; exit 2; }
+  export VICTORY_KEYS="$keys"
+fi
+
+# The run's folder.
+runs="${VICTORY_RUNS_DIR:-$HOME/.local/share/victory/runs}"
+run="$runs/$(date +%Y%m%d-%H%M%S)${bench:+-bench-$bench}"
+mkdir -p "$run/marks"
+ln -sfn "$run" "$runs/latest"
+: > "$run/marks.csv"
+export VICTORY_FRAMES_CSV="$(winpath "$run/frames.csv")"
+if (( proton_log )); then export PROTON_LOG=1 PROTON_LOG_DIR="$run"; fi
+if (( mangohud )) && command -v mangohud >/dev/null; then
+  export MANGOHUD=1
+  export MANGOHUD_CONFIG="${MANGOHUD_CONFIG:-no_display,output_folder=$run,autostart_log=1,log_interval=0,toggle_hud=Shift_L+F12,toggle_logging=Shift_L+F2}"
+fi
+# (No gamemoderun: its preload cannot load inside umu's Steam Runtime
+# container and only adds errors there.)
+
+started=$(date +%s)
+python3 -I "$repo/scripts/victory-report.py" --write-run-json "$run" --start \
+  --profile "$profile" --exe "$exe" --repo "$repo" ${bench:+--bench "$bench"} || true
+
+# The title in a process group of its own, so that Ctrl-C here reaches this
+# script only, which then asks the title to end.
+echo "run folder: $run"
+setsid umu-run "$win_exe" run "$(winpath "$game/game_scarlett_master.exe")" --console series-s --execute \
+  > >(python3 -I -u -c 'import sys, time
+for line in sys.stdin:
+    sys.stdout.write(time.strftime("%H:%M:%S ") + line)' | tee "$run/victory.log") 2>&1 &
+title=$!
+"$repo/scripts/victory-sampler.sh" "$run" $$ "$title" &
+sampler=$!
+
+stopping=0
+stop() {
+  (( stopping )) && return
+  stopping=1
+  echo "stopping the title (SIGTERM)..." >&2
+  # The title's Wine process first (found below umu-run, never by a name
+  # match across the system), then umu's own group; never SIGKILL.
+  local wine
+  wine=$("$repo/scripts/victory-title-pid.sh" "$title") && kill -TERM "$wine" 2>/dev/null || true
+  kill -TERM -- -"$title" 2>/dev/null || true
+}
+trap stop INT TERM
+if (( bench_secs > 0 )); then
+  ( sleep "$bench_secs"; kill -TERM $$ 2>/dev/null ) &
+  timer=$!
+fi
+
+code=0
+while kill -0 "$title" 2>/dev/null; do
+  wait "$title" && code=0 || code=$?
+done
+trap - INT TERM
+[[ -n "${timer:-}" ]] && kill "$timer" 2>/dev/null || true
+kill "$sampler" 2>/dev/null || true
+wait 2>/dev/null || true
+
+# MangoHud names its files after the program; give them fixed names.
+for f in "$run"/*_summary.csv; do [[ -e "$f" ]] && mv -f "$f" "$run/mangohud-summary.csv"; done
+for f in "$run"/*.csv; do
+  case "$(basename "$f")" in frames.csv|system.csv|marks.csv|mangohud*.csv) ;; *) mv -f "$f" "$run/mangohud.csv" ;; esac
+done
+python3 -I "$repo/scripts/victory-report.py" --write-run-json "$run" --end --exit-code "$code" \
+  --seconds $(( $(date +%s) - started )) || true
+echo "run finished (exit $code, $(( $(date +%s) - started )) s): $run"
+echo "summary: scripts/victory-report.py $run"
+exit "$code"

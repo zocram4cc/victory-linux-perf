@@ -16,6 +16,8 @@ const MAX_ENCODED_RUN: usize = 512;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
     "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
+    // Playtest tooling (scripts/victory-report.py) and benchmark routes (scripts/bench/*.keys).
+    "py", "keys",
 ];
 const ALLOWED_NAMES: &[&str] = &[
     ".gitignore",
@@ -240,6 +242,8 @@ mod tests {
         assert!(check(".githooks/pre-commit", b"#!/bin/sh\n").is_empty());
         assert!(check(".githooks/commit-msg", b"#!/bin/sh\n").is_empty());
         assert!(check(".githooks/pre-push", b"#!/bin/sh\n").is_empty());
+        assert!(check("scripts/victory-report.py", b"print('hi')\n").is_empty());
+        assert!(check("scripts/bench/example.keys", b"duration=60\n12:Enter\n").is_empty());
     }
 
     #[test]

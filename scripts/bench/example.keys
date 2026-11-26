@@ -1,0 +1,27 @@
+# A benchmark route for `scripts/play-linux.sh --bench example`: VICTORY_KEYS
+# entries, one a line, and how long the run lasts. When the time is up the
+# launcher ends the title cleanly (SIGTERM). Copy this file to make a route of
+# your own and time it against your save: the seconds count from the moment the
+# title starts reading input.
+#
+#   <seconds>:<key>          tap a key (0.2 s)
+#   <from>-<to>:<key>        hold it from..to
+#
+# Keys: a letter or digit, Enter, Esc, Tab, Back, Up, Down, Left, Right.
+# With a controller connected the keys also move the pad:
+#   W/A/S/D the left stick, I/J/K/L the right stick (camera), Z/C the triggers.
+#
+# This one only gets past the start screens and stands still for a minute;
+# it is a template, not a measured route.
+duration=150
+12:Enter
+16:Enter
+20:A
+25:Enter
+30:A
+35:Enter
+40:A
+50:Enter
+# Walk forward while turning slowly, as a world benchmark would.
+90-120:W
+95-105:L

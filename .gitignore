@@ -76,3 +76,6 @@
 *.swp
 Thumbs.db
 .DS_Store
+
+# Python bytecode (scripts/victory-report.py)
+__pycache__/
