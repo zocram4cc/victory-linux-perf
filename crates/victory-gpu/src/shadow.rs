@@ -499,6 +499,22 @@ mod card_tests {
 /// - what goes up to a copy in the card's memory is numbered
 ///   ([`card_dirty`]), so that a merge can tell the title's bytes the card
 ///   had not received from bytes the card wrote.
+/// `VICTORY_BACK_CEILING=1`, for measurement only (1.3): no snapshots and
+/// no copy-back of what shaders write into title buffers' host copies
+/// (copies in the card's memory still go back). The title then reads its
+/// own stale bytes wherever the GPU wrote: the picture or the run may
+/// break. It gives the frame time 1.3 could reach at most.
+pub(crate) fn back_ceiling() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_BACK_CEILING").is_some_and(|v| v == "1");
+        if on {
+            tracing::warn!("VICTORY_BACK_CEILING=1: nothing shaders write goes back to the title (measurement only)");
+        }
+        on
+    })
+}
+
 pub(crate) fn relay() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("VICTORY_RELAY").is_ok_and(|v| v == "1" || v == "2") && !keeps())
@@ -1805,6 +1821,10 @@ impl Shadow {
         }
         // Dispatches declare the same ranges thousands of times.
         if pending.contains(&range) {
+            return;
+        }
+        if back_ceiling() {
+            pending.push(range);
             return;
         }
         // In the card's memory: no snapshot. What shaders wrote is found on
