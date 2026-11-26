@@ -2988,6 +2988,20 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         drop(map);
         return loose(address, end, len <= 1, any);
     };
+    // M.1 (`VICTORY_ONE_COPY=1`): the title reaches the same memory as a
+    // buffer and by raw address; a window made for the raw asks and a
+    // buffer copy then held the same bytes, and what shaders wrote in one
+    // reached the other only through the copy-back and title memory
+    // (~245 written ranges a frame, 58-62 MB). An ask a window holds whole
+    // takes the window, so both names share one copy.
+    if one_copy() {
+        drop(map);
+        if let Some(window) = window_holding(address, end) {
+            ONE_COPY.fetch_add(1, Ordering::Relaxed);
+            return Some(window);
+        }
+        map = buffers();
+    }
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
@@ -3182,6 +3196,35 @@ fn longest_tail(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u6
     windows
         .filter(|&(start, bytes)| start >= cell && start <= step && start + bytes == cell + len)
         .min()
+}
+
+/// `VICTORY_ONE_COPY=1` (M.1): buffer asks that a window holds take it.
+fn one_copy() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_ONE_COPY").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("VICTORY_ONE_COPY=1: buffer asks inside a window share its copy");
+        }
+        on
+    })
+}
+
+/// Buffer asks that took a window instead (`VICTORY_ONE_COPY`), since the
+/// last frame line.
+pub(crate) static ONE_COPY: AtomicU64 = AtomicU64::new(0);
+
+/// A window that holds `[address, end)` whole, noted as used.
+fn window_holding(address: u64, end: u64) -> Option<Arc<Shadow>> {
+    let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let (_, shadow) = map
+        .range((address.saturating_sub(WINDOW * 4), 0)..=(address, u64::MAX))
+        .rev()
+        .find(|(key, shadow)| key.0 <= address && key.0 + key.1 >= end && !shadow.in_place())?;
+    shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+    shadow.asked[0].fetch_min(address, Ordering::Relaxed);
+    shadow.asked[1].fetch_max(end, Ordering::Relaxed);
+    Some(shadow.clone())
 }
 
 /// Copies of title memory outside buffers, by (start, length).

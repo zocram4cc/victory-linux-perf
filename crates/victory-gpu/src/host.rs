@@ -5900,6 +5900,10 @@ impl Meter {
         crate::resource::textures_made_line(frames);
         crate::pool::pool_line(frames);
         crate::census::census_line(frames);
+        let shared = crate::shadow::ONE_COPY.swap(0, Ordering::Relaxed);
+        if shared > 0 {
+            tracing::info!("buffer asks that took a window's copy per frame (M.1, VICTORY_ONE_COPY): {:.0}", shared as f64 / frames);
+        }
         {
             let [ranges, overlapped, bytes, over, copies, bb, bw, wb, ww] =
                 [0, 1, 2, 3, 4, 5, 6, 7, 8].map(|i| BACK_OVERLAP[i].swap(0, Ordering::Relaxed) as f64 / frames);
