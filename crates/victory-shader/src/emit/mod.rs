@@ -129,6 +129,28 @@ pub use shader::{
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 
+/// Whether a pixel program's quad-local reads use the host's quad
+/// operations (which reach helper lanes); on unless
+/// `VICTORY_PIXEL_QUAD_READS=0` (diagnostic: wave reads instead, as before,
+/// wrong at triangle edges). Under suspicion of crashing NVIDIA's SPIR-V
+/// compiler together with discards (demote) under vkd3d-proton.
+pub fn pixel_quad_reads() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIXEL_QUAD_READS").is_none_or(|v| v != "0"))
+}
+
+/// Whether a loop closed by an unconditional jump back leaves the program
+/// through the abort block at the iteration limit; on unless
+/// `VICTORY_LOOP_ABORT=0` (diagnostic: such loops then have no second exit,
+/// and one that never meets its own exit runs on). An exit from inside the
+/// loop body to a return was under suspicion of crashing NVIDIA's SPIR-V
+/// compiler under vkd3d-proton. Part of the translation, so the shader cache
+/// keys on it.
+pub fn loop_abort() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LOOP_ABORT").is_none_or(|v| v != "0"))
+}
+
 /// The iteration count after which a translated loop is left, per lane and
 /// per entry into the loop: [`DEFAULT_LOOP_LIMIT`].
 ///
@@ -274,6 +296,23 @@ fn parse_set(value: Option<&str>, unset: u32, all: u32) -> u32 {
     parsed.map_or(unset, |n| n & all)
 }
 
+/// The name and value of every `VICTORY_*` switch the translator's source
+/// reads (found by `build.rs`), for a cache key: a switch left out of one
+/// serves translations made with another value (`VICTORY_WAVE_LDS_LOOSE`
+/// was, in `victory-gpu`'s shader cache, until this).
+pub fn switch_values() -> Vec<u8> {
+    let mut out = Vec::new();
+    for name in env!("VICTORY_SHADER_SWITCHES").split(',').filter(|n| !n.is_empty()) {
+        out.extend_from_slice(name.as_bytes());
+        out.push(b'=');
+        if let Some(value) = std::env::var_os(name) {
+            out.extend_from_slice(value.as_encoded_bytes());
+        }
+        out.push(0);
+    }
+    out
+}
+
 /// Everything a translation depends on besides the container: the
 /// translator's own source (hashed at build time), the value of every
 /// `VICTORY_*` switch it reads, the host facts the device hands it (widest
@@ -285,14 +324,7 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out.extend_from_slice(env!("VICTORY_SHADER_SOURCE_HASH").as_bytes());
     out.push(u8::from(cfg!(feature = "diagnostics")));
     out.push(u8::from(cfg!(debug_assertions)));
-    for name in env!("VICTORY_SHADER_SWITCHES").split(',').filter(|n| !n.is_empty()) {
-        out.extend_from_slice(name.as_bytes());
-        out.push(b'=');
-        if let Some(value) = std::env::var_os(name) {
-            out.extend_from_slice(value.as_encoded_bytes());
-        }
-        out.push(0);
-    }
+    out.extend_from_slice(&switch_values());
     out.extend_from_slice(&lower::host_max_wave().to_le_bytes());
     out.extend_from_slice(&lower::host_rdna().to_le_bytes());
     out.extend_from_slice(&shader::view_heap_limit().to_le_bytes());

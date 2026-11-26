@@ -85,6 +85,10 @@ fn build() -> [u8; 32] {
         }
         // And which clean-up passes ran over the translated code.
         bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
+        // Every other switch the translator reads (the list above names
+        // only some; `VICTORY_WAVE_LDS_LOOSE` and `VICTORY_LOOP_ABORT` were
+        // missing, so a run with them changed was served old translations).
+        bytes.extend_from_slice(&victory_shader::emit::switch_values());
         bytes
     });
     let mut hash = blake3::Hasher::new();
