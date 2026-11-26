@@ -329,7 +329,7 @@ stopping=0
 stop() {
   (( stopping )) && return
   stopping=1
-  echo "stopping the title (SIGTERM)..." >&2
+  echo "stopping the title (SIGTERM)..." >&2 || true
   # The title's Wine process first (found below umu-run, never by a name
   # match across the system), then umu's own group; never SIGKILL.
   local wine
@@ -337,8 +337,10 @@ stop() {
   kill -TERM -- -"$title" 2>/dev/null || true
 }
 # A closed terminal (SIGHUP) stops the title as Ctrl-C does, and the run's
-# end is still written.
-trap stop INT TERM HUP
+# end is still written: output goes nowhere from then on (a write to the
+# closed terminal would end this script under set -e before the end).
+trap stop INT TERM
+trap 'exec >/dev/null 2>&1; stop' HUP
 if (( bench_secs > 0 )); then
   ( sleep "$bench_secs"; kill -TERM $$ 2>/dev/null ) &
   timer=$!
@@ -360,6 +362,6 @@ for f in "$run"/*.csv; do
 done
 python3 -I "$repo/scripts/victory-report.py" --write-run-json "$run" --end --exit-code "$code" \
   --seconds $(( $(date +%s) - started )) || true
-echo "run finished (exit $code, $(( $(date +%s) - started )) s): $run"
-echo "summary: scripts/victory-report.py $run"
+echo "run finished (exit $code, $(( $(date +%s) - started )) s): $run" || true
+echo "summary: scripts/victory-report.py $run" || true
 exit "$code"
