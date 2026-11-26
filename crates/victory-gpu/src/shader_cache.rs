@@ -139,6 +139,12 @@ fn build() -> [u8; 32] {
         if victory_shader::emit::one_latch() {
             bytes.extend_from_slice(b"one latch");
         }
+        // And whether 16-bit integer typed loads after a group barrier also
+        // read the slot's raw view (`victory_shader::emit::raw_typed_loads`,
+        // under Wine): only when they do, as with the latch.
+        if victory_shader::emit::raw_typed_loads() {
+            bytes.extend_from_slice(b"raw typed loads");
+        }
         bytes
     });
     let mut hash = blake3::Hasher::new();
