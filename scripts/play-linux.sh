@@ -17,9 +17,8 @@
 #   --proton-log    Wine's own log into the run folder (large)
 #   --levels-on-demand  texture mip levels as draws need them
 #                   (VICTORY_LEVELS_ON_DEMAND=1; off by default since it used more memory)
-#   --texture-waits wait longer for textures in the first frames and the first
-#                   cutscene (VICTORY_EARLY_TEXTURES_MS=40, VICTORY_BAKE_TEXTURES_MS=10000,
-#                   the willy build's; against faces of noise)
+#   --no-texture-waits  the title's shorter waits for textures in the first frames and
+#                   the first cutscene (VICTORY_EARLY_TEXTURES_MS=12, VICTORY_BAKE_TEXTURES_MS=1500)
 #   --view-tree     GE-Proton11-14 with GE PR #1016's wineserver (memory views kept in a
 #                   tree), from ~/.local/share/victory/proton/GE-Proton11-14-viewtree
 #   --mangohud      also MangoHud's frame log (off by default: its NVIDIA thread
@@ -55,9 +54,9 @@ while (( $# )); do
     --bench) shift; bench="${1:?--bench needs a route name}" ;;
     --proton-log) proton_log=1 ;;
     --levels-on-demand) export VICTORY_LEVELS_ON_DEMAND="${VICTORY_LEVELS_ON_DEMAND:-1}" ;;
-    --texture-waits)
-      export VICTORY_EARLY_TEXTURES_MS="${VICTORY_EARLY_TEXTURES_MS:-40}"
-      export VICTORY_BAKE_TEXTURES_MS="${VICTORY_BAKE_TEXTURES_MS:-10000}" ;;
+    --no-texture-waits)
+      export VICTORY_EARLY_TEXTURES_MS="${VICTORY_EARLY_TEXTURES_MS:-12}"
+      export VICTORY_BAKE_TEXTURES_MS="${VICTORY_BAKE_TEXTURES_MS:-1500}" ;;
     --skip-intro) export VICTORY_KEYS="${VICTORY_KEYS-12:Enter,16:Enter,20:A,25:Enter,30:A,35:Enter,40:A,50:Enter}" ;;
     --view-tree) export PROTONPATH="${PROTONPATH:-$HOME/.local/share/victory/proton/GE-Proton11-14-viewtree}" ;;
     --mangohud) mangohud=1 ;;
@@ -183,6 +182,12 @@ fi
 # 11.2 -> 9.7 GB, 99th percentile frame 802 -> 578 ms); the willy build's
 # setting. --levels-on-demand turns it back on.
 d VICTORY_LEVELS_ON_DEMAND 0
+# Longer waits for textures in the first frames and the first cutscene (the
+# willy build's): with them run 20261126-221648 reached 305 s of the intro
+# with clothes and faces lit right and a lower memory peak than without
+# (-221207). --no-texture-waits: the shorter waits.
+d VICTORY_EARLY_TEXTURES_MS 40
+d VICTORY_BAKE_TEXTURES_MS 10000
 d VICTORY_CARD_BUFFERS_MIN_KB 64
 # Both faces: under Proton character heads and hair are culled away otherwise.
 d VICTORY_CULL_NONE 1
