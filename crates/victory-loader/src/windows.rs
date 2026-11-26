@@ -174,7 +174,12 @@ impl ImportResolver for WithTitleDlls<'_> {
         self.dlls
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case(dll))
-            .and_then(|(_, image)| image.export_symbol(symbol))
+            .and_then(|(_, image)| {
+                let export = image.export_symbol(symbol)?;
+                // `VICTORY_SKIP_MOVIES`: a few Bink imports go to stubs.
+                let stub = crate::movies::redirect(dll, symbol, &|name| image.export(name));
+                Some(stub.unwrap_or(export))
+            })
             .map_or(Resolution::Missing, |address| Resolution::Found {
                 address,
                 provenance: Provenance::Title,
