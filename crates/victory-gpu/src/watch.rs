@@ -991,12 +991,12 @@ pub(crate) fn ask_once_end() {
     }
 }
 
-/// We wrote title memory `[at, at + len)` while a submission's one asking
-/// stands (the title's buffer copies, done at submission): its pages count
-/// as written after that asking, so the refreshes that follow copy them.
+/// We wrote title memory `[at, at + len)` (the title's buffer copies, done at submission): its
+/// pages count as written after that asking, so the refreshes that follow copy them. Told while a
+/// submission's one asking stands, or at all while [`noting`] is on.
 pub(crate) fn wrote(at: usize, len: usize) {
     let mut j = journal_mut();
-    if !j.kept || len == 0 {
+    if (!j.kept && !noting()) || len == 0 {
         return;
     }
     let now = next_asking();
@@ -1012,6 +1012,40 @@ pub(crate) fn wrote(at: usize, len: usize) {
             j.note(other / PAGE, WHOLE, now);
         }
     }
+}
+
+/// Our writes into title memory `spans` (address, bytes), whose bytes are in, are told to the
+/// journal exactly, by 4 KiB, whether or not an asking stands: a copy that took those pages before
+/// is refreshed after them, and a refresh answered from the journal sees them. Landings through the
+/// title's own address, read-backs, bottom-of-pipe writes and texture backs are told this way.
+/// `VICTORY_NOTE_WRITES=0`: not told, as before ([`noting`]).
+pub(crate) fn told(spans: &[(usize, usize)]) {
+    if spans.is_empty() || !noting() {
+        return;
+    }
+    let elsewhere: Vec<(usize, Vec<usize>)> = spans.iter().flat_map(|&(at, len)| elsewhere(at, len)).collect();
+    let mut j = journal_mut();
+    let now = next_asking();
+    j.ahead_asked = now;
+    for &(at, len) in spans.iter().filter(|s| s.1 > 0) {
+        for page in at / KERNEL_PAGE..(at + len - 1) / KERNEL_PAGE + 1 {
+            j.note(page / PARTS, 1u16 << (page % PARTS), now);
+        }
+    }
+    for (_, others) in &elsewhere {
+        for &other in others {
+            j.note(other / PAGE, WHOLE, now);
+        }
+    }
+}
+
+/// Whether our writes into title memory are told to the journal whether or not an asking stands
+/// ([`wrote`], [`told`]). On by default; `VICTORY_NOTE_WRITES=0` tells [`wrote`] only while an
+/// asking stands and [`told`] nothing, as before. Each note takes the journal's lock: this switch
+/// measures that cost.
+pub(crate) fn noting() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("VICTORY_NOTE_WRITES").is_none_or(|v| v != "0"));
+    *ON
 }
 
 /// The blocks of `[at, at + len)` whose pages the title shows at other
@@ -3663,6 +3697,42 @@ mod tests {
         );
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// `VICTORY_ASK_QUIET`: our write into a quiet block after the asking that found it quiet has
+    /// ended is in the journal: the frame's next submission, answered from the journal, reports it.
+    /// (`wrote` told the journal only while an asking stood.)
+    #[test]
+    fn our_write_between_two_covered_preparations_is_copied() {
+        const MIB: usize = 1 << 20;
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                2 * MIB,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        let a = p.next_multiple_of(MIB);
+        let (start, end) = (a, a + MIB);
+        let (frame, keep) = (7_200_000, 2);
+        ask_once_quiet(&[(start, end)], frame, keep);
+        let (asked, _) = writes(start, end, false).expect("watched");
+        ask_once_end();
+        // A Copy step: our bytes go into title memory, and then the journal is told.
+        // SAFETY: a committed page of ours.
+        unsafe { ((a + 3 * PAGE + 8) as *mut u8).write(1) };
+        wrote(a + 3 * PAGE, PAGE);
+        // The frame's next submission: the block is answered from the journal, not asked about again.
+        ask_once_quiet(&[(start, end)], frame, keep);
+        let (_, after) = writes(start, end, false).expect("watched");
+        ask_once_end();
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+        let page = (a + 3 * PAGE) / PAGE;
+        assert!(after.iter().any(|&(p, w)| p == page && w > asked), "our write is not in the journal: {after:?} (asked {asked})");
     }
 
     /// `VICTORY_ASK_QUIET`: a 1 MiB block that nothing was found written in
