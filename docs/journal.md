@@ -4,6 +4,10 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**Ceiling with one copy: still no picture, so buffers and windows are not the only consumers**
+- `VICTORY_BACK_CEILING=1 VICTORY_ONE_COPY=2` (`bench/trials-…-ceiling-onecopy`): the user, live: "no se ve nada, la pantalla parpadea en blanco y negro", in both runs. Overlaps between our buffer copies are down 82 %, yet without the copy-back there is no picture at all.
+- So other consumers read what the GPU wrote through title memory. The likeliest: **textures the title fills** (`crate::texture` staging: detiled from title memory by us at the next use). A pass that writes a buffer the title then samples as a texture reaches the texture only through the copy-back. Our own reads were outside the CPU census (lifted at the next submission). Next: count written ranges over title-filled textures' memory.
+
 **M.1: `VICTORY_ONE_COPY=2` (small buffers take their cell's window): overlaps −82 %, the picture holds**
 - `bench/trials-20261126-065216-one-copy3*`: **overlapped ranges 44 a frame** (240-249 without, 130 with mode 1), 66-68 copies, 97 MB of overlap: what is left is big buffers that span more than one 4 MiB cell. Frame 464-507 ms (unchanged while the copy-back runs).
 - The user watched each run: "se ve muy bien", black only while things stream in; in one run Jason's head was black, in the next all was right. Jason's head black was also seen in two earlier runs **without** the switch (census runs, `…-063055-window-use`, `…-063417-lookup-miss`): an intermittent problem that predates M.1 (S.9 family), not caused by it.

@@ -84,6 +84,28 @@ unsafe impl Sync for Staging {}
 
 static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
 
+/// 1.3 census (`VICTORY_BACK_OVERLAP=1`): title textures with a staging
+/// buffer (textures the title fills, detiled from its memory) whose memory
+/// overlaps `[at, end)`: how many, and the bytes of overlap. What shaders
+/// write there reaches those textures only through title memory.
+pub(crate) fn staged_overlapping(at: u64, end: u64) -> (u64, u64) {
+    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(map) = map.as_ref() else {
+        return (0, 0);
+    };
+    let mut n = 0;
+    let mut bytes = 0;
+    for staging in map.values() {
+        let lo = staging.memory as u64;
+        let hi = lo + staging.size as u64;
+        if lo < end && hi > at {
+            n += 1;
+            bytes += hi.min(end) - lo.max(at);
+        }
+    }
+    (n, bytes)
+}
+
 /// The buffer a texture the host writes is copied through into the texture
 /// of a view the title placed in its memory in another format
 /// ([`alias`]): every level of every layer as each of the two formats lays
