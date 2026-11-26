@@ -12,6 +12,8 @@
 #   --safe          without the newest, faster ways (scripts/play.ps1 -Safe)
 #   --ray-tracing   the title's ray-traced indirect light
 #   --bench <route> a scripted run: keys from scripts/bench/<route>.keys, stopped when it ends
+#   --skip-intro    press through the boot screens and logos (meeyao's timings, same
+#                   game build): Enter/A at 12-50 s, so the run reaches the load sooner
 #   --proton-log    Wine's own log into the run folder (large)
 #   --mangohud      also MangoHud's frame log (off by default: its NVIDIA thread
 #                   aborted the title under umu, `free(): invalid pointer`)
@@ -45,6 +47,7 @@ while (( $# )); do
     --ray-tracing) export VICTORY_BVH_BUILDER="${VICTORY_BVH_BUILDER:-1}" ;;
     --bench) shift; bench="${1:?--bench needs a route name}" ;;
     --proton-log) proton_log=1 ;;
+    --skip-intro) export VICTORY_KEYS="${VICTORY_KEYS-12:Enter,16:Enter,20:A,25:Enter,30:A,35:Enter,40:A,50:Enter}" ;;
     --mangohud) mangohud=1 ;;
     --no-mangohud) mangohud=0 ;;
     -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
