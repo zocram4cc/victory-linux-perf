@@ -33,6 +33,8 @@ Documents:
 
 ## 0. New base: moving to kroeeee's tree (decided 26 Nov 2026)
 
+> **Now (26 Nov evening): read [`k7900`'s docs/royale/STATUS.md](../../tree/k7900/docs/royale/STATUS.md)**: 17-19 fps at Jason's house with the view-tree wineserver (PR #1 to the author), P.4 in progress.
+
 **Decision.** Work moves from our base (joshuu/victory-amd plus this roadmap) to [kroeeee-eeee/VIctory-Linux-Proton-Wine-7900XT-XTX](https://github.com/kroeeee-eeee/VIctory-Linux-Proton-Wine-7900XT-XTX): avatarmanz/VIctory-7900XTX (the cool_fox family) with the fixes it takes under Proton on RADV. Branch **`k7900`** in this repository; the old line stays as tag **`archive/victory-amd-2026-11-26`** and as `main` until `k7900` replaces it.
 
 ### Why
