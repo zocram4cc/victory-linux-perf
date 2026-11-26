@@ -340,6 +340,14 @@ fn in_place_order() -> bool {
     crate::toggled!("VICTORY_PORT_CONSTANTS_ORDER")
 }
 
+/// With [`in_place_order`]: such executions never in a batch
+/// (`VICTORY_PORT_CONSTANTS_ORDER_ALONE=1`, run pop-14); unset, in a batch
+/// opened after the last shader that may write buffers.
+fn in_place_alone() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PORT_CONSTANTS_ORDER_ALONE").is_some_and(|v| v == "1"))
+}
+
 /// Since the last line: indirect executions with arguments in place, those
 /// clamped alone for it, and the 1 MiB ranges they came from (diagnostics).
 static IN_PLACE_INDIRECT: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
@@ -374,7 +382,7 @@ pub(crate) fn in_place_indirect_line(frames: f64) {
         .map(|(mb, n)| format!("{:#x}+1MiB: {:.0} draws {:.0} dispatches {:.0} mesh", mb << 20, n[0] as f64 / frames, n[1] as f64 / frames, n[2] as f64 / frames))
         .collect();
     tracing::info!(
-        "renderer port 1: indirect executions with arguments or count in place per frame: {:.0}, of them {:.0} clamped alone right before they ran (VICTORY_PORT_CONSTANTS_ORDER); from {} ranges of 1 MiB, the busiest: {}",
+        "renderer port 1: indirect executions with arguments or count in place per frame: {:.0}, of them {:.0} clamped after the last shader write before them (VICTORY_PORT_CONSTANTS_ORDER); from {} ranges of 1 MiB, the busiest: {}",
         all as f64 / frames,
         alone as f64 / frames,
         by.len(),
@@ -4690,9 +4698,16 @@ impl State {
         if in_place {
             in_place_indirect(arguments, kind);
         }
-        let alone = in_place && in_place_order();
-        if alone {
-            self.batch = None;
+        let ordered = in_place && in_place_order();
+        // Alone (`VICTORY_PORT_CONSTANTS_ORDER_ALONE=1`): no batch at all.
+        // Else a batch that a shader writing buffers was recorded after is
+        // not used: a new one is opened here, after it (what
+        // `VICTORY_INDIRECT_BATCH=1` does for every batch).
+        let alone = ordered && in_place_alone();
+        if ordered {
+            if alone || self.batch.as_ref().is_some_and(|b| b.wrote) {
+                self.batch = None;
+            }
             self.window = None;
         }
         // One record without a count: clamped in a batch (`batches`).
@@ -4712,7 +4727,7 @@ impl State {
         const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
         let windowed = windows()
-            && !alone
+            && !ordered
             && kind != DISPATCH
             && max == 1
             && count.is_none()
