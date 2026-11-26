@@ -475,7 +475,7 @@ fn bind_zeros(
 /// C.1 census: inclusive time and calls of the draw path's parts since the
 /// last frame line (draw, draw_indexed, dispatch, execute_indirect,
 /// prepare_for, bind, tables), on the title's recording threads.
-pub(crate) static TIMED: [[AtomicU64; 2]; 7] = [const { [AtomicU64::new(0), AtomicU64::new(0)] }; 7];
+pub(crate) static TIMED: [[AtomicU64; 2]; 10] = [const { [AtomicU64::new(0), AtomicU64::new(0)] }; 10];
 
 pub(crate) struct Timed(usize, std::time::Instant);
 
@@ -2100,9 +2100,12 @@ impl State {
         }
         fresh.sort_unstable();
         fresh.dedup();
-        for u in used.iter().filter(tables) {
-            if !fresh.contains(&u.slot) {
-                self.table_entry(list, u, compute);
+        {
+            let _timed = Timed::new(7);
+            for u in used.iter().filter(tables) {
+                if !fresh.contains(&u.slot) {
+                    self.table_entry(list, u, compute);
+                }
             }
         }
         let mut made = Vec::new();
@@ -2166,6 +2169,7 @@ impl State {
                 (table, n, h.finish())
             };
             if let Some(&first) = self.fresh_tables.get(&key) {
+                let _timed = Timed::new(8);
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
@@ -2186,6 +2190,7 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
+            let _timed = Timed::new(9);
             let Some(first) = host.dynamic(n) else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
