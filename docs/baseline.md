@@ -74,3 +74,21 @@ The analysis is in [memory.md](memory.md).
 | heap buffer pass | 133 ms, 1 a frame | | | |
 
 With the pool off: 485-502 ms, the same within noise.
+
+## Where the open-world frame goes, and what each piece is worth (26 Nov 2026, morning)
+
+Jason save, outside the house, ~480 ms a frame (2.0-2.1 fps), `main` at `7b58468`. Sources: [journal](journal.md) entries of 26 Nov; `bench/trials-20261126-*`.
+
+| Part of the frame | Cost | Piece | What the measurements say |
+|---|---|---|---|
+| The card working | ~265 ms (223-233 ms with the copy-back off) | Q | near its limit in this way of working |
+| The card idle while our thread prepares and copies back | 173-228 ms | B, M, Q | the serial chain; 3.1 overlaps it (~270 ms a frame in theory) |
+| Copy-back | 72 ms, ~40 MB | B | the CPU reads ~1 page of ~10,600 a frame (census) |
+| Snapshots before each submission | 408-437 MB copied | B | needed only because the copy-back is |
+| Ceiling without copy-back and snapshots | 362-374 ms (−22 %), black picture | B, M | GPU→GPU coherence goes through title memory: ~245 written ranges a frame overlap another copy, always a buffer copy over a 4 MiB window |
+| Heap pass (`heap_buffers`) | 30 ms average, 231 ms spike every 16 passes | D | not on the critical path: the frame does not move with it |
+| Streaming textures by index (`heap_textures`) | 6-115 ms | A | detiling is 0.0-0.4 ms of it; the rest is texture creation, view mirrors, mapped-page queries |
+| Draws dropped for want of a pipeline | ~300 + ~900 indirect a frame | P | two Xbox pipeline methods (`0x1c8`, `0x218`) make pipelines from console RDNA2 code |
+| World entry | 9.5 s frame → 0.63 s | P | the pipeline library was never made; fixed (`c436241`) |
+
+**The order that follows:** M.1 (one copy per byte: windows under buffers) → 1.3 step 2 (copy-back on demand: the −22 %) → 3.1 (frames in flight). Alongside: P.4 (the missing pipelines, for the picture), A.2 (texture creation off the recording thread).
