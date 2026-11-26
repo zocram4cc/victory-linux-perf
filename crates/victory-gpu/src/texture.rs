@@ -62,6 +62,9 @@ pub(crate) struct Staging {
     /// Made by the pass over textures picked by index, for one upload
     /// ([`once`]): read when the list is submitted, and never looked at again.
     once: std::sync::atomic::AtomicBool,
+    /// Whether the last check found the memory plain write-watched: its range then joins a
+    /// submission's one asking ([`Staging::joins_asking`]).
+    plain: std::sync::atomic::AtomicBool,
     /// The staging buffer's bytes (counted in `STAGED` while it lives).
     bytes: u64,
     /// The title texture's shape, for `crate::texstore`.
@@ -1219,6 +1222,13 @@ impl Staging {
         *self.holds.lock().unwrap_or_else(|e| e.into_inner()) = hash.map(|hash| (self.first, hash));
     }
 
+    /// The title memory this texture's check reads, when it is plain write-watched memory: the one
+    /// range a submission's asking may take in ([`crate::watch::ask_once`]).
+    pub(crate) fn joins_asking(&self) -> Option<(usize, usize)> {
+        let from = self.memory as usize;
+        self.plain.load(std::sync::atomic::Ordering::Relaxed).then_some((from, from + self.read))
+    }
+
     /// Detiles the texture memory into the staging buffer if it changed
     /// since the last time (and is mapped at all).
     pub(crate) fn refresh(&self) {
@@ -1249,7 +1259,9 @@ impl Staging {
         if alone && last.hash.is_some() {
             return 0;
         }
-        if !alone && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
+        let plain = if alone { None } else { waited(1, || crate::watch::writes_for_texture(start, start + size, false)) };
+        self.plain.store(plain.is_some(), std::sync::atomic::Ordering::Relaxed);
+        if let Some((now, written)) = plain {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
             }
@@ -1279,7 +1291,7 @@ impl Staging {
         let mut blind = false;
         if !alone
             && *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
-            && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
+            && let Some((now, written)) = waited(1, || crate::watch::writes_for_texture(start, start + size, true))
         {
             const HASH_EVERY: u64 = 8;
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
@@ -1937,6 +1949,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         serial: copy.serial,
         holds: copy.holds.clone(),
         once: std::sync::atomic::AtomicBool::new(once() && !on_demand && PICKING.get().is_some()),
+        plain: std::sync::atomic::AtomicBool::new(false),
         bytes: total,
         shape: desc.shape(),
         memory,

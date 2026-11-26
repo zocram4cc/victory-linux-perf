@@ -825,22 +825,24 @@ pub(crate) fn once() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_ONCE").is_none_or(|v| v != "0"))
 }
 
-/// With [`once`]: asks about `ranges` (everything a submission's lists
-/// refresh) as [`ask_ahead`] does, and lets that asking stand until
-/// [`ask_once_end`]. With [`quiet_frames`], the quiet blocks among them are
-/// asked about once a frame ([`ask_once_quiet`]).
-pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
-    ask_submission(ranges, quiet_frames());
+/// With [`once`]: asks about `ranges` (everything a submission's lists refresh) as [`ask_ahead`] does,
+/// and lets that asking stand until [`ask_once_end`]. `textures`: the title memory of the textures the
+/// lists check ([`textures_join`]) is merged into the same pass, so a texture near a buffer is answered
+/// from this asking; a texture alone is left to its own check, as before. With [`quiet_frames`], the
+/// quiet blocks among them are asked about once a frame ([`ask_once_quiet`]), and the textures are left
+/// to their own checks.
+pub(crate) fn ask_once(ranges: &[(usize, usize)], textures: &[(usize, usize)]) {
+    ask_submission(ranges, textures, quiet_frames());
 }
 
 /// [`ask_once`] again, all of it, for what the flights landed (the settle
 /// paths): what came to be written since the frame's asking must be seen, so
 /// the quiet blocks are asked about too.
 pub(crate) fn ask_again(ranges: &[(usize, usize)]) {
-    ask_submission(ranges, 0);
+    ask_submission(ranges, &[], 0);
 }
 
-fn ask_submission(ranges: &[(usize, usize)], keep: u64) {
+fn ask_submission(ranges: &[(usize, usize)], textures: &[(usize, usize)], keep: u64) {
     if !once() {
         return;
     }
@@ -853,7 +855,8 @@ fn ask_submission(ranges: &[(usize, usize)], keep: u64) {
         // other threads' askings again (0.5 ms a time, run fills-ab3), and no
         // other asking comes between the two parts.
         let _all = Asking::hold_all();
-        ask_ahead_held(ranges, true);
+        let merged: Vec<(usize, usize)> = ranges.iter().chain(textures).copied().collect();
+        ask_ahead_held(&merged, true);
         spent.next("asking: the rest");
         ask_rest(ranges, true);
     }
@@ -1290,6 +1293,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     if let Some(known) = ahead(&journal()) {
         return Some(known);
     }
+    ASKED_HERE.with(|c| c.set(c.get() + 1));
     let mut guards_asked = false;
     // (View memory read-only by our hand: the kernel would refuse.)
     let refused = guarded && light() && PROTECTED.any(first, last);
@@ -1340,6 +1344,50 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         publish(&pages.iter().map(|p| p.0).collect::<Vec<_>>());
     }
     Some(answer)
+}
+
+thread_local! {
+    /// The askings this thread made of the kernel or the guards in [`writes`]: a texture's check
+    /// ([`writes_for_texture`]) tells by them whether it asked.
+    static ASKED_HERE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Since the last frame-rate line: the texture checks of the write watch ([`writes_for_texture`])
+/// that asked the kernel or the guards (count, microseconds), and those answered without asking.
+static TEXTURE_CHECKS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// [`writes`] for a texture's check, counted in [`TEXTURE_CHECKS`].
+pub(crate) fn writes_for_texture(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let before = ASKED_HERE.with(|c| c.get());
+    let began = std::time::Instant::now();
+    let answer = writes(start, end, guarded);
+    let us = began.elapsed().as_micros() as u64;
+    let i = if ASKED_HERE.with(|c| c.get()) != before { 0 } else { 2 };
+    TEXTURE_CHECKS[i].fetch_add(1, Relaxed);
+    TEXTURE_CHECKS[i + 1].fetch_add(us, Relaxed);
+    answer
+}
+
+/// [`TEXTURE_CHECKS`], taken, for the frame line: `frames` frames since the last.
+pub(crate) fn texture_checks_line(frames: f64) -> String {
+    let [asks, asks_us, held, held_us] = [0, 1, 2, 3].map(|i| TEXTURE_CHECKS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64);
+    format!(
+        "texture checks of the write watch per frame (VICTORY_ASK_TEXTURES={}): {:.1} asked the kernel or the guards ({:.2} ms), {:.1} answered without asking ({:.2} ms)",
+        u8::from(textures_join()),
+        asks / frames,
+        asks_us / 1e3 / frames,
+        held / frames,
+        held_us / 1e3 / frames,
+    )
+}
+
+/// Whether a submission's one asking takes in the title memory its textures' checks read
+/// (`VICTORY_ASK_TEXTURES=1`; off by default until measured: see [`texture_checks_line`]).
+pub(crate) fn textures_join() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("VICTORY_ASK_TEXTURES").is_some_and(|v| v != "0"));
+    *ON
 }
 
 /// Whether nothing of `[start, end)` was written that a copy with the notes
@@ -3923,6 +3971,65 @@ mod tests {
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
         let page = (a + 3 * PAGE) / PAGE;
         assert!(after.iter().any(|&(p, w)| p == page && w > asked), "our write is not in the journal: {after:?} (asked {asked})");
+    }
+
+    /// `VICTORY_ASK_TEXTURES`: a texture's range near a buffer's is asked about with it, in the
+    /// submission's one asking, so the texture's own check is answered from the journal.
+    #[test]
+    fn a_texture_range_joins_the_submissions_asking() {
+        const MIB: usize = 1 << 20;
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4 * MIB,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        let a = p.next_multiple_of(MIB);
+        // A buffer's range, and a texture's 2 MiB on: within the gap the merged pass joins over.
+        let (buffer, texture) = ((a, a + PAGE), (a + 2 * MIB, a + 2 * MIB + PAGE));
+        // SAFETY: a committed page of ours, in the texture's range.
+        unsafe { ((a + 2 * MIB + 8) as *mut u8).write(1) };
+        ask_once(&[buffer], &[texture]);
+        let joined = asked(texture.0, texture.1);
+        ask_once_end();
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+        let (_, pages) = joined.expect("the texture is not in the submission's asking");
+        assert!(pages.iter().any(|&(page, _)| page == (a + 2 * MIB) / PAGE), "{pages:?}");
+    }
+
+    /// `VICTORY_ASK_TEXTURES`: a texture's range that lies alone is left to its own check, which asks
+    /// about it then.
+    #[test]
+    fn a_lone_texture_range_is_left_to_its_own_asking() {
+        const MIB: usize = 1 << 20;
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                68 * MIB,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        let a = p.next_multiple_of(MIB);
+        // Sixty-four MiB on: beyond the gap the merged pass joins over.
+        let (buffer, texture) = ((a, a + PAGE), (a + 64 * MIB, a + 64 * MIB + PAGE));
+        // SAFETY: a committed page of ours, in the texture's range.
+        unsafe { ((a + 64 * MIB + 8) as *mut u8).write(1) };
+        ask_once(&[buffer], &[texture]);
+        let joined = asked(texture.0, texture.1).is_some();
+        ask_once_end();
+        let (_, own) = writes(texture.0, texture.1, false).expect("watched");
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+        assert!(!joined, "a lone texture range was asked about with the submission");
+        assert!(own.iter().any(|&(page, _)| page == (a + 64 * MIB) / PAGE), "{own:?}");
     }
 
     /// `VICTORY_ASK_QUIET`: a 1 MiB block that nothing was found written in

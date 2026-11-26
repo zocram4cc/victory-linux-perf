@@ -5771,6 +5771,9 @@ impl Host {
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
             let mut spans: ByCopy<(usize, usize)> = ByCopy::default();
+            // The title textures the lists check: asked with the copies' ranges when `VICTORY_ASK_TEXTURES=1`.
+            let join = crate::watch::textures_join();
+            let mut textures: Vec<(usize, usize)> = Vec::new();
             for list in runs {
                 for step in &list.deferred().copies {
                     if let Step::Refresh(shadow, address, len) = step
@@ -5780,6 +5783,8 @@ impl Host {
                             .entry(std::sync::Arc::as_ptr(shadow) as usize)
                             .or_insert((*address, *address + *len));
                         *span = (span.0.min(*address), span.1.max(*address + *len));
+                    } else if let Step::Texture(staging) = step && join {
+                        textures.extend(staging.joins_asking());
                     }
                 }
             }
@@ -5787,7 +5792,7 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             SPLIT[8].fetch_add(split.so_far(), Ordering::Relaxed);
             stage.next("submit: asking the write watch");
-            crate::watch::ask_once(&ranges);
+            crate::watch::ask_once(&ranges, &textures);
             #[cfg(feature = "diagnostics")]
             split.part(0);
             stage.next("submit: title bytes under flights' writes");
@@ -9037,6 +9042,7 @@ impl Meter {
             }
             let [own, asking, still, all] =
                 [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+            tracing::info!("{}", crate::watch::texture_checks_line(frames));
             {
                 if all >= 1.0 {
                     tracing::info!(
@@ -10442,7 +10448,7 @@ mod refresh_tests {
         static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
         let asked: Vec<(usize, usize)> = ranges.iter().filter(|r| !r.0.unwatched()).map(|r| (r.1, r.1 + r.2)).collect();
-        crate::watch::ask_once(&asked);
+        crate::watch::ask_once(&asked, &[]);
         let mut batch = Batch::default();
         for part in ranges.chunks(ranges.len().div_ceil(flushes).max(1)) {
             for (shadow, at, len) in part {
@@ -10821,7 +10827,7 @@ mod refresh_tests {
                 // if a submission of another test ended it.)
                 let mut known = false;
                 for _ in 0..100 {
-                    crate::watch::ask_once(&[(at, at + len), (region + 7 * PAGE, region + 8 * PAGE)]);
+                    crate::watch::ask_once(&[(at, at + len), (region + 7 * PAGE, region + 8 * PAGE)], &[]);
                     known = copy.nothing_new(at, len);
                     if known || !expected {
                         break;
