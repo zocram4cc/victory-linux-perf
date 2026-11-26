@@ -223,6 +223,33 @@ pub(crate) struct HostHeap {
     spanned: Slots,
 }
 
+impl Drop for HostHeap {
+    /// Under Wine: the title released its heap, and what the slots viewed
+    /// and the stride table go through the graveyard (`crate::host::retire`),
+    /// not at once. Lists recorded or in flight that bound the heap hold the
+    /// host heap object (`HostList::keep`) but not what its descriptors view:
+    /// a shader reading a slot of it read freed memory (a texture-unit page
+    /// fault; the owner's tree, d46d31b). And its title-memory run leaves
+    /// the map ([`crate::memory::heap_gone`]).
+    fn drop(&mut self) {
+        if !crate::wine::on_wine() {
+            return;
+        }
+        crate::memory::heap_gone(std::ptr::from_ref(self) as usize);
+        let mut n = 0u64;
+        for slot in std::mem::take(&mut self.kept) {
+            if let Some(resource) = slot.into_inner().unwrap_or_else(|e| e.into_inner()) {
+                n += 1;
+                crate::host::retire_resource(resource);
+            }
+        }
+        if let Some((strides, ..)) = self.strides.take() {
+            crate::host::retire_resource(strides);
+        }
+        tracing::info!(slots = n, "a host view heap is let go: what its slots viewed is retired");
+    }
+}
+
 /// Whether a slot's write of no placed texture view leaves `placed` alone
 /// when the slot is not in it ([`HostHeap::spanned`]; `VICTORY_SPANS_QUICK=0`:
 /// its lock is taken for every write, as before).
