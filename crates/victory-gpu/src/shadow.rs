@@ -4976,6 +4976,31 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // memory. Not the big ones `cards` puts in the card's memory: those
         // are read too often to stay in the PC's.
         let big = cards() && (size >= card_limits().0 || card_all());
+        // Folded (`VICTORY_FOLD_BUFFERS`, on unless 0): a buffer inside one
+        // window takes the window of the title's memory around it as its
+        // copy, the one asks by address outside buffers are given, instead
+        // of a second copy of the same bytes. Two copies of one range made
+        // every submission that refreshed one while a flight's shaders wrote
+        // the other wait for the card to drain (Neptune: 179.2 -> 160.1 ms
+        // a frame, settles 4.5 -> 1.0; viyourmom a540bb8, by way of
+        // meeyao/victory-8gb-linux). Not one that crosses a grid line: its
+        // window would be two cells no other ask names, a third copy.
+        // (`let_go_idle` keeps a window a buffer holds.)
+        if !big
+            && fold_buffers()
+            && folds(key.0, entry.end, window())
+            && let Some(window) = loose(key.0, entry.end, false, false)
+        {
+            if FOLDED.fetch_add(1, Ordering::Relaxed) < 8 {
+                tracing::info!(
+                    start = format_args!("{:#x}", key.0),
+                    len,
+                    "a buffer's copy is its window's (VICTORY_FOLD_BUFFERS)"
+                );
+            }
+            entry.shadow = Some(window);
+            return entry.shadow.clone();
+        }
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
@@ -5057,6 +5082,30 @@ fn window() -> u64 {
         grid(kb)
     })
 }
+
+/// Whether a buffer that fits in one window takes the window of the title's
+/// memory it lies in as its copy, rather than a copy of its own (on unless
+/// `VICTORY_FOLD_BUFFERS=0`, which gives every buffer its own copy, as
+/// before).
+fn fold_buffers() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| fold_setting(std::env::var_os("VICTORY_FOLD_BUFFERS").as_deref()))
+}
+
+/// [`fold_buffers`] for a value of `VICTORY_FOLD_BUFFERS`.
+fn fold_setting(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_none_or(|v| v != "0")
+}
+
+/// Whether the buffer `[start, end)` lies in one window of the `grid`
+/// ([`window_of`]), and so can take that window as its copy.
+fn folds(start: u64, end: u64, grid: u64) -> bool {
+    end > start && window_of(start, end, grid).1 == grid
+}
+
+/// Buffers that took a window as their copy since the start
+/// ([`fold_buffers`]).
+pub(crate) static FOLDED: AtomicU64 = AtomicU64::new(0);
 
 /// The window grid in bytes for a setting in KiB: a power of two from
 /// 64 KiB to 4 MiB, 4 MiB for anything else.
@@ -5425,7 +5474,7 @@ pub(crate) fn exact_line(frames: f64) {
 #[cfg(test)]
 mod window_tests {
     use super::{
-        WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, resolve_card_limits,
+        WINDOW, cover, default_card_limits_mb, fold_setting, folds, grid, holder, longest_tail, resolve_card_limits,
         tail_of, window_of,
     };
 
@@ -5540,6 +5589,27 @@ mod window_tests {
         for bad in [0, 32, 100, 1000, 8192] {
             assert_eq!(grid(Some(bad)), WINDOW, "{bad}");
         }
+    }
+
+    /// A buffer folds into its window only when it lies in one cell of the
+    /// grid; folding is on unless the setting is 0.
+    #[test]
+    fn buffers_fold_into_one_window_only() {
+        let base = 0x2_0040_0000;
+        // Inside one 4 MiB cell, the whole cell included.
+        assert!(folds(base, base + 0x1_0000, WINDOW));
+        assert!(folds(base + 0x30_0000, base + WINDOW, WINDOW));
+        assert!(folds(base, base + WINDOW, WINDOW));
+        // Across a grid line, bigger than a cell, or empty.
+        assert!(!folds(base + 0x3F_F000, base + 0x40_1000, WINDOW));
+        assert!(!folds(base, base + WINDOW + 4, WINDOW));
+        assert!(!folds(base, base, WINDOW));
+        // On a finer grid the same buffer can cross a line.
+        assert!(!folds(base + 0x3_F000, base + 0x4_1000, 256 << 10));
+        assert!(folds(base + 0x3_F000, base + 0x4_1000, WINDOW));
+        let on = |v: Option<&str>| fold_setting(v.map(std::ffi::OsStr::new));
+        assert!(on(None) && on(Some("1")) && on(Some("")));
+        assert!(!on(Some("0")));
     }
 
     /// A window holds its ask and is cut on the grid; on the default grid
