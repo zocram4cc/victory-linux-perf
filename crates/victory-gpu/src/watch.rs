@@ -4124,15 +4124,21 @@ fn allocation_end(at: usize, inside: usize) -> usize {
 /// Tells what keeps track of what title memory shows; the guards, with no
 /// block of the range known unmapped.
 fn title_memory_changed(at: usize, len: usize) -> Guards {
+    // (A span of the timeline for each step: what the hooks of the page mapping cost piece by piece.)
+    let mut span = crate::timeline::span("page mapping: title_memory_changed, the descriptors");
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
     // The views the runtime told us of there are no longer what it shows.
+    span.next("page mapping: title_memory_changed, the views gone");
     crate::inplace::views_gone(at, len);
     // And nothing stays in place over it.
+    span.next("page mapping: title_memory_changed, what is in place let go of");
     crate::inplace::title_memory_freeing(at, len);
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
+    span.next("page mapping: title_memory_changed, waiting for the guards' stripes");
     let mut g = lock_stripes(&stripes_of(range.start, range.end), false);
+    span.next("page mapping: title_memory_changed, the notes of the range");
     if known_reserved() {
         known_runs().changed(range.start, range.end);
     }
