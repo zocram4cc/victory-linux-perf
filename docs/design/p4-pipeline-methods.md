@@ -44,6 +44,10 @@ These are shader containers by (pointer, length), like the PC description's `D3D
 
 **What this means:** implementing them needs the translator to start from raw ISA plus this metadata, instead of from a container. Next: compare with what `victory_shader` extracts from a container (it translates console ISA carried inside the containers `create_graphics` receives). If the container's ISA part and these blocks are the same format, a container can be built from them and handed to the existing path.
 
+**The existing path, for comparison** (`crates/victory-shader/src/native.rs`): `create_graphics` receives `DXIL` parts whose `XDAT` index holds an `XBCH` (zlib) blob, unpacked to `FSSM`. The `FSSM` payload has one **record** per stage (code offset and size, flags with wave32, root layout and used-resource tables with counts, register counts), followed by stage data (PS inputs and export patches, VS inputs and outputs, CS group size, mesh outputs). The translator works from `NativeProgram` (code + record + tables + stage data), not from the container as such.
+
+**Hypothesis to test next:** each image block of a `0x1c8`/`0x218` description is one stage's record plus its stage data (sizes 0xbc-0x2f0 fit: a 0x54-byte record and the VS/PS/CS data after it), with absolute pointers where `FSSM` has payload-relative offsets, and the heap block next to it is that stage's code. If so, a `NativeProgram` can be built from each (metadata, code) pair and handed to the existing translator, and the pipeline made as `create_graphics` makes it, with the root signature from the table.
+
 ## Steps
 
 1. **Census:** count the calls of each method per run, and the draws and indirect draws dropped for want of a pipeline. Is it these pipelines, or other ones (untranslated shaders, slow compiles)? Log `missing()` reasons for the top dropped pipelines in a diagnostics build.
