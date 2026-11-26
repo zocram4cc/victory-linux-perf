@@ -4,6 +4,12 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**1.3 ceiling: −22 % frame without copy-back, but the picture goes black; title memory is the hub between host copies**
+- `VICTORY_BACK_CEILING=1` (`bench/trials-20261126-055937-back-ceiling`, measurement only): **362-374 ms against 477-486** (windows marked invalid: the draw count swings). Frame line: preparing ~50 ms (119 before), copying back 9 ms / 8.5 MB (72 ms / 46 MB; what is left is the card copies), GPU ~228 ms (265); the card idle behind us **~60 ms a frame (173-228 before)**.
+- **The picture is almost all black** (`shot-*.png`): only faint UI outlines. Yet the census saw the title's CPU read about one page a frame of what goes back.
+- **What that means:** the copy-back is not only for the CPU. What one submission's shaders write into one host copy reaches later GPU reads through title memory: other host copies of the same memory (views, aliases, the 64 KiB page-pool mappings) are refreshed from it. Title memory is the hub of GPU→GPU coherence between our copies. The census measured CPU reads only, and is blind to this.
+- **For 1.3 step 2:** an on-demand copy-back must keep that path: either GPU→GPU copies between our host copies of the same title range (on the card, no CPU), or one host copy per title range (piece M, phase 2). The CPU-read side alone (census) is a small part of the problem. The design doc gets this before any step-2 code.
+
 **D.1: spreading the full rescan is no gain; the heap pass is not on the frame's critical path now**
 - `VICTORY_HEAP_ROLL=1` (`bench/trials-20261126-055355-heap-roll`): 477-486 ms against 478-486 without (`…-d1-parts`). Each pass now looks at ~18,800 slots, ~130 ms a frame of the slot loop (against ~30 ms on average plus the 231 ms spike every 16 passes); p95 505-511 against 508-529. **Off.**
 - The frame does not move with the pass's cost either way, so the heap pass is not what the frame waits for at present (the serial chain is). D.1 drops in priority; its texture side goes with A.

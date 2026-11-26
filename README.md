@@ -411,7 +411,7 @@ In roadmap order. Piece letters refer to [the target](#the-target-pieces-that-fi
 | S.4 Open-world baseline (Jason, outside the house) | G | maintainer | `s5-heap-sync` | **done**: 497 ms (2.0 fps), GPU-bound, a serial chain ([baseline.md](docs/baseline.md)) |
 | S.2 Exact lifetimes for host copies | L | *open* | | after S.1 |
 | S.3 Texture coherence without the sweep | T | *open* | | after S.1 |
-| 1.3 Copy back only what the CPU reads ([design](docs/design/p1.3-copyback-on-demand.md)): read census first | B | maintainer | | **in progress**: census measured: ~40 MB a frame copied back, the title reads ~1 page before the next submission; next: reads after it, aliases; gates 3.1 |
+| 1.3 Copy back only what the CPU reads ([design](docs/design/p1.3-copyback-on-demand.md)): read census first | B | maintainer | | **in progress**: census: the CPU reads ~1 page of ~40 MB; ceiling: −22 % frame but black picture, because the GPU reads it back through other host copies (title memory is the hub); step 2 must carry GPU writes between copies on the card or join copies (M); gates 3.1 |
 | 1.2 Cheaper write tracking (ask write watch once per submission) | W | *open* | | |
 | 1.1 Memory census by use | M | maintainer | `p1.1-census` | in progress (input for 1.3 and phase 2) |
 | 1.7 Stop re-copying our own write-back (`VICTORY_F1_OWN`, `VICTORY_F1_CARD_MERGE`) | B | maintainer | `p1.1-census` | **done**: uploads −49 %, hash passes −82 %, frame −2 % |
