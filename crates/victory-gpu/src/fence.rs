@@ -44,6 +44,37 @@ fn fence<'a>(this: This) -> &'a Fence {
     unsafe { &*this.cast::<Fence>() }
 }
 
+/// Keeps a fence alive until the queue finishes using it.
+#[cfg(windows)]
+#[derive(PartialEq, Eq)]
+pub(crate) struct FenceRef(usize);
+
+#[cfg(windows)]
+impl FenceRef {
+    pub(crate) fn hold(this: This) -> Self {
+        object::add_ref(this);
+        Self(this as usize)
+    }
+
+    pub(crate) fn as_this(&self) -> This {
+        self.0 as This
+    }
+}
+
+#[cfg(windows)]
+impl Clone for FenceRef {
+    fn clone(&self) -> Self {
+        Self::hold(self.as_this())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for FenceRef {
+    fn drop(&mut self) {
+        release(self.as_this());
+    }
+}
+
 pub(crate) extern "system" fn create(
     _: This,
     initial: u64,
@@ -177,6 +208,19 @@ static FUNCTIONS: Table<24> = {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[cfg(windows)]
+    #[test]
+    fn queued_references_keep_the_fence_alive_after_release() {
+        let mut f = std::ptr::null();
+        assert_eq!(create(std::ptr::null(), 1, 0, &FENCE_IIDS[0], &mut f), S_OK);
+        let queued = FenceRef::hold(f);
+        let waiting = queued.clone();
+        assert_eq!(release(f), 2);
+        drop(waiting);
+        set(queued.as_this(), 5);
+        assert_eq!(completed(queued.as_this()), 5);
+    }
 
     #[cfg(windows)]
     #[test]

@@ -50,6 +50,7 @@ use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::This;
+use crate::fence::FenceRef;
 
 /// One thing in the line: what it stands at, if it does, and what it does.
 pub(super) trait Work: Send {
@@ -440,8 +441,8 @@ type Recordings = std::sync::Arc<[std::sync::Arc<crate::list::thin::Recording>]>
 
 /// What the title's queues put in the line.
 enum Job {
-    /// The queue waits for the fence (its address) to reach the value.
-    Wait(usize, u64),
+    /// The queue waits for the fence to reach the value.
+    Wait(FenceRef, u64),
     /// A part of a submission waits for a memory value.
     Value(crate::list::ValueWait),
     /// A submission, or a part of one: the lists' host sides and the order
@@ -452,9 +453,9 @@ enum Job {
     Lists(usize, Recordings),
     /// Parts taken along with a submission ([`crate::host::joins`]): where they
     /// begin in the order, and the signals given behind them.
-    Joined(usize, Vec<crate::list::Detached>, Vec<usize>, Vec<usize>, Vec<(usize, u64)>),
+    Joined(usize, Vec<crate::list::Detached>, Vec<usize>, Vec<usize>, Vec<(FenceRef, u64)>),
     /// A signal of the queue's.
-    Signal(usize, u64),
+    Signal(FenceRef, u64),
     /// A frame is shown: the base texture (and optional overlay plane) and the states their lists leave them in.
     Present(
         Option<(std::sync::Arc<crate::resource::HostTexture>, u32)>,
@@ -469,7 +470,7 @@ enum Job {
 unsafe impl Send for Job {}
 
 enum Ask {
-    Wait(usize, u64),
+    Wait(FenceRef, u64),
     Value(crate::list::ValueWait),
     Lists(Recordings),
 }
@@ -479,7 +480,7 @@ impl Work for Job {
 
     fn ask(&self) -> Option<Ask> {
         match self {
-            &Job::Wait(fence, value) => Some(Ask::Wait(fence, value)),
+            Job::Wait(fence, value) => Some(Ask::Wait(fence.clone(), *value)),
             Job::Value(wait) => Some(Ask::Value(*wait)),
             Job::Lists(_, lists) => Some(Ask::Lists(lists.clone())),
             _ => None,
@@ -537,7 +538,7 @@ impl Work for Job {
 
     fn met(ask: &Ask) -> bool {
         match ask {
-            &Ask::Wait(fence, value) => crate::fence::completed(fence as This) >= value,
+            Ask::Wait(fence, value) => crate::fence::completed(fence.as_this()) >= *value,
             Ask::Value(wait) => super::value_met(wait),
             Ask::Lists(recordings) => recordings.iter().all(|r| r.done()),
         }
@@ -572,8 +573,10 @@ impl Work for Job {
                     return Err(next);
                 }
             }
-            &Job::Wait(fence, value) => {
-                if crate::fence::completed(fence as This) < value && !signals.iter().any(|&(f, v)| f == fence && v >= value) {
+            Job::Wait(fence, value) => {
+                if crate::fence::completed(fence.as_this()) < *value
+                    && !signals.iter().any(|(f, v)| f == fence && v >= value)
+                {
                     return Err(next);
                 }
             }
@@ -586,14 +589,13 @@ impl Work for Job {
             }
             Job::Joined(..) | Job::Present(..) | Job::Lists(..) => return Err(next),
         }
-        let taken = std::mem::replace(self, Job::Wait(0, 0));
-        let (queue, mut lists, mut order, mut parts, mut signals) = match taken {
-            Job::Run(queue, lists, order) => (queue, lists, order, Vec::new(), Vec::new()),
-            Job::Joined(queue, lists, order, parts, signals) => (queue, lists, order, parts, signals),
-            other => {
-                *self = other;
-                return Err(next);
-            }
+        // (A signal held in the line keeps its fence: no placeholder job
+        // can stand in for this one while it is taken apart.)
+        if let Job::Run(queue, lists, order) = self {
+            *self = Job::Joined(*queue, std::mem::take(lists), std::mem::take(order), Vec::new(), Vec::new());
+        }
+        let Job::Joined(_, lists, order, parts, signals) = self else {
+            return Err(next);
         };
         let run = matches!(next, Job::Run(..));
         match next {
@@ -606,7 +608,6 @@ impl Work for Job {
             Job::Signal(fence, value) => signals.push((fence, value)),
             _ => {}
         }
-        *self = Job::Joined(queue, lists, order, parts, signals);
         Ok(run)
     }
 
@@ -652,14 +653,14 @@ impl Work for Job {
                 // (A part that had no list is one all the same.)
                 QUEUED.fetch_sub(1 + parts.len() as u64, Relaxed);
                 for (fence, value) in signals {
-                    if !crate::host::late_signal(fence, value) {
-                        crate::fence::set(fence as This, value);
+                    if !crate::host::late_signal(fence.as_this(), value) {
+                        crate::fence::set(fence.as_this(), value);
                     }
                 }
             }
             Job::Signal(fence, value) => {
-                if !crate::host::late_signal(fence, value) {
-                    crate::fence::set(fence as This, value);
+                if !crate::host::late_signal(fence.as_this(), value) {
+                    crate::fence::set(fence.as_this(), value);
                 }
             }
             Job::Present(texture, overlay, shown) => {
@@ -894,10 +895,9 @@ fn jobs_of(this: This, lists: &[This]) -> Vec<Job> {
 /// A signal of queue `this`: behind what it has in the line; if that is
 /// nothing, behind the flights in the air, or now.
 pub(super) fn signal(this: This, fence: This, value: u64) {
-    let fence = fence as usize;
-    LANE.push_behind(this as usize, false, Job::Signal(fence, value), || {
+    LANE.push_behind(this as usize, false, Job::Signal(FenceRef::hold(fence), value), || {
         if !crate::host::late_signal(fence, value) {
-            crate::fence::set(fence as This, value);
+            crate::fence::set(fence, value);
         }
     });
 }
@@ -906,7 +906,7 @@ pub(super) fn signal(this: This, fence: This, value: u64) {
 /// the fence is there already.
 pub(super) fn wait(this: This, fence: This, value: u64) {
     let always = crate::fence::completed(fence) < value;
-    LANE.push_behind(this as usize, always, Job::Wait(fence as usize, value), || {});
+    LANE.push_behind(this as usize, always, Job::Wait(FenceRef::hold(fence), value), || {});
 }
 
 /// A present on queue `this` of `texture`, in the state the lists recorded so
