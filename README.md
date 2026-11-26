@@ -403,6 +403,7 @@ In roadmap order. Piece letters refer to [the target](#the-target-pieces-that-fi
 | P.1 Pipeline census: compile time per frame on the submitting thread, by stage (our translation, vkd3d, RADV), cache hits; the load into the world | P | *open* | | **next after 1.3's census**; the user asked for it (26 Nov) |
 | P.2 Pipeline journal and replay at start-up on spare cores (KytyPS5's model) | P | *open* | | after P.1 |
 | P.3 Pipelines missing in play built on workers; the draw waits a few frames instead of the frame waiting | P | *open* | | after P.2 |
+| P.4 Two pipeline creation methods not implemented (device `0x1c8`, `0x218`, `device.rs` `unknown_pipeline`): the title goes without those pipelines (16 + 13 logged calls, up to thousands; no fork implements them, upstream included). In play: ~320 draws and ~980 indirect draws a frame dropped for want of a host pipeline, minutes in (26 Nov play log); a candidate for S.9 and missing objects | P | *open* | | to decode: the descriptions are (pointer, size) pairs into the title image |
 | A.1 Upload census: time and bytes of texture and buffer uploads on the submitting thread, during the load and in play | A | *open* | | with P.1 |
 | A.2 Uploads on a copy queue of their own, fed by workers | A | *open* | | after A.1 |
 | S.7 Prologue null fault (SQC, address 0): 1 of 6 prologue runs with the wait | L | maintainer | | cause likely found (root view left at 0, `draw.rs`); guarded with zeros, to verify |

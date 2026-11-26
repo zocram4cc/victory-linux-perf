@@ -4,6 +4,11 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**P.1 begun: the pipeline library was never made; draws dropped for good**
+- `pipeline/library.rs` asked vkd3d-proton for an empty library with an empty slice, whose pointer is not null. vkd3d refuses a pointer with a length of 0 (`if (!blob_length && blob) return E_INVALIDARG`, `libs/vkd3d/cache.c` `d3d12_pipeline_library_init`). So **every run went without a library** (*"no host pipeline library: pipelines are not kept"*), the early list of title pipelines stayed at 0, and each run made all its pipelines again: ~3,000 entering the open world. Fixed in `c436241` (a null blob); with it, the 0.5 s/frame budget and the early start (decision 0007) can work as designed. To measure: two runs in a row, the second should load from the library.
+- New counters on the "host pipelines all made" line: ms in the host's make and load calls, the workers' total, title threads' wait, draws dropped after waiting.
+- **In play, minutes in:** `dropped 342 without a host pipeline (3 being made) and 981 indirect` per frame (play log 04:13). Not pipelines still being made: pipelines that never come. Likely the two Xbox pipeline creation methods (`0x1c8`, `0x218`) that no fork implements (P.4). Mesa's disk cache is used (13 new entries over the whole session), so RADV compiles are not the load's cost.
+
 **Playing it: the load is slow and black, and two pieces were missing (P, A)**
 - The user played the Jason save (our build, pool and S.7 guard not yet built). Seen: the world comes in black (Jason's house included) with many textures missing for a long time, and ~3 fps. Screenshot in play (`bench/user-play-20261126/shot-now.png`): S.9 again, a dark interior, Jason as a black silhouette, white frost-like speckles on the floor and table, windows blown out.
 - Play log (`royale-save/logs/20261126-050658-run.log`): ~3,000 pipelines first bound in the first 2-3 minutes of the world (1,795 in the first minute), **one frame of 9,953 ms** at 04:10:19, then 2.1-3.0 fps. The shader translation hits its disk cache; the pipelines are created on first bind, on the submitting thread.
