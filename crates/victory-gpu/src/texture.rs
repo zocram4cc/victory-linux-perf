@@ -84,6 +84,13 @@ unsafe impl Sync for Staging {}
 
 static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
 
+/// 2.1 census: the title memory of every texture with a staging buffer, as
+/// (start, bytes).
+pub(crate) fn staged_spans() -> Vec<(u64, u64)> {
+    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    map.as_ref().map_or_else(Vec::new, |m| m.values().map(|s| (s.memory as u64, s.size as u64)).collect())
+}
+
 /// 1.3 census (`VICTORY_BACK_OVERLAP=1`): title textures with a staging
 /// buffer (textures the title fills, detiled from its memory) whose memory
 /// overlaps `[at, end)`: how many, and the bytes of overlap. What shaders

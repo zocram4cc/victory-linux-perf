@@ -876,6 +876,26 @@ fn lazy_prelude() -> bool {
 #[cfg(feature = "diagnostics")]
 const STAMPS: u32 = 4096;
 
+/// 2.1 (`VICTORY_REGIONS_FILE=<path>`): at every frame line, the title
+/// memory the GPU uses (buffers, windows, textures the title fills) as
+/// "start bytes kind" lines, for a sampled census of the CPU's reads of
+/// it (`scripts/cpu-reads.py`, with AMD IBS).
+fn regions_dump() {
+    static PATH: OnceLock<Option<String>> = OnceLock::new();
+    let Some(path) = PATH.get_or_init(|| std::env::var("VICTORY_REGIONS_FILE").ok()) else { return };
+    let mut text = String::new();
+    for (start, len, window) in crate::shadow::spans() {
+        text.push_str(&format!("{start:x} {len:x} {}\n", if window { "window" } else { "buffer" }));
+    }
+    for (start, len) in crate::texture::staged_spans() {
+        text.push_str(&format!("{start:x} {len:x} texture\n"));
+    }
+    let tmp = format!("{path}.tmp");
+    if std::fs::write(&tmp, text).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
 /// G.1: timestamps per list for the GPU census.
 const CENSUS_STAMPS: u32 = 8192;
 /// G.1 keys for work that is not a title pipeline's.
@@ -6181,6 +6201,7 @@ impl Meter {
         crate::pool::pool_line(frames);
         crate::census::census_line(frames);
         gpu_census_line(frames);
+        regions_dump();
         if crate::indirect::batch_on() {
             let w = [0, 1, 2, 3, 4, 5].map(|i| crate::indirect::BATCH_WHY[i].swap(0, Ordering::Relaxed) as f64 / frames);
             tracing::info!(
