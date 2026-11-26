@@ -472,10 +472,18 @@ fn bind_zeros(
     }
 }
 
+/// `VICTORY_FRESH_COPY=1` (C.1): fresh tables copy the host descriptors of
+/// the title's own slots instead of making each view anew. Off until
+/// measured.
+fn fresh_copy() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FRESH_COPY").is_some_and(|v| v == "1"))
+}
+
 /// C.1 census: inclusive time and calls of the draw path's parts since the
 /// last frame line (draw, draw_indexed, dispatch, execute_indirect,
 /// prepare_for, bind, tables), on the title's recording threads.
-pub(crate) static TIMED: [[AtomicU64; 2]; 14] = [const { [AtomicU64::new(0), AtomicU64::new(0)] }; 14];
+pub(crate) static TIMED: [[AtomicU64; 2]; 15] = [const { [AtomicU64::new(0), AtomicU64::new(0)] }; 15];
 
 pub(crate) struct Timed(usize, std::time::Instant);
 
@@ -2219,7 +2227,19 @@ impl State {
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {
-                        {
+                        let handle = table + u64::from(k) * 32;
+                        // C.1 (`VICTORY_FRESH_COPY`): the title's own slot made
+                        // (once, while its record stays) and copied, instead of
+                        // the view made anew for every draw's fresh table
+                        // (~120,000 a frame at 8-9 µs, ~1 s of the recording
+                        // threads' time a frame, 26 Nov).
+                        let copied = fresh_copy()
+                            && title_first.is_some_and(|title| {
+                                let _timed = Timed::new(14);
+                                host.mirror(title + k, handle, true);
+                                host.copy_made(title + k, index, handle)
+                            });
+                        if !copied {
                             let _timed = Timed::new(11);
                             host.make_at(index, &view);
                         }
@@ -2240,7 +2260,7 @@ impl State {
                             && crate::descriptor::host::is_texture_view(&view)
                         {
                             host.texture_slot_tabled(title + k, kind.is_some());
-                            if kind.is_some() {
+                            if kind.is_some() && !copied {
                                 host.mirror(title + k, table + u64::from(k) * 32, true);
                             }
                         }

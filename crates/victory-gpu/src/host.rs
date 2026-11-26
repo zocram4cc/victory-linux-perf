@@ -6202,7 +6202,7 @@ impl Meter {
         crate::census::census_line(frames);
         gpu_census_line(frames);
         {
-            let names = ["draw", "draw_indexed", "dispatch", "execute_indirect", "prepare_for", "bind", "tables", "tables: plain entries", "tables: fresh reused", "tables: fresh made", "fresh: constant buffers", "fresh: make_at", "fresh: readable", "fresh: mirror"];
+            let names = ["draw", "draw_indexed", "dispatch", "execute_indirect", "prepare_for", "bind", "tables", "tables: plain entries", "tables: fresh reused", "tables: fresh made", "fresh: constant buffers", "fresh: make_at", "fresh: readable", "fresh: mirror", "fresh: copied (mirror + copy)"];
             let parts: Vec<String> = names
                 .iter()
                 .enumerate()

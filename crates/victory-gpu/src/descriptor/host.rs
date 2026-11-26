@@ -1437,6 +1437,39 @@ impl HostHeap {
         self.keep(index, kept.flatten());
     }
 
+    /// C.1: copies the host descriptor of title slot `from` into dynamic
+    /// slot `to`, with the resource it keeps, if `from` is made from the
+    /// view the title has at `handle` now ([`HostHeap::mirror`] just ran).
+    /// A memory copy, where making the view again took 8-9 µs. False if the
+    /// slot is not made from that view (left for later, kept older, null).
+    pub(crate) fn copy_made(&self, from: u32, to: u32, handle: u64) -> bool {
+        if self.sampler || from >= self.count {
+            return false;
+        }
+        // SAFETY: the handle is a descriptor slot in title memory.
+        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        if tag != VIEW_TAG {
+            return false;
+        }
+        let key = u64::from(generation) << 32 | u64::from(i);
+        {
+            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            if made.get(from as usize).copied() != Some(key) {
+                return false;
+            }
+        }
+        let Some(host) = crate::host::host() else {
+            return false;
+        };
+        let resource = self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(from as usize).cloned().flatten();
+        // SAFETY: two slots of this heap's CPU range.
+        unsafe {
+            host.device.CopyDescriptorsSimple(1, self.cpu(to), self.cpu(from), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        }
+        self.keep(to, resource);
+        true
+    }
+
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
     pub(crate) fn make_null(&self, index: u32) {
         if self.sampler {
