@@ -395,13 +395,15 @@ In roadmap order. Piece letters refer to [the target](#the-target-pieces-that-fi
 |---|---|---|---|---|
 | S.1 Wrong reads / device loss, Jason as reproducer | D | maintainer | `s5-heap-sync` | **found**: slot writes during a submission; `VICTORY_SLOT_WAIT=1` holds 5 of 5 |
 | S.6 Host textures in pre-mapped heaps ([design](docs/design/s6-premapped-textures.md)); the proper form of the wait, needed for 3.1 | M, D, Q | maintainer | `s5-heap-sync` | **done**: `pool.rs`, on by default; no wait needed (5 of 5 against 8 of 8 lost), ~6 % faster |
-| S.8 Bound texture memory: 35,000 live textures, 12-14 GB after minutes in the world; an exact rule for letting go | T, L | maintainer | | next |
+| S.8 Bound texture memory | T, L | maintainer | `s5-heap-sync` | the sweep works with the pool again (25,800 live, 9.2 GB); left: release empty heaps |
+| D.1 Heap buffer pass: 133 ms a frame in the open world (`draw.rs` `heap_buffers`, 110,000 views, 4,085 copies) | D, W | *open* | | measured |
+| S.9 Interior lighting: white speckles and blown-out areas indoors (Jason at the TV) | T | *open* | | seen |
 | S.7 Prologue null fault (SQC, address 0): 1 of 6 prologue runs with the wait | L | maintainer | | watched |
 | S.5 Evaluate fxceless `a26859f` (descriptor mirroring) | D | maintainer | `s5-heap-sync` | **done**: ported (`VICTORY_HEAP_SYNC=1`, off); not the cause; the title copies ~225,000 records a frame as bytes |
-| S.4 Open-world baseline (Jason, `bench.sh --auto -p royale-save`) | G | maintainer | | unblocked: 2.1 fps, 477 ms a frame, ~13,000 draws (first figures) |
+| S.4 Open-world baseline (Jason, outside the house) | G | maintainer | `s5-heap-sync` | **done**: 497 ms (2.0 fps), GPU-bound, a serial chain ([baseline.md](docs/baseline.md)) |
 | S.2 Exact lifetimes for host copies | L | *open* | | after S.1 |
 | S.3 Texture coherence without the sweep | T | *open* | | after S.1 |
-| 1.3 Copy back only what the CPU reads | B | maintainer | | first after phase S; gates 3.1 |
+| 1.3 Copy back only what the CPU reads ([design](docs/design/p1.3-copyback-on-demand.md)): read census first | B | maintainer | | **next**; gates 3.1 |
 | 1.2 Cheaper write tracking (ask write watch once per submission) | W | *open* | | |
 | 1.1 Memory census by use | M | maintainer | `p1.1-census` | in progress (input for 1.3 and phase 2) |
 | 1.7 Stop re-copying our own write-back (`VICTORY_F1_OWN`, `VICTORY_F1_CARD_MERGE`) | B | maintainer | `p1.1-census` | **done**: uploads −49 %, hash passes −82 %, frame −2 % |

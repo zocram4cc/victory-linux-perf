@@ -4,6 +4,12 @@ What was tried, what came out of it, and what was decided. Newest first. The Spa
 
 ## 2026-11-26
 
+**The open world is a serial chain; the order of the roadmap holds**
+- The layer's card clock, open world outside: **the card has nothing of ours queued 212-284 ms a frame (busy 48-57 %), 173-228 ms of that while our submitting thread is working**; the thread then waits for the card ~265 ms. CPU and card never overlap. Overlapped, the frame would fall towards ~270 ms (phase 3, ~1.8×).
+- Within our thread's work: **408-437 MB a frame snapshotted on the CPU** to find what shaders wrote in title buffers' copies (copy-back, piece B), plus 72 ms / 46 MB of copy-back.
+- `VICTORY_CARD_BUFFERS_MIN_MB=1` (the card compares copies of 1 MiB or more): 491-494 ms against 491-504; prepare 119 → 107 ms but GPU 265 → 276 ms, and the CPU still snapshots 408 MB. No gain; stays off (`bench/trials-…-world-out-card1`).
+- **Next:** 1.3, measured first: how much of what is copied back does the CPU read before the GPU writes it again ([design](design/p1.3-copyback-on-demand.md)). Lesson 1 (from `fx`) says the copy-back must shrink before frames in flight.
+
 **S.4: the open-world baseline (outside the house), and where its time goes**
 - **Baseline** (`BENCH_SETTLE=5 scripts/trials.sh -n 3 -l world-out -s 30`, all windows valid, none lost): **491-504 ms a frame (2.0 fps)**, prepare 116-124 ms, GPU 262-269 ms (card busy 53 % of it), copies 49-54 ms / 133 MB, copy-back 71-74 ms / 46 MB, ~13,100 draws. Recorded in [baseline.md](baseline.md).
 - **Correction:** with the pool off (and the wait on), the same: 485-502 ms. The pool's earlier "~6 % faster" came from invalid windows of different scenes. Its value is stability without waits (frames in flight), not speed.
