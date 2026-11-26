@@ -6201,6 +6201,19 @@ impl Meter {
         crate::pool::pool_line(frames);
         crate::census::census_line(frames);
         gpu_census_line(frames);
+        {
+            let names = ["draw", "draw_indexed", "dispatch", "execute_indirect", "prepare_for", "bind", "tables"];
+            let parts: Vec<String> = names
+                .iter()
+                .enumerate()
+                .map(|(i, n)| {
+                    let ns = crate::draw::TIMED[i][0].swap(0, Ordering::Relaxed) as f64 / frames;
+                    let calls = crate::draw::TIMED[i][1].swap(0, Ordering::Relaxed) as f64 / frames;
+                    format!("{n} {:.1} ms ({calls:.0}x, {:.1} us each)", ns / 1e6, if calls > 0.0 { ns / calls / 1e3 } else { 0.0 })
+                })
+                .collect();
+            tracing::info!("draw path per frame, inclusive, all recording threads (C.1): {}", parts.join(", "));
+        }
         regions_dump();
         if crate::inplace::level() >= 2 {
             let [n, mixed, bytes_n, bytes_mixed] =

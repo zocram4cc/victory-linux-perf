@@ -472,6 +472,27 @@ fn bind_zeros(
     }
 }
 
+/// C.1 census: inclusive time and calls of the draw path's parts since the
+/// last frame line (draw, draw_indexed, dispatch, execute_indirect,
+/// prepare_for, bind, tables), on the title's recording threads.
+pub(crate) static TIMED: [[AtomicU64; 2]; 7] = [const { [AtomicU64::new(0), AtomicU64::new(0)] }; 7];
+
+pub(crate) struct Timed(usize, std::time::Instant);
+
+impl Timed {
+    #[inline]
+    pub(crate) fn new(kind: usize) -> Self {
+        Timed(kind, std::time::Instant::now())
+    }
+}
+
+impl Drop for Timed {
+    fn drop(&mut self) {
+        TIMED[self.0][0].fetch_add(self.1.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        TIMED[self.0][1].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 macro_rules! once {
     ($($arg:tt)*) => {{
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -840,6 +861,7 @@ impl State {
 
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
+        let _timed = Timed::new(4);
         // `VICTORY_SKIP_PIPELINES` in every build: it was diagnostics-only,
         // so release builds never skipped what the profile asked for (the
         // AMD page fault of fxceless/victory-fork#3).
@@ -937,6 +959,7 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        let _timed = Timed::new(5);
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -1816,6 +1839,7 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        let _timed = Timed::new(2);
         // It may write the arguments a window holds clamped.
         self.window = None;
         // `VICTORY_SKIP_PIPELINES` in every build: it was diagnostics-only,
@@ -2045,6 +2069,7 @@ impl State {
         indexed: &[RootIndexedView],
         compute: bool,
     ) -> Vec<(u8, u32)> {
+        let _timed = Timed::new(6);
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Vec<u8> = used
             .iter()
@@ -2296,6 +2321,7 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
+        let _timed = Timed::new(0);
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
@@ -2403,6 +2429,7 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
+        let _timed = Timed::new(1);
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
@@ -2447,6 +2474,7 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        let _timed = Timed::new(3);
         // Skip before the argument clamp can mutate the indirect buffer.
         // `VICTORY_SKIP_PIPELINES` in every build: it was diagnostics-only,
         // so release builds never skipped what the profile asked for (the
