@@ -90,9 +90,11 @@ does not pass a console program's output on: run it under `cmd /c` with the
 output redirected to a file.
 
 The launch settings of `scripts/play.ps1` apply on Linux as on Windows.
-`VICTORY_KEYS` presses the pad's A on the start screen in every build, so an
-unattended run gets past it. On a build without the single-latch fix (see
-"Every frame waits 500 ms") add `VICTORY_PIPELINE_WAIT_MS=0`.
+`VICTORY_KEYS` presses the pad's A on the start screen, so an unattended run
+gets past it. It needs a build with `--features scripted` (see
+`docs/README-fxceless.md`): a plain release build has no scripted keys. On a
+build without the single-latch fix (see "Every frame waits 500 ms") add
+`VICTORY_PIPELINE_WAIT_MS=0`.
 
 ## Problems seen under Proton
 
