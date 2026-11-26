@@ -2932,7 +2932,7 @@ impl State {
     /// The stand-in for the indirect light after a dispatch of `p`
     /// (`crate::ambient`). Whether it recorded anything.
     fn ambient(&self, list: &HostList, p: &HostPipeline, role: crate::ambient::Role) -> bool {
-        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, REFLECTIONS, Role, Views};
+        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, REFLECTIONS, REFLECTIONS_ALPHA, Role, Views};
         if role == Role::Reflected {
             static SEEN: std::sync::Once = std::sync::Once::new();
             SEEN.call_once(|| tracing::info!(translated = p.stages.first().is_some(), "the title's last reflection program was dispatched"));
@@ -2946,11 +2946,12 @@ impl State {
             Role::Radiance => RADIANCE,
             Role::Air => AIR,
             Role::Reflected => REFLECTIONS,
+            Role::ReflectedAlpha => REFLECTIONS_ALPHA,
         };
         let image = entry(ResourceType::Uav, at);
         let depth = match role {
             Role::Resolve => entry(ResourceType::Srv, DEPTH),
-            Role::Radiance | Role::Air | Role::Reflected => image,
+            Role::Radiance | Role::Air | Role::Reflected | Role::ReflectedAlpha => image,
         };
         let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
             once!(?role, "no stand-in for the indirect light: other tables");
