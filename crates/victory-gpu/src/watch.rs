@@ -283,9 +283,13 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
         {
             tally(12, count as u64);
             use crate::copystat::{C, add};
+            let us = started.elapsed().as_micros() as u64;
             add(C::Watches, 1);
-            add(C::WatchUs, started.elapsed().as_micros() as u64);
-            slow(started.elapsed().as_micros() as u64);
+            add(C::WatchUs, us);
+            if us >= 1000 {
+                let runs = dirty_runs(found[..count].iter().copied(), KERNEL_PAGE);
+                slow(us, (last - first) * PAGE, count, runs);
+            }
             tally(0, 1);
             tally(1, ((last - first) * (PAGE >> 10)) as u64);
         }
@@ -299,6 +303,20 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
         }
         Some(pages)
     })
+}
+
+/// The runs of dirty pages in `at` (ascending, `step` apart), for [`slow`].
+#[cfg(feature = "diagnostics")]
+fn dirty_runs(mut at: impl Iterator<Item = usize>, step: usize) -> usize {
+    let Some(mut last) = at.next() else {
+        return 0;
+    };
+    let mut runs = 1;
+    for a in at {
+        runs += usize::from(a != last + step);
+        last = a;
+    }
+    runs
 }
 
 /// Ranges of one submission closer than this are asked about together:
@@ -359,29 +377,137 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     }
 }
 
-/// Since the last frame line: the kernel askings that took a millisecond
-/// or more, their microseconds, and the longest asking's. An asking walks
-/// page tables, some ten microseconds for most ranges; in run 75 the 2,644
-/// askings of a frame took 219 ms in the lines where the pass over the
-/// heap's views ran long, 25-50 ms in the others. These numbers say
-/// whether a few askings wait for something or all of them are slow.
+/// Since the last frame line: the kernel askings (and the guard askings) that took a millisecond or
+/// more, by who asked, by range size and by dirty runs, and the longest. An asking walks page
+/// tables, some ten microseconds for most ranges; in run 75 the 2,644 askings of a frame took 219
+/// ms in the lines where the pass over the heap's views ran long, 25-50 ms in the others. These
+/// say which askings are slow, and where.
 #[cfg(feature = "diagnostics")]
-static SLOW: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+static SLOW: Mutex<Slow> = Mutex::new(Slow::EMPTY);
 
+/// Who asks, for [`SLOW`]: set on a thread by [`asker`].
 #[cfg(feature = "diagnostics")]
-fn slow(us: u64) {
-    use std::sync::atomic::Ordering::Relaxed;
-    if us >= 1000 {
-        SLOW[0].fetch_add(1, Relaxed);
-        SLOW[1].fetch_add(us, Relaxed);
-    }
-    SLOW[2].fetch_max(us, Relaxed);
+#[derive(Clone, Copy)]
+pub(crate) enum Asker {
+    /// Anything else: the title's threads, the early asks.
+    Other,
+    /// A submission, on the thread that makes it.
+    Submit,
+    /// A thread of a refresh pool ([`crate::land`]).
+    Refresh,
+    /// A texture's refresh.
+    Texture,
 }
 
-/// [`SLOW`], taken.
 #[cfg(feature = "diagnostics")]
-pub(crate) fn slow_asks() -> [u64; 3] {
-    [0, 1, 2].map(|i| SLOW[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+impl Asker {
+    fn name(self) -> &'static str {
+        ["other", "the submitting thread", "refresh workers", "texture"][self as usize]
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    static ASKER: std::cell::Cell<Asker> = const { std::cell::Cell::new(Asker::Other) };
+}
+
+/// Makes `who` the asker on this thread until the guard is dropped.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn asker(who: Asker) -> AskerGuard {
+    AskerGuard(ASKER.with(|a| a.replace(who)))
+}
+
+/// Restores the asker that [`asker`] replaced.
+#[cfg(feature = "diagnostics")]
+pub(crate) struct AskerGuard(Asker);
+
+#[cfg(feature = "diagnostics")]
+impl Drop for AskerGuard {
+    fn drop(&mut self) {
+        ASKER.with(|a| a.set(self.0));
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+#[derive(Clone, Copy)]
+struct Longest {
+    us: u64,
+    who: Asker,
+    bytes: usize,
+    pages: usize,
+    runs: usize,
+}
+
+/// The askings of a millisecond or more: count and microseconds of all of them (`all`), then by
+/// who asked (0-3), by range size (4-7: under 4, 64, 256 MiB, more) and by dirty runs (8-11: under
+/// 128, 1024, 8192, more).
+#[cfg(feature = "diagnostics")]
+struct Slow {
+    all: [u64; 2],
+    by: [[u64; 2]; 12],
+    longest: Option<Longest>,
+}
+
+#[cfg(feature = "diagnostics")]
+impl Slow {
+    const EMPTY: Slow = Slow { all: [0; 2], by: [[0; 2]; 12], longest: None };
+}
+
+/// An asking that took `us` microseconds over `bytes` of memory, and found `pages` dirty in `runs`
+/// runs. Only the askings of a millisecond or more are noted.
+#[cfg(feature = "diagnostics")]
+fn slow(us: u64, bytes: usize, pages: usize, runs: usize) {
+    let who = ASKER.with(|a| a.get());
+    let size = [4 << 20, 64 << 20, 256 << 20].iter().filter(|&&n| bytes >= n).count();
+    let run = [128, 1024, 8192].iter().filter(|&&n| runs >= n).count();
+    let mut s = SLOW.lock().unwrap_or_else(|e| e.into_inner());
+    for i in [who as usize, 4 + size, 8 + run] {
+        s.by[i][0] += 1;
+        s.by[i][1] += us;
+    }
+    s.all[0] += 1;
+    s.all[1] += us;
+    if s.longest.is_none_or(|l| us > l.us) {
+        s.longest = Some(Longest { us, who, bytes, pages, runs });
+    }
+}
+
+/// [`SLOW`], taken, for the frame line: `frames` frames since the last.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn slow_asks_line(frames: f64) -> String {
+    let s = std::mem::replace(&mut *SLOW.lock().unwrap_or_else(|e| e.into_inner()), Slow::EMPTY);
+    let cell = |i: usize| {
+        let [n, us] = s.by[i];
+        format!("{:.1} ({:.1} ms)", n as f64 / frames, us as f64 / 1e3 / frames)
+    };
+    let longest = match s.longest {
+        Some(l) => format!(
+            "{} asked {} MiB, {} dirty pages in {} runs, {:.1} ms",
+            l.who.name(),
+            l.bytes >> 20,
+            l.pages,
+            l.runs,
+            l.us as f64 / 1e3
+        ),
+        None => "none".to_owned(),
+    };
+    format!(
+        "write-watch askings of a millisecond or more: {:.1} a frame, {:.1} ms a frame; by who asked: the submitting thread {}, refresh workers {}, texture {}, other {}; by range under 4, 64, 256 MiB, more: {}, {}, {}, {}; by dirty runs under 128, 1024, 8192, more: {}, {}, {}, {}; the longest: {longest}",
+        s.all[0] as f64 / frames,
+        s.all[1] as f64 / 1e3 / frames,
+        cell(1),
+        cell(2),
+        cell(3),
+        cell(0),
+        cell(4),
+        cell(5),
+        cell(6),
+        cell(7),
+        cell(8),
+        cell(9),
+        cell(10),
+        cell(11),
+    )
 }
 
 /// Whether a thread asks, between a submission's askings, about the memory
@@ -912,10 +1038,13 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
                 use crate::copystat::{C, add};
                 let us = guarding.elapsed().as_micros() as u64;
                 add(C::GuardUs, us);
-                if written.is_some() {
+                if let Some(pages) = &written {
                     add(C::Watches, 1);
                     add(C::WatchUs, us);
-                    slow(us);
+                    if us >= 1000 {
+                        let runs = dirty_runs(pages.iter().map(|p| p.0), 1);
+                        slow(us, (last - first) * PAGE, pages.len(), runs);
+                    }
                 }
             }
             written?

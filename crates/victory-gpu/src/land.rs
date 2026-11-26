@@ -238,6 +238,8 @@ impl Pool {
         for i in 1..threads {
             // (A helper that is not there is only missed.)
             let _ = std::thread::Builder::new().name(format!("{name}-{i}")).spawn(move || {
+                #[cfg(feature = "diagnostics")]
+                let _asker = crate::watch::asker(crate::watch::Asker::Refresh);
                 if name == "victory-land" {
                     crate::cores::keep_helper_on_fast_cores(name);
                 } else {

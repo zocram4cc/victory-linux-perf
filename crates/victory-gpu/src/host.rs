@@ -5409,6 +5409,8 @@ impl Host {
     /// other, as they would have.
     fn submit<'a>(&'a self, runs: &[&HostList], parts: &[usize], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
         #[cfg(feature = "diagnostics")]
+        let _asker = crate::watch::asker(crate::watch::Asker::Submit);
+        #[cfg(feature = "diagnostics")]
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::submission_begins();
@@ -8631,7 +8633,9 @@ impl Meter {
         // Copies in the card's memory (`crate::shadow::cards`).
         let card = crate::shadow::card_stats();
         #[cfg(feature = "diagnostics")]
-        let slow = crate::watch::slow_asks();
+        let slow = crate::watch::slow_asks_line(frames);
+        #[cfg(feature = "diagnostics")]
+        let quiet = crate::watch::quiet_line(frames);
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
@@ -8749,12 +8753,12 @@ impl Meter {
                 );
             }
             #[cfg(feature = "diagnostics")]
-            tracing::info!(
-                "write-watch askings of a millisecond or more: {:.1} a frame, {:.1} ms a frame; the longest asking {:.1} ms",
-                slow[0] as f64 / frames,
-                slow[1] as f64 / 1e3 / frames,
-                slow[2] as f64 / 1e3
-            );
+            {
+                tracing::info!("{slow}");
+                if crate::watch::quiet_frames() > 0 {
+                    tracing::info!("{quiet}");
+                }
+            }
             if crate::shadow::cards() {
                 let per_frame = |i: usize| card[i] as f64 / frames;
                 tracing::info!(
