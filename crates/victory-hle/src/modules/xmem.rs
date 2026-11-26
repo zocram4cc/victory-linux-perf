@@ -998,8 +998,22 @@ enum Call {
     Commit = 13,
 }
 
-/// Runs `f`, a system call, and counts it while the streaming log is on.
+impl Call {
+    /// What the timeline calls the system call.
+    fn span(self) -> &'static str {
+        match self {
+            Call::Unmap => "page mapping: UnmapViewOfFile2",
+            Call::Split => "page mapping: VirtualFree, a placeholder cut out",
+            Call::Map => "page mapping: MapViewOfFile3",
+            Call::Commit => "page mapping: committing the pages",
+        }
+    }
+}
+
+/// Runs `f`, a system call, and counts it while the streaming log is on; it
+/// is a span of the timeline, named by what it is.
 fn counted<T>(call: Call, f: impl FnOnce() -> T) -> T {
+    let _span = victory_gpu::timeline::span(call.span());
     if !super::dstorage::stream_log::on() {
         return f();
     }
@@ -1008,6 +1022,16 @@ fn counted<T>(call: Call, f: impl FnOnce() -> T) -> T {
     MAPPING[call as usize].fetch_add(1, Ordering::Relaxed);
     MAPPING[call as usize + 1].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
     done
+}
+
+/// `$call`, a hook of the GPU side or the wait for a lock, as a span of the
+/// timeline named `$name`: what the title's `CopyPageMappings` costs piece by
+/// piece (it and the other calls that map pages share these).
+macro_rules! spanned {
+    ($name:literal, $call:expr) => {{
+        let _span = victory_gpu::timeline::span($name);
+        $call
+    }};
 }
 
 /// Counts a mapping call when dropped.
@@ -1073,6 +1097,7 @@ pub(crate) fn lift_thread() {
     if !*ON {
         return;
     }
+    let _span = victory_gpu::timeline::span("page mapping: GetThreadPriority and SetThreadPriority");
     // SAFETY: plain calls on this thread.
     unsafe {
         let thread = GetCurrentThread();
@@ -1294,9 +1319,10 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let _costed = Costed::begin(None);
     let _busy = Busy::begin();
-    let mut physical = physical();
+    let mut physical = spanned!("page mapping: waiting for the physical-pages lock", physical());
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
-    let _changing = victory_gpu::title_memory_remapping();
+    let _changing =
+        spanned!("page mapping: title_memory_remapping, waiting for the readers", victory_gpu::title_memory_remapping());
     unmap(&mut physical, to, len);
     for k in (0..len).step_by(PAGE) {
         if from == 0 {
@@ -1334,7 +1360,7 @@ pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
     let mut at = 0;
     while at < pages.len() {
         let _busy = Busy::begin();
-        let mut physical = physical();
+        let mut physical = spanned!("page mapping: waiting for the physical-pages lock", physical());
         let mut ops: Vec<Op> = Vec::new();
         let mut touched = std::collections::HashSet::new();
         for &(to, from) in &pages[at..] {
@@ -1349,7 +1375,8 @@ pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
             ops.push(Op::new(to, slice.flatten()));
             at += 1;
         }
-        let _changing = victory_gpu::title_memory_remapping();
+        let _changing =
+            spanned!("page mapping: title_memory_remapping, waiting for the readers", victory_gpu::title_memory_remapping());
         ok &= change(&mut physical, ops);
     }
     ok
@@ -1543,9 +1570,9 @@ fn change(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
         match there {
             Some((base, PAGE)) if base == op.at => {
                 if let Some((size, slice)) = physical.views.remove(&op.at) {
-                    shown_mut().forget(op.at, size, &slice);
+                    spanned!("page mapping: the shown pages, forgetting", shown_mut().forget(op.at, size, &slice));
                 }
-                victory_gpu::title_memory_unmapping(op.at, PAGE);
+                spanned!("page mapping: title_memory_unmapping", victory_gpu::title_memory_unmapping(op.at, PAGE));
                 physical.holes.remove(&op.at);
                 (op.had, op.own) = (true, lean());
             }
@@ -1567,15 +1594,18 @@ fn change(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
             op.own = true;
         }
     }
-    let done = pool::all(ops);
+    let done = spanned!("page mapping: the mapping threads' calls, waiting", pool::all(ops));
     let mut ok = true;
     for (op, done) in done {
         match op.slice {
             Some(slice) if done => {
                 // As in `map`.
-                shown_mut().note(op.at, PAGE, &slice);
-                victory_gpu::title_memory_remapped(op.at, PAGE);
-                victory_gpu::title_memory_view(op.at, PAGE, slice.section.handle as usize, (slice.index * PAGE) as u64);
+                spanned!("page mapping: the shown pages, noting", shown_mut().note(op.at, PAGE, &slice));
+                spanned!("page mapping: title_memory_remapped", victory_gpu::title_memory_remapped(op.at, PAGE));
+                spanned!(
+                    "page mapping: title_memory_view",
+                    victory_gpu::title_memory_view(op.at, PAGE, slice.section.handle as usize, (slice.index * PAGE) as u64)
+                );
                 physical.views.insert(op.at, (PAGE, slice));
             }
             None if op.had && done => {
@@ -1717,11 +1747,14 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     // Noted before the GPU side is told: bytes DirectStorage put in earlier,
     // without notice at these addresses ([`pages_written`]), are there by
     // the time the copies of them go.
-    shown_mut().note(base, len, &slice);
+    spanned!("page mapping: the shown pages, noting", shown_mut().note(base, len, &slice));
     // New contents, read-write: the GPU side's copies no longer guard it.
-    victory_gpu::title_memory_remapped(base, len);
+    spanned!("page mapping: title_memory_remapped", victory_gpu::title_memory_remapped(base, len));
     // What the range shows now, for the GPU side's in-place census.
-    victory_gpu::title_memory_view(base, len, slice.section.handle as usize, (slice.index * PAGE) as u64);
+    spanned!(
+        "page mapping: title_memory_view",
+        victory_gpu::title_memory_view(base, len, slice.section.handle as usize, (slice.index * PAGE) as u64)
+    );
     physical.views.insert(base, (len, slice));
     true
 }
@@ -1774,7 +1807,9 @@ fn show(base: usize, len: usize, slice: &Slice, own: bool) -> bool {
     }
     if !slice.section.commit_shown(slice.index, base, len) {
         // SAFETY: the view just mapped, back to a placeholder.
-        unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
+        spanned!("page mapping: UnmapViewOfFile2", unsafe {
+            UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER)
+        });
         return false;
     }
     true
@@ -1866,12 +1901,12 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
         };
-        shown_mut().forget(at, size, &slice);
+        spanned!("page mapping: the shown pages, forgetting", shown_mut().forget(at, size, &slice));
         if at < base || at + size > end {
             // Parts of it stay, and are mapped again below.
-            victory_gpu::title_memory_splitting(at, size);
+            spanned!("page mapping: title_memory_splitting", victory_gpu::title_memory_splitting(at, size));
         }
-        victory_gpu::title_memory_unmapping(at, size);
+        spanned!("page mapping: title_memory_unmapping", victory_gpu::title_memory_unmapping(at, size));
         // SAFETY: a view we mapped; it becomes a placeholder again.
         let gone = counted(Call::Unmap, || unsafe {
             UnmapViewOfFile2(
