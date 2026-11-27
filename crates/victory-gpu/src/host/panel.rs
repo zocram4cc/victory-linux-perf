@@ -236,6 +236,8 @@ struct Buffers {
     turn: usize,
     /// It is not in the card's buffer yet.
     fresh: bool,
+    /// `card` has already been copied into once and now sits in `COPY_SOURCE`.
+    uploaded: bool,
 }
 
 // SAFETY: free-threaded resources, and memory only written under the presenter's lock.
@@ -268,7 +270,7 @@ impl Buffers {
                 .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut card)
                 .ok()?;
         }
-        Some(Buffers { format, scale, pitch, uploads, card: card?, turn: 0, fresh: false })
+        Some(Buffers { format, scale, pitch, uploads, card: card?, turn: 0, fresh: false, uploaded: false })
     }
 
     fn write(&mut self, lines: &[String]) {
@@ -381,12 +383,20 @@ impl Panel {
         // SAFETY: an open list and live resources; the box lies within both.
         unsafe {
             if std::mem::take(&mut buffers.fresh) {
+                if buffers.uploaded {
+                    list.ResourceBarrier(&[transition(
+                        &buffers.card,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    )]);
+                }
                 list.CopyResource(&buffers.card, &buffers.uploads[buffers.turn].0);
                 list.ResourceBarrier(&[transition(
                     &buffers.card,
                     D3D12_RESOURCE_STATE_COPY_DEST,
                     D3D12_RESOURCE_STATE_COPY_SOURCE,
                 )]);
+                buffers.uploaded = true;
             }
             let from = D3D12_TEXTURE_COPY_LOCATION {
                 pResource: std::mem::transmute_copy(&buffers.card),
