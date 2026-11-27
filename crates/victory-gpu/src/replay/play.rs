@@ -96,6 +96,8 @@ pub struct Options {
     /// Skip what runs a pipeline whose name or shader hash has one of
     /// these in it.
     pub skip_shaders: Vec<String>,
+    /// Depth bias of pipelines named, as given (`--bias`).
+    pub bias: Vec<BiasEdit>,
     /// Shaders taken from this folder where it has them: `<hash>.dxil`, by
     /// the hash the runtime names the title's shader by (ours: by their own).
     pub shaders: Option<PathBuf>,
@@ -134,6 +136,7 @@ impl Default for Options {
             only: None,
             until: None,
             skip_shaders: Vec::new(),
+            bias: Vec::new(),
             shaders: None,
             shaders_b: None,
             compare: false,
@@ -155,6 +158,7 @@ impl Options {
             || self.wait_lists
             || self.only.is_some()
             || !self.skip_shaders.is_empty()
+            || !self.bias.is_empty()
     }
 
     /// The same without the experiments.
@@ -171,6 +175,7 @@ impl Options {
             awake: false,
             only: None,
             skip_shaders: Vec::new(),
+            bias: Vec::new(),
             ..self.clone()
         }
     }
@@ -333,6 +338,66 @@ pub fn find(folder: &Path) -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("no capture (frame.bin) in {}", folder.display()))
 }
 
+/// `--bias <text>=<constant>,<clamp>,<slope>`: the depth bias of pipelines
+/// whose name (or id) has `<text>` in it, as given; an empty field keeps the
+/// recorded value.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BiasEdit {
+    pub what: String,
+    pub constant: Option<i32>,
+    pub clamp: Option<f32>,
+    pub slope: Option<f32>,
+}
+
+impl BiasEdit {
+    /// From `<text>=<constant>,<clamp>,<slope>`.
+    pub fn parse(s: &str) -> Result<BiasEdit> {
+        let (what, values) = s.split_once('=').context("--bias wants <text>=<constant>,<clamp>,<slope>")?;
+        let v: Vec<&str> = values.split(',').collect();
+        if v.len() != 3 {
+            bail!("--bias wants three values: <constant>,<clamp>,<slope> (empty keeps one)");
+        }
+        fn field(s: &str) -> Option<&str> {
+            (!s.trim().is_empty()).then(|| s.trim())
+        }
+        Ok(BiasEdit {
+            what: what.to_owned(),
+            constant: field(v[0]).map(str::parse).transpose()?,
+            clamp: field(v[1]).map(str::parse).transpose()?,
+            slope: field(v[2]).map(str::parse).transpose()?,
+        })
+    }
+
+    /// The parts of pipeline `id` called `name` with this bias, or none
+    /// where it is not one of those named or has no rasterizer part.
+    fn apply(&self, id: u32, name: &str, parts: &[wire::Part]) -> Option<Vec<wire::Part>> {
+        if !(name.contains(&self.what) || id.to_string() == self.what) {
+            return None;
+        }
+        let mut out = parts.to_vec();
+        let mut found = false;
+        for part in &mut out {
+            // D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER: DepthBias at
+            // byte 12, DepthBiasClamp at 16, SlopeScaledDepthBias at 20.
+            if let wire::Part::Plain { kind: 10, data } = part
+                && data.0.len() >= 24
+            {
+                if let Some(c) = self.constant {
+                    data.0[12..16].copy_from_slice(&c.to_le_bytes());
+                }
+                if let Some(c) = self.clamp {
+                    data.0[16..20].copy_from_slice(&c.to_le_bytes());
+                }
+                if let Some(s) = self.slope {
+                    data.0[20..24].copy_from_slice(&s.to_le_bytes());
+                }
+                found = true;
+            }
+        }
+        found.then_some(out)
+    }
+}
+
 /// The host facts the translator takes from the card (`host.rs` sets the
 /// same at a run's start): its widest and narrowest waves decide the form
 /// of wave64 compute programs (on a card of 32 lanes they run in waves of
@@ -493,7 +558,7 @@ pub fn replay(folder: &Path, options: &Options) -> Result<Vec<(String, Report)>>
         let _pipelines = match &options.shaders_b {
             Some(folder) => {
                 let kept = std::mem::take(&mut player.pipelines);
-                player.make_pipelines(Some(folder))?;
+                player.make_pipelines(Some(folder), &options.bias)?;
                 kept
             }
             None => HashMap::new(),
@@ -659,7 +724,7 @@ impl Player {
         let mut at = Instant::now();
         player.make_resources(options.buffers, &options.only_buffers)?;
         step("resources", &mut at);
-        player.make_pipelines(options.shaders.as_deref())?;
+        player.make_pipelines(options.shaders.as_deref(), &options.bias)?;
         step("pipelines", &mut at);
         player.make_descriptors()?;
         step("descriptors", &mut at);
@@ -907,7 +972,7 @@ impl Player {
         Ok(())
     }
 
-    fn make_pipelines(&mut self, shaders: Option<&Path>) -> Result<()> {
+    fn make_pipelines(&mut self, shaders: Option<&Path>, bias: &[BiasEdit]) -> Result<()> {
         for (id, blob) in &self.frame.roots {
             if self.roots.contains_key(id) {
                 // (Made for another set of shaders: the root signatures are the same.)
@@ -972,7 +1037,9 @@ impl Player {
                         };
                         let root = |id: u32| roots.get(&id).cloned();
                         let taken = std::cell::Cell::new(false);
-                        let mut m = super::pso::make(&device, &p.parts, root, |i| {
+                        let edited = bias.iter().find_map(|b| b.apply(p.id, &p.name, &p.parts));
+                        let parts = edited.as_deref().unwrap_or(&p.parts);
+                        let mut m = super::pso::make(&device, parts, root, |i| {
                             let other = shaders.and_then(|dir| {
                                 let own = || frame.codes.get(i as usize).map(|c| c.hash[..8].iter().map(|b| format!("{b:02x}")).collect());
                                 let hash = title_hash(p, i).map(str::to_owned).or_else(own)?;
@@ -984,7 +1051,7 @@ impl Player {
                         if taken.get() && m.is_err() {
                             // Not for the root signature or the other stage recorded.
                             kept.fetch_add(1, Ordering::Relaxed);
-                            m = super::pso::make(&device, &p.parts, root, recorded);
+                            m = super::pso::make(&device, parts, root, recorded);
                         } else if taken.get() {
                             swapped.fetch_add(1, Ordering::Relaxed);
                         }
@@ -3574,6 +3641,29 @@ mod tests {
 #[cfg(test)]
 mod card_tests {
     /// A card is RDNA where it is the vendor's and has waves of 32 and 64.
+    /// `--bias` sets the rasterizer's three bias fields of the pipelines
+    /// named and leaves the others and the empty fields alone.
+    #[test]
+    fn a_bias_edit_sets_the_rasterizer_fields_named() {
+        use super::wire::{Blob, Part};
+        let b = super::BiasEdit::parse("8135=,0.0005,").unwrap();
+        assert_eq!((b.constant, b.clamp, b.slope), (None, Some(0.0005), None));
+        let mut raster = vec![0u8; 44];
+        raster[12..16].copy_from_slice(&7i32.to_le_bytes());
+        raster[16..20].copy_from_slice(&0.0024f32.to_le_bytes());
+        raster[20..24].copy_from_slice(&1.45f32.to_le_bytes());
+        let parts = vec![Part::Root { root: 1 }, Part::Plain { kind: 10, data: Blob(raster) }];
+        assert!(b.apply(1, "[vertex 643101624bd14159]", &parts).is_none());
+        let out = b.apply(8135, "[vertex 643101624bd14159]", &parts).unwrap();
+        let Part::Plain { data, .. } = &out[1] else { panic!() };
+        let f = |at: usize| f32::from_le_bytes(data.0[at..at + 4].try_into().unwrap());
+        assert_eq!(i32::from_le_bytes(data.0[12..16].try_into().unwrap()), 7);
+        assert_eq!((f(16), f(20)), (0.0005, 1.45));
+        let all = super::BiasEdit::parse("643101624bd14159=0,0,0").unwrap();
+        assert!(all.apply(2, "[vertex 643101624bd14159]", &parts).is_some());
+        assert!(super::BiasEdit::parse("x=1,2").is_err());
+    }
+
     #[test]
     fn rdna_is_told_as_the_runtime_tells_it() {
         assert!(super::wave_facts_rdna(true, 32, 64));

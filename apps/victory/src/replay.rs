@@ -99,6 +99,11 @@ pub(crate) struct Replay {
     /// (may be given several times).
     #[arg(long = "skip-shader")]
     skip_shader: Vec<String>,
+    /// The depth bias of pipelines whose name (or id) has `<text>` in it:
+    /// `<text>=<constant>,<clamp>,<slope>`, an empty value keeping the
+    /// recorded one (may be given several times).
+    #[arg(long)]
+    bias: Vec<String>,
     /// Find the commands that make identical runs differ: each list is run
     /// this often from the same memory.
     #[arg(long, num_args = 0..=1, default_missing_value = "3")]
@@ -292,6 +297,7 @@ pub(crate) fn run(r: Replay) -> Result<()> {
         only,
         until,
         skip_shaders: r.skip_shader,
+        bias: r.bias.iter().map(|b| play::BiasEdit::parse(b)).collect::<Result<_>>()?,
         shaders: r.shaders,
         shaders_b: r.shaders_b,
         compare: r.compare,
