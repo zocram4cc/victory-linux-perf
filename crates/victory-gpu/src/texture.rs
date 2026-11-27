@@ -455,6 +455,7 @@ fn through_copy() -> bool {
 /// through the kernel into this thread's read buffer; pages that are not
 /// there read as zeros. The bytes are those a read in place would see.
 fn with_title<R>(memory: *const u8, size: usize, f: impl FnOnce(&[u8]) -> R) -> R {
+    let _census = crate::census::tag();
     with_read(size, |read| {
         crate::host::copy_mapped(read.as_mut_ptr(), memory, size, false);
         f(read)
@@ -1231,6 +1232,7 @@ impl Staging {
     }
 
     fn refresh_timed(&self) -> usize {
+        let _census = crate::census::tag();
         let size = self.read;
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));

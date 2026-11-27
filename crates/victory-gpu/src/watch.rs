@@ -3366,6 +3366,7 @@ pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
     {
         let mut g = guards_timed();
         open(&g, at, at.saturating_add(len));
+        crate::census::disarm(at, len);
         if len != 0 {
             // Nothing known of them stands while they are left alone.
             let absent: Vec<usize> = g.absent.range(first..last).collect();
@@ -3380,6 +3381,21 @@ pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
     }
     crate::descriptor::host::remapped(at, len);
     KernelWrite(first, if len == 0 { first } else { last })
+}
+
+/// For the census ([`crate::census::arm`]): runs `f` holding the guards
+/// alone, so that no block's protection changes meanwhile; `f` is given
+/// whether the block of an address is ours to leave alone (read-only by our
+/// hand, or about to be, or being written by the kernel for the title).
+pub(crate) fn census_arm(f: impl FnOnce(&dyn Fn(usize) -> bool)) {
+    let g = guards();
+    let busy = |at: usize| {
+        let block = at / BLOCK;
+        PROTECTED.any(block, block + 1)
+            || g.protected.contains(block)
+            || g.kernel.iter().any(|&(first, last)| (first..last).contains(&block))
+    };
+    f(&busy);
 }
 
 impl Drop for KernelWrite {

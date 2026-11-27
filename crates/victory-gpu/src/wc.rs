@@ -130,6 +130,36 @@ impl Ranges {
     pub(crate) fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+
+    /// Takes `[from, to)` out, cutting the ranges it overlaps.
+    pub(crate) fn remove(&mut self, from: usize, to: usize) {
+        if from >= to {
+            return;
+        }
+        let cut: Vec<(usize, usize)> = self.overlapping(from, to).collect();
+        for (s, e) in cut {
+            self.0.remove(&s);
+            if s < from {
+                self.0.insert(s, from);
+            }
+            if e > to {
+                self.0.insert(to, e);
+            }
+        }
+    }
+
+    /// Whether all of `[from, to)` is in the set.
+    pub(crate) fn covers(&self, from: usize, to: usize) -> bool {
+        from >= to || self.0.range(..=from).next_back().is_some_and(|(_, &e)| e >= to)
+    }
+
+    pub(crate) fn contains(&self, at: usize) -> bool {
+        self.0.range(..=at).next_back().is_some_and(|(_, &e)| e > at)
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.0.iter().map(|(&s, &e)| (s, e))
+    }
 }
 
 /// Start of a range -> (end, kind); ranges never overlap.
@@ -276,6 +306,19 @@ mod tests {
         insert(&mut map, 0x2000, 0x6000, Kind::Uncached);
         let got: Vec<_> = map.iter().map(|(&s, &(e, k))| (s, e, k)).collect();
         assert_eq!(got, [(0x1000, 0x2000, Kind::Cached), (0x2000, 0x6000, Kind::Uncached), (0x6000, 0x9000, Kind::Cached)]);
+    }
+
+    #[test]
+    fn ranges_remove_cuts_and_cover() {
+        let mut r = Ranges::default();
+        r.add(0, 100);
+        r.add(200, 300);
+        r.remove(50, 250);
+        assert_eq!(r.iter().collect::<Vec<_>>(), vec![(0, 50), (250, 300)]);
+        assert!(r.covers(10, 50) && !r.covers(10, 51) && r.covers(260, 300));
+        assert!(r.contains(0) && !r.contains(50) && r.contains(299) && !r.contains(300));
+        r.remove(0, 1000);
+        assert!(r.is_empty());
     }
 
     #[test]

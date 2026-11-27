@@ -2645,6 +2645,12 @@ impl Drop for Shadow {
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
         LIVE[1].fetch_sub(self.len, Ordering::Relaxed);
+        if crate::census::on() {
+            let owned = self.card_owned.get_mut().unwrap_or_else(|e| e.into_inner());
+            for (from, to) in owned.iter() {
+                crate::census::forget(from, to);
+            }
+        }
         if self.kept.get_mut().unwrap_or_else(|e| e.into_inner()).1 {
             KEPT_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
@@ -3967,12 +3973,14 @@ impl Shadow {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         self.card_owned.lock().unwrap_or_else(|e| e.into_inner()).add(from, to);
+        crate::census::note(from, to);
     }
 
     /// At submission: copies what changed of `[address, address + len)`
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        let _census = crate::census::tag();
         // In place: the card reads title memory itself.
         if self.place.is_some() {
             return 0;
@@ -4373,6 +4381,7 @@ impl Shadow {
 
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
     fn copy(&self, from: usize, to: usize) -> usize {
+        let _census = crate::census::tag();
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
