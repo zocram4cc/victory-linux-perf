@@ -425,8 +425,12 @@ pub(crate) fn bound_ahead(
 }
 
 /// Whether a clamp's two waits are asked for by what they wait for, under
-/// Wine (`VICTORY_CLAMP_SYNC`, read here and only under Wine: on there,
-/// `=0` as on Windows; A/B-able). On Windows nothing changes.
+/// Wine (`VICTORY_CLAMP_SYNC=1`, read here and only under Wine; off unless
+/// set here, upstream has it on under Wine; A/B-able). On Windows nothing
+/// changes. Off by default in this tree: it batches its clamps
+/// (`VICTORY_INDIRECT_BATCH`), the case upstream measured no difference for
+/// (run 41), and the narrow waits name compute writers only (a count or an
+/// argument the title or a card step writes by a copy is not waited for).
 ///
 /// A clamp stands between two waits for every earlier shader write
 /// ([`record_clamp_as`]) and moves its scratch buffer twice. vkd3d-proton
@@ -459,7 +463,7 @@ fn narrow() -> bool {
         return on && crate::wine::on_wine();
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| crate::wine::on_wine() && std::env::var_os("VICTORY_CLAMP_SYNC").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| crate::wine::on_wine() && std::env::var_os("VICTORY_CLAMP_SYNC").is_some_and(|v| v == "1"))
 }
 
 /// What a wait of the newer kind names on one side: the work, and what it
