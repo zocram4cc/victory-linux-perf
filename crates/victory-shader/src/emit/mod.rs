@@ -191,6 +191,50 @@ pub fn legacy_fma() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LEGACY_FMA").is_none_or(|v| v != "0"))
 }
 
+/// `DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER` of a console pixel program: the
+/// depth and stencil tests (and the depth write) run before the program, as
+/// HLSL's `[earlydepthstencil]` asks.
+pub(crate) const DEPTH_BEFORE_SHADER: u32 = 1 << 12;
+/// `DB_SHADER_CONTROL`'s Z_EXPORT_ENABLE, STENCIL_TEST_VAL_EXPORT_ENABLE and
+/// STENCIL_OP_VAL_EXPORT_ENABLE: the program writes depth or stencil.
+const DEPTH_STENCIL_EXPORT: u32 = 0b111;
+
+#[cfg(test)]
+thread_local! {
+    /// [`early_depth`] for the tests of one thread.
+    static EARLY_DEPTH_FOR_TESTS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether a pixel program whose console code tests depth and stencil before
+/// it runs ([`DEPTH_BEFORE_SHADER`]) gets D3D12's early depth-stencil test
+/// too (DXIL shader flag ForceEarlyDepthStencil); on unless
+/// `VICTORY_EARLY_DEPTH=0`. Without it the host tests after any program that
+/// writes unordered views or discards, and its writes to unordered views
+/// land for pixels the depth test then rejects: the title's alpha prepass
+/// keeps the nearest transparent depth and velocity with 64-bit atomics, a
+/// full-screen resolve writes them into the scene depth, and glass behind a
+/// character's hair took the hair's place there. Part of the translation:
+/// the shader cache keys on it.
+pub fn early_depth() -> bool {
+    #[cfg(test)]
+    if let Some(on) = EARLY_DEPTH_FOR_TESTS.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EARLY_DEPTH").is_none_or(|v| v != "0"))
+}
+
+/// Whether a pixel program with `db_shader_control` and these outputs gets
+/// D3D12's early depth-stencil test, with [`early_depth`] `on`: where the
+/// console tests before the program and the program writes neither depth
+/// nor stencil (the early test would not take those). Pure, for testing.
+pub(crate) fn early_depth_of(db_shader_control: u32, outputs: &[container::SigElement], on: bool) -> bool {
+    on && db_shader_control & DEPTH_BEFORE_SHADER != 0
+        && db_shader_control & DEPTH_STENCIL_EXPORT == 0
+        // SV_Depth, SV_DepthLessEqual, SV_DepthGreaterEqual, SV_StencilRef.
+        && !outputs.iter().any(|o| (17..=20).contains(&o.kind))
+}
+
 /// Whether a compute program's per-lane branches around a scalar that a join after them
 /// reads are taken by the whole wave, as the console takes them (`lower::scalar_splits`);
 /// on unless `VICTORY_SCALAR_SPLITS=0` (per lane, as before: the lanes that skipped the
@@ -1529,6 +1573,118 @@ mod tests {
         let sfi0 = host.part(FourCC::SFI0).unwrap().data;
         let features = u64::from_le_bytes(sfi0.try_into().unwrap());
         assert_ne!(features & 0x200, 0, "SFI0 {features:#x}: no StencilRef");
+    }
+
+    /// Which pixel programs keep the console's early depth test: those whose
+    /// `DB_SHADER_CONTROL` asks for it and that write neither depth nor
+    /// stencil, with the switch on.
+    #[test]
+    fn early_depth_is_given_where_the_console_tests_before_the_program() {
+        let el = |kind| SigElement {
+            name: "X".into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 1,
+            usage: 1,
+            half: false,
+        };
+        let target = [el(16)];
+        // The title's alpha prepass: depth before the program, kill.
+        let glass = 0x1450;
+        assert!(early_depth_of(glass, &target, true));
+        assert!(!early_depth_of(glass, &target, false));
+        // Early Z then late Z alone is the hardware's choice, not the title's.
+        assert!(!early_depth_of(0x50, &target, true));
+        assert!(!early_depth_of(0, &target, true));
+        // A depth or stencil export keeps the late test.
+        assert!(!early_depth_of(glass | 1, &target, true));
+        assert!(!early_depth_of(glass | 4, &target, true));
+        for kind in 17..=20 {
+            assert!(!early_depth_of(glass, &[el(16), el(kind)], true));
+        }
+    }
+
+    /// A pixel program whose console code tests depth before it declares
+    /// D3D12's early depth-stencil test (ShaderFlags bit 3) with
+    /// `VICTORY_EARLY_DEPTH` on, and not with it off nor where the console
+    /// tests after it; dxil.dll, where there is one, takes the declaration.
+    #[test]
+    fn the_consoles_early_depth_test_is_declared_with_the_switch() {
+        let translate = |db_shader_control: u32, on: bool| {
+            EARLY_DEPTH_FOR_TESTS.with(|c| c.set(Some(on)));
+            let words = [
+                0x7E00_02F2u32, // v_mov_b32 v0, 1.0
+                0xF800_180F,
+                0x0000_0000, // exp mrt0, v0, v0, v0, v0 done vm
+                0xBF81_0000,
+            ];
+            let native = NativeProgram {
+                stage: HwStage::Ps,
+                wave64: false,
+                vgprs: 1,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Ps {
+                    inputs: vec![],
+                    input_addr: 0,
+                    db_shader_control,
+                    patches: vec![],
+                },
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let target = SigElement {
+                name: "SV_Target".into(),
+                index: 0,
+                kind: 16,
+                comp: 9,
+                interp: 0,
+                row: Some(0),
+                col: 0,
+                cols: 4,
+                usage: 15,
+                half: false,
+            };
+            let osg1 = container::signature(&[target], false);
+            let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+            let c = Container::parse(&bytes).unwrap();
+            let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let outputs = signature(c.part(FourCC::OSG1).unwrap().data).unwrap();
+            let lowered = lower::lower(&lower::Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs,
+                prims: vec![],
+                mesh_stride: 0,
+            })
+            .unwrap();
+            let out = emit(&c, &native, &p, &st, &io, &res).unwrap();
+            EARLY_DEPTH_FOR_TESTS.with(|c| c.set(None));
+            (lowered.early_depth, out.dxil)
+        };
+        let (given, dxil) = translate(0x1450, true);
+        assert!(given, "asked for and switched on: declared");
+        let (off, _) = translate(0x1450, false);
+        assert!(!off, "switched off: the late test, as before");
+        let (late, _) = translate(0, true);
+        assert!(!late, "the console tests after the program: the late test");
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut dxil.clone()).unwrap();
+        }
+        let _ = dxil;
     }
 
     /// A pixel program with an ordered section, as the console compiler
