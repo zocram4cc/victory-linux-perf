@@ -7,6 +7,11 @@
 //! what each descriptor slot holds, and follows the states of textures.
 //! Lists are recorded only while it is armed: a few frames ahead of the one
 //! captured, since the title records lists before they run.
+//!
+//! A process takes as many captures as it is asked for (`capture-1`,
+//! `capture-2`, ...), each one whole on its own: a capture reads all it
+//! needs afresh, and what is kept from the device's start on (objects,
+//! descriptors, states, shader code) is only added to by a capture.
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
@@ -41,7 +46,13 @@ pub struct Settings {
     /// Record lists from the start on, not only once a capture is near: for
     /// a title that submits lists it recorded long before.
     pub always: bool,
+    /// After a capture ends, how long asks for the next are not followed:
+    /// the title catches up on the time it stood frozen.
+    pub gap: std::time::Duration,
 }
+
+/// The rest after a capture, by default.
+pub const GAP: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum At {
@@ -56,7 +67,8 @@ pub enum At {
 
 impl Settings {
     /// From `VICTORY_RECORD`, `VICTORY_RECORD_AT` (seconds, or `f<frame>`),
-    /// `VICTORY_RECORD_FRAMES` and `VICTORY_RECORD_ALWAYS=1`.
+    /// `VICTORY_RECORD_FRAMES`, `VICTORY_RECORD_ALWAYS=1` and
+    /// `VICTORY_RECORD_GAP` (seconds of rest after a capture; 5).
     pub fn from_env() -> Option<Settings> {
         let folder = PathBuf::from(std::env::var_os("VICTORY_RECORD").filter(|v| !v.is_empty())?);
         let at = parse_at(&std::env::var("VICTORY_RECORD_AT").unwrap_or_default());
@@ -65,11 +77,17 @@ impl Settings {
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(1);
         let always = std::env::var_os("VICTORY_RECORD_ALWAYS").is_some_and(|v| v == "1");
+        let gap = std::env::var("VICTORY_RECORD_GAP")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|s| s.is_finite() && *s >= 0.0)
+            .map_or(GAP, std::time::Duration::from_secs_f64);
         Some(Settings {
             folder,
             at,
             frames: std::cmp::max(frames, 1),
             always,
+            gap,
         })
     }
 }
@@ -107,8 +125,9 @@ pub(super) struct Res {
     pub(super) clear: Option<[u32; 5]>,
     pub(super) subs: u32,
     pub(super) seen: gpu::Seen,
-    /// Made while a frame was being captured.
-    pub(super) late: bool,
+    /// The capture under way when it was made (0: none): to that capture it
+    /// is made during the frame; to later ones it is like any other.
+    pub(super) late: u32,
 }
 
 impl Res {
@@ -293,9 +312,11 @@ struct QueueState {
     kind: i32,
 }
 
-/// Shader code, written to `shaders.bin` as it is met, once each.
+/// Shader code, written to `shaders.bin` of the first capture as it is
+/// met, once each (later captures take a copy of what they name).
 pub(super) struct Codes {
     file: Option<std::fs::File>,
+    path: PathBuf,
     at: u64,
     index: HashMap<[u8; 32], u32>,
     pub(super) all: Vec<wire::Code>,
@@ -325,8 +346,17 @@ impl Ids {
 
 pub(super) struct Recorder {
     pub(super) settings: Settings,
-    /// Where this process' capture goes.
-    pub(super) folder: PathBuf,
+    /// Where this process' first capture goes (made at the start, as it
+    /// holds the shader code met).
+    first: PathBuf,
+    /// The last capture written.
+    last: Mutex<Option<PathBuf>>,
+    /// The number of the capture being taken (0: none), for resources made
+    /// meanwhile.
+    pub(super) capture: AtomicU32,
+    /// A capture was asked for and is not over: what cannot be recorded is
+    /// noted for it alone (`this`), not for all (`problems`).
+    pending: AtomicBool,
     pub(super) began: std::time::Instant,
     next: AtomicU32,
     ids: Ids,
@@ -355,8 +385,11 @@ pub(super) struct Recorder {
     /// (its last reference was going when ours was taken) is taken out: see
     /// `Recorder::gone`.
     pub(super) held: Mutex<HashMap<u32, ID3D12Resource>>,
-    /// What could not be recorded, with how often.
+    /// What could not be recorded, with how often: outside captures (it
+    /// holds for every capture after), and since the one under way was asked
+    /// for.
     problems: Mutex<BTreeMap<String, u64>>,
+    this: Mutex<BTreeMap<String, u64>>,
     /// Submissions and presents, one at a time.
     pub(super) submits: Mutex<snap::Phase>,
 }
@@ -405,20 +438,22 @@ fn ours() -> bool {
 
 impl Recorder {
     fn new(settings: Settings) -> std::io::Result<Recorder> {
-        std::fs::create_dir_all(&settings.folder)?;
-        let mut n = 1;
-        let folder = loop {
-            let folder = settings.folder.join(format!("capture-{n}"));
-            match std::fs::create_dir(&folder) {
-                Ok(()) => break folder,
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => n += 1,
-                Err(e) => return Err(e),
-            }
-        };
-        let file = std::fs::File::create(folder.join("shaders.bin"))?;
+        let folder = free_folder(&settings.folder)?;
+        let path = folder.join("shaders.bin");
+        // Read too: later captures copy from it.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)?;
+        let gap = settings.gap;
         Ok(Recorder {
             settings,
-            folder,
+            first: folder,
+            last: Mutex::default(),
+            capture: AtomicU32::new(0),
+            pending: AtomicBool::new(false),
             began: std::time::Instant::now(),
             next: AtomicU32::new(1),
             ids: Ids::default(),
@@ -434,6 +469,7 @@ impl Recorder {
             names: Mutex::default(),
             codes: Mutex::new(Codes {
                 file: Some(file),
+                path,
                 at: 0,
                 index: HashMap::new(),
                 all: Vec::new(),
@@ -446,7 +482,8 @@ impl Recorder {
             writes: Mutex::default(),
             held: Mutex::default(),
             problems: Mutex::default(),
-            submits: Mutex::new(snap::Phase::default()),
+            this: Mutex::default(),
+            submits: Mutex::new(snap::Phase::new(gap)),
         })
     }
 
@@ -460,7 +497,11 @@ impl Recorder {
     }
 
     pub(super) fn problem_times(&self, what: &str, n: u64) {
-        let mut problems = lock(&self.problems);
+        let mut problems = if self.pending.load(Ordering::SeqCst) {
+            lock(&self.this)
+        } else {
+            lock(&self.problems)
+        };
         let seen = problems.entry(what.to_owned()).or_insert(0);
         if *seen == 0 {
             tracing::warn!("frame recorder: {what}");
@@ -468,10 +509,14 @@ impl Recorder {
         *seen += n;
     }
 
-    /// The problems so far.
+    /// The problems of the capture under way: those outside captures, and
+    /// its own.
     pub(super) fn problems(&self) -> Vec<String> {
-        lock(&self.problems)
-            .iter()
+        let mut all = lock(&self.problems).clone();
+        for (what, n) in lock(&self.this).iter() {
+            *all.entry(what.clone()).or_insert(0) += n;
+        }
+        all.iter()
             .map(|(what, n)| {
                 if *n == 1 {
                     what.clone()
@@ -484,6 +529,56 @@ impl Recorder {
 
     pub(super) fn arm(&self, on: bool) {
         self.armed.store(on, Ordering::SeqCst);
+    }
+
+    /// A capture was asked for: lists are recorded, and problems are its own
+    /// from now on.
+    pub(super) fn asked(&self) {
+        lock(&self.this).clear();
+        self.pending.store(true, Ordering::SeqCst);
+        self.arm(true);
+    }
+
+    /// The capture asked for is over: written to `folder`, or not (None).
+    /// The recorder is as it was before it was asked for.
+    pub(super) fn over(&self, folder: Option<PathBuf>) {
+        self.watching.store(false, Ordering::SeqCst);
+        self.capture.store(0, Ordering::SeqCst);
+        self.arm(self.settings.always);
+        self.pending.store(false, Ordering::SeqCst);
+        lock(&self.this).clear();
+        lock(&self.writes).clear();
+        if folder.is_some() {
+            *lock(&self.last) = folder;
+        }
+    }
+
+    /// The folder for capture `n` of this process: the one made at the
+    /// start for the first, the next free `capture-<n>` for the others.
+    pub(super) fn folder_for(&self, n: u32) -> std::io::Result<PathBuf> {
+        if n <= 1 {
+            return Ok(self.first.clone());
+        }
+        free_folder(&self.settings.folder)
+    }
+
+    /// The shader code met so far, and a `shaders.bin` in `folder` that
+    /// holds it (the one collected into, or a copy of what it held now).
+    pub(super) fn codes_into(&self, folder: &std::path::Path) -> std::io::Result<Vec<wire::Code>> {
+        let (all, at, file, path) = {
+            let codes = lock(&self.codes);
+            let file = match &codes.file {
+                Some(f) => f.try_clone()?,
+                None => return Err(std::io::Error::other("no shader code was collected")),
+            };
+            (codes.all.clone(), codes.at, file, codes.path.clone())
+        };
+        let to = folder.join("shaders.bin");
+        if to == path {
+            return Ok(all);
+        }
+        copy_prefix(&file, at, &to)?;
+        Ok(all)
     }
 
     pub(super) fn device(&self) -> Option<ID3D12Device> {
@@ -567,7 +662,11 @@ impl Recorder {
             0
         };
         let placed = matches!(place, Place::Placed { .. });
-        let late = self.watching.load(Ordering::SeqCst);
+        let late = if self.watching.load(Ordering::SeqCst) {
+            self.capture.load(Ordering::SeqCst)
+        } else {
+            0
+        };
         {
             let mut states = lock(&self.states);
             if !is_buffer {
@@ -594,7 +693,7 @@ impl Recorder {
         });
         write(&self.resources).insert(id, res);
         self.ids.set(p as usize, id);
-        if late {
+        if late != 0 {
             lock(&self.held).insert(id, ID3D12Resource::clone(&object));
         }
         self.tell_gone(
@@ -704,7 +803,6 @@ impl Recorder {
     }
 
     fn code(&self, bytes: &[u8]) -> u32 {
-        use std::io::Write;
         let hash = *blake3::hash(bytes).as_bytes();
         let mut codes = lock(&self.codes);
         if let Some(&i) = codes.index.get(&hash) {
@@ -712,10 +810,11 @@ impl Recorder {
         }
         let i = codes.all.len() as u32;
         let at = codes.at;
+        // At its place: the file is also read from (`codes_into`).
         let wrote = codes
             .file
-            .as_mut()
-            .is_some_and(|f| f.write_all(bytes).is_ok());
+            .as_ref()
+            .is_some_and(|f| write_all_at(f, bytes, at).is_ok());
         if !wrote {
             drop(codes);
             self.problem("shader code could not be written");
@@ -839,10 +938,14 @@ pub(crate) fn from_env(device: &ID3D12Device) {
 }
 
 /// Starts the recorder (once a process) and hooks `device`, which must have
-/// made nothing the frame will use. Where the capture will be.
+/// made nothing the frame will use. Where the first capture will be.
 pub fn start(settings: Settings, device: &ID3D12Device) -> std::io::Result<PathBuf> {
+    if RECORDER.get().is_some() {
+        // Before a folder is made for nothing.
+        return Err(std::io::Error::other("the recorder is already on"));
+    }
     let r = Recorder::new(settings)?;
-    let folder = r.folder.clone();
+    let folder = r.first.clone();
     if RECORDER.set(r).is_err() {
         return Err(std::io::Error::other("the recorder is already on"));
     }
@@ -909,10 +1012,56 @@ pub fn present(texture: &ID3D12Resource, state: D3D12_RESOURCE_STATES) {
     }
 }
 
-/// Where the capture is, once it is done.
+/// Where the last capture written is.
 pub fn finished() -> Option<PathBuf> {
-    let r = recorder()?;
-    lock(&r.submits).done().then(|| r.folder.clone())
+    lock(&recorder()?.last).clone()
+}
+
+/// A new `capture-<n>` in `folder`, the first free one.
+fn free_folder(folder: &std::path::Path) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(folder)?;
+    let mut n = 1;
+    loop {
+        let to = folder.join(format!("capture-{n}"));
+        match std::fs::create_dir(&to) {
+            Ok(()) => return Ok(to),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => n += 1,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// All of `bytes` into `file` at `at`, whatever its cursor.
+fn write_all_at(file: &std::fs::File, mut bytes: &[u8], mut at: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !bytes.is_empty() {
+        let n = file.seek_write(bytes, at)?;
+        if n == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        bytes = &bytes[n..];
+        at += n as u64;
+    }
+    Ok(())
+}
+
+/// The first `len` bytes of `from` into a new file `to`, read at their
+/// places (`from` may be written to meanwhile, past them).
+fn copy_prefix(from: &std::fs::File, len: u64, to: &std::path::Path) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    let out = std::fs::File::create(to)?;
+    let mut buf = vec![0u8; 8 << 20];
+    let mut at = 0u64;
+    while at < len {
+        let want = buf.len().min((len - at) as usize);
+        let n = from.seek_read(&mut buf[..want], at)?;
+        if n == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        write_all_at(&out, &buf[..n], at)?;
+        at += n as u64;
+    }
+    Ok(())
 }
 
 /// Sets a method of a table to a function of its type.

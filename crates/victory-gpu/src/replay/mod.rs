@@ -13,5 +13,6 @@ pub mod play;
 mod pso;
 pub mod record;
 mod snap;
+mod trigger;
 mod states;
 mod wire;

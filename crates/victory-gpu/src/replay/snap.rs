@@ -14,6 +14,7 @@ use windows::core::Interface;
 
 use super::gpu::{self, Seen, Worker};
 use super::record::{At, Heap, Ours, Recorder, Res, lock, not_recorded_calls, read};
+use super::trigger::{self, Gate, Verdict};
 use super::states::{COMMON, COPY_SOURCE, Change, States};
 use super::wire::{
     self, ALL, Cmd, Content, Delta, Loc, MISSING, NONE, Place, Slot, Va, ZERO, slot,
@@ -35,19 +36,20 @@ const PATIENCE: u64 = 100;
 
 #[derive(Default)]
 enum Stage {
+    /// For a capture to be asked for (again, after one).
     #[default]
     Waiting,
-    /// Lists are recorded, since this many presents.
-    Armed(u64),
+    /// Lists are recorded for capture `.1`, since `.0` presents.
+    Armed(u64, u32),
     Capturing(Box<Capture>),
-    Done,
 }
 
 /// Where the recorder is.
-#[derive(Default)]
 pub(super) struct Phase {
     presents: u64,
     stage: Stage,
+    /// Keeps captures apart.
+    gate: Gate,
     /// Submissions of this frame so far, and lists among them that were not
     /// recorded.
     submits: u32,
@@ -55,8 +57,14 @@ pub(super) struct Phase {
 }
 
 impl Phase {
-    pub(super) fn done(&self) -> bool {
-        matches!(self.stage, Stage::Done)
+    pub(super) fn new(gap: std::time::Duration) -> Phase {
+        Phase {
+            presents: 0,
+            stage: Stage::Waiting,
+            gate: Gate::new(gap),
+            submits: 0,
+            missing: 0,
+        }
     }
 }
 
@@ -108,13 +116,17 @@ pub(super) fn submit(
     states.decay();
 }
 
-/// The capture failed.
+/// The capture failed: the recorder waits for the next ask.
 fn stop(r: &Recorder, phase: &mut Phase, e: &(dyn std::error::Error + Send + Sync)) {
     tracing::error!("frame recorder: the capture failed: {e}");
-    let _ = std::fs::write(r.folder.join("failed.txt"), e.to_string());
-    phase.stage = Stage::Done;
-    r.watching.store(false, Ordering::SeqCst);
-    r.arm(false);
+    let folder = match &phase.stage {
+        Stage::Capturing(c) => c.folder.clone(),
+        _ => r.settings.folder.clone(),
+    };
+    let _ = std::fs::write(folder.join("failed.txt"), e.to_string());
+    phase.stage = Stage::Waiting;
+    phase.gate.end(Instant::now());
+    r.over(None);
     let held = std::mem::take(&mut *lock(&r.held));
     drop(held);
 }
@@ -128,20 +140,46 @@ pub(super) fn present(r: &Recorder, texture: &ID3D12Resource, state: u32) {
         std::mem::take(&mut phase.missing),
     );
     let mut finished = None;
+    // Taken whenever it is there: an ask that is not followed is not kept.
+    let asked = trigger::take(&r.settings.folder);
     match &mut phase.stage {
         Stage::Waiting => {
-            let due = match r.settings.at {
-                At::Seconds(s) => r.began.elapsed().as_secs_f64() >= s,
-                At::Frame(f) => presents >= f,
-                At::Trigger => false,
-            };
-            if due || r.settings.folder.join("go").exists() {
-                tracing::info!(presents, "frame recorder: lists are recorded from now on");
-                r.arm(true);
-                phase.stage = Stage::Armed(presents);
+            // The time or frame set asks for the first capture only.
+            let due = phase.gate.taken() == 0
+                && match r.settings.at {
+                    At::Seconds(s) => r.began.elapsed().as_secs_f64() >= s,
+                    At::Frame(f) => presents >= f,
+                    At::Trigger => false,
+                };
+            if due || asked {
+                match phase.gate.ask(Instant::now()) {
+                    Verdict::Take(n) => {
+                        tracing::info!(
+                            presents,
+                            capture = n,
+                            why = if asked { "the trigger file" } else { "the time set" },
+                            "frame recorder: lists are recorded from now on"
+                        );
+                        r.asked();
+                        phase.stage = Stage::Armed(presents, n);
+                    }
+                    Verdict::Resting(left) => tracing::info!(
+                        "frame recorder: the trigger is not followed: {:.1} s of rest after the last capture remain; touch it again then",
+                        left.as_secs_f64()
+                    ),
+                    Verdict::Busy => tracing::info!("frame recorder: the trigger is not followed: a capture is under way"),
+                }
             }
         }
-        Stage::Armed(since) => {
+        _ if asked => {
+            tracing::info!("frame recorder: the trigger is not followed: a capture is under way");
+        }
+        _ => {}
+    }
+    match &mut phase.stage {
+        Stage::Waiting => {}
+        Stage::Armed(since, n) => {
+            let n = *n;
             let waited = presents - *since;
             let whole = submits > 0 && missing == 0;
             if waited >= 2 && (whole || waited > PATIENCE) {
@@ -153,7 +191,7 @@ pub(super) fn present(r: &Recorder, texture: &ID3D12Resource, state: u32) {
                     waited,
                     "frame recorder: the next frame is captured"
                 );
-                match Capture::new(r) {
+                match Capture::new(r, n) {
                     Ok(c) => phase.stage = Stage::Capturing(Box::new(c)),
                     Err(e) => stop(r, &mut phase, &*e),
                 }
@@ -171,17 +209,17 @@ pub(super) fn present(r: &Recorder, texture: &ID3D12Resource, state: u32) {
             match done {
                 Ok(false) => {}
                 Ok(true) => {
-                    r.watching.store(false, Ordering::SeqCst);
-                    r.arm(false);
-                    if let Stage::Capturing(c) = std::mem::replace(&mut phase.stage, Stage::Done) {
+                    if let Stage::Capturing(c) = std::mem::take(&mut phase.stage) {
+                        r.over(Some(c.folder.clone()));
                         finished = Some((c, std::mem::take(&mut *lock(&r.held))));
                     }
+                    phase.gate.end(Instant::now());
                 }
                 Err(e) => stop(r, &mut phase, &*e),
             }
         }
         // A frame without a submission: the next one.
-        Stage::Capturing(_) | Stage::Done => {}
+        Stage::Capturing(_) => {}
     }
     drop(phase);
     // What was kept alive goes without a lock held.
@@ -297,6 +335,9 @@ unsafe impl Send for CpuBuffer {}
 unsafe impl Sync for CpuBuffer {}
 
 struct Capture {
+    /// Its number in this process (1 for the first), and where it goes.
+    number: u32,
+    folder: std::path::PathBuf,
     worker: Worker,
     others: Vec<Worker>,
     started: bool,
@@ -325,8 +366,11 @@ struct Capture {
 }
 
 impl Capture {
-    fn new(r: &Recorder) -> Result<Capture, Fault> {
+    fn new(r: &Recorder, number: u32) -> Result<Capture, Fault> {
         let _ours = Ours::new();
+        let folder = r.folder_for(number)?;
+        // Descriptor writes of before are in the heaps it reads whole.
+        lock(&r.writes).clear();
         let device = r.device().ok_or("no device")?;
         let queues = lock(&r.queues).clone();
         let direct = queues
@@ -338,6 +382,10 @@ impl Capture {
             others.push(Worker::new(&device, queue)?);
         }
         Ok(Capture {
+            deltas: File::create(folder.join("deltas.bin"))?,
+            present_file: File::create(folder.join("present.bin"))?,
+            number,
+            folder,
             worker: Worker::new(&device, &direct.0)?,
             others,
             started: false,
@@ -350,12 +398,10 @@ impl Capture {
             known: HashSet::new(),
             viewed: HashSet::new(),
             blocks: Vec::new(),
-            deltas: File::create(r.folder.join("deltas.bin"))?,
             delta_at: AtomicU64::new(0),
             lists: Vec::new(),
             submits: Vec::new(),
             presents: Vec::new(),
-            present_file: File::create(r.folder.join("present.bin"))?,
             present_at: 0,
             calls: not_recorded_calls(),
             began: Instant::now(),
@@ -377,6 +423,7 @@ impl Capture {
     /// Before the first submission of the frame: what the card holds.
     fn start(&mut self, r: &Recorder) -> Result<(), Fault> {
         self.began = Instant::now();
+        r.capture.store(self.number, Ordering::SeqCst);
         r.watching.store(true, Ordering::SeqCst);
         self.started = true;
         self.worker.idle()?;
@@ -387,7 +434,7 @@ impl Capture {
         {
             let live = read(&r.resources);
             let mut held = lock(&r.held);
-            for res in live.values().filter(|res| !res.late) {
+            for res in live.values().filter(|res| res.late != self.number) {
                 let object = res.object();
                 // SAFETY: a live resource, or one whose end waits for the
                 // lock held here (`Recorder::gone`): the count tells which.
@@ -541,7 +588,7 @@ impl Capture {
                 D3D12_RESOURCE_FLAG_NONE,
             )?);
         }
-        let file = File::create(r.folder.join("contents.bin"))?;
+        let file = File::create(self.folder.join("contents.bin"))?;
         let end = AtomicU64::new(0);
         let contents: std::sync::Mutex<Vec<Content>> = std::sync::Mutex::default();
         let failed: std::sync::Mutex<Option<std::io::Error>> = std::sync::Mutex::default();
@@ -900,7 +947,7 @@ impl Capture {
         self.present_at += total;
         match gpu::rgb(width, height, pitch, desc.Format.0, bytes) {
             Some(rgb) => std::fs::write(
-                r.folder.join(format!("frame-{}.png", self.frame)),
+                self.folder.join(format!("frame-{}.png", self.frame)),
                 crate::capture::png(width, height, &rgb),
             )?,
             None => r.problem("the presented format is not shown in a PNG"),
@@ -915,7 +962,8 @@ impl Capture {
         {
             let names = lock(&r.names);
             for res in read(&r.resources).values() {
-                let state = match (res.is_buffer(), res.late) {
+                let late = res.late == self.number;
+                let state = match (res.is_buffer(), late) {
                     (true, _) => vec![COMMON],
                     (_, true) => vec![res.made_in as u32],
                     _ => self.states.get(res.id).unwrap_or(vec![COMMON]),
@@ -928,7 +976,7 @@ impl Capture {
                     clear: res.clear,
                     state,
                     idle: self.idle.contains(&res.id),
-                    late: res.late,
+                    late,
                     name: names.get(&res.id).cloned().unwrap_or_default(),
                 });
             }
@@ -1044,7 +1092,7 @@ impl Capture {
             heaps,
             resources,
             roots,
-            codes: lock(&r.codes).all.clone(),
+            codes: r.codes_into(&self.folder)?,
             pipelines,
             signatures,
             descriptor_heaps: self
@@ -1077,9 +1125,9 @@ impl Capture {
             contents: std::mem::take(&mut self.contents),
             presents: std::mem::take(&mut self.presents),
         };
-        frame.write(&r.folder.join("frame.bin"))?;
-        std::fs::write(r.folder.join("notes.txt"), notes.join("\n"))?;
-        tracing::info!(folder = %r.folder.display(), "frame recorder: the frame is captured");
+        frame.write(&self.folder.join("frame.bin"))?;
+        std::fs::write(self.folder.join("notes.txt"), notes.join("\n"))?;
+        tracing::info!(folder = %self.folder.display(), capture = self.number, "frame recorder: the frame is captured");
         Ok(())
     }
 }

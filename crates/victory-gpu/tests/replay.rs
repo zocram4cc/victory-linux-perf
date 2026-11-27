@@ -1653,6 +1653,7 @@ fn a_frame_is_recorded_and_replayed() {
         at: At::Frame(1),
         frames: 1,
         always: false,
+        gap: std::time::Duration::ZERO,
     };
     let folder = record::start(settings, &device).unwrap();
     assert!(record::on());
@@ -1663,7 +1664,8 @@ fn a_frame_is_recorded_and_replayed() {
                 folder: dir.path().to_owned(),
                 at: At::Trigger,
                 frames: 1,
-                always: false
+                always: false,
+                gap: record::GAP,
             },
             &device
         )
@@ -1688,6 +1690,18 @@ fn a_frame_is_recorded_and_replayed() {
         after == without,
         "the recorder changed what the program makes"
     );
+    // The trigger file asks for a second capture in the same process: one
+    // of its own, whole (it is replayed below), and the file is taken.
+    std::fs::write(dir.path().join("go"), "").unwrap();
+    let mut n = 5;
+    while record::finished().as_ref() == Some(&folder) && n < 20 {
+        scene.frame(n);
+        n += 1;
+    }
+    let second = record::finished().unwrap();
+    assert_ne!(second, folder, "a second capture, in a folder of its own");
+    assert!(!dir.path().join("go").exists(), "the trigger file is taken");
+    let expected_second = scene.outcome();
     drop(scene);
     record::unhook(&device);
     assert_eq!(table_of(&device), own, "the device is as it was");
@@ -1701,6 +1715,7 @@ fn a_frame_is_recorded_and_replayed() {
         "frame-0.png",
     ] {
         assert!(folder.join(name).exists(), "{name}");
+        assert!(second.join(name).exists(), "{name} of the second capture");
     }
     println!(
         "{}",
@@ -1711,8 +1726,13 @@ fn a_frame_is_recorded_and_replayed() {
         loops: 3,
         ..Default::default()
     };
-    let mut player = Player::load(dir.path(), &plain).unwrap();
+    let mut player = Player::load(&folder, &plain).unwrap();
     check(&mut player, &plain, &expected, "unchanged");
+    {
+        // The folder's last capture: the second.
+        let mut player = Player::load(dir.path(), &plain).unwrap();
+        check(&mut player, &plain, &expected_second, "the second capture");
+    }
     let detailed = Options {
         detailed: true,
         ..plain.clone()
