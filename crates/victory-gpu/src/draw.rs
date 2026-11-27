@@ -16,6 +16,7 @@ use victory_shader::resource::RootIndexedView;
 use victory_shader::{ResourceType, RootType, UsedResource};
 
 use crate::descriptor::View;
+use crate::descriptor::host::TextureRecheck;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -1046,6 +1047,29 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 /// Frames after a whole upload of a texture picked by index at which its
 /// memory is looked at again, each counted from the look before.
 const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
+
+/// Whether a slot found changed in place without a notice keeps the longest
+/// wait of [`RECHECK_FRAMES`] after its schedule ended, as the slots
+/// [`recheck_forever`] keeps do (`VICTORY_HEAP_RECHECK_PERSISTENT=1`; off by
+/// default: out of the queue after the fifth look, as before).
+fn persistent_heap_recheck() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("VICTORY_HEAP_RECHECK_PERSISTENT").is_some_and(|v| v == "1"));
+    *ON
+}
+
+/// The wait of the next look at an uploaded texture after `unchanged_looks`
+/// looks that found it unchanged, with that look's count. After the last
+/// wait of [`RECHECK_FRAMES`] there is none, unless `keep_longest`: then the
+/// longest wait again.
+fn next_texture_recheck(unchanged_looks: u8, keep_longest: bool) -> Option<(u8, u64)> {
+    let next = usize::from(unchanged_looks) + 1;
+    if let Some(&wait) = RECHECK_FRAMES.get(next) {
+        Some((next as u8, wait))
+    } else {
+        keep_longest.then_some((unchanged_looks, RECHECK_FRAMES[RECHECK_FRAMES.len() - 1]))
+    }
+}
 
 /// Whether a slot stays on the longest wait of [`RECHECK_FRAMES`] after the
 /// schedule ended, for as long as it lives (`VICTORY_HEAP_RECHECK_FOREVER=1`;
@@ -3075,7 +3099,9 @@ impl State {
             // (all their blocks are shown at other addresses too), and each
             // was shown four frames late, over and over.
             let mut again_in = RECHECK_FRAMES[0];
-            if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
+            let mut changed_in_place = false;
+            if let Some(mut checked) = host.texture_slot_checked(index, write) {
+                let TextureRecheck { address: at, bytes: len, fingerprint, unchanged_looks, uploaded, .. } = checked;
                 // A whole look reads all of the texture: this frame's bytes
                 // bound how many; the slots over it stay due for a later
                 // pass, which reads them once the next frame has begun.
@@ -3088,27 +3114,22 @@ impl State {
                     HEAP_TEXTURES_FULL_RECHECK[0].fetch_add(1, Ordering::Relaxed);
                     HEAP_TEXTURES_FULL_RECHECK[1].fetch_add(len, Ordering::Relaxed);
                 }
-                if recheck_fingerprint(at, len) == print {
+                if recheck_fingerprint(at, len) == fingerprint {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
-                    match RECHECK_FRAMES.get(usize::from(looks) + 1) {
-                        Some(wait) => {
-                            host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
+                    let keep_longest = recheck_forever() || (checked.changed_in_place && persistent_heap_recheck());
+                    match next_texture_recheck(unchanged_looks, keep_longest) {
+                        Some((looks, wait)) => {
+                            checked.unchanged_looks = looks;
+                            host.texture_slot_recheck(index, write, frame + wait, checked);
                         }
-                        // The schedule has ended: the slot stays on its
-                        // longest wait (`recheck_forever`).
-                        None if recheck_forever() => host.texture_slot_recheck(
-                            index,
-                            write,
-                            frame + RECHECK_FRAMES[RECHECK_FRAMES.len() - 1],
-                            (at, len),
-                            print,
-                            looks,
-                            uploaded,
-                        ),
+                        // The schedule has ended: the slot stays on its longest
+                        // wait if kept (`recheck_forever`, or
+                        // `VICTORY_HEAP_RECHECK_PERSISTENT` for one changed in place).
                         None => host.texture_slot_done(index, write, None),
                     }
                     continue;
                 }
+                changed_in_place = true;
                 if recheck_soon() {
                     again_in = 1;
                 }
@@ -3128,12 +3149,27 @@ impl State {
                         address = format_args!("{at:#x}"),
                         bytes = len,
                         frames_after_upload = frame.saturating_sub(uploaded),
-                        looks,
+                        looks = unchanged_looks,
                         changed = n + 1,
                         "a texture picked by index changed after its upload with nothing to tell of it: uploaded again"
                     );
                 }
             }
+            let schedule_recheck = |address, bytes| {
+                host.texture_slot_recheck(
+                    index,
+                    write,
+                    frame + again_in,
+                    TextureRecheck {
+                        address,
+                        bytes,
+                        fingerprint: recheck_fingerprint(address, bytes),
+                        unchanged_looks: 0,
+                        uploaded: frame,
+                        changed_in_place,
+                    },
+                );
+            };
             let mut partly = None;
             let mut there = None;
             if let Some(View::Placed(false, resource, desc)) = heap.handle(index).and_then(crate::descriptor::view) {
@@ -3284,10 +3320,7 @@ impl State {
                 let again = partly.map(|mapped| (frame + 1, mapped));
                 let memory = if again.is_none() && heap_recheck() { crate::texture::title_span(resource, first) } else { None };
                 match memory {
-                    Some((at, len)) => {
-                        let print = recheck_fingerprint(at, len);
-                        host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
-                    }
+                    Some((at, len)) => schedule_recheck(at, len),
                     None => host.texture_slot_done(index, write, again),
                 }
                 continue;
@@ -3413,10 +3446,7 @@ impl State {
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
             match memory {
                 // Whole and uploaded: looked at again (see above).
-                Some((at, len)) => {
-                    let print = recheck_fingerprint(at, len);
-                    host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
-                }
+                Some((at, len)) => schedule_recheck(at, len),
                 None => host.texture_slot_done(index, write, again),
             }
         }
@@ -5886,7 +5916,19 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::staging_budget_per_frame;
+    use super::{next_texture_recheck, staging_budget_per_frame};
+
+    #[test]
+    fn keeping_the_final_recheck_interval_is_asked_for() {
+        for keep in [false, true] {
+            assert_eq!(next_texture_recheck(0, keep), Some((1, 12)));
+            assert_eq!(next_texture_recheck(1, keep), Some((2, 40)));
+            assert_eq!(next_texture_recheck(2, keep), Some((3, 120)));
+            assert_eq!(next_texture_recheck(3, keep), Some((4, 400)));
+        }
+        assert_eq!(next_texture_recheck(4, false), None);
+        assert_eq!(next_texture_recheck(4, true), Some((4, 400)));
+    }
 
     /// A look that reads the whole texture sees a square written between
     /// the three windows the short look reads; both find memory left alone
