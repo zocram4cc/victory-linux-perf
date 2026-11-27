@@ -436,6 +436,22 @@ if (( bench_secs > 0 )); then
   timer=$!
 fi
 
+# Headless, the process waited for is gamescope, which can stay up after
+# the title has ended (runs 20261127-035630 and -042354 hung 20 minutes
+# after it). Once the title's own process has come and gone, gamescope
+# gets 15 s to end, then SIGTERM.
+if (( headless )); then
+  ( seen=0
+    while kill -0 "$title" 2>/dev/null; do
+      if "$repo/scripts/victory-title-pid.sh" "$title" >/dev/null; then seen=1
+      elif (( seen )); then
+        sleep 15
+        kill -0 "$title" 2>/dev/null && kill -TERM -- -"$title" 2>/dev/null
+        break
+      fi
+      sleep 2
+    done ) &
+fi
 code=0
 while kill -0 "$title" 2>/dev/null; do
   wait "$title" && code=0 || code=$?
@@ -446,7 +462,12 @@ trap '' INT
 trap - TERM HUP
 [[ -n "${timer:-}" ]] && kill "$timer" 2>/dev/null || true
 kill "$sampler" 2>/dev/null || true
-wait "$sampler" ${timer:+"$timer"} 2>/dev/null || true
+# At most 10 s for the sampler and the bench timer: a helper stuck in a
+# GPU query must not keep the run's end from being written.
+for _ in $(seq 20); do
+  kill -0 "$sampler" 2>/dev/null || { [[ -n "${timer:-}" ]] && kill -0 "$timer" 2>/dev/null; } || break
+  sleep 0.5
+done
 
 # MangoHud names its files after the program; give them fixed names.
 for f in "$run"/*_summary.csv; do [[ -e "$f" ]] && mv -f "$f" "$run/mangohud-summary.csv"; done

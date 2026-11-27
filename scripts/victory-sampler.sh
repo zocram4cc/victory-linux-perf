@@ -47,7 +47,9 @@ while kill -0 "$watch" 2>/dev/null; do
   fi
   mem=$(awk '/^MemAvailable:/ {a=$2} /^SwapTotal:/ {st=$2} /^SwapFree:/ {sf=$2} /^Committed_AS:/ {c=$2}
              END {printf "%.0f,%.0f,%.0f", a/1024, (st-sf)/1024, c/1024}' /proc/meminfo)
-  gpu=$(nvidia-smi --query-gpu=memory.used,utilization.gpu,clocks.gr,temperature.gpu \
+  # Bounded: nvidia-smi can block while the driver tears a device down
+  # (the sampler stopped at the title's end in run 20261127-044226).
+  gpu=$(timeout 5 nvidia-smi --query-gpu=memory.used,utilization.gpu,clocks.gr,temperature.gpu \
           --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
   [[ -n "$gpu" ]] || gpu=",,,"
   echo "$t,$rss,$swap,$mem,$gpu,$(read_cpus)" >> "$out"
