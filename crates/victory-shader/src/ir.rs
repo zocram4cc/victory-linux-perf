@@ -285,10 +285,17 @@ fn unspill(
             _ => None,
         };
         match (inst.name()?, v.dst?, v.src.as_slice()) {
-            ("v_writelane_b32", Operand::Vector { reg, .. }, [Operand::Scalar { code, .. }, k]) if *code < 105 => {
+            // SGPRs and VCC (106/107: a scalar pair like any other; the
+            // console compiler parks it beside the rest, and one such save
+            // used to keep the whole VGPR from being unspilled).
+            ("v_writelane_b32", Operand::Vector { reg, .. }, [Operand::Scalar { code, .. }, k])
+                if *code < 105 || matches!(*code, VCC | 107) =>
+            {
                 Some((true, reg, *code, lane(k)?))
             }
-            ("v_readlane_b32", Operand::Scalar { code, .. }, [Operand::Vector { reg, .. }, k]) if code < 105 => {
+            ("v_readlane_b32", Operand::Scalar { code, .. }, [Operand::Vector { reg, .. }, k])
+                if code < 105 || matches!(code, VCC | 107) =>
+            {
                 Some((false, *reg, code, lane(k)?))
             }
             _ => None,

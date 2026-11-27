@@ -87,6 +87,7 @@ fn main() {
                 ok += 1;
                 ok_list.push(name.trim_start_matches("218_").to_owned());
             }
+            Err(e) if std::env::var_os("K_FULL_ERRORS").is_some() => errors.entry(e).or_default().push(name),
             Err(e) => {
                 // One group per kind of error: without the code offset.
                 let e = match (e.find(" code at "), e.rfind(": ")) {
