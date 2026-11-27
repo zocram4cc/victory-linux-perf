@@ -7,7 +7,7 @@
 #               Light DRED is requested by default for diag and requires --features diagnostics.
 # -More         other settings: -More @{VICTORY_PANEL='1'}
 # -FrameGen     AMD frame generation (about twice the frames shown; fast motion ghosts):
-#               Series S, renderer ports 1, 2, 5, 6, 7, the 60 fps unlock; needs -FidelityFxDir
+#               Series S, renderer ports 1, 2, 5, 6, 7, the 60 fps unlock, BAR windows; needs -FidelityFxDir
 # -FidelityFxDir the FidelityFX SDK's Kits\FidelityFX\signedbin folder
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
 param(
@@ -39,6 +39,9 @@ if ($FrameGen) {
     foreach ($p in 'CONSTANTS', 'DESCRIPTORS', 'CBV', 'GUARD', 'JOURNAL') { $settings["VICTORY_PORT_$p"] = '1' }
     $settings.VICTORY_FRAME_INTERVAL_MS = '16.667'; $settings.VICTORY_FRAMEGEN = '1'
     $settings.VICTORY_FIDELITYFX_DIR = $FidelityFxDir
+    # Measured with frame generation: steadier with the windows in the card's memory through
+    # Resizable BAR (99.4 % of seconds at 30+ shown); VICTORY_SKIP_WC_BACK is on by default.
+    $settings.VICTORY_WINDOWS_BAR_MB = '4096'
     $console = @('--console', 'series-s')
 }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
