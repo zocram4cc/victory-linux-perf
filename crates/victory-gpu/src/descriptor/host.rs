@@ -716,6 +716,12 @@ impl Spans {
     /// The first span that starts inside `[start, end)` past the first
     /// [`HEAD`] bytes of it.
     fn next_start(&self, start: u64, end: u64) -> Option<u64> {
+        // A texture no longer than its first block has no room for one;
+        // the range would start past its end, which panics (fxceless
+        // 32a8c87d: VICTORY_PACKED_LEVELS asks for textures of any size).
+        if start.saturating_add(HEAD) >= end {
+            return None;
+        }
         self.by_start.range(start.saturating_add(HEAD)..end).next().map(|(at, _)| *at)
     }
 
@@ -5135,6 +5141,19 @@ mod tests {
             assert!(neutral_for(&view(8), at).is_none());
             assert!(host.device.GetDeviceRemovedReason().is_ok());
         }
+    }
+
+    /// The next texture placed inside a texture's span is found past its
+    /// first block; a texture no longer than that block has none (and the
+    /// search does not panic: fxceless 32a8c87d).
+    #[test]
+    fn the_next_texture_inside_a_span_is_found_past_its_first_block() {
+        let mut spans = Spans::default();
+        spans.note(1, 0x10000, 0x50000, true);
+        spans.note(2, 0x14000, 0x15000, true);
+        assert_eq!(spans.next_start(0x10000, 0x50000), Some(0x14000));
+        assert_eq!(spans.next_start(0x10000, 0x10800), None);
+        assert_eq!(spans.next_start(0x14000, 0x15000), None);
     }
 
     /// Memory past the levels a slot's view shows is not its texture's.

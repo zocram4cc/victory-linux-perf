@@ -3531,6 +3531,13 @@ impl State {
             match memory {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
+                    // (`VICTORY_PACKED_LEVELS=1`: of its own bytes only,
+                    // up to where the next texture starts inside it.)
+                    let len = if crate::texture::packed_levels() {
+                        crate::descriptor::host::next_start(at, at.saturating_add(len)).map_or(len, |next| next - at)
+                    } else {
+                        len
+                    };
                     let print = crate::texture::fingerprint(at, len);
                     host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
                 }

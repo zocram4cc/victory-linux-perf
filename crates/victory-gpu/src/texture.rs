@@ -689,6 +689,30 @@ fn once() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_ONCE").is_none_or(|v| v != "0"))
 }
 
+/// `VICTORY_PACKED_LEVELS=1` (off by default, as upstream: fxceless #1401,
+/// b2230981 and 32a8c87d by lines9686-rgb): a placed texture inside whose
+/// memory at full size another placed texture starts (the title holds only
+/// its smallest levels and puts the next texture where the larger ones
+/// would be) is read only as far as that start; the levels past it are
+/// zeros in its host copy. Without it only textures with levels on demand
+/// were cut so (`VICTORY_LEVELS_ON_DEMAND`, off in the Linux launcher), and
+/// any other such texture showed its neighbour's bytes as its own large
+/// levels: multicoloured blocks on skin, or a piece of another picture.
+/// Upstream also starts such a texture's views at its first level before
+/// the cut (`VICTORY_PARTIAL_CLAMP`), which this tree does not have yet:
+/// here the cut levels read as zeros (dark) where it is seen up close. Its
+/// look after an upload reads its own bytes alone.
+pub(crate) fn packed_levels() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_PACKED_LEVELS").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("VICTORY_PACKED_LEVELS=1: placed textures read up to the next one inside them");
+        }
+        on
+    })
+}
+
 /// A 128-bit digest of `bytes`, to tell a texture's memory changed: four
 /// lanes of folded multiplications over 64 bytes at a time. (Not a
 /// cryptographic one, which took 0.27 ms a megabyte, four times the detiling
@@ -788,6 +812,12 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     // of its memory changed. The levels are judged anew: detiled again at
     // this list's submission, and uploaded by this list.
     if staging.on_demand && staging.judgement() != staging.judged() {
+        staging.forget();
+        staging.dirty.store(true, Relaxed);
+    }
+    // `VICTORY_PACKED_LEVELS=1`: the same for any other placed texture
+    // inside whose span another now starts, or no longer does.
+    if !staging.on_demand && packed_levels() && staging.packed_limit() != staging.judged()[1] {
         staging.forget();
         staging.dirty.store(true, Relaxed);
     }
@@ -1173,6 +1203,19 @@ impl Staging {
         [first, limit]
     }
 
+    /// `VICTORY_PACKED_LEVELS=1`, for a texture not made with levels on
+    /// demand: where the next texture placed in this one's span starts, in
+    /// bytes from this one's start (`u64::MAX`: none does, or the switch
+    /// is off).
+    fn packed_limit(&self) -> u64 {
+        if self.on_demand || !packed_levels() {
+            return u64::MAX;
+        }
+        let start = self.memory as u64;
+        crate::descriptor::host::next_start(start, start.saturating_add(self.layout.size))
+            .map_or(u64::MAX, |at| at - start)
+    }
+
     /// What [`Staging::judgement`] said at the last detiling.
     fn judged(&self) -> [u64; 2] {
         use std::sync::atomic::Ordering::Relaxed;
@@ -1516,6 +1559,14 @@ impl Staging {
             let held = self.held_levels(judged);
             self.detiled.store(held, Relaxed);
             held
+        } else if packed_levels() {
+            // The levels whose bytes lie where another texture starts are
+            // that texture's: zeros here, not its bytes read as this
+            // one's (colour noise, or a piece of another picture).
+            use std::sync::atomic::Ordering::Relaxed;
+            let limit = self.packed_limit();
+            self.judged[1].store(limit, Relaxed);
+            if limit == u64::MAX { u32::MAX } else { self.held_levels([0, limit]) }
         } else {
             u32::MAX
         };
