@@ -61,12 +61,13 @@ const MAP_PRIVATE: i32 = 2;
 const MAP_FIXED: i32 = 0x10;
 const MAP_ANONYMOUS: i32 = 0x20;
 const MAP_NORESERVE: i32 = 0x4000;
+const MADV_HUGEPAGE: i32 = 14;
 const MADV_NOHUGEPAGE: i32 = 15;
 
 struct Direct {
     mmap: Mmap,
     close: Close,
-    /// The C library's `madvise`, if found ([`Direct::no_huge`] only).
+    /// The C library's `madvise`, if found ([`Direct::advise`] only).
     madvise: Option<Madvise>,
     handle_to_fd: HandleToFd,
 }
@@ -456,14 +457,15 @@ impl Direct {
         true
     }
 
-    /// Keeps `[base, base + len)` off huge pages (`madvise`,
-    /// `MADV_NOHUGEPAGE`): the kernel neither faults it in as one nor
-    /// gathers its pages into one later, which moves them.
-    fn no_huge(&self, base: usize, len: usize) -> bool {
+    /// `madvise` on `[base, base + len)`: `MADV_NOHUGEPAGE` keeps it off huge
+    /// pages (the kernel neither faults it in as one nor gathers its pages
+    /// into one later, which moves them); `MADV_HUGEPAGE` has faults take
+    /// huge pages, compacting memory for them if need be.
+    fn advise(&self, base: usize, len: usize, advice: i32) -> bool {
         // SAFETY: the C library's `madvise` on a range of the caller's that is mapped: advice,
         // no byte changes.
         self.madvise.is_some_and(|madvise| {
-            unsafe { madvise(base as *mut c_void, len, MADV_NOHUGEPAGE) == 0 }
+            unsafe { madvise(base as *mut c_void, len, advice) == 0 }
         })
     }
 }
@@ -498,27 +500,35 @@ pub(crate) fn own(base: usize, len: usize) -> bool {
             return false;
         }
     }
-    if home_no_huge() {
-        let kept = direct.no_huge(base, len);
-        tracing::info!(
-            at = format_args!("{base:#x}"),
-            len,
-            kept,
-            "memory of the process's own for pages at home, kept off huge pages (VICTORY_HOME_NOHUGE=1)"
-        );
+    if let Some((advice, what)) = home_pages() {
+        let kept = direct.advise(base, len, advice);
+        tracing::info!(at = format_args!("{base:#x}"), len, kept, "memory of the process's own for pages at home, {what}");
     }
     true
 }
 
-/// `VICTORY_HOME_NOHUGE=1` (off unless set; read here): memory [`own`] makes is
-/// kept off huge pages. The card's driver holds it by address (a heap opened
-/// there, read in place), and with transparent huge pages on (`always` on the
-/// rig) the kernel may move its pages to gather them into a huge one; the
-/// driver then waits for the card's work on them and takes them anew.
-fn home_no_huge() -> bool {
-    static ON: LazyLock<bool> =
-        LazyLock::new(|| std::env::var_os("VICTORY_HOME_NOHUGE").is_some_and(|v| v == "1"));
-    *ON
+/// How memory [`own`] makes is told to take pages (read here; off unless set).
+/// The card's driver holds it by address (a heap opened there, read in place).
+/// `VICTORY_HOME_NOHUGE=1`: kept off huge pages: with transparent huge pages on
+/// (`always` on the rig) the kernel may move its pages to gather them into a
+/// huge one; the driver then waits for the card's work on them and takes them
+/// anew. `VICTORY_HOME_HUGE=1`: huge pages asked for: the driver walks the
+/// page tables of what it holds by address at every submission (amdgpu,
+/// `hmm_range_fault`: 128-512 us a walk, ~80 a frame, 41 % of vkd3d's queue
+/// thread in hmm1), and a huge page is one entry where small ones are 512;
+/// with `defrag` at `defer+madvise` only advised memory is compacted for them.
+fn home_pages() -> Option<(i32, &'static str)> {
+    static HOW: LazyLock<Option<(i32, &'static str)>> = LazyLock::new(|| {
+        let on = |name| std::env::var_os(name).is_some_and(|v| v == "1");
+        if on("VICTORY_HOME_NOHUGE") {
+            Some((MADV_NOHUGEPAGE, "kept off huge pages (VICTORY_HOME_NOHUGE=1)"))
+        } else if on("VICTORY_HOME_HUGE") {
+            Some((MADV_HUGEPAGE, "on huge pages (VICTORY_HOME_HUGE=1)"))
+        } else {
+            None
+        }
+    });
+    *HOW
 }
 
 /// The file descriptor behind `section`, to show its pages with; `None` if
@@ -747,9 +757,30 @@ mod tests {
             unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE, PAGE_NOACCESS) } as usize;
         assert_ne!(base, 0, "no reservation for the test");
         assert!(own(base, LEN), "made memory of the process's own");
-        assert!(direct.no_huge(base, LEN), "the host took the advice");
+        assert!(direct.advise(base, LEN, MADV_NOHUGEPAGE), "the host took the advice");
         let flags = own_flags(base).expect("the host's flags of the mapping");
         assert!(flags.split_whitespace().any(|f| f == "nh"), "kept off huge pages: {flags}");
+        // SAFETY: ours, from above.
+        unsafe { VirtualFree(base as *mut c_void, 0, MEM_RELEASE) };
+    }
+
+    /// `VICTORY_HOME_HUGE=1`'s call: the same memory asked onto huge pages
+    /// (`hg` among the host's flags of its mapping).
+    #[test]
+    fn memory_of_its_own_can_ask_for_huge_pages() {
+        let Some(direct) = DIRECT.as_ref() else {
+            eprintln!("not tried: not under Wine with pages shown by mmap (VICTORY_WINE_MAP=1)");
+            return;
+        };
+        const LEN: usize = 4 << 20;
+        // SAFETY: a reservation of the test's own, released below.
+        let base =
+            unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE, PAGE_NOACCESS) } as usize;
+        assert_ne!(base, 0, "no reservation for the test");
+        assert!(own(base, LEN), "made memory of the process's own");
+        assert!(direct.advise(base, LEN, MADV_HUGEPAGE), "the host took the advice");
+        let flags = own_flags(base).expect("the host's flags of the mapping");
+        assert!(flags.split_whitespace().any(|f| f == "hg"), "on huge pages: {flags}");
         // SAFETY: ours, from above.
         unsafe { VirtualFree(base as *mut c_void, 0, MEM_RELEASE) };
     }
