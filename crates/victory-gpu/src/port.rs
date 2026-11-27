@@ -478,8 +478,8 @@ mod tests {
     #[test]
     #[ignore = "needs VICTORY_PORT_CONSTANTS=1 in the environment"]
     fn the_constants_heap_is_used_in_place_with_the_switch() {
-        assert!(wanted(0x34e1_0000, 0xae0_0000), "the title's constants heap is not used in place (a host copy is tracked)");
-        assert!(!wanted(0xe_1c80_0000, 0x1000), "memory above 4 GiB was taken in place");
+        assert!(wanted(0x34e1_0000, 0xae0_0000, false), "the title's constants heap is not used in place (a host copy is tracked)");
+        assert!(!wanted(0xe_1c80_0000, 0x1000, false), "memory above 4 GiB was taken in place");
     }
 
     /// `VICTORY_PORT_CONSTANTS=1` turns the port on on Windows; under Wine it
