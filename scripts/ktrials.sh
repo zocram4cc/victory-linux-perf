@@ -56,6 +56,14 @@ printf 'run\tresult\tentry_s\tlines\tfps\tms\tprep\tcopies\tgpu\tback\twrite_wat
 keys=$(seq 8 3 50 | sed 's/$/:Enter/' | paste -sd,)
 for ((r = 1; r <= RUNS; r++)); do
     say "run $r of $RUNS${VARS[*]:+ with ${VARS[*]}}"
+    # The title autosaves: every run starts from the same save (K_SAVE, a
+    # profile's data to copy in; K_SAVE= to keep what is there). Measured
+    # runs drifted to other places and times of day without this (27 Nov).
+    save=${K_SAVE-$HOME/Games/victory-data/perfiles/royale-save/data}
+    if [[ -n $save && -d $save ]]; then
+        rm -rf "$HOME/Games/victory-data/perfiles/kroeeee/data"
+        cp -a "$save" "$HOME/Games/victory-data/perfiles/kroeeee/data"
+    fi
     before=$(ls -t "$LOGS"/run-*.txt 2>/dev/null | head -n1 || true)
     t0=$(date +%s)
     env VICTORY_KEYS="${VICTORY_KEYS:-$keys}" ${VARS[@]+"${VARS[@]}"} setsid "$LAUNCH" >"$OUT/launch-$r.out" 2>&1 </dev/null &
