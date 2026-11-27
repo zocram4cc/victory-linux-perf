@@ -6,6 +6,7 @@
 //! reads it through a table and finds the slot changed.
 
 use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -235,7 +236,15 @@ impl DynamicBits {
     }
 }
 
+/// Each host heap's identity, handed out in order: a range of dynamic slots
+/// is given back to the heap that took it, and a heap made later at the same
+/// address is not that heap ([`HostHeap::release_many`]; after
+/// fxceless/victory-fork #1324 by cccw).
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
 pub(crate) struct HostHeap {
+    /// [`NEXT_ID`]'s number for this heap ([`HostHeap::release_many`]).
+    id: u64,
     pub(crate) buffer_sweep: Mutex<crate::draw::BufferSweep>,
     pub(crate) buffer_frame: std::sync::atomic::AtomicU64,
     pub(crate) heap: ID3D12DescriptorHeap,
@@ -1927,6 +1936,7 @@ impl HostHeap {
             .flatten();
         let queued = std::sync::Arc::new(Queued::new(if sampler { 0 } else { count }));
         let h = HostHeap {
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             buffer_sweep: Mutex::default(),
             buffer_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
             heap,
@@ -2098,6 +2108,12 @@ impl HostHeap {
 
     /// The title slots this heap has host slots for; fewer than the title's
     /// when the host caps its size.
+    /// This heap's identity ([`NEXT_ID`]): dynamic slots are given back only
+    /// to it, never to a heap made later at the same address.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
     pub(crate) fn count(&self) -> u32 {
         self.count
     }
@@ -2988,16 +3004,20 @@ impl HostHeap {
     /// (Tests) [`HostHeap::release_many`] of one range.
     #[cfg(test)]
     pub(crate) fn release(&self, first: u32, n: u32) {
-        self.release_many(&[(first, n)]);
+        self.release_many(self.id, &[(first, n)]);
     }
 
     /// Gives back, for each `(first, n)`, `n` dynamic slots from `first` (an
     /// index [`dynamic`] returned), under one take of the lock (RDNA port: a
-    /// list gave its tables back one lock at a time).
+    /// list gave its tables back one lock at a time), if they were taken by
+    /// this heap: `id` is [`HostHeap::id`]'s. The title can release the heap
+    /// a list's slots came from and make a later one at the same address; the
+    /// list's reset then names the old heap and must not free the new one's
+    /// slots ([`NEXT_ID`]).
     ///
     /// [`dynamic`]: HostHeap::dynamic
-    pub(crate) fn release_many(&self, ranges: &[(u32, u32)]) {
-        if ranges.is_empty() {
+    pub(crate) fn release_many(&self, id: u64, ranges: &[(u32, u32)]) {
+        if id != self.id || ranges.is_empty() {
             return;
         }
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
