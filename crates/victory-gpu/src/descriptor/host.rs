@@ -6,12 +6,24 @@
 //! reads it through a table and finds the slot changed.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
+
+/// Whether the raw views made for root buffers ([`HostHeap::raw_at`],
+/// [`HostHeap::raw_uav_at`]) are kept inside their host buffer: a range past
+/// its end is shortened to the whole dwords that fit, and a start past it,
+/// or not on 16 bytes, is a null view (on by default;
+/// `VICTORY_RAW_VIEW_CLAMP=0`: the range as asked, without asking the
+/// buffer's width). Read once. From trustno1 aec85ef (fxceless PR #1266).
+fn raw_view_clamp() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RAW_VIEW_CLAMP").is_none_or(|v| v != "0"))
+}
 
 /// A set of a heap's slots, a bit for each: no lock (a pass that went through
 /// a set of 70,000 under its lock kept everyone who writes slots waiting for
@@ -1220,6 +1232,86 @@ pub(crate) fn is_texture_view(view: &View) -> bool {
         View::Shader(r, _) => crate::resource::buffer_bytes(*r as crate::object::This).is_none(),
         _ => false,
     }
+}
+
+/// FirstElement is a 64-bit dword index. Only NumElements can be shortened.
+#[derive(Clone, Copy)]
+struct RawRange {
+    first: u64,
+    elements: u32,
+}
+
+/// Why a request lost part of its range, for the counters below.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cut {
+    /// The start is at a position with no complete dword left.
+    Past,
+    /// The buffer width or the 32-bit element count shortened the view.
+    Length,
+    /// The title named less than a dword: one element, as before this guard.
+    Short,
+    /// The start is not on the 16 bytes a raw view needs.
+    Unaligned,
+}
+
+fn raw_range(size: u64, offset: u64, len: u64) -> (Option<RawRange>, Option<Cut>) {
+    let words = size / 4;
+    if !offset.is_multiple_of(16) {
+        return (None, Some(Cut::Unaligned));
+    }
+    let asked = offset / 4;
+    if asked >= words {
+        return (None, Some(Cut::Past));
+    }
+    let avail = words - asked;
+    // A length under a dword made one element before this guard. The floor is
+    // kept because nothing was gathered about why the title would ask for less
+    // than a dword; the buffer's end still caps it.
+    let want = (len / 4).max(1);
+    let elements = want.min(avail).min(u64::from(u32::MAX));
+    let cut = if elements < want {
+        Some(Cut::Length)
+    } else if len < 4 {
+        Some(Cut::Short)
+    } else {
+        None
+    };
+    (
+        Some(RawRange {
+            first: asked,
+            elements: elements as u32,
+        }),
+        cut,
+    )
+}
+
+// Since launch, in Cut order: past the end, shortened, sub-dword, unaligned.
+static RAW_SRV_CUTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+static RAW_UAV_CUTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+pub(crate) fn raw_view_counts() -> [[u64; 4]; 2] {
+    [&RAW_SRV_CUTS, &RAW_UAV_CUTS].map(|cuts| cuts.each_ref().map(|n| n.load(Ordering::Relaxed)))
+}
+
+fn raw_view_range(
+    buffer: &ID3D12Resource,
+    offset: u64,
+    len: u64,
+    counts: &[AtomicU64; 4],
+) -> Option<RawRange> {
+    if !raw_view_clamp() {
+        return Some(RawRange {
+            first: offset / 4,
+            elements: (len / 4).clamp(1, u64::from(u32::MAX)) as u32,
+        });
+    }
+    // SAFETY: buffer is a live resource.
+    let size = unsafe { buffer.GetDesc() }.Width;
+    let (range, cut) = raw_range(size, offset, len);
+    if let Some(cut) = cut {
+        counts[cut as usize].fetch_add(1, Ordering::Relaxed);
+    }
+    range
 }
 
 /// Buffer views left null because the host would refuse them
@@ -3096,15 +3188,18 @@ impl HostHeap {
     /// the host placed after the buffer.
     pub(crate) fn raw_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
         let Some(host) = host() else { return };
-        let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
+        let Some(range) = raw_view_range(buffer, offset, len, &RAW_SRV_CUTS) else {
+            self.null_raw_at(index);
+            return;
+        };
         let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                 Buffer: D3D12_BUFFER_SRV {
-                    FirstElement: offset / 4,
-                    NumElements: elements,
+                    FirstElement: range.first,
+                    NumElements: range.elements,
                     StructureByteStride: 0,
                     Flags: D3D12_BUFFER_SRV_FLAG_RAW,
                 },
@@ -3138,14 +3233,17 @@ impl HostHeap {
     /// reaching whatever the host placed after the buffer.
     pub(crate) fn raw_uav_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
         let Some(host) = host() else { return };
-        let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
+        let Some(range) = raw_view_range(buffer, offset, len, &RAW_UAV_CUTS) else {
+            self.null_raw_uav_at(index);
+            return;
+        };
         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
             Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
                 Buffer: D3D12_BUFFER_UAV {
-                    FirstElement: offset / 4,
-                    NumElements: elements,
+                    FirstElement: range.first,
+                    NumElements: range.elements,
                     StructureByteStride: 0,
                     CounterOffsetInBytes: 0,
                     Flags: D3D12_BUFFER_UAV_FLAG_RAW,
@@ -5190,6 +5288,117 @@ mod tests {
             assert_eq!(bit_exact_format(from), to, "{from:?}");
             let bytes = |f: DXGI_FORMAT| crate::resource::element(f.0 as u32).map(|(b, _)| b);
             assert_eq!(bytes(from), bytes(to), "{from:?}: element size");
+        }
+    }
+
+    fn rr(size: u64, offset: u64, len: u64) -> (Option<(u64, u32)>, Option<Cut>) {
+        let (range, cut) = raw_range(size, offset, len);
+        (range.map(|v| (v.first, v.elements)), cut)
+    }
+
+    fn range(size: u64, offset: u64, len: u64) -> Option<(u64, u32)> {
+        rr(size, offset, len).0
+    }
+
+    /// The table of the first review, plus the counterexample it found: 100
+    /// bytes of buffer, an offset of 112 — the clamp this replaced viewed bytes
+    /// 96 to 99, which the request had asked nothing about.
+    #[test]
+    fn the_range_stays_inside_the_buffer() {
+        assert_eq!(range(1024, 0, 256), Some((0, 64)));
+        assert_eq!(range(1024, 768, 512), Some((192, 64)));
+        assert_eq!(range(1024, 1024, 16), None, "a start at the end");
+        assert_eq!(range(1024, 1040, 16), None, "a start past the end");
+        assert_eq!(range(100, 112, 16), None, "no intersection: never the tail");
+        assert_eq!(range(100, 96, 16), Some((24, 1)), "the last dword");
+        assert_eq!(range(100, 96, 4), Some((24, 1)));
+        assert_eq!(range(0, 0, 16), None, "an empty buffer");
+        assert_eq!(range(3, 0, 16), None, "no whole dword");
+        assert_eq!(range(1024, 0, 0), Some((0, 1)), "the floor of one element stands");
+        assert_eq!(range(1024, 0, 1), Some((0, 1)), "as does a length under a dword");
+        assert_eq!(range(1024, 3, 16), None, "not on 16 bytes");
+        assert_eq!(range(1024, u64::MAX, 16), None, "no wrap, no clamp back");
+        assert_eq!(range(1024, 0, u64::MAX), Some((0, 256)), "the length is cut");
+    }
+
+    /// Why a request was refused or cut, which is what the counters report.
+    #[test]
+    fn the_cause_is_the_one_the_counters_would_report() {
+        assert_eq!(rr(100, 112, 16), (None, Some(Cut::Past)));
+        assert_eq!(rr(1024, 3, 16), (None, Some(Cut::Unaligned)));
+        assert_eq!(rr(1024, 0, 0), (Some((0, 1)), Some(Cut::Short)));
+        assert_eq!(rr(1024, 768, 512), (Some((192, 64)), Some(Cut::Length)));
+        // Nothing cut, nothing refused: no counter is touched at all.
+        assert_eq!(rr(1024, 0, 256), (Some((0, 64)), None));
+        assert_eq!(rr(1024, 0, 1020), (Some((0, 255)), None), "255 of 256 dwords");
+    }
+
+    /// `FirstElement` is 64-bit: a start past the 32-bit element index is kept
+    /// as it is, not narrowed to `u32::MAX`.
+    #[test]
+    fn a_start_past_32_bits_is_kept() {
+        let size = 1u64 << 40;
+        let offset = (u64::from(u32::MAX) + 10) * 16;
+        let range = range(size, offset, 64).expect("inside the buffer");
+        assert_eq!(range.0, offset / 4);
+        assert!(range.0 > u64::from(u32::MAX));
+        assert_eq!(range.1, 16);
+    }
+
+    /// `NumElements` is 32-bit: the length alone is cut at `u32::MAX`.
+    #[test]
+    fn the_length_is_cut_at_32_bits() {
+        let size = 1u64 << 40;
+        assert_eq!(range(size, 0, u64::MAX), Some((0, u32::MAX)));
+    }
+
+    /// An aligned start far past a buffer is still refused: alignment is not a
+    /// reason to accept a request, and the check is not reached by the
+    /// unaligned case first.
+    #[test]
+    fn an_aligned_start_past_the_buffer_is_refused() {
+        let size = 1u64 << 40;
+        assert_eq!(rr(size, 1u64 << 60, 64), (None, Some(Cut::Past)));
+        assert_eq!(rr(size, size, 64), (None, Some(Cut::Past)));
+        assert_eq!(rr(size, size - 16, 64), (Some((size / 4 - 4, 4)), Some(Cut::Length)));
+    }
+
+    /// Every accepted range holds the four things the patch promises, and no
+    /// request that the input rules allow is turned away for no reason.
+    #[test]
+    fn accepted_ranges_hold_their_invariant() {
+        let sizes = [0u64, 1, 3, 4, 100, 1024, 4096, 1 << 30];
+        let offsets = [0u64, 4, 16, 48, 96, 112, 1024, 1040, 4096, u64::MAX];
+        let lens = [0u64, 1, 3, 4, 16, 512, 1 << 20, u64::MAX];
+        for size in sizes {
+            for offset in offsets {
+                for len in lens {
+                    let (range, _) = raw_range(size, offset, len);
+                    let aligned = offset.is_multiple_of(16);
+                    let inside = offset / 4 < size / 4;
+                    match range {
+                        Some(range) => {
+                            assert!(range.elements > 0, "{size} {offset} {len}");
+                            assert_eq!(
+                                range.first,
+                                offset / 4,
+                                "{size} {offset} {len}: the start moved"
+                            );
+                            assert_eq!(range.first % 4, 0, "a raw view starts on 16 bytes");
+                            assert!(
+                                range.first + u64::from(range.elements) <= size / 4,
+                                "{size} {offset} {len}: {} + {} past the buffer",
+                                range.first,
+                                range.elements
+                            );
+                        }
+                        None => assert!(
+                            !(aligned && inside),
+                            "{size} {offset} {len}: refused though the rules allow it"
+                        ),
+                    }
+                }
+            }
         }
     }
 
