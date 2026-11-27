@@ -519,7 +519,7 @@ pub(crate) fn flip_now() {
 pub(crate) static FLIPPED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// The key of the record at `handle`, a view's descriptor slot; 0: none.
-fn record_key(handle: u64) -> u64 {
+pub(crate) fn record_key(handle: u64) -> u64 {
     // SAFETY: the handle is a descriptor slot in title memory.
     let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
     if tag == VIEW_TAG { u64::from(generation) << 32 | u64::from(i) } else { 0 }

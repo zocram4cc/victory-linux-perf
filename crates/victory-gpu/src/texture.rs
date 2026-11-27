@@ -1894,36 +1894,38 @@ pub(crate) fn unchanged(resource: This, first: u32) -> bool {
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SAME").is_none_or(|v| v != "0")) {
         return false;
     }
+    current(resource, first) == Some(true)
+}
+
+/// Whether the levels from `first` on of `resource`'s host copy hold what
+/// title memory holds now ([`unchanged`], whatever `VICTORY_TEXTURE_SAME`
+/// says): `Some(false)` when they hold other bytes or not those levels;
+/// `None` when that cannot be told (no host copy, nothing noted of what it
+/// holds, none of the memory mapped, or a view of a texture the host
+/// writes). Reads the levels' memory once.
+pub(crate) fn current(resource: This, first: u32) -> Option<bool> {
     // A view read from a texture the host writes ([`alias`]) takes nothing
     // from title memory: that it holds what an upload before the other
     // texture was written left there says nothing, and the look that found
     // it so left the view as it was (Legendary 65498fd copies at that look;
     // here the look is not made and the pass goes on to the copy).
     if (uav_recheck() || alias_host_written()) && crate::resource::is_aliased(resource) {
-        return false;
+        return None;
     }
-    let Some(copy) = crate::resource::made_copy(resource) else {
-        return false;
-    };
-    let Some((from, held)) = *copy.holds.lock().unwrap_or_else(|e| e.into_inner()) else {
-        return false;
-    };
-    let Some((memory, desc)) = crate::resource::texture_memory(resource) else {
-        return false;
-    };
-    let Some(layout) = crate::resource::texture_layout(&desc) else {
-        return false;
-    };
+    let copy = crate::resource::made_copy(resource)?;
+    let (from, held) = (*copy.holds.lock().unwrap_or_else(|e| e.into_inner()))?;
+    let (memory, desc) = crate::resource::texture_memory(resource)?;
+    let layout = crate::resource::texture_layout(&desc)?;
     let layout = &layout.planes[0].layout;
     if from > crate::resource::read_from(layout, first).max(copy.base) {
-        return false;
+        return Some(false);
     }
     let size = layout.bytes_from(from) as usize;
     with_read(size, |read| {
         if crate::host::read_there(memory, read) == 0 {
-            return false;
+            return None;
         }
-        digest(read) == held
+        Some(digest(read) == held)
     })
 }
 
