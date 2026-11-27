@@ -9742,6 +9742,18 @@ impl Meter {
             );
             #[cfg(not(feature = "diagnostics"))]
             let (ram_mb, cpu_pct) = (0.0, 0.0);
+            let remaps = crate::remap::take(frames);
+            if crate::remap::on() {
+                tracing::info!(
+                    "title memory remaps per frame (VICTORY_REMAP_STATS=1): maps {}, unmaps {}, splits {}; GPU page-mapping copies {} (their maps and unmaps are in the figures above too); the remapping lock waited {:.2} ms and was held {:.2} ms, all threads",
+                    remaps.map,
+                    remaps.unmap,
+                    remaps.split,
+                    remaps.alias,
+                    remaps.lock_wait.ms,
+                    remaps.lock_hold.ms,
+                );
+            }
             let row = crate::frametime::Row {
                 frame: presented,
                 frames,
@@ -9779,6 +9791,7 @@ impl Meter {
                 depth_planes: planes,
                 ram_mb,
                 cpu_pct,
+                remaps,
             };
             crate::frametime::record(&row);
             // On-screen figures (`VICTORY_DEBUG_HUD=1`): the same row the dump

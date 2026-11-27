@@ -4478,7 +4478,7 @@ static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 /// What the runtime holds while it changes what title memory shows
 /// ([`title_memory_remapping`]).
-pub struct Remapping(#[allow(dead_code)] Changing);
+pub struct Remapping(#[allow(dead_code)] Changing, #[allow(dead_code)] Option<crate::remap::Timed>);
 
 #[allow(dead_code)]
 enum Changing {
@@ -4657,14 +4657,17 @@ pub fn title_memory_remapping_with<R: AsRef<[(usize, usize)]>>(ranges: impl FnOn
             tracing::info!(met, "accesses of title threads that waited for a change of mapping");
         }
     }
-    let changing = if fine::on() {
-        Changing::Fine(fine::FINE.write(ranges().as_ref()))
-    } else {
-        Changing::Whole(MAPPING.write().unwrap_or_else(|e| e.into_inner()))
+    let changing = {
+        let _waited = crate::remap::Timed::begin(crate::remap::Kind::LockWait, 0);
+        if fine::on() {
+            Changing::Fine(fine::FINE.write(ranges().as_ref()))
+        } else {
+            Changing::Whole(MAPPING.write().unwrap_or_else(|e| e.into_inner()))
+        }
     };
     CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     CHANGING.set((true, false));
-    Remapping(changing)
+    Remapping(changing, crate::remap::Timed::begin(crate::remap::Kind::LockHold, 0))
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
