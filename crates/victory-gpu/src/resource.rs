@@ -1457,6 +1457,10 @@ static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
 /// all zeros from a first stage that held light (run 88).
 /// `VICTORY_ALIAS_COPY=0`: none is found, as before; `=1`: only textures
 /// of one level and one layer, as at first.
+/// Where no such texture lies, one the title fills that the host copied
+/// into is found the same way, block-compressed ones too
+/// (`crate::texture::alias_host_written`, `VICTORY_ALIAS_HOST_WRITTEN=0`:
+/// not).
 #[cfg(windows)]
 pub(crate) fn alias_of(this: This) -> Option<This> {
     use std::sync::atomic::Ordering::Relaxed;
@@ -1483,7 +1487,24 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
     }
     // Under the table's lock: a texture leaves it before it is freed.
     let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
-    let other = *targets.get(&(r.data() as u64))? as This;
+    let at = r.data() as u64;
+    // No target there: a texture the title fills that the host copied into
+    // at this very address (`crate::texture::host_written`), a bake's
+    // atlas. The texels copied are on the card in its host copy alone; the
+    // view's host copy was filled from title memory, which they never
+    // reached. Looked at under that table's lock, as a target under its
+    // own. (After Legendary 65498fd; `VICTORY_ALIAS_HOST_WRITTEN=0`: not
+    // looked for, as before.)
+    let (other, copied) = match targets.get(&at) {
+        Some(&other) => (other as This, None),
+        None => {
+            let (other, held) = crate::texture::host_written_at(at)?;
+            (other, Some(held))
+        }
+    };
+    if other == this {
+        return None;
+    }
     let o = resource(other);
     const DEPTH: u32 = 0x2;
     let same = one(&o.desc)
@@ -1494,7 +1515,9 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
         && o.desc.depth_or_array_size == r.desc.depth_or_array_size
         && o.desc.flags & DEPTH == 0
         && target_format(o.desc.format) == o.desc.format
-        && element(o.desc.format).is_some_and(|e| e.1 == 1 && Some(e) == element(r.desc.format));
+        // (A texture the host copied into may be block-compressed: its
+        // blocks go through the same copy, as wide in both.)
+        && element(o.desc.format).is_some_and(|e| (copied.is_some() || e.1 == 1) && Some(e) == element(r.desc.format));
     if !same && r.desc.sample_count <= 1 {
         // What shaders wrote there is on the card in the other texture; this
         // one is filled from title memory, which they never reached. Each
@@ -1520,6 +1543,28 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
         }
     }
     same.then_some(other)
+}
+
+/// Whether a texture the title placed at `this`'s address ([`texture_at`])
+/// is read from `this` on the host ([`alias_of`]): what the host writes to
+/// `this` has to reach that texture's host copy too.
+#[cfg(windows)]
+pub(crate) fn aliased_by_a_view(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return false;
+    }
+    let at = r.data() as u64;
+    // (Placed textures stay for the run: none is freed once the lock is
+    // let go.)
+    let views: Vec<usize> = {
+        let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        map.range((at, [0; 14])..=(at, [u32::MAX; 14])).map(|(_, &view)| view).collect()
+    };
+    views.into_iter().any(|view| view != this as usize && alias_of(view as This) == Some(this))
 }
 
 /// Whether host copies are made on first use. On by default;
@@ -4125,6 +4170,143 @@ mod tests {
         resource_release(view);
         resource_release(source);
         assert_eq!(actual, packed_light, "the sampled texture kept the CPU upload instead of the GPU atlas");
+    }
+
+    /// A texture the title placed where a texture it fills lies is read from
+    /// title memory until the host copies into that texture; from then on
+    /// from the texture, if it is like it, block-compressed or not, and the
+    /// write is told for the view's slots. Not once the texture is released.
+    /// (After Legendary 65498fd and 54ebfc1.)
+    #[cfg(windows)]
+    #[test]
+    fn a_view_placed_over_a_texture_the_host_copied_into_is_read_from_it() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let null = std::ptr::null();
+        let mut atlas = null;
+        // 64x64 BC3, one level.
+        assert_eq!(
+            create_committed(null, &PROPERTIES, 0, &texture(64, 64, 77, 1), 0, null.cast(), &RESOURCE_IIDS[0], &mut atlas),
+            S_OK
+        );
+        let at = resource(atlas).data() as u64;
+        let words = |width: u32, format: u32| [3u32, 0, 0, 0, width, 0, 64, 0x1_0001, format, 1, 0, 0x105, 0, 0];
+        let view = texture_at(at, &words(64, 77)).unwrap();
+        let narrow = texture_at(at, &words(32, 77)).unwrap();
+        let other_blocks = texture_at(at, &words(64, 71)).unwrap();
+        assert_eq!(alias_of(view), None, "title memory has all of it");
+        assert!(!aliased_by_a_view(atlas));
+        let told = crate::texture::GPU_WRITES[1].load(Relaxed);
+        crate::texture::host_written(atlas);
+        assert_eq!(alias_of(view), Some(atlas));
+        assert_eq!(alias_of(narrow), None, "not as wide");
+        assert_eq!(alias_of(other_blocks), None, "blocks of 8 bytes over blocks of 16");
+        assert!(aliased_by_a_view(atlas));
+        assert_eq!(crate::texture::GPU_WRITES[1].load(Relaxed), told + 1, "the copy is told for the view");
+        assert!(!crate::texture::unchanged(view, 0), "no look at title memory for it");
+        resource_release(atlas);
+        assert_eq!(alias_of(view), None, "the texture is gone");
+    }
+
+    /// The blocks the host copied into a block-compressed texture reach the
+    /// texture of a view placed over it: an upload of the view from title
+    /// memory (zeros here) earlier in the list does not stand.
+    #[test]
+    fn a_view_over_a_block_compressed_texture_the_host_copied_into_gets_its_blocks() {
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let null = std::ptr::null();
+        let mut atlas = null;
+        let mut view = null;
+        // 8x8 BC3: two rows of two 16-byte blocks.
+        assert_eq!(
+            create_committed(null, &PROPERTIES, 0, &texture(8, 8, 77, 1), 0, null.cast(), &RESOURCE_IIDS[0], &mut atlas),
+            S_OK
+        );
+        assert_eq!(
+            create_at_address(
+                null,
+                resource(atlas).data() as u64,
+                &texture(8, 8, 77, 1),
+                0,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut view,
+            ),
+            S_OK
+        );
+        resource(view).host.placed.store(true, Relaxed);
+        let written = host_resource(atlas).unwrap();
+        let sampled = host_resource(view).unwrap();
+        let (upload, data) = host.upload_buffer(1024).unwrap();
+        let back = host.read_back_buffer(1024).unwrap();
+        let rows = |buffer: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer the location never releases.
+            pResource: unsafe { std::mem::transmute_copy(buffer) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: 0,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                        Format: DXGI_FORMAT(77),
+                        Width: 8,
+                        Height: 8,
+                        Depth: 1,
+                        RowPitch: 256,
+                    },
+                },
+            },
+        };
+        let whole = |texture: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: as above.
+            pResource: unsafe { std::mem::transmute_copy(texture) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+        };
+        let block = |row: usize, i: usize| (row * 64 + i * 5 + 3) as u8;
+        let seed = host.new_list().unwrap();
+        crate::list::ensure_state(&seed, atlas, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
+        // SAFETY: two rows of 32 bytes in the upload's 1024 mapped bytes; an
+        // open list and live resources.
+        unsafe {
+            for row in 0..2 {
+                for i in 0..32 {
+                    data.add(row * 256 + i).write(block(row, i));
+                }
+            }
+            seed.list.CopyTextureRegion(&whole(written), 0, 0, 0, &rows(&upload), None);
+        }
+        seed.close();
+        host.execute(&[&seed]);
+        assert_eq!(alias_of(view), None);
+        crate::texture::host_written(atlas);
+        assert_eq!(alias_of(view), Some(atlas));
+
+        let list = host.new_list().unwrap();
+        crate::texture::upload(&list, view, sampled);
+        assert!(crate::texture::alias(&list, view, atlas));
+        crate::list::ensure_state(&list, view, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+        // SAFETY: an open list and live resources.
+        unsafe { list.list.CopyTextureRegion(&rows(&back), 0, 0, 0, &whole(sampled), None) };
+        list.close();
+        host.execute(&[&list]);
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: the copy has run; the buffer holds both rows.
+        let seen: Vec<u8> = unsafe {
+            back.Map(0, None, Some(&mut mapped)).unwrap();
+            let bytes = std::slice::from_raw_parts(mapped.cast::<u8>(), 512);
+            let seen = [&bytes[..32], &bytes[256..288]].concat();
+            back.Unmap(0, None);
+            seen
+        };
+        resource_release(view);
+        resource_release(atlas);
+        let expected: Vec<u8> = (0..2).flat_map(|row| (0..32).map(move |i| block(row, i))).collect();
+        assert_eq!(seen, expected, "the view's texture has the blocks the host copied");
     }
 
     /// A 16-bit depth texture the title also asks unordered access for gets
