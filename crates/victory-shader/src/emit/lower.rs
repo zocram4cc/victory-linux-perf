@@ -13028,15 +13028,23 @@ impl<'a> Lower<'a> {
             let (op, name) = if typed {
                 // shortcut: typed stores are taken to write all four channels
                 // of a float format.
-                if count != 4 || *offen || *offset != 0 {
+                // One to three channels (`buffer_store_format_x/xy/xyz`): the
+                // view's format has that many, the rest filled with 0 (as
+                // image stores of a prefix mask). At an offset: refused.
+                if count == 0 || count > 4 || *offen || *offset != 0 {
                     return Err("a typed buffer store of some channels or at an offset");
                 }
                 // Four unsigned integers for halves, four floats otherwise.
                 let component = if halves { 0x405 } else { 0x409 };
                 args.push(self.handle(site, src, false, (10 | u, component))?);
                 args.extend([index.unwrap_or(self.s.m.i32(0)), iu]);
+                let present = vals.len();
                 for x in vals {
                     args.push(if halves { x } else { self.as_float(x) });
+                }
+                let zero = if halves { self.s.m.i32(0) } else { self.s.m.f32(0) };
+                for _ in present..4 {
+                    args.push(zero);
                 }
                 (
                     69,
