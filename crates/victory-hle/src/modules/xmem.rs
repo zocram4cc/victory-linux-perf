@@ -786,18 +786,27 @@ thread_local! {
 }
 
 /// Whether `VICTORY_<name>` switches something on: `1` and `0` say so, and
-/// unset it is on under Wine only (where the mapping calls it saves are
-/// dear, and where it was tested), unless `VICTORY_XMEM_RUNS=0` turns all
-/// of them off at once: the views joined, the runs of scatter, alias and
-/// unmap calls, the pages left that show the same already (zeex64 502e905's
-/// mapping port; measured there on a stock wineserver, not on ours with
-/// the view tree).
+/// unset it is on under Wine only when `VICTORY_XMEM_RUNS=1` turns all of
+/// them on at once: the views joined, the runs of scatter, alias and unmap
+/// calls, the pages left that show the same already (zeex64 502e905's
+/// mapping port). Off unless asked for: upstream measured it on a stock
+/// wineserver only, not on ours with the view tree, its author had six
+/// title crashes in some 28 runs on a view-tree wineserver of their own, and
+/// a join leaves a moment in which a write of another title thread to the
+/// neighbour's pages is not seen ([`victory_gpu::title_memory_regrouped`]).
 fn wine_switch(name: &str) -> bool {
     match std::env::var(name).ok().as_deref() {
         Some("1") => true,
         Some("0") => false,
-        _ => on_wine() && std::env::var_os("VICTORY_XMEM_RUNS").is_none_or(|v| v != "0"),
+        _ => on_wine() && runs_asked(),
     }
+}
+
+/// `VICTORY_XMEM_RUNS=1` ([`wine_switch`]).
+fn runs_asked() -> bool {
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("VICTORY_XMEM_RUNS").is_some_and(|v| v == "1"));
+    *ON
 }
 
 /// A [`wine_switch`], asked once.
@@ -811,7 +820,7 @@ fn switched(on: &LazyLock<bool>) -> bool {
 
 /// Whether a view mapped beside one that shows the section's slices just
 /// before or after its own is made one view with it (`VICTORY_JOIN_VIEWS`,
-/// on under Wine), within windows of [`JOIN_WINDOW`].
+/// on under Wine with XMEM_RUNS=1), within windows of [`JOIN_WINDOW`].
 ///
 /// The title maps its memory a page at a time: 122,880 of the 132,870
 /// views it had mapped when a first world appeared were one page beside
@@ -845,7 +854,7 @@ const _: () = assert!(JOIN_WINDOW / PAGE <= SHORT);
 
 /// Whether the entries of one `XMemMapPhysicalPagesScatter` call at
 /// addresses that follow one another are mapped (or unmapped) as one call
-/// instead of one call per page (`VICTORY_SCATTER_RUNS`, on under Wine;
+/// instead of one call per page (`VICTORY_SCATTER_RUNS`, on under Wine with XMEM_RUNS=1;
 /// then no pages are mapped side by side, [`side_by_side`]: the threads
 /// would stand in line for wineserver's one).
 fn scatter_runs() -> bool {
@@ -855,7 +864,7 @@ fn scatter_runs() -> bool {
 
 /// Whether the GPU's page-mapping copies map each run of consecutive
 /// pages as one view instead of one view per page (`VICTORY_ALIAS_RUNS`,
-/// on under Wine; then each range is mapped by the caller alone, as with
+/// on under Wine with XMEM_RUNS=1; then each range is mapped by the caller alone, as with
 /// `VICTORY_MAP_THREADS=1`).
 fn alias_runs() -> bool {
     static ON: LazyLock<bool> = LazyLock::new(|| wine_switch("VICTORY_ALIAS_RUNS"));
@@ -863,7 +872,7 @@ fn alias_runs() -> bool {
 }
 
 /// Whether pages that show what a call asks them to show already are left
-/// as they are (`VICTORY_MAP_SAME`, on under Wine; `0`: every page of a call
+/// as they are (`VICTORY_MAP_SAME`, on under Wine with XMEM_RUNS=1; `0`: every page of a call
 /// is unmapped and mapped again, as before). The pages at the two ends of a
 /// call's range that are the same stay; what lies between the first and the
 /// last page that change is unmapped and mapped as before (a page that is
@@ -879,7 +888,7 @@ fn map_same() -> bool {
 
 /// Whether the entries of one page-mapping copy of the GPU's
 /// ([`map_aliases`]) at addresses that follow one another are mapped as one
-/// call (`VICTORY_ALIAS_BATCH`, on under Wine, with [`alias_runs`]; `0`: an
+/// call (`VICTORY_ALIAS_BATCH`, on under Wine with XMEM_RUNS=1, with [`alias_runs`]; `0`: an
 /// entry after the other, as before). The title has a page mapped per entry;
 /// entry by entry, each page that shows the section's next slice is joined
 /// with the view before it ([`join_views`]), which unmaps that view and maps
@@ -893,7 +902,7 @@ fn alias_batch() -> bool {
 
 /// Whether the views a call unmaps whole that stand side by side are told
 /// to the GPU side as one range, not one after the other
-/// (`VICTORY_UNMAP_RUNS`, on under Wine; `0`: each by itself before its own
+/// (`VICTORY_UNMAP_RUNS`, on under Wine with XMEM_RUNS=1; `0`: each by itself before its own
 /// unmapping, as before). What is told is the same; it is told in one taking
 /// of the guards' lock (which every refresh and every write fault of the
 /// title's waits for) instead of one for each view.
@@ -904,7 +913,7 @@ fn unmap_runs() -> bool {
 
 /// Whether a join ([`map_joined`]) splits the new range off its placeholder
 /// only where our own note of the placeholders does not say it is the
-/// range's own already (`VICTORY_MAP_KNOWN`, on under Wine; `0`: split every
+/// range's own already (`VICTORY_MAP_KNOWN`, on under Wine with XMEM_RUNS=1; `0`: split every
 /// time, as before, the call failing harmlessly where there is nothing to
 /// split).
 fn known() -> bool {
@@ -1534,8 +1543,8 @@ fn lean() -> bool {
 ///
 /// Asking a thread's priority is a request to wineserver under Wine, one
 /// for every scatter call and every page-mapping copy: a thread is asked
-/// about once a second at most there (`VICTORY_LIFT_SELDOM`, on under Wine;
-/// `0`: at every call, as before).
+/// about once a second at most there (`VICTORY_LIFT_SELDOM`, on under Wine
+/// with XMEM_RUNS=1; `0`: at every call, as before).
 pub(crate) fn lift_thread() {
     use windows_sys::Win32::System::Threading::{
         GetCurrentThread, GetThreadPriority, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
@@ -2584,7 +2593,9 @@ fn show(base: usize, len: usize, slice: &Slice, own: bool, quiet: bool) -> bool 
     if view.Value as usize != base {
         cost(cost::REFUSED, 1);
     }
-    if view.Value as usize != base && len > PAGE {
+    // (Only with the runs of [`wine_switch`], which map runs over pages
+    // unmapped singly: with them off, a refusal fails as before.)
+    if view.Value as usize != base && len > PAGE && (join_views() || scatter_runs() || alias_runs()) {
         // The range may be several placeholders (a run of pages mapped over
         // pages unmapped singly was refused).
         // SAFETY: reads and restores this thread's error.
