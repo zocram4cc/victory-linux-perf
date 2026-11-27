@@ -71,6 +71,9 @@ opt-level = 2
 
 [profile.release]
 debug = "line-tables-only"
+# Cross-crate inlining: the hot paths (copies, hashing, detiling, list
+# recording) call across crates. Thin LTO keeps builds parallel.
+lto = "thin"
 
 # The development build: release code generation plus the `diagnostics`
 # feature (`cargo build --profile diag -p victory --features diagnostics`),
