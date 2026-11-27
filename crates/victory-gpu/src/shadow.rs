@@ -3280,6 +3280,9 @@ impl Shadow {
         // title wrote there.
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
         LIVE[1].fetch_sub(len, Ordering::Relaxed);
+        // Where memory in place lies ([`at_stake`]).
+        PLACED_SPAN[0].fetch_min(start, Ordering::Relaxed);
+        PLACED_SPAN[1].fetch_max(start + len, Ordering::Relaxed);
         *shadow.watched.get_mut() = NOT_WATCHED;
         shadow.window = window;
         shadow.place = Some((placed.heap, placed.bias));
@@ -3354,13 +3357,14 @@ impl Shadow {
     /// a GPU-side dirty mask would save that if big ranges make it slow.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         // In place the shaders write title memory itself: no snapshot, no
-        // compare, nothing to copy back, and no wait on its account.
-        // shortcut: another host copy of the same bytes (a title buffer
-        // inside this one with a copy of its own, a texture in it) is not
-        // told: the card's writes are not seen by write watching.
-        if self.place.is_some() {
-            return;
-        }
+        // compare and nothing to copy back ([`Shadow::writing`] and the
+        // copy-back leave such a copy alone). The range is declared all the
+        // same, as for a copy: what reads title memory on the CPU waits for
+        // the flights that write it (`crate::host::late_blocked`).
+        // shortcut: another host copy of the same bytes (a texture in it, a
+        // view's own bytes, [`exact`]) is not told: the card's writes are
+        // not seen by write watching. No title buffer's or window's copy
+        // lies over memory in place ([`ONE_OWNER`]).
         self.written.store(true, Ordering::Relaxed);
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize);
@@ -5418,6 +5422,84 @@ fn take_copies(map: &mut BTreeMap<(u64, usize), Entry>, at: u64, end: u64, wante
     gone
 }
 
+// One owner per byte (S1, notes/inplace-design.md 3.9): memory in place is
+// read and written by the card where the title has it. A host copy of the
+// same bytes would not see what the card writes there (write watching does
+// not see it), and the place would not see what shaders write into the copy
+// until it lands: run ab-inplace1-log, uploads and copy-back doubled. So no
+// title buffer's or window's copy is made over memory in place (what is in
+// place there is let go first), and nothing is placed over such a copy.
+
+/// Held while a title buffer's or a window's copy, or a placement, is made
+/// that memory in place could meet ([`at_stake`]), taken before [`BUFFERS`]'
+/// or [`LOOSE`]'s lock: what the other table holds is looked at and changed
+/// inside it. The one place where one of them is taken inside the other, so
+/// no two threads hold them the other way round.
+static ONE_OWNER: Mutex<()> = Mutex::new(());
+
+/// The lowest and the highest title address ever placed ([`Shadow::placed`];
+/// the first above the second: none). Never shrinks.
+static PLACED_SPAN: [AtomicU64; 2] = [AtomicU64::new(u64::MAX), AtomicU64::new(0)];
+
+/// Since the start: placements left undone because a copy holds the same
+/// bytes, and what was in place let go because a copy was made over it.
+static OWNERS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+fn one_owner() -> std::sync::MutexGuard<'static, ()> {
+    ONE_OWNER.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether a copy or a placement of `[at, end)` may meet memory in place:
+/// some was placed around it, or may be meanwhile (with `VICTORY_INPLACE`
+/// anywhere, with renderer port 1 below 4 GiB).
+fn at_stake(at: u64, end: u64) -> bool {
+    crate::inplace::level() > 0
+        || at < 1 << 32 && crate::port::on()
+        || PLACED_SPAN[0].load(Ordering::Relaxed) < end && at < PLACED_SPAN[1].load(Ordering::Relaxed)
+}
+
+/// The longest a window is ([`root_window_most`]): those that begin this far
+/// below an address may reach it.
+fn longest_window() -> u64 {
+    root_window_most().max(WINDOW)
+}
+
+/// Whether a copy (not memory in place) holds any of `[at, end)`, among the
+/// title buffers' (found as [`take_copies`] finds them) and the windows'.
+fn copied_over(buffers: &BTreeMap<(u64, usize), Entry>, windows: &BTreeMap<(u64, u64), Arc<Shadow>>, at: u64, end: u64) -> bool {
+    buffers.range(..(end, 0)).rev().take(256).any(|(_, e)| e.end > at && e.shadow.as_ref().is_some_and(|s| s.place.is_none()))
+        || windows.range((at.saturating_sub(longest_window()), 0)..(end, 0)).any(|(key, s)| key.0 + key.1 > at && s.place.is_none())
+}
+
+/// What is in place over any of `[at, end)` is taken out of both tables and
+/// retired, as [`in_place_let_go`] does: the next ask makes a copy or opens
+/// the memory anew.
+fn placed_out(buffers: &mut BTreeMap<(u64, usize), Entry>, windows: &mut BTreeMap<(u64, u64), Arc<Shadow>>, at: u64, end: u64) {
+    let mut gone = take_copies(buffers, at, end, |s| s.place.is_some());
+    let keys: Vec<(u64, u64)> = windows
+        .range((at.saturating_sub(longest_window()), 0)..(end, 0))
+        .filter(|(key, s)| key.0 + key.1 > at && s.place.is_some())
+        .map(|(key, _)| *key)
+        .collect();
+    gone.extend(keys.iter().filter_map(|key| windows.remove(key)));
+    OWNERS[1].fetch_add(gone.len() as u64, Ordering::Relaxed);
+    for shadow in gone {
+        crate::host::retire(shadow);
+    }
+}
+
+/// For the frame line: [`OWNERS`], while there is any.
+pub(crate) fn owners_line() {
+    let [refused, let_go] = [0, 1].map(|i| OWNERS[i].load(Ordering::Relaxed));
+    if refused + let_go > 0 {
+        tracing::info!(
+            target: "victory_gpu::host",
+            "one owner per byte, since the start: {refused} placements of title memory left undone (a copy holds the same bytes), \
+             {let_go} let go (a title buffer's or a window's copy was made over them)"
+        );
+    }
+}
+
 /// For the in-place census (`crate::inplace`): the title buffers (start,
 /// bytes, false) and the windows outside buffers that have a copy (start,
 /// bytes, true).
@@ -5500,21 +5582,33 @@ fn lookup_with(address: u64, len: u64, any: bool, quick: bool, buckets: bool) ->
             }
         }
     }
-    let mut map = buffers();
-    let key = map
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .find(|(_, e)| e.end >= end)
-        .map(|(k, _)| *k);
-    let Some(key) = key else {
-        drop(map);
-        return loose(address, end, len <= 1, any);
+    // Taken first, and the map looked at again, when the copy to be made may
+    // meet memory in place ([`at_stake`]).
+    let mut one = None;
+    let (mut map, key) = loop {
+        let map = buffers();
+        let key = map
+            .range(..=(address, usize::MAX))
+            .rev()
+            .take(64)
+            .find(|(_, e)| e.end >= end)
+            .map(|(k, _)| *k);
+        let Some(key) = key else {
+            drop((map, one));
+            return loose(address, end, len <= 1, any);
+        };
+        let entry = map.get(&key)?;
+        if one.is_none() && entry.shadow.is_none() && at_stake(key.0, entry.end) {
+            drop(map);
+            one = Some(one_owner());
+            continue;
+        }
+        break (map, key);
     };
-    let entry = map.get_mut(&key)?;
-    if entry.shadow.is_none() {
-        touch(key.0, entry.end);
-        let len = entry.end - key.0;
+    let until = map.get(&key)?.end;
+    if map.get(&key)?.shadow.is_none() {
+        touch(key.0, until);
+        let len = until - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
         // Shaders write some buffers (unordered access), so not upload memory.
         let size = len.next_multiple_of(1 << 16);
@@ -5523,15 +5617,27 @@ fn lookup_with(address: u64, len: u64, any: bool, quick: bool, buckets: bool) ->
         // memory. Not the big ones `cards` puts in the card's memory: those
         // are read too often to stay in the PC's.
         let big = cards() && (size >= card_limits().0 || card_all());
+        // One owner per byte ([`ONE_OWNER`]): not in place over a copy of the
+        // same bytes, ...
+        let over = one.is_some() && copied_over(&map, &LOOSE.read().unwrap_or_else(|e| e.into_inner()), key.0, until);
         // Renderer port 1 (`crate::port`, `VICTORY_PORT_CONSTANTS=1`): the
         // title's 32-bit graphics heap in place, big or not.
-        if let Some(placed) = crate::port::place_for(key.0, len, false) {
-            entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
-            return entry.shadow.clone();
+        let placed = if over {
+            None
+        } else {
+            crate::port::place_for(key.0, len, false).or_else(|| if big { None } else { crate::inplace::place_for(key.0, len, false) })
+        };
+        if let Some(placed) = placed {
+            let shadow = Arc::new(Shadow::placed(placed, key.0, len, false));
+            map.get_mut(&key)?.shadow = Some(shadow.clone());
+            return Some(shadow);
         }
-        if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
-            entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
-            return entry.shadow.clone();
+        if over && (crate::port::wanted(key.0, len) || !big && crate::inplace::level() >= 2) {
+            OWNERS[0].fetch_add(1, Ordering::Relaxed);
+        }
+        // ... and no copy over memory in place: what is in place there goes.
+        if one.is_some() {
+            placed_out(&mut map, &mut LOOSE.write().unwrap_or_else(|e| e.into_inner()), key.0, until);
         }
         let (buffer, data) = host()?.shared_buffer(size)?;
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
@@ -5578,9 +5684,9 @@ fn lookup_with(address: u64, len: u64, any: bool, quick: bool, buckets: bool) ->
         if shadow.card.is_some() {
             CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
         }
-        entry.shadow = Some(shadow);
+        map.get_mut(&key)?.shadow = Some(shadow);
     }
-    entry.shadow.clone()
+    map.get(&key)?.shadow.clone()
 }
 
 #[cfg(test)]
@@ -5845,6 +5951,127 @@ mod find_tests {
                 }
             }
         }
+    }
+}
+
+/// For tests: title memory `[start, start + len)`, private memory of the
+/// test's own committed whole, in place on `device`, as `crate::port` and
+/// `crate::inplace` place it.
+#[cfg(test)]
+pub(crate) fn in_place_for_tests(device: &windows::Win32::Graphics::Direct3D12::ID3D12Device, start: u64, len: u64, window: bool) -> Arc<Shadow> {
+    let placed = crate::inplace::place_part(device, start, len).unwrap_or_else(|e| panic!("title memory not placed: {e:?}"));
+    crate::inplace::counted(window, len);
+    Arc::new(Shadow::placed(placed, start, len, window))
+}
+
+/// One owner per byte (S1): no copy of title memory lies over memory in
+/// place, whose bytes the card reads and writes where the title has them.
+#[cfg(test)]
+mod one_owner_tests {
+    use super::*;
+
+    const KIB: u64 = 1 << 10;
+    const MIB: u64 = 1 << 20;
+
+    /// `n` cells of the window grid ([`WINDOW`]), from a line of it on:
+    /// private memory of the test's own, committed whole. Never let go: a
+    /// heap opened on it holds its pages a moment past its last reference.
+    fn cells(n: u64) -> u64 {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        // SAFETY: an allocation of the test's own.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), ((n + 1) * WINDOW) as usize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as u64;
+        assert_ne!(base, 0, "no memory for the test");
+        base.next_multiple_of(WINDOW)
+    }
+
+    fn device() -> &'static windows::Win32::Graphics::Direct3D12::ID3D12Device {
+        &crate::host::host().expect("these tests need the host GPU").device
+    }
+
+    /// A copy of a window is made over a title buffer in place (no switch
+    /// places the window): the buffer in place is let go, and asked for
+    /// again it gets a copy too. Kept, it would write title memory the
+    /// window's copy never looks at again (run ab-inplace1-log: uploads
+    /// and copy-back doubled).
+    #[test]
+    fn a_window_copy_over_a_buffer_in_place_lets_the_buffer_go() {
+        let a = cells(1);
+        register(0x51_0001, a, MIB);
+        let placed = in_place_for_tests(device(), a, MIB, false);
+        {
+            let mut map = buffers();
+            touch(a, a + MIB);
+            map.get_mut(&(a, 0x51_0001)).expect("registered").shadow = Some(placed);
+        }
+        let window = lookup_with(a + 512 * KIB, MIB, true, false, false).expect("a window's copy");
+        assert!(!window.in_place(), "no switch places the window");
+        let buffer = lookup_with(a, 16, false, false, false).expect("the buffer's copy");
+        assert!(!buffer.in_place(), "the buffer in place was let go when a copy of a window over it was made: one owner per byte");
+        unregister(0x51_0001, a);
+    }
+
+    /// A title buffer's copy is made in a window in place: the window is
+    /// let go.
+    #[test]
+    fn a_buffer_copy_in_a_window_in_place_lets_the_window_go() {
+        let c = cells(1);
+        let window = in_place_for_tests(device(), c, WINDOW, true);
+        LOOSE.write().unwrap_or_else(|e| e.into_inner()).insert((c, WINDOW), window);
+        register(0x51_0002, c + MIB, 64 * KIB);
+        let buffer = lookup_with(c + MIB, 16, false, false, false).expect("the buffer's copy");
+        assert!(!buffer.in_place(), "no switch places the buffer");
+        let kept = LOOSE.read().unwrap_or_else(|e| e.into_inner()).get(&(c, WINDOW)).is_some_and(|s| s.in_place());
+        assert!(!kept, "the window in place was let go when a copy of a buffer in it was made: one owner per byte");
+        unregister(0x51_0002, c + MIB);
+    }
+
+    /// With `VICTORY_INPLACE=2`, on the card's driver: a window over private
+    /// memory is placed, and the card reads the title's bytes there and
+    /// writes its own where the title reads them (an import that fell back
+    /// to memory of vkd3d-proton's own reads zeros; `VKD3D_DEBUG=warn` names
+    /// it). And nothing is placed over a copy of the same bytes, a window
+    /// over a buffer's copy nor a buffer under a window's copy.
+    #[test]
+    #[ignore = "wants VICTORY_INPLACE=2 VKD3D_DEBUG=warn, the card, and a process of its own (under Proton)"]
+    fn memory_in_place_is_the_titles_and_lies_under_no_copy() {
+        use windows_sys::Win32::System::Memory::{PAGE_PROTECTION_FLAGS, PAGE_READONLY, VirtualProtect};
+        assert!(crate::inplace::level() >= 2, "run with VICTORY_INPLACE=2");
+        let base = cells(7);
+        let (a, b, c) = (base, base + WINDOW, base + 6 * WINDOW);
+        // The canary: the card reads and writes the title's bytes in place.
+        // SAFETY: the test's own committed memory.
+        let title = |at: u64, n: usize| unsafe { std::slice::from_raw_parts_mut(at as *mut u8, n) };
+        for (i, byte) in title(a, WINDOW as usize).iter_mut().enumerate() {
+            *byte = (i as u8).wrapping_mul(31).wrapping_add(7);
+        }
+        let window = lookup_with(a + 0x1000, 16, true, false, false).expect("a window");
+        assert!(window.in_place(), "a window over private memory committed whole is placed");
+        let (heap, _) = window.place.as_ref().expect("in place");
+        let shows = crate::inplace::heap_shows(device(), heap, a as usize, WINDOW as usize);
+        assert_eq!(shows, Some(true), "the card reads the title's bytes in place: the host imported the memory");
+        let mut rig = crate::inplace::Rig::new(device()).expect("a queue of the test's own");
+        rig.store(&window.buffer, window.offset(a + 0x2000), &[0xc3; 256]).expect("the card writes");
+        assert!(title(a + 0x2000, 256).iter().all(|&v| v == 0xc3), "the card's write is in title memory, nothing copied back");
+        // A big buffer's copy (in the card's memory, never placed), then a
+        // window over it: not placed.
+        assert!(16 * MIB >= card_limits().0, "a buffer of 16 MiB is big");
+        register(0x51_0003, b + MIB, 16 * MIB);
+        let buffer = lookup_with(b + MIB, 16, false, false, false).expect("the buffer's copy");
+        assert!(!buffer.in_place(), "a big buffer is a copy");
+        let window = lookup_with(b + 0x1000, 16, true, false, false).expect("a window");
+        assert!(!window.in_place(), "no window in place over a buffer's copy: one owner per byte");
+        // A window's copy (a page of its cell read-only: not placed), then a
+        // buffer in it: not placed.
+        let mut was: PAGE_PROTECTION_FLAGS = 0;
+        // SAFETY: a page of the test's own memory.
+        assert_ne!(unsafe { VirtualProtect((c + 3 * MIB) as *const _, 64 * KIB as usize, PAGE_READONLY, &mut was) }, 0);
+        let window = lookup_with(c + 3 * MIB + 0x100, 16, true, false, false).expect("a window");
+        assert!(!window.in_place(), "a window over a read-only page is a copy");
+        register(0x51_0004, c + MIB, 64 * KIB);
+        let buffer = lookup_with(c + MIB, 16, false, false, false).expect("the buffer");
+        assert!(!buffer.in_place(), "no buffer in place under a window's copy: one owner per byte");
+        unregister(0x51_0003, b + MIB);
+        unregister(0x51_0004, c + MIB);
     }
 }
 
@@ -6194,30 +6421,51 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
             return Some(shadow.clone());
         }
     }
-    let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
-    let (start, len) = if unsized_ask && tails() {
-        let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
-        longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
-    } else if any && fine() && !unsized_ask {
-        // The windows that begin in the ask's cell at or below the ask (one
-        // that begins in a cell below and reaches this far is passed over:
-        // the ask then makes its own).
-        let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
-        holder(there, address, end).unwrap_or(named)
-    } else {
-        named
+    // Taken first, and the map looked at again, when the window to be made
+    // may meet memory in place ([`at_stake`]).
+    let mut one = None;
+    let (mut map, start, len) = loop {
+        let map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        let (start, len) = if unsized_ask && tails() {
+            let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+            longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
+        } else if any && fine() && !unsized_ask {
+            // The windows that begin in the ask's cell at or below the ask (one
+            // that begins in a cell below and reaches this far is passed over:
+            // the ask then makes its own).
+            let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+            holder(there, address, end).unwrap_or(named)
+        } else {
+            named
+        };
+        if let Some(shadow) = map.get(&(start, len)) {
+            note(shadow);
+            return Some(shadow.clone());
+        }
+        if one.is_none() && at_stake(start, start + len) {
+            drop(map);
+            one = Some(one_owner());
+            continue;
+        }
+        break (map, start, len);
     };
-    if let Some(shadow) = map.get(&(start, len)) {
-        note(shadow);
-        return Some(shadow.clone());
-    }
     // In place, if asked for and the window's memory can be opened: the
-    // window is the title's own memory, with nothing to copy.
-    if let Some(placed) = crate::port::place_for(start, len, true).or_else(|| crate::inplace::place_for(start, len, true)) {
+    // window is the title's own memory, with nothing to copy. One owner per
+    // byte ([`ONE_OWNER`]): not over a copy of the same bytes, ...
+    let over = one.is_some() && copied_over(&buffers_read(), &map, start, start + len);
+    let placed = if over { None } else { crate::port::place_for(start, len, true).or_else(|| crate::inplace::place_for(start, len, true)) };
+    if let Some(placed) = placed {
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
         note(&shadow);
         map.insert((start, len), shadow.clone());
         return Some(shadow);
+    }
+    if over && (crate::port::wanted(start, len) || crate::inplace::level() > 0) {
+        OWNERS[0].fetch_add(1, Ordering::Relaxed);
+    }
+    // ... and no copy over memory in place: what is in place there goes.
+    if one.is_some() {
+        placed_out(&mut buffers(), &mut map, start, start + len);
     }
     // One buffer in the card's memory, filled by the CPU through the bus.
     if let Some((buffer, data)) = window_mapped_for(len) {
