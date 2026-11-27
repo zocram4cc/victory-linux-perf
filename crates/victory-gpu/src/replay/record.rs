@@ -1913,7 +1913,19 @@ unsafe extern "system" fn copy_descriptors(
 unsafe extern "system" fn execute(this: Ptr, n: u32, lists: *const Ptr) {
     // SAFETY: `n` closed lists, as D3D12 asks; the state is the queue's.
     unsafe {
-        let go = || own!(this, ID3D12CommandQueue_Vtbl.ExecuteCommandLists)(this, n, lists);
+        // The lists as the system made them for the call itself
+        // ([`hook::unhooked_for_a_while`]): closed lists, not recorded into
+        // while they are sent.
+        let go = || {
+            let all = std::slice::from_raw_parts(lists, n as usize);
+            let back: Vec<Option<usize>> = all.iter().map(|&l| hook::unhooked_for_a_while(l)).collect();
+            own!(this, ID3D12CommandQueue_Vtbl.ExecuteCommandLists)(this, n, lists);
+            for (&l, at) in all.iter().zip(back) {
+                if let Some(at) = at {
+                    hook::rehook(l, at);
+                }
+            }
+        };
         let Some(r) = recorder().filter(|_| !ours()) else {
             return go();
         };

@@ -131,6 +131,36 @@ pub(super) unsafe fn install(
     true
 }
 
+/// Points the object back at its own method table for a while, if it
+/// points at a shim of ours; what to put back after ([`rehook`]).
+/// vkd3d-proton tells its kinds of command lists apart by their table
+/// (`unsafe_impl_from_ID3D12CommandList`): a list with a shim handed to its
+/// `ExecuteCommandLists` came out as no list and the process died reading
+/// at 0x2b20 the moment the recorder was on.
+///
+/// # Safety
+/// `this` is a live COM object no other thread calls meanwhile.
+pub(super) unsafe fn unhooked_for_a_while(this: *mut c_void) -> Option<usize> {
+    let made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: a live COM object starts with its table's address.
+    let at = unsafe { *this.cast::<usize>() };
+    if !made.contains(&at) {
+        return None;
+    }
+    // SAFETY: the object points into a shim: its own table is kept there.
+    unsafe { this.cast::<*const usize>().write((*shim(this)).orig) };
+    Some(at)
+}
+
+/// Points the object at the shim [`unhooked_for_a_while`] took it from.
+///
+/// # Safety
+/// As there, with what it returned.
+pub(super) unsafe fn rehook(this: *mut c_void, at: usize) {
+    // SAFETY: the caller's.
+    unsafe { this.cast::<usize>().write(at) };
+}
+
 /// The table the object points at.
 ///
 /// # Safety
