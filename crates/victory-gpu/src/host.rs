@@ -9396,11 +9396,12 @@ impl Meter {
                 // (run 20261127-224639).
                 let sweep_ms = c[5] as f64 * 0.017 + (c[7] >> 20) as f64 * 0.003;
                 tracing::info!(
-                    "uploaded textures picked by index, where they lie: {} slots ({} MB) in views of physical pages, \
-                     which the guards cover; {} slots ({} MB) in memory the kernel's write watch tracks, where no fault \
-                     tells of a write; those make {} spans joined under 64 KiB apart, {} under 1 MB ({} MB covered), \
-                     {} under 16 MB; one ask of the write watch over the 1 MB spans would take about {sweep_ms:.1} ms \
-                     (this count: {} spans walked, {:.2} ms with the texture locks held, {:.2} ms in all)",
+                    "uploaded textures picked by index, where they lie (the last round of the walk over their spans): \
+                     {} slots ({} MB) in views of physical pages, which the guards cover; {} slots ({} MB) in memory \
+                     the kernel's write watch tracks, where no fault tells of a write; those make {} spans joined under \
+                     64 KiB apart, {} under 1 MB ({} MB covered), {} under 16 MB; one ask of the write watch over the \
+                     1 MB spans would take about {sweep_ms:.1} ms (the round: {} spans walked, the texture locks held \
+                     {:.2} ms at most a frame, {:.2} ms in all)",
                     c[0],
                     c[1] >> 20,
                     c[2],
@@ -9412,6 +9413,27 @@ impl Meter {
                     cost[2],
                     cost[0] as f64 / 1e3,
                     cost[1] as f64 / 1e3
+                );
+            }
+            if crate::descriptor::host::watch_textures() {
+                // Since the line before (about five seconds).
+                static BEFORE: [std::sync::atomic::AtomicU64; 9] = [const { std::sync::atomic::AtomicU64::new(0) }; 9];
+                let now = crate::descriptor::host::WATCH_SWEEP.each_ref().map(|c| c.load(Ordering::Relaxed));
+                let d: [u64; 9] = std::array::from_fn(|i| now[i].saturating_sub(BEFORE[i].swap(now[i], Ordering::Relaxed)));
+                tracing::info!(
+                    "the write watch asked about uploaded textures picked by index in memory it tracks, since the line \
+                     before (VICTORY_WATCH_TEXTURES=0: not asked): {} askings over {} MB in {:.2} ms, {} slots looked \
+                     at, {} written since their upload, {} made due again; of those looked at: {} uploaded again \
+                     ({} MB), {} found holding the bytes already",
+                    d[0],
+                    d[1],
+                    d[2] as f64 / 1e3,
+                    d[3],
+                    d[4],
+                    d[5],
+                    d[6],
+                    d[7] >> 20,
+                    d[8]
                 );
             }
             if crate::resource::held_only() {

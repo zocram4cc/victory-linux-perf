@@ -97,6 +97,12 @@ fn next_asking() -> u64 {
     ASKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
 }
 
+/// The number of the last asking: a write found by a later one ([`writes`]
+/// gives each page's) came after this was read, or was not seen before.
+pub(crate) fn asking_now() -> u64 {
+    ASKED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// A title-memory range whose changed pages another subsystem needs to read.
 pub(crate) struct Tracked {
     start: usize,

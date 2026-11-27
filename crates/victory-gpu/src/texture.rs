@@ -1099,6 +1099,8 @@ fn record_upload(
 ) {
     use std::sync::atomic::Ordering::Relaxed;
     const COPY_DEST: u32 = 0x400;
+    #[cfg(feature = "diagnostics")]
+    crate::descriptor::host::first_upload_seen(resource);
     // A texture cut from a block may lie where another did: what the card
     // holds of that one is done with before the first upload into this one.
     if crate::pool::on() && !staging.uploaded.load(Relaxed) {

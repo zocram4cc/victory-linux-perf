@@ -944,8 +944,9 @@ struct GuardDue {
     left: Vec<u32>,
     /// The frame a slot was last made due so.
     last: std::collections::HashMap<u32, u64>,
-    /// Slots made due so whose upload has not been counted yet.
-    pending: std::collections::HashMap<u32, u64>,
+    /// Slots made due so whose upload has not been counted yet: the frame,
+    /// and what made them due ([`GUARD`] or [`WATCH`]).
+    pending: std::collections::HashMap<u32, (u64, u8)>,
 }
 
 impl GuardDue {
@@ -953,9 +954,9 @@ impl GuardDue {
     /// that came after is noted again).
     const LEFT_MOST: usize = 1 << 16;
 
-    /// Of the slots put off before and `found` now, the ones to make due
-    /// at `frame` (at most `most`), and how many were put off.
-    fn pick(&mut self, found: &[u32], frame: u64, most: usize, every: u64) -> (Vec<u32>, usize) {
+    /// Of the slots put off before and `found` now (by `source`), the ones
+    /// to make due at `frame` (at most `most`), and how many were put off.
+    fn pick(&mut self, found: &[u32], frame: u64, most: usize, every: u64, source: u8) -> (Vec<u32>, usize) {
         let mut seen = std::collections::HashSet::new();
         let all: Vec<u32> =
             std::mem::take(&mut self.left).into_iter().chain(found.iter().copied()).filter(|s| seen.insert(*s)).collect();
@@ -967,7 +968,7 @@ impl GuardDue {
                 continue;
             }
             self.last.insert(slot, frame);
-            self.pending.insert(slot, frame);
+            self.pending.insert(slot, (frame, source));
             due.push(slot);
         }
         if self.left.len() > Self::LEFT_MOST {
@@ -979,18 +980,23 @@ impl GuardDue {
             self.last.retain(|_, at| frame < *at + every);
         }
         if self.pending.len() > 4 * most.max(1024) {
-            self.pending.retain(|_, at| frame < *at + 600);
+            self.pending.retain(|_, at| frame < at.0 + 600);
         }
         let put_off = self.left.len();
         (due, put_off)
     }
 
-    /// Whether slot `index` was made due by a guard write and not uploaded
-    /// since (then it is now).
-    fn uploaded(&mut self, index: u32) -> bool {
-        self.pending.remove(&index).is_some()
+    /// What made slot `index` due if it was made due so and not uploaded
+    /// or looked at since (then it is now).
+    fn uploaded(&mut self, index: u32) -> Option<u8> {
+        self.pending.remove(&index).map(|p| p.1)
     }
 }
+
+/// [`GuardDue`] sources: a write the guards saw, and one the write watch
+/// found ([`watch_textures`]).
+const GUARD: u8 = 0;
+const WATCH: u8 = 1;
 
 static GUARD_DUE: std::sync::LazyLock<Mutex<GuardDue>> = std::sync::LazyLock::new(Mutex::default);
 
@@ -998,12 +1004,15 @@ static GUARD_DUE: std::sync::LazyLock<Mutex<GuardDue>> = std::sync::LazyLock::ne
 /// bytes already: counted if a guard write made it due ([`GUARD_WRITES`] 8).
 pub(crate) fn guard_due_same(index: u32) {
     use std::sync::atomic::Ordering::Relaxed;
-    if !guard_writes() {
+    if !guard_writes() && !watch_textures() {
         return;
     }
-    if GUARD_DUE.lock().unwrap_or_else(|e| e.into_inner()).uploaded(index) {
-        GUARD_WRITES[8].fetch_add(1, Relaxed);
+    match GUARD_DUE.lock().unwrap_or_else(|e| e.into_inner()).uploaded(index) {
+        Some(GUARD) => _ = GUARD_WRITES[8].fetch_add(1, Relaxed),
+        Some(_) => _ = WATCH_SWEEP[8].fetch_add(1, Relaxed),
+        None => {}
     }
+    watch_uploaded(index);
 }
 
 /// A slot of a texture picked by index was uploaded with `bytes`: counted
@@ -1011,60 +1020,88 @@ pub(crate) fn guard_due_same(index: u32) {
 /// Returns whether it was.
 pub(crate) fn guard_due_uploaded(index: u32, bytes: u64) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
-    if !guard_writes() {
+    if !guard_writes() && !watch_textures() {
         return false;
     }
-    let again = GUARD_DUE.lock().unwrap_or_else(|e| e.into_inner()).uploaded(index);
-    if again {
-        GUARD_WRITES[6].fetch_add(1, Relaxed);
-        GUARD_WRITES[7].fetch_add(bytes, Relaxed);
-    }
-    again
+    watch_uploaded(index);
+    let source = GUARD_DUE.lock().unwrap_or_else(|e| e.into_inner()).uploaded(index);
+    let counts = match source {
+        Some(GUARD) => &GUARD_WRITES[6..8],
+        Some(_) => &WATCH_SWEEP[6..8],
+        None => return false,
+    };
+    counts[0].fetch_add(1, Relaxed);
+    counts[1].fetch_add(bytes, Relaxed);
+    true
 }
 
-/// Diagnostics: what the first upload of each slot of a texture picked by
-/// index found at the start of its memory, to tell, when a guard write has
-/// it uploaded again ([`guard_due_uploaded`]), what was repaired: a line
-/// with the slot, the texture's shape, the frames since its first upload,
-/// and the first 16 bytes then and now (data that is no texture, such as
-/// compressed bytes or 16-bit numbers, shows there). For the first 256
-/// such uploads, then at counts that double.
+/// Diagnostics: the first 16 bytes of level 0 of each title texture at its
+/// first upload, by the address of its memory ([`first_upload_seen`]), to
+/// tell, when a guard or write-watch write has a texture picked by index
+/// uploaded again ([`guard_upload_seen`]), what was repaired.
+#[cfg(feature = "diagnostics")]
+static FIRST_UPLOADS: std::sync::LazyLock<Mutex<std::collections::HashMap<u64, (u64, [u8; 16])>>> =
+    std::sync::LazyLock::new(Mutex::default);
+
+/// Diagnostics: the address of `resource`'s memory and the first 16 bytes
+/// of its level 0 there now (its first block; the start of the memory holds
+/// the smallest levels, often still zeros while the texture streams in).
+#[cfg(feature = "diagnostics")]
+fn level0_bytes(resource: crate::object::This) -> Option<(u64, [u8; 16])> {
+    let (memory, desc) = crate::resource::texture_memory(resource)?;
+    let layout = crate::resource::texture_layout(&desc)?;
+    let offset = layout.planes.first()?.layout.offset(0, 0, 0, 0).ok()?;
+    let mut bytes = [0u8; 16];
+    crate::host::read_into(memory.wrapping_add(offset as usize), &mut bytes).then_some((memory as u64, bytes))
+}
+
+/// Diagnostics: a title texture is uploaded (by any path: the texture pass,
+/// or a draw that reads it through a table); its level 0's first bytes are
+/// kept if it is the first upload of its memory (at most 2^18 kept, then all
+/// are let go).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn first_upload_seen(resource: crate::object::This) {
+    const MOST: usize = 1 << 18;
+    if !guard_writes() && !watch_textures() {
+        return;
+    }
+    let Some((at, bytes)) = level0_bytes(resource) else {
+        return;
+    };
+    let mut first = FIRST_UPLOADS.lock().unwrap_or_else(|e| e.into_inner());
+    if first.len() >= MOST && !first.contains_key(&at) {
+        first.clear();
+    }
+    first.entry(at).or_insert((crate::frame::current(), bytes));
+}
+
+/// Diagnostics: a texture picked by index was uploaded, `again` if a guard
+/// or write-watch write made it due. Then a line, once for each slot (of
+/// textures more than one texel high; at most 4,096 lines): the slot, the
+/// texture's shape, the frames since its memory's first upload, and the
+/// first 16 bytes of its level 0 then and now (data that is no texture,
+/// such as compressed bytes or 16-bit numbers, shows there).
 #[cfg(feature = "diagnostics")]
 pub(crate) fn guard_upload_seen(index: u32, resource: crate::object::This, frame: u64, again: bool) {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-    /// Slots remembered at most; past it all are let go and the count goes on.
-    const MOST: usize = 1 << 18;
-    static FIRST: std::sync::LazyLock<Mutex<std::collections::HashMap<(u32, u64), (u64, [u8; 16])>>> =
-        std::sync::LazyLock::new(Mutex::default);
+    static LOGGED: std::sync::LazyLock<Mutex<std::collections::HashSet<u32>>> = std::sync::LazyLock::new(Mutex::default);
     static LINES: AtomicU64 = AtomicU64::new(0);
-    if !guard_writes() {
-        return;
-    }
-    let Some((at, _)) = crate::texture::title_span(resource, 0) else {
-        return;
-    };
-    let mut now = [0u8; 16];
-    if !crate::host::read_into(at as *const u8, &mut now) {
-        return;
-    }
-    let mut first = FIRST.lock().unwrap_or_else(|e| e.into_inner());
     if !again {
-        if first.len() >= MOST {
-            first.clear();
-        }
-        first.entry((index, at)).or_insert((frame, now));
-        return;
-    }
-    let before = first.get(&(index, at)).copied();
-    drop(first);
-    let n = LINES.fetch_add(1, Relaxed) + 1;
-    if n > 256 && !n.is_power_of_two() {
+        first_upload_seen(resource);
         return;
     }
     let (w, h, levels, format) = crate::resource::texture_shape(resource).unwrap_or_default();
+    if h <= 1 || LINES.load(Relaxed) >= 4096 || !LOGGED.lock().unwrap_or_else(|e| e.into_inner()).insert(index) {
+        return;
+    }
+    let Some((at, now)) = level0_bytes(resource) else {
+        return;
+    };
+    let before = FIRST_UPLOADS.lock().unwrap_or_else(|e| e.into_inner()).get(&at).copied();
+    let n = LINES.fetch_add(1, Relaxed) + 1;
     let hex = |b: &[u8; 16]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
     tracing::info!(
-        uploads = n,
+        lines = n,
         slot = index,
         address = format_args!("{at:#x}"),
         width = w,
@@ -1072,14 +1109,15 @@ pub(crate) fn guard_upload_seen(index: u32, resource: crate::object::This, frame
         levels,
         format,
         frames_since_first_upload = before.map_or(-1, |(f, _)| frame.saturating_sub(f) as i64),
-        first_bytes_then = before.map_or_else(|| "unknown".to_string(), |(_, b)| hex(&b)),
-        first_bytes_now = hex(&now),
-        "a texture picked by index uploaded again after a write the guards saw (VICTORY_GUARD_WRITES)"
+        level0_first_bytes_then = before.map_or_else(|| "unknown".to_string(), |(_, b)| hex(&b)),
+        level0_first_bytes_now = hex(&now),
+        memory = if crate::inplace::shown_bytes(at as usize, 1).is_some_and(|n| n > 0) { "view" } else { "write watch" },
+        "a texture picked by index uploaded again after a write the guards or the write watch saw"
     );
 }
 
-/// Where the uploaded textures picked by index lie, counted every
-/// [`WATCH_CENSUS_EVERY`] frames: slots and bytes in views of physical
+/// Where the uploaded textures picked by index lie, counted by the walk
+/// over a round ([`HostHeap::texture_watch_walk`]): slots and bytes in views of physical
 /// pages (the guards cover them: [`guard_written`] hears of the title's
 /// writes there); slots and bytes elsewhere in title memory (the kernel's
 /// write watch tracks it, and no fault tells of a write: a texture filled
@@ -1091,13 +1129,118 @@ pub(crate) fn guard_upload_seen(index: u32, resource: crate::object::This, frame
 pub(crate) static WATCH_CENSUS: [std::sync::atomic::AtomicU64; 8] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 8];
 
-/// Frames between two counts of [`WATCH_CENSUS`].
-const WATCH_CENSUS_EVERY: u64 = 150;
+/// Spans of placed textures the walk ([`HostHeap::texture_watch_walk`])
+/// takes in a frame: with some 20,000 spans a round is about 20 frames, and
+/// a share holds the span and queue locks some 0.2 ms (the whole walk at
+/// once held them 4.2-4.6 ms, run 20261127-231847).
+const WATCH_SHARE: usize = 1024;
 
-/// What the last count of [`WATCH_CENSUS`] took: microseconds with the
-/// span and queue locks held, and in all; and the spans walked.
+/// What the last round of the walk took: the longest the span and queue
+/// locks were held in one share, in microseconds; microseconds in all; and
+/// the spans walked.
 pub(crate) static WATCH_CENSUS_COST: [std::sync::atomic::AtomicU64; 3] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Whether the walk asks the kernel's write watch about the uploaded
+/// textures picked by index that lie in memory it tracks
+/// (`VICTORY_WATCH_TEXTURES`, on; `=0`: counted only). No fault tells of a
+/// write there ([`guard_written`] hears only of views): a texture the title
+/// fills there after its upload kept its first bytes. The spans the walk
+/// takes in a frame are joined where under 1 MB apart and each is asked
+/// once; a slot a page of which was found written by a later asking than
+/// the one current at its upload is made due as a guard write makes it
+/// ([`GuardDue`]: the same share, put-offs and counts of uploads). Some
+/// 22 such spans in a round, 0.6 ms of asking a second (run
+/// 20261127-231847).
+pub(crate) fn watch_textures() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WATCH_TEXTURES").is_none_or(|v| v != "0"))
+}
+
+/// Since the start: askings of the write watch the walk made; MB they
+/// covered; microseconds they took; slots looked at in tracked memory;
+/// those found written since their upload; of those, slots made due;
+/// uploads of slots made due so; their bytes; and looks at such slots
+/// that found the host copy holding title memory's bytes already.
+pub(crate) static WATCH_SWEEP: [std::sync::atomic::AtomicU64; 9] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 9];
+
+/// The walk's place and what its round has counted so far.
+#[derive(Default)]
+struct Walk {
+    /// The start of the next span to take; 0: a round begins.
+    cursor: u64,
+    /// [`WATCH_CENSUS`] 0-3 of the round so far.
+    counts: [u64; 4],
+    /// Spans in tracked memory found in the round, in address order.
+    watched: Vec<(u64, u64)>,
+    /// [`WATCH_CENSUS_COST`] of the round so far.
+    held_most: u64,
+    took: u64,
+    walked: u64,
+}
+
+static WALK: std::sync::LazyLock<Mutex<Walk>> = std::sync::LazyLock::new(Mutex::default);
+
+/// The asking current when each slot was last uploaded or found holding
+/// title memory's bytes ([`watch_uploaded`]): a write found by a later
+/// asking may be one its host copy has not.
+static WATCH_BASE: std::sync::LazyLock<Mutex<std::collections::HashMap<u32, u64>>> =
+    std::sync::LazyLock::new(Mutex::default);
+
+/// Slot `index` was uploaded, or found holding title memory's bytes: the
+/// writes the write watch finds from now on are new to it.
+pub(crate) fn watch_uploaded(index: u32) {
+    /// Slots remembered at most (past it all are let go: a slot without one
+    /// takes the next asking as its own, and is not made due by it).
+    const MOST: usize = 1 << 20;
+    if !watch_textures() {
+        return;
+    }
+    let now = crate::watch::asking_now();
+    let mut base = WATCH_BASE.lock().unwrap_or_else(|e| e.into_inner());
+    if base.len() >= MOST {
+        base.clear();
+    }
+    base.insert(index, now);
+}
+
+/// Of the slots of `spans` (start, end, slots), the ones a page of whose
+/// span `pages` (page number, the asking that last found it written; in
+/// page order, pages of `page` bytes) has written after the asking in
+/// `base`. A slot without one takes `now` and is not counted. Returns the
+/// slots looked at, and those found written.
+fn written_since(
+    spans: &[(u64, u64, Vec<u32>)],
+    pages: &[(usize, u64)],
+    page: u64,
+    base: &mut std::collections::HashMap<u32, u64>,
+    now: u64,
+) -> (u64, Vec<u32>) {
+    let mut looked = 0;
+    let mut found = Vec::new();
+    for (start, end, slots) in spans {
+        let (first, last) = ((start / page) as usize, end.div_ceil(page) as usize);
+        let at = pages.partition_point(|&(p, _)| p < first);
+        let latest = pages[at..].iter().take_while(|&&(p, _)| p < last).map(|&(_, w)| w).max().unwrap_or(0);
+        for &slot in slots {
+            match base.get(&slot) {
+                None => {
+                    base.insert(slot, now);
+                }
+                Some(&b) => {
+                    looked += 1;
+                    if latest > b {
+                        found.push(slot);
+                    }
+                }
+            }
+        }
+    }
+    found.sort_unstable();
+    found.dedup();
+    (looked, found)
+}
 
 /// How many spans `spans` (sorted by start) make when those less than `gap`
 /// bytes apart are joined, and the bytes the joined spans cover.
@@ -1122,27 +1265,6 @@ fn coalesced(spans: &[(u64, u64)], gap: u64) -> (u64, u64) {
     (n, covered)
 }
 
-/// [`WATCH_CENSUS`] of the spans of uploaded textures (sorted by start, with
-/// the number of slots each holds), `shown` telling whether views of
-/// physical pages show a span.
-fn watch_census(spans: &[(u64, u64, u64)], shown: impl Fn(u64, u64) -> bool) -> [u64; 8] {
-    let mut c = [0u64; 8];
-    let mut watched = Vec::new();
-    for &(start, end, slots) in spans {
-        if shown(start, end) {
-            c[0] += slots;
-            c[1] += end - start;
-        } else {
-            c[2] += slots;
-            c[3] += end - start;
-            watched.push((start, end));
-        }
-    }
-    c[4] = coalesced(&watched, 64 << 10).0;
-    (c[5], c[7]) = coalesced(&watched, 1 << 20);
-    c[6] = coalesced(&watched, 16 << 20).0;
-    c
-}
 
 /// Title memory the runtime mapped, unmapped or is about to write since a
 /// texture pass last took the ranges ([`remapped`]).
@@ -2403,7 +2525,7 @@ impl HostHeap {
         use std::sync::atomic::Ordering::Relaxed;
         self.texture_slots_page_written(frame);
         self.texture_slots_guard_written(frame);
-        self.texture_watch_census(frame);
+        self.texture_watch_walk(frame);
         let mut ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
         if ranges.is_empty() {
             return 0;
@@ -2537,44 +2659,141 @@ impl HostHeap {
         [held, slots.len(), slots.len()]
     }
 
-    /// Counts, every [`WATCH_CENSUS_EVERY`] frames, where the uploaded
-    /// textures picked by index lie ([`WATCH_CENSUS`]). A walk over the
-    /// spans of placed textures and a look at the runtime's record of views
-    /// for each: no question to the host.
-    fn texture_watch_census(&self, frame: u64) {
+    /// Walks [`WATCH_SHARE`] spans of placed textures a frame, in address
+    /// order: counts where the uploaded ones lie ([`WATCH_CENSUS`], at the
+    /// end of each round), and with [`watch_textures`] asks the write watch
+    /// about the ones in memory it tracks and makes due those written since
+    /// their upload. The locks are held only while the share is taken.
+    fn texture_watch_walk(&self, frame: u64) {
         use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-        static LAST: AtomicU64 = AtomicU64::new(0);
+        static LAST: AtomicU64 = AtomicU64::new(u64::MAX);
         let last = LAST.load(Relaxed);
-        if frame < last + WATCH_CENSUS_EVERY || LAST.compare_exchange(last, frame, Relaxed, Relaxed).is_err() {
+        if last == frame || LAST.compare_exchange(last, frame, Relaxed, Relaxed).is_err() {
             return;
         }
         let began = std::time::Instant::now();
-        let (walked, spans): (u64, Vec<(u64, u64, u64)>) = {
+        let cursor = WALK.lock().unwrap_or_else(|e| e.into_inner()).cursor;
+        let (share, next, walked) = {
             let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
             let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-            let spans: Vec<(u64, u64, u64)> = placed
-                .by_start
-                .iter()
-                .filter_map(|(&start, (end, slots))| {
-                    let uploaded = slots
-                        .iter()
-                        .filter(|slot| textures.slots.get(slot).is_none_or(|w| w.mapped > 0 || w.checked.2 != 0))
-                        .count() as u64;
-                    (uploaded > 0).then_some((start, *end, uploaded))
-                })
-                .collect();
-            (placed.by_start.len() as u64, spans)
+            let mut share: Vec<(u64, u64, Vec<u32>)> = Vec::new();
+            let (mut next, mut walked) = (None, 0u64);
+            for (&start, (end, slots)) in placed.by_start.range(cursor..) {
+                if walked as usize == WATCH_SHARE {
+                    next = Some(start);
+                    break;
+                }
+                walked += 1;
+                let uploaded: Vec<u32> = slots
+                    .iter()
+                    .copied()
+                    .filter(|slot| textures.slots.get(slot).is_none_or(|w| w.mapped > 0 || w.checked.2 != 0))
+                    .collect();
+                if !uploaded.is_empty() {
+                    share.push((start, *end, uploaded));
+                }
+            }
+            (share, next, walked)
         };
         let held = began.elapsed().as_micros() as u64;
-        let c = watch_census(&spans, |start, end| {
-            crate::inplace::shown_bytes(start as usize, (end - start) as usize).is_some_and(|n| n > 0)
-        });
-        for (counter, value) in WATCH_CENSUS.iter().zip(c) {
-            counter.store(value, Relaxed);
+        let (mut shown, mut tracked) = (Vec::new(), Vec::new());
+        for span in share {
+            if crate::inplace::shown_bytes(span.0 as usize, (span.1 - span.0) as usize).is_some_and(|n| n > 0) {
+                shown.push(span);
+            } else {
+                tracked.push(span);
+            }
         }
-        WATCH_CENSUS_COST[0].store(held, Relaxed);
-        WATCH_CENSUS_COST[1].store(began.elapsed().as_micros() as u64, Relaxed);
-        WATCH_CENSUS_COST[2].store(walked, Relaxed);
+        if watch_textures() && !tracked.is_empty() {
+            self.watch_sweep(&tracked, frame);
+        }
+        let mut walk = WALK.lock().unwrap_or_else(|e| e.into_inner());
+        for (start, end, slots) in &shown {
+            walk.counts[0] += slots.len() as u64;
+            walk.counts[1] += end - start;
+        }
+        for (start, end, slots) in &tracked {
+            walk.counts[2] += slots.len() as u64;
+            walk.counts[3] += end - start;
+            walk.watched.push((*start, *end));
+        }
+        walk.held_most = walk.held_most.max(held);
+        walk.took += began.elapsed().as_micros() as u64;
+        walk.walked += walked;
+        match next {
+            Some(start) => walk.cursor = start,
+            None => {
+                // The round is over: what it counted stands until the next.
+                let (c, watched) = (walk.counts, std::mem::take(&mut walk.watched));
+                let census = [
+                    c[0],
+                    c[1],
+                    c[2],
+                    c[3],
+                    coalesced(&watched, 64 << 10).0,
+                    coalesced(&watched, 1 << 20).0,
+                    coalesced(&watched, 16 << 20).0,
+                    coalesced(&watched, 1 << 20).1,
+                ];
+                for (counter, value) in WATCH_CENSUS.iter().zip(census) {
+                    counter.store(value, Relaxed);
+                }
+                for (counter, value) in WATCH_CENSUS_COST.iter().zip([walk.held_most, walk.took, walk.walked]) {
+                    counter.store(value, Relaxed);
+                }
+                *walk = Walk::default();
+            }
+        }
+    }
+
+    /// Asks the write watch about `tracked` (spans in memory it tracks, in
+    /// address order, with their uploaded slots), joined where under 1 MB
+    /// apart, and makes due ([`GuardDue`]) the slots written since their
+    /// upload ([`written_since`]).
+    fn watch_sweep(&self, tracked: &[(u64, u64, Vec<u32>)], frame: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let began = std::time::Instant::now();
+        let mut found = Vec::new();
+        let mut looked = 0;
+        let mut at = 0;
+        while at < tracked.len() {
+            // The spans under 1 MB apart from `at` on: one asking.
+            let (start, mut end) = (tracked[at].0, tracked[at].1);
+            let mut to = at + 1;
+            while to < tracked.len() && tracked[to].0 <= end.saturating_add(1 << 20) {
+                end = end.max(tracked[to].1);
+                to += 1;
+            }
+            let now = crate::watch::asking_now();
+            if let Some((_, pages)) = crate::watch::writes(start as usize, end as usize, false) {
+                WATCH_SWEEP[0].fetch_add(1, Relaxed);
+                WATCH_SWEEP[1].fetch_add((end - start) >> 20, Relaxed);
+                let mut base = WATCH_BASE.lock().unwrap_or_else(|e| e.into_inner());
+                let (n, written) = written_since(&tracked[at..to], &pages, crate::watch::PAGE as u64, &mut base, now);
+                looked += n;
+                found.extend(written);
+            }
+            at = to;
+        }
+        WATCH_SWEEP[2].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
+        WATCH_SWEEP[3].fetch_add(looked, Relaxed);
+        WATCH_SWEEP[4].fetch_add(found.len() as u64, Relaxed);
+        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        found.retain(|slot| textures.slots.get(slot).is_none_or(|w| w.mapped > 0 || w.checked.2 != 0));
+        let (due, _) = {
+            let mut picker = GUARD_DUE.lock().unwrap_or_else(|e| e.into_inner());
+            if found.is_empty() && picker.left.is_empty() {
+                return;
+            }
+            picker.pick(&found, frame, guard_writes_most(), GUARD_WRITE_EVERY, WATCH)
+        };
+        WATCH_SWEEP[5].fetch_add(due.len() as u64, Relaxed);
+        let mut base = WATCH_BASE.lock().unwrap_or_else(|e| e.into_inner());
+        for &slot in &due {
+            textures.changed(slot, frame, frame + PAGE_WRITE_AFTER);
+            // Not found written again by the same writes before its upload.
+            base.insert(slot, crate::watch::asking_now());
+        }
     }
 
     /// Takes the blocks the title wrote that the guards saw since the last
@@ -2616,7 +2835,7 @@ impl HostHeap {
             if slots.is_empty() && picker.left.is_empty() {
                 return 0;
             }
-            picker.pick(&slots, frame, most, every)
+            picker.pick(&slots, frame, most, every, GUARD)
         };
         GUARD_WRITES[2].fetch_add(held as u64, Relaxed);
         GUARD_WRITES[3].fetch_add(slots.len() as u64, Relaxed);
@@ -6992,10 +7211,9 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(slots(62), [1]);
     }
 
-    /// Where uploaded textures lie: in views (the guards cover them) or
-    /// elsewhere, and the spans the others make when near ones are joined.
+    /// Spans near one another are joined, and the bytes they cover counted.
     #[test]
-    fn the_watch_census_counts_views_and_joins_near_spans() {
+    fn near_spans_are_joined() {
         assert_eq!(coalesced(&[], 1 << 20), (0, 0));
         let spans = [(0x1000, 0x2000), (0x3000, 0x4000), (0x20_0000, 0x20_1000), (0x400_0000, 0x400_1000)];
         // Under 64 KiB apart: the first two are one.
@@ -7004,13 +7222,31 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(coalesced(&spans, 4 << 20).0, 2);
         // A span inside another adds nothing.
         assert_eq!(coalesced(&[(0, 0x10_0000), (0x1000, 0x2000)], 0), (1, 0x10_0000));
-        // Spans at 0x1000.. are views: two slots there; the rest watched.
-        let with_slots = [(0x1000, 0x2000, 2), (0x3000, 0x4000, 1), (0x20_0000, 0x20_1000, 1)];
-        let c = watch_census(&with_slots, |start, _| start < 0x2000);
-        assert_eq!(c[..4], [2, 0x1000, 2, 0x2000]);
-        // Watched: 0x3000 and 0x200000 are 2 MB apart.
-        assert_eq!((c[4], c[5], c[6]), (2, 2, 1));
-        assert_eq!(c[7], 0x2000);
+        // At 0x3000 and 0x200000, 2 MB apart: two under 1 MB, one under 16.
+        let watched = [(0x3000, 0x4000), (0x20_0000, 0x20_1000)];
+        assert_eq!(coalesced(&watched, 1 << 20), (2, 0x2000));
+        assert_eq!(coalesced(&watched, 16 << 20).0, 1);
+    }
+
+    /// The write watch's pages against each slot's asking at its upload:
+    /// only a page of its own span written by a later asking makes it
+    /// written; a slot seen for the first time takes the asking now.
+    #[test]
+    fn a_slot_is_written_since_its_upload_only_by_its_own_later_pages() {
+        let page = 64 << 10;
+        // Slots 1 and 2 share pages 2-3; slot 3 is on page 8.
+        let spans = [(2 * page, 4 * page, vec![1, 2]), (8 * page, 8 * page + 100, vec![3])];
+        let mut base: std::collections::HashMap<u32, u64> = [(1, 10), (2, 20), (3, 10)].into();
+        // Page 3 written by asking 15, page 5 (no slot's) by 99.
+        let pages = [(3usize, 15u64), (5, 99)];
+        assert_eq!(written_since(&spans, &pages, page, &mut base, 30), (3, vec![1]));
+        // Page 8 by 11: slot 3 too.
+        assert_eq!(written_since(&spans, &[(8, 11)], page, &mut base, 30), (3, vec![3]));
+        // A slot never uploaded here takes the asking now, and is not written.
+        let spans = [(8 * page, 9 * page, vec![7])];
+        assert_eq!(written_since(&spans, &[(8, 11)], page, &mut base, 30), (0, vec![]));
+        assert_eq!(base[&7], 30);
+        assert_eq!(written_since(&spans, &[(8, 31)], page, &mut base, 40), (1, vec![7]));
     }
 
     /// Guard writes make at most a pass's share of slots due, none again
@@ -7020,23 +7256,26 @@ void main(uint3 id : SV_DispatchThreadID) {
     fn guard_writes_are_bounded_and_none_is_lost() {
         let mut g = GuardDue::default();
         // Three slots, a share of two: the third waits.
-        assert_eq!(g.pick(&[5, 6, 7], 100, 2, 8), (vec![5, 6], 1));
+        assert_eq!(g.pick(&[5, 6, 7], 100, 2, 8, GUARD), (vec![5, 6], 1));
         // Next pass: nothing new; the one put off goes now.
-        assert_eq!(g.pick(&[], 101, 2, 8), (vec![7], 0));
+        assert_eq!(g.pick(&[], 101, 2, 8, GUARD), (vec![7], 0));
         // Slot 5 written again three frames on: put off, not dropped, and
         // the same slot found twice is one.
-        assert_eq!(g.pick(&[5, 5, 9], 103, 2, 8), (vec![9], 1));
+        assert_eq!(g.pick(&[5, 5, 9], 103, 2, 8, GUARD), (vec![9], 1));
         // Still too soon at 107, due at 108 (eight frames after 100).
-        assert_eq!(g.pick(&[], 107, 2, 8), (vec![], 1));
-        assert_eq!(g.pick(&[], 108, 2, 8), (vec![5], 0));
+        assert_eq!(g.pick(&[], 107, 2, 8, GUARD), (vec![], 1));
+        assert_eq!(g.pick(&[], 108, 2, 8, GUARD), (vec![5], 0));
         // Uploads and looks are counted once per making due.
-        assert!(g.uploaded(5));
-        assert!(!g.uploaded(5));
-        assert!(g.uploaded(9) && g.uploaded(6) && g.uploaded(7));
-        assert!(!g.uploaded(42));
+        assert_eq!(g.uploaded(5), Some(GUARD));
+        assert_eq!(g.uploaded(5), None);
+        assert!([9, 6, 7].iter().all(|&s| g.uploaded(s) == Some(GUARD)));
+        assert_eq!(g.uploaded(42), None);
+        // What the write watch made due is told apart.
+        assert_eq!(g.pick(&[11], 300, 2, 8, WATCH), (vec![11], 0));
+        assert_eq!(g.uploaded(11), Some(WATCH));
         // A title that writes one slot every frame: one making due in eight.
         let mut g = GuardDue::default();
-        let made: usize = (0..64).map(|f| g.pick(&[3], 200 + f, 256, 8).0.len()).sum();
+        let made: usize = (0..64).map(|f| g.pick(&[3], 200 + f, 256, 8, GUARD).0.len()).sum();
         assert_eq!(made, 8);
     }
 
