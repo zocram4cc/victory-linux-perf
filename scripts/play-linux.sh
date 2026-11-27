@@ -15,6 +15,8 @@
 #   --skip-intro    press through the boot screens and logos (meeyao's timings, same
 #                   game build): Enter/A at 12-50 s, so the run reaches the load sooner
 #   --proton-log    Wine's own log into the run folder (large)
+#   --headless      in gamescope's headless backend (1920x1080, no window or monitor
+#                   needed): for unattended runs; the picture is only in captures
 #   --new-game      start at the opening scene: the story save and player record are
 #                   moved to ~/.local/share/victory/save-backups/<time> first (settings stay),
 #                   then ~/.local/share/victory/save-templates/new-game is copied in (a player
@@ -57,7 +59,7 @@ winpath() { local p; p="$(realpath -m -- "$1")"; printf 'Z:%s' "${p//\//\\}"; }
 usage() { sed -n '2,8p' "$0" >&2; exit 2; }
 
 # Options that apply to every command, taken out first.
-profile=release safe=0 bench="" proton_log=0 mangohud=0 stock_wineserver=0 new_game=0 args=()
+profile=release safe=0 bench="" proton_log=0 mangohud=0 stock_wineserver=0 new_game=0 headless=0 args=()
 while (( $# )); do
   case "$1" in
     --diag) profile=diag ;;
@@ -73,6 +75,7 @@ while (( $# )); do
     --no-texture-waits) ;; # the default now
     --skip-intro) export VICTORY_KEYS="${VICTORY_KEYS-12:Enter,16:Enter,20:A,25:Enter,30:A,35:Enter,40:A,50:Enter}" ;;
     --stock-wineserver) stock_wineserver=1 ;;
+    --headless) headless=1 ;;
     --view-tree) ;; # the default where the copy is installed
     --mangohud) mangohud=1 ;;
     --no-mangohud) mangohud=0 ;;
@@ -375,7 +378,11 @@ disown $!
 # The title in a process group of its own, so that Ctrl-C here reaches this
 # script only, which then asks the title to end.
 echo "run folder: $run"
-setsid umu-run "$win_exe" run "$(winpath "$game/game_scarlett_master.exe")" --console series-s --execute \
+wrap=()
+if (( headless )); then
+  wrap=(gamescope --backend headless -W 1920 -H 1080 -w 1920 -h 1080 --)
+fi
+setsid "${wrap[@]}" umu-run "$win_exe" run "$(winpath "$game/game_scarlett_master.exe")" --console series-s --execute \
   > >(python3 -I -u -c 'import re, signal, sys, time
 # Runs until the title closes its output: Ctrl-C and a closed terminal are
 # for the script above, which stops the title.
