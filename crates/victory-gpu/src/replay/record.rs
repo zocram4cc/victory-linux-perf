@@ -119,9 +119,12 @@ pub fn sheets_from(var: impl Fn(&str) -> Option<String>) -> Option<super::trigge
     })
 }
 
-/// The automatic trigger's defaults: see [`sheets_from`].
-pub const SHEETS_ROW: u32 = 1;
-pub const SHEETS_MIN: u32 = 1;
+/// The automatic trigger's defaults: see [`sheets_from`]. Waves spanning
+/// more than the screen's width, at least 8 in a frame: in replays of five
+/// captures (two loops each) 37-41 and 49-50 where sheets show, 5-6 where few
+/// do, 0 in one without.
+pub const SHEETS_ROW: u32 = 3;
+pub const SHEETS_MIN: u32 = 8;
 
 fn parse_at(text: &str) -> At {
     let text = text.trim();

@@ -46,7 +46,8 @@
 # (5). VICTORY_RECORD_AT (seconds, or f<frame>), VICTORY_RECORD_FRAMES, VICTORY_RECORD_ALWAYS=1.
 # VICTORY_RECORD_SHEETS=1: also a capture by itself when the characters' pre-skinned mesh
 # programs draw waves of vertices spanning much of the screen (stretched "sheets"); at most
-# VICTORY_RECORD_SHEETS_MAX a run (2); _ROW and _MIN set what counts. Best with ALWAYS=1.
+# VICTORY_RECORD_SHEETS_MAX a run (2); _ROW (3: wider than the screen) and _MIN (8 waves) set
+# what counts. The capture comes 3-4 frames after the sheet: a short one is gone by then.
 #
 # Every game run leaves a folder in ~/.local/share/victory/runs/ (VICTORY_RUNS_DIR):
 # run.json, victory.log, frames.csv, system.csv, marks.csv, marks/ (mangohud.csv with --mangohud).
