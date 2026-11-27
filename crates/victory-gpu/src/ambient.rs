@@ -56,15 +56,38 @@ pub(crate) enum Role {
     /// Gives see-through surfaces the sky probe's light as their
     /// reflection where no ray answered (glass, a tank of water).
     ReflectedAlpha,
+    /// Resolves the title's reflections where rays find nothing
+    /// (`CS_ResolveScreenSpace`, three dispatches a frame in the first
+    /// house): floors and table tops wear the open sky's glare indoors.
+    /// Held as [`Role::Reflected`] is, right after it
+    /// (`VICTORY_REFLECT_SCREEN=1`; after Trexies' Whiplash fork's
+    /// floor-reflection patch for cool_fox f4b48ad, GPL-3.0-or-later).
+    ReflectedScreen,
+}
+
+/// `VICTORY_REFLECT_SCREEN=1`: the hold follows `CS_ResolveScreenSpace` too.
+pub(crate) fn reflect_screen() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REFLECT_SCREEN").is_some_and(|v| v == "1"))
+}
+
+/// The most [`Role::ReflectedScreen`] holds, as a multiple of the light
+/// around (`VICTORY_AMBIENT_REFLECT_SCREEN`, 0.5 as Whiplash has it).
+fn reflect_screen_most() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let set = std::env::var("VICTORY_AMBIENT_REFLECT_SCREEN").unwrap_or_default();
+        set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.5)
+    })
 }
 
 /// The program's part in this, by its name in the container.
 pub(crate) fn role(container: &[u8]) -> Option<Role> {
-    role_when(container, see_through())
+    role_when(container, reflect_screen(), see_through())
 }
 
-/// [`role`] with the see-through switch given.
-fn role_when(container: &[u8], see_through: bool) -> Option<Role> {
+/// [`role`] with the reflection switches given.
+fn role_when(container: &[u8], screen: bool, see_through: bool) -> Option<Role> {
     let has = |name: &[u8]| container.windows(name.len()).any(|w| w == name);
     if has(b"CS_ScreenProbes_TemporalResolve") {
         Some(Role::Resolve)
@@ -74,6 +97,8 @@ fn role_when(container: &[u8], see_through: bool) -> Option<Role> {
         Some(Role::Air)
     } else if see_through && has(b"CS_DeferredFallbacksAlpha_SkyProbe") {
         Some(Role::ReflectedAlpha)
+    } else if screen && has(b"CS_ResolveScreenSpace") {
+        Some(Role::ReflectedScreen)
     } else if has(b"CS_UpdateHistory") {
         Some(Role::Reflected)
     } else {
@@ -96,6 +121,9 @@ pub(crate) const REFLECTIONS: (u8, u32) = (1, 40);
 /// 1280x720): read off the program's tables with breakwater's
 /// `VICTORY_VIEWS_OF`, not ported here.
 pub(crate) const REFLECTIONS_ALPHA: (u8, u32) = (1, 48);
+/// Where `CS_ResolveScreenSpace` writes its reflections (R11G11B10_FLOAT, a
+/// quarter of the resolve's pixels).
+pub(crate) const REFLECTIONS_SCREEN: (u8, u32) = (1, 128);
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Set {
@@ -756,7 +784,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     if role == Role::Air && (constant > 0.0 || air() == 0.0) {
         return false;
     }
-    if matches!(role, Role::Reflected | Role::ReflectedAlpha) && (constant > 0.0 || reflect() == 0.0) {
+    if matches!(role, Role::Reflected | Role::ReflectedAlpha | Role::ReflectedScreen) && (constant > 0.0 || reflect() == 0.0) {
         return false;
     }
     static SAID: Mutex<u32> = Mutex::new(0);
@@ -788,7 +816,12 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[7] = views.size[1];
     words[8] = follow(role).to_bits();
     words[9] = 4.0f32.to_bits();
-    words[10] = if matches!(role, Role::Reflected | Role::ReflectedAlpha) { reflect() } else { air() }.to_bits();
+    words[10] = match role {
+        Role::Reflected | Role::ReflectedAlpha => reflect(),
+        Role::ReflectedScreen => reflect_screen_most(),
+        _ => air(),
+    }
+    .to_bits();
     words[11] = u32::from(crate::lightprobe::on());
     words[12] = settle().map_or(0.0, |s| s.jump).to_bits();
     words[13] = settle().map_or(0.0, |s| s.fresh).to_bits();
@@ -818,7 +851,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                 KEPT.store(true, Ordering::Relaxed);
             }
             Role::Reflected => run(&pass.hold, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1),
-            Role::ReflectedAlpha => run(&pass.hold_f, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1),
+            Role::ReflectedAlpha | Role::ReflectedScreen => run(&pass.hold_f, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1),
             Role::Air => run(&pass.air, views.size[0].div_ceil(8), views.size[1].div_ceil(8), views.slices.div_ceil(2)),
             Role::Resolve => {
                 if constant == 0.0 {
@@ -857,8 +890,14 @@ mod tests {
 
     #[test]
     fn see_through_is_a_role_by_its_switch() {
-        assert_eq!(role_when(b"CS_DeferredFallbacksAlpha_SkyProbe", true), Some(Role::ReflectedAlpha));
-        assert_eq!(role_when(b"CS_DeferredFallbacksAlpha_SkyProbe", false), None);
+        assert_eq!(role_when(b"CS_DeferredFallbacksAlpha_SkyProbe", false, true), Some(Role::ReflectedAlpha));
+        assert_eq!(role_when(b"CS_DeferredFallbacksAlpha_SkyProbe", false, false), None);
+    }
+
+    #[test]
+    fn screen_is_a_role_by_its_switch() {
+        assert_eq!(role_when(b"CS_ResolveScreenSpace", true, false), Some(Role::ReflectedScreen));
+        assert_eq!(role_when(b"CS_ResolveScreenSpace", false, false), None);
     }
 
     #[test]

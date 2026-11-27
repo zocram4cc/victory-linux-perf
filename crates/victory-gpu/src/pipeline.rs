@@ -67,11 +67,12 @@ pub(crate) struct Shader {
     /// Its part in the light probe (`crate::lightprobe`).
     #[cfg(windows)]
     pub(crate) probe: Option<crate::lightprobe::Role>,
-    /// `VICTORY_CLEAR_AFTER=<name part>:<root parameter>:<dwords>;...`: the
-    /// images of its tables that are set to zero after each dispatch of it
-    /// (an experiment's tool: what a program writes without rays is dropped).
+    /// `VICTORY_CLEAR_AFTER=<name part>:<root parameter>:<dwords>[:<w>x<h>];...`:
+    /// the images of its tables that are set to zero after each dispatch of it
+    /// (an experiment's tool: what a program writes without rays is dropped);
+    /// with a size, only that much of the image's top-left corner (0: all).
     #[cfg(windows)]
-    pub(crate) clear_after: Vec<(u8, u32)>,
+    pub(crate) clear_after: Vec<(u8, u32, u32, u32)>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -109,21 +110,26 @@ pub(crate) fn kept() -> [u64; 7] {
 }
 
 /// `VICTORY_CLEAR_AFTER`, read once.
-fn clear_after() -> &'static [(Vec<u8>, u8, u32)] {
-    static SET: OnceLock<Vec<(Vec<u8>, u8, u32)>> = OnceLock::new();
+fn clear_after() -> &'static [(Vec<u8>, u8, u32, u32, u32)] {
+    static SET: OnceLock<Vec<(Vec<u8>, u8, u32, u32, u32)>> = OnceLock::new();
     SET.get_or_init(|| parse_clear_after(&std::env::var("VICTORY_CLEAR_AFTER").unwrap_or_default()))
 }
 
 /// The entries of a `VICTORY_CLEAR_AFTER` value, split by `;`: name part,
-/// root parameter and dwords of each.
-fn parse_clear_after(set: &str) -> Vec<(Vec<u8>, u8, u32)> {
+/// root parameter, dwords and size (0, 0: all) of each.
+fn parse_clear_after(set: &str) -> Vec<(Vec<u8>, u8, u32, u32, u32)> {
     set.split(';')
         .filter_map(|entry| {
             let mut parts = entry.trim().split(':');
             let name = parts.next()?.trim().as_bytes().to_vec();
             let slot = parts.next()?.trim().parse().ok()?;
             let at = parts.next()?.trim().parse().ok()?;
-            (!name.is_empty()).then_some((name, slot, at))
+            let (w, h) = parts
+                .next()
+                .and_then(|s| s.trim().split_once('x'))
+                .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))
+                .unwrap_or((0, 0));
+            (!name.is_empty()).then_some((name, slot, at, w, h))
         })
         .collect()
 }
@@ -148,7 +154,7 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 probe: crate::lightprobe::on().then(|| crate::lightprobe::role(bytes)).flatten(),
                 #[cfg(windows)]
                 clear_after: if stage == "compute" {
-                    clear_after().iter().filter(|(part, ..)| bytes.windows(part.len()).any(|w| w == part.as_slice())).map(|(_, slot, at)| (*slot, *at)).collect()
+                    clear_after().iter().filter(|(part, ..)| bytes.windows(part.len()).any(|w| w == part.as_slice())).map(|(_, slot, at, w, h)| (*slot, *at, *w, *h)).collect()
                 } else {
                     Vec::new()
                 },
@@ -895,8 +901,8 @@ mod tests {
     #[test]
     fn clear_after_entries() {
         assert_eq!(
-            super::parse_clear_after("CS_A:1:176; ;CS_B:0:464;x:y:z"),
-            [(b"CS_A".to_vec(), 1, 176), (b"CS_B".to_vec(), 0, 464)]
+            super::parse_clear_after("CS_A:1:176; ;CS_B:0:464;x:y:z;CS_C:2:8:640x360"),
+            [(b"CS_A".to_vec(), 1, 176, 0, 0), (b"CS_B".to_vec(), 0, 464, 0, 0), (b"CS_C".to_vec(), 2, 8, 640, 360)]
         );
     }
 
