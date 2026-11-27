@@ -206,6 +206,29 @@ pub(crate) fn mirroring_alpha() -> bool {
     *SET.get_or_init(|| std::env::var("VICTORY_AMBIENT_SPECULAR_ALPHA").is_ok_and(|v| v.trim() == "1"))
 }
 
+/// What the raise keeps of the light the title's own resolve left
+/// (`VICTORY_AMBIENT_LEFTOVER`; the shader reads 0, 1, 2):
+/// - unset or `keep` (0): the larger of it and the estimate per channel, its
+///   brightness bounded to `most` times the estimate's: its hue stays. Without
+///   rays that leftover is whatever the probes' memory held; other trees saw
+///   paper glow magenta and a floor take a pink cast with it
+///   (Ortomanic/victory-fork bc4fee9, from Neptune-VE).
+/// - `hue` (1): its brightness, within the same bound, in the estimate's colour.
+/// - `off` (2): the estimate alone.
+fn leftover() -> u32 {
+    static SET: OnceLock<u32> = OnceLock::new();
+    *SET.get_or_init(|| leftover_mode(&std::env::var("VICTORY_AMBIENT_LEFTOVER").unwrap_or_default()))
+}
+
+/// [`leftover`] of a switch's value. Pure, for testing.
+fn leftover_mode(set: &str) -> u32 {
+    match set.trim() {
+        s if s.eq_ignore_ascii_case("hue") => 1,
+        s if s.eq_ignore_ascii_case("off") || s == "0" => 2,
+        _ => 0,
+    }
+}
+
 /// The most the air scatters, as a multiple of the light around
 /// (`VICTORY_AMBIENT_AIR=<multiple>`; unset or 0: what the title has).
 fn air() -> f32 {
@@ -265,7 +288,7 @@ fn shade() -> [f32; 2] {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=13, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
+#define RS "RootConstants(num32BitConstants=14, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -279,7 +302,7 @@ cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
     float follow; float most; float air; float cut;
-    float held;
+    float held; uint leftover;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -564,6 +587,16 @@ void raise(uint3 at : SV_DispatchThreadID) {
     // outdoors, not the blocks of other memory.
     float top = max(dot(found, LUMA) * most, 1e-6);
     float has = dot(was, LUMA);
+    // (VICTORY_AMBIENT_LEFTOVER: 2 the estimate alone, 1 the leftover's
+    // brightness in the estimate's colour, 0 the larger of the two.)
+    if (leftover == 2) {
+        light[p] = pack(found);
+        return;
+    }
+    if (leftover == 1) {
+        light[p] = pack(found * max(1.0, min(has, top) / max(dot(found, LUMA), 1e-6)));
+        return;
+    }
     was *= min(1.0, top / max(has, 1e-6));
     light[p] = pack(max(was, found));
 }
@@ -838,7 +871,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     list.keep(&pass.points);
     let [strength, radius] = shade();
     let floats = [level, constant, strength, radius, 0.1, 0.45];
-    let mut words = [0u32; 13];
+    let mut words = [0u32; 14];
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
@@ -855,6 +888,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     };
     words[11] = if placed_already { -1.0f32 } else { cut() }.to_bits();
     words[12] = reflect().to_bits();
+    words[13] = leftover();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -862,7 +896,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     unsafe {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 13, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, 14, words.as_ptr().cast(), 0);
         if let Some(depth) = views.depth {
             l.SetComputeRootDescriptorTable(1, depth);
         }
@@ -963,6 +997,17 @@ mod tests {
         assert_eq!(reflect_part(Some("-1")), 0.0);
         assert_eq!(reflect_part(Some("nan")), 0.0);
         assert_eq!(reflect_part(Some("x")), 0.0);
+    }
+
+    /// `VICTORY_AMBIENT_LEFTOVER`: today's `keep` unless `hue` or `off`.
+    #[test]
+    fn leftover_settings() {
+        assert_eq!(leftover_mode(""), 0);
+        assert_eq!(leftover_mode("keep"), 0);
+        assert_eq!(leftover_mode(" Hue "), 1);
+        assert_eq!(leftover_mode("off"), 2);
+        assert_eq!(leftover_mode("0"), 2);
+        assert_eq!(leftover_mode("whatever"), 0);
     }
 
     /// The passes compile with the system's compiler and the host takes them.
