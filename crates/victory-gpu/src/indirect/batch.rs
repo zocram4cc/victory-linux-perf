@@ -274,13 +274,21 @@ pub(super) fn record(
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
         D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
     );
+    // Under Wine (`super::narrow`): the pass waits for the compute passes
+    // before it and no more (its place in `dst` is its own,
+    // `HostList::batch_place`: no execution before it reads there), and
+    // what reads its records waits for the pass alone.
+    let narrow = super::narrow_list(l);
     // SAFETY: an open list; our root signature and pipeline; live buffers:
     // the sources and the table are read in the common state (promoted).
     unsafe {
-        l.ResourceBarrier(&[
-            uav_barrier(),
-            transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-        ]);
+        match &narrow {
+            Some(l7) => super::wait(l7, super::COMPUTE, super::COMPUTE),
+            None => l.ResourceBarrier(&[
+                uav_barrier(),
+                transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            ]),
+        }
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
         for (i, source) in sources.into_iter().enumerate() {
@@ -292,6 +300,9 @@ pub(super) fn record(
         l.Dispatch(JOBS.div_ceil(64), 1, 1);
         // Nothing else the pass writes is read before the next full wait
         // (the budget, by the next pass): only the records have to be there.
-        l.ResourceBarrier(&[after]);
+        match &narrow {
+            Some(l7) => super::wait(l7, super::COMPUTE, super::READ),
+            None => l.ResourceBarrier(&[after]),
+        }
     }
 }
