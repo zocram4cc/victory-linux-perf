@@ -1745,11 +1745,16 @@ impl Staging {
             if !crate::host::read_into(self.memory, read) {
                 return false;
             }
-            last.convert(Some(digest(read)), || {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+            if last.convert(Some(digest(read)), || {
                 let converted = self.detile(read);
                 self.keep_whole(read);
                 converted
-            });
+            }) {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+            }
             true
         });
         if read {
