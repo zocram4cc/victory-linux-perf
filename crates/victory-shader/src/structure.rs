@@ -68,6 +68,42 @@ pub struct Bools {
 
 /// The tables below have small integer keys; SipHash dominated run time.
 type Map<K, V> = HashMap<K, V, BuildHasherDefault<Fx>>;
+type Set<K> = HashSet<K, BuildHasherDefault<Fx>>;
+
+/// A set of what a walk has met: a list scan while it is small (most lane
+/// masks are a handful of nodes), a hash set once it grows.
+struct Seen<T> {
+    list: Vec<T>,
+    set: Set<T>,
+}
+
+impl<T> Default for Seen<T> {
+    fn default() -> Self {
+        Seen {
+            list: Vec::new(),
+            set: Set::default(),
+        }
+    }
+}
+
+impl<T: Copy + Eq + std::hash::Hash> Seen<T> {
+    const SCAN: usize = 32;
+
+    /// Adds `x`; false if it was already in.
+    fn insert(&mut self, x: T) -> bool {
+        if self.set.is_empty() {
+            if self.list.contains(&x) {
+                return false;
+            }
+            if self.list.len() < Self::SCAN {
+                self.list.push(x);
+                return true;
+            }
+            self.set.extend(self.list.drain(..));
+        }
+        self.set.insert(x)
+    }
+}
 
 /// FxHash's multiply-rotate step.
 #[derive(Default)]
@@ -142,15 +178,18 @@ impl Bools {
         vars.into_iter().map(|v| self.atoms[v as usize]).collect()
     }
 
+    /// The variables `b` tests, in the order a depth-first walk meets them.
+    /// Each node is visited once: scanning lists of every node and variable
+    /// seen made this quadratic in the size of `b`.
     fn vars(&self, b: Bool) -> Vec<u32> {
-        let (mut seen, mut vars, mut stack) = (Vec::new(), Vec::new(), vec![b]);
+        let (mut seen, mut found) = (Seen::default(), Seen::default());
+        let (mut vars, mut stack) = (Vec::new(), vec![b]);
         while let Some(b) = stack.pop() {
             let (v, lo, hi) = self.nodes[b.0 as usize];
-            if v == TERMINAL || seen.contains(&b) {
+            if v == TERMINAL || !seen.insert(b) {
                 continue;
             }
-            seen.push(b);
-            if !vars.contains(&v) {
+            if found.insert(v) {
                 vars.push(v);
             }
             stack.extend([lo, hi]);
@@ -358,36 +397,54 @@ impl Bools {
         r
     }
 
-    fn restrict(&mut self, b: Bool, v: u32, value: bool, memo: &mut Map<Bool, Bool>) -> Bool {
-        let (bv, lo, hi) = self.nodes[b.0 as usize];
-        if bv == TERMINAL || bv > v {
+    /// `b` with every variable in `values` (sorted by variable) replaced by
+    /// its value. Nothing below a node testing a later variable than the
+    /// last of them changes.
+    fn restrict(&mut self, b: Bool, values: &[(u32, bool)], memo: &mut Map<Bool, Bool>) -> Bool {
+        let (v, lo, hi) = self.nodes[b.0 as usize];
+        if v == TERMINAL || values.last().is_none_or(|&(last, _)| v > last) {
             return b;
-        }
-        if bv == v {
-            return if value { hi } else { lo };
         }
         if let Some(&r) = memo.get(&b) {
             return r;
         }
-        let l = self.restrict(lo, v, value, memo);
-        let h = self.restrict(hi, v, value, memo);
-        let r = self.mk(bv, l, h);
-        memo.insert(b, r);
+        let decided = values.binary_search_by_key(&v, |&(v, _)| v).ok();
+        let r = match decided {
+            Some(i) => self.restrict(if values[i].1 { hi } else { lo }, values, memo),
+            None => {
+                let l = self.restrict(lo, values, memo);
+                let h = self.restrict(hi, values, memo);
+                self.mk(v, l, h)
+            }
+        };
+        // While only decided nodes were walked the walk is one path, which
+        // meets no node twice: the table (and its allocation) can wait.
+        if decided.is_none() || !memo.is_empty() {
+            memo.insert(b, r);
+        }
         r
     }
 
-    /// `b` with each atom that `known` decides replaced by its value.
-    fn given(&mut self, mut b: Bool, known: Bool) -> Bool {
+    /// `b` with each atom that `known` decides replaced by its value. The
+    /// atoms are replaced together, in one walk of `b`: cofactors for
+    /// different variables commute, and a walk per atom made this cost the
+    /// size of `b` times the number of atoms.
+    fn given(&mut self, b: Bool, known: Bool) -> Bool {
+        let mut values = Vec::new();
         for v in self.vars(b) {
             let x = self.mk(v, Bool::FALSE, Bool::TRUE);
             let nx = self.not(x);
             if self.implies(known, x) {
-                b = self.restrict(b, v, true, &mut Map::default());
+                values.push((v, true));
             } else if self.implies(known, nx) {
-                b = self.restrict(b, v, false, &mut Map::default());
+                values.push((v, false));
             }
         }
-        b
+        if values.is_empty() {
+            return b;
+        }
+        values.sort_unstable();
+        self.restrict(b, &values, &mut Map::default())
     }
 }
 
@@ -1996,5 +2053,212 @@ mod tests {
                 .any(|&e| matches!(s.bools.support(e)[..], [Atom::Lane(_)])),
             "{edges:?}"
         );
+    }
+
+    /// [`Bools::vars`] as it was: lists of the nodes and variables seen.
+    fn vars_by_scan(b: &Bools, root: Bool) -> Vec<u32> {
+        let (mut seen, mut vars, mut stack) = (Vec::new(), Vec::new(), vec![root]);
+        while let Some(n) = stack.pop() {
+            let (v, lo, hi) = b.nodes[n.0 as usize];
+            if v == TERMINAL || seen.contains(&n) {
+                continue;
+            }
+            seen.push(n);
+            if !vars.contains(&v) {
+                vars.push(v);
+            }
+            stack.extend([lo, hi]);
+        }
+        vars
+    }
+
+    /// One variable's cofactor, as `restrict` did before it took several.
+    fn restrict_one(
+        b: &mut Bools,
+        f: Bool,
+        v: u32,
+        value: bool,
+        memo: &mut Map<Bool, Bool>,
+    ) -> Bool {
+        let (bv, lo, hi) = b.nodes[f.0 as usize];
+        if bv == TERMINAL || bv > v {
+            return f;
+        }
+        if bv == v {
+            return if value { hi } else { lo };
+        }
+        if let Some(&r) = memo.get(&f) {
+            return r;
+        }
+        let l = restrict_one(b, lo, v, value, memo);
+        let h = restrict_one(b, hi, v, value, memo);
+        let r = b.mk(bv, l, h);
+        memo.insert(f, r);
+        r
+    }
+
+    /// [`Bools::given`] as it was: a walk of `f` per decided variable.
+    fn given_by_walks(b: &mut Bools, mut f: Bool, known: Bool) -> Bool {
+        for v in vars_by_scan(b, f) {
+            let x = b.mk(v, Bool::FALSE, Bool::TRUE);
+            let nx = b.not(x);
+            if b.implies(known, x) {
+                f = restrict_one(b, f, v, true, &mut Map::default());
+            } else if b.implies(known, nx) {
+                f = restrict_one(b, f, v, false, &mut Map::default());
+            }
+        }
+        f
+    }
+
+    /// Atoms `0..n` of a fresh [`Bools`], in variable order.
+    fn atoms(n: u64) -> (Bools, Vec<Bool>) {
+        let mut b = Bools::new();
+        let xs = (0..n).map(|i| b.atom(Atom::Constant(i), 0)).collect();
+        (b, xs)
+    }
+
+    /// `x[i] == y[i]` for every `i`, with every `x` ordered before every
+    /// `y`: the classic order that makes the diagram exponential in `n`.
+    fn pairs_equal(b: &mut Bools, xs: &[Bool], n: usize) -> Bool {
+        let mut f = Bool::TRUE;
+        for i in 0..n {
+            let ne = b.xor(xs[i], xs[n + i]);
+            let eq = b.not(ne);
+            f = b.and(f, eq);
+        }
+        f
+    }
+
+    /// A deterministic mix of ands, ors and xors over `xs`.
+    fn mixed(b: &mut Bools, xs: &[Bool], seed: u64, steps: usize) -> Bool {
+        let mut s = seed;
+        let mut next = || {
+            s = s
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (s >> 33) as usize
+        };
+        let mut f = xs[next() % xs.len()];
+        for _ in 0..steps {
+            let x = xs[next() % xs.len()];
+            let x = if next() % 2 == 0 { b.not(x) } else { x };
+            f = match next() % 3 {
+                0 => b.and(f, x),
+                1 => b.or(f, x),
+                _ => b.xor(f, x),
+            };
+        }
+        f
+    }
+
+    /// The function of `f` on the assignment `bits` (bit `v`: variable `v`).
+    fn value_at(b: &Bools, mut f: Bool, bits: u64) -> bool {
+        loop {
+            match f {
+                Bool::FALSE => return false,
+                Bool::TRUE => return true,
+                _ => {
+                    let (v, lo, hi) = b.nodes[f.0 as usize];
+                    f = if bits >> v & 1 == 1 { hi } else { lo };
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn vars_match_the_scan() {
+        let (mut b, xs) = atoms(16);
+        let mut fs = vec![Bool::FALSE, Bool::TRUE, xs[3], pairs_equal(&mut b, &xs, 8)];
+        for seed in 0..40 {
+            fs.push(mixed(&mut b, &xs, seed, 30));
+        }
+        for f in fs {
+            assert_eq!(b.vars(f), vars_by_scan(&b, f));
+        }
+    }
+
+    #[test]
+    fn given_matches_a_walk_per_variable() {
+        let (mut b, xs) = atoms(12);
+        for seed in 0..60 {
+            let f = mixed(&mut b, &xs, seed, 24);
+            let known = mixed(&mut b, &xs, seed ^ 0x9e37, 3);
+            let fast = b.given(f, known);
+            // Equal functions are equal nodes, so the ids match too.
+            assert_eq!(fast, given_by_walks(&mut b, f, known), "seed {seed}");
+            // Where `known` holds, the result agrees with `f`.
+            for bits in 0..1u64 << 12 {
+                if value_at(&b, known, bits) {
+                    assert_eq!(value_at(&b, fast, bits), value_at(&b, f, bits));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn given_replaces_every_decided_atom() {
+        let (mut b, xs) = atoms(12);
+        let f = pairs_equal(&mut b, &xs, 6);
+        // x0..x5 all true: f becomes y0 && .. && y5.
+        let mut known = Bool::TRUE;
+        let mut ys = Bool::TRUE;
+        for i in 0..6 {
+            known = b.and(known, xs[i]);
+            ys = b.and(ys, xs[6 + i]);
+        }
+        assert_eq!(b.given(f, known), ys);
+        // Nothing decided: unchanged; a contradiction decides nothing useful
+        // but must not panic.
+        assert_eq!(b.given(f, Bool::TRUE), f);
+        let _ = b.given(f, Bool::FALSE);
+        assert_eq!(b.given(Bool::TRUE, known), Bool::TRUE);
+    }
+
+    #[test]
+    #[ignore = "benchmark: cargo test --release -p victory-shader bench_bools -- --ignored --nocapture"]
+    fn bench_bools() {
+        // Microseconds per call, over at least 3 calls and 50 ms.
+        let time = |f: &mut dyn FnMut()| {
+            let (t, mut calls) = (std::time::Instant::now(), 0);
+            while calls < 3 || t.elapsed().as_millis() < 50 {
+                f();
+                calls += 1;
+            }
+            t.elapsed().as_secs_f64() * 1e6 / f64::from(calls)
+        };
+        for n in [2, 4, 8, 10, 12, 13] {
+            let (mut b, xs) = atoms(2 * n as u64);
+            let f = pairs_equal(&mut b, &xs, n);
+            let count = vars_by_scan(&b, f).len();
+            let size = {
+                let (mut seen, mut stack) = (Set::default(), vec![f]);
+                while let Some(g) = stack.pop() {
+                    let (v, lo, hi) = b.nodes[g.0 as usize];
+                    if v != TERMINAL && seen.insert(g) {
+                        stack.extend([lo, hi]);
+                    }
+                }
+                seen.len()
+            };
+            // Half the x's known true.
+            let mut known = Bool::TRUE;
+            for x in &xs[..n / 2] {
+                known = b.and(known, *x);
+            }
+            let (expect, mut got) = (given_by_walks(&mut b, f, known), Bool::FALSE);
+            let vars_old = time(&mut || assert_eq!(vars_by_scan(&b, f).len(), count));
+            let vars_new = time(&mut || assert_eq!(b.vars(f).len(), count));
+            let given_old = time(&mut || got = given_by_walks(&mut b, f, known));
+            assert_eq!(got, expect);
+            let given_new = time(&mut || got = b.given(f, known));
+            assert_eq!(got, expect);
+            println!(
+                "n={n} nodes={size}: vars {vars_old:.2} -> {vars_new:.2} us ({:.1}x), \
+                 given {given_old:.2} -> {given_new:.2} us ({:.1}x)",
+                vars_old / vars_new,
+                given_old / given_new
+            );
+        }
     }
 }
