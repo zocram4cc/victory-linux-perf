@@ -296,6 +296,31 @@ fn scalar_quad_masks_pack_nibbles_and_set_scc() {
     });
 }
 
+/// `s_min_*` / `s_max_*` set SCC when S0 is the one chosen (S0 < S1 for
+/// min, S0 > S1 for max), not when the result is non-zero: min(0, 5) is 0
+/// with SCC 1, max(0, 5) is 5 with SCC 0. (XboxCompatibility T-0045,
+/// original test; the report is AvatarManz #404.)
+#[test]
+fn scalar_min_max_set_scc_when_the_first_source_is_chosen() {
+    let cases = [[0, 5, 0, 0], [5, 0, 0, 0], [7, 7, 0, 0], [u32::MAX, 1, 0, 0], [1, u32::MAX, 0, 0], [0x8000_0000, 0, 0, 0]];
+    let ops: [(u8, &str, fn(u32, u32) -> bool); 4] = [
+        (0x06, "s_min_i32", |a, b| (a as i32) < (b as i32)),
+        (0x07, "s_min_u32", |a, b| a < b),
+        (0x08, "s_max_i32", |a, b| (a as i32) > (b as i32)),
+        (0x09, "s_max_u32", |a, b| a > b),
+    ];
+    for (opcode, name, chosen) in ops {
+        let shader = build_valu_cs(&[
+            sop2(opcode, 2, 0, 1),     // s_min/max s2, s0, s1
+            sop2(0x0a, 3, 129, 128),   // s_cselect_b32 s3, 1, 0
+            vop1(1, 0, sgpr(3)),       // v_mov_b32 v0, s3
+        ]);
+        run_cases(&shader, &cases, |backend, _, inputs, got| {
+            assert_eq!(got, u32::from(chosen(inputs[0], inputs[1])), "{backend}: {name} {:#x}, {:#x}", inputs[0], inputs[1]);
+        });
+    }
+}
+
 fn is_f16_nan(bits: u16) -> bool {
     (bits & 0x7FFF) > 0x7C00
 }
