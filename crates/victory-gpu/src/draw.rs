@@ -618,11 +618,19 @@ pub(crate) fn table_memo_line(frames: f64) {
 
 impl Drop for State {
     fn drop(&mut self) {
-        crate::descriptor::release_dynamic_many(&self.dynamic);
+        self.release_slots();
     }
 }
 
 impl State {
+    fn release_slots(&mut self) {
+        let confirmed = !self.dynamic.is_empty()
+            && crate::descriptor::host::reclaim_dynamic()
+            && crate::host::host().is_some_and(|host| host.submitted_work_complete());
+        crate::descriptor::release_dynamic_many(&self.dynamic, confirmed);
+        self.dynamic.clear();
+    }
+
     /// The list's submission has run (submissions are waited for): the
     /// dynamic slots its tables were made in are given back, not kept
     /// until the title resets the list. A frame of the opening cutscene
@@ -630,6 +638,7 @@ impl State {
     /// slots out, and up to 4,900 draws a frame went without their tables.
     /// shortcut: a list the title runs a second time without a reset then
     /// reads slots others may have taken (logged once).
+    /// With VICTORY_RECLAIM_DYNAMIC=1 the list keeps its reservations for replay.
     pub(crate) fn tables_done(&mut self) {
         if self.tables_gone && self.dynamic.is_empty() {
             return;
@@ -638,15 +647,18 @@ impl State {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("a list ran again after its descriptor tables were given back"));
         }
-        crate::descriptor::release_dynamic_many(&self.dynamic);
-        self.dynamic.clear();
+        // In reclaim mode the old descriptors may be replaced with nulls.
+        // Keep their reservations for possible replay until reset or drop.
+        if !crate::descriptor::host::reclaim_dynamic() {
+            self.release_slots();
+        }
         self.fresh_tables.clear();
         self.entry_memo.clear();
         self.view_memo.clear();
         self.recording = 0;
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
-        self.tables_gone = true;
+        self.tables_gone = self.dynamic.is_empty();
     }
 }
 

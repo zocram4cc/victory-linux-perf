@@ -9420,6 +9420,15 @@ impl Host {
         }
     }
 
+    /// Whether the direct queue has actually reached its last submission.
+    /// A failed signal or wait can return to the caller before that happens.
+    pub(crate) fn submitted_work_complete(&self) -> bool {
+        let Ok(target) = self.submitted.try_lock() else { return false };
+        // SAFETY: a query of our live fence. Removal reports u64::MAX.
+        let completed = unsafe { self.fence.GetCompletedValue() };
+        completed != u64::MAX && completed >= *target
+    }
+
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         MADE[0].fetch_add(1, Ordering::Relaxed);
         MADE[1].fetch_add(size, Ordering::Relaxed);

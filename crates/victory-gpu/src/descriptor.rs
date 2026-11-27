@@ -858,7 +858,7 @@ pub(crate) fn with_heap<T>(heap: usize, f: impl FnOnce(&Heap) -> T) -> Option<T>
 /// each host heap's lock taken once for a run of entries of one heap (RDNA
 /// port: once an entry).
 #[cfg(windows)]
-pub(crate) fn release_dynamic_many(entries: &[(usize, u32, u32)]) {
+pub(crate) fn release_dynamic_many(entries: &[(usize, u32, u32)], confirmed: bool) {
     if entries.is_empty() {
         return;
     }
@@ -876,7 +876,7 @@ pub(crate) fn release_dynamic_many(entries: &[(usize, u32, u32)]) {
             // SAFETY: registered heaps are live (removed when dropped).
             && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
         {
-            host.release_many(&batch);
+            host.release_many(&batch, confirmed);
         }
     }
 }
