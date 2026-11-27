@@ -20,6 +20,16 @@
 //! pipelines they were dropped; that run had no lamps and no diffuse light to
 //! its end (run textures-d2, the first after a new translation; Belobug
 //! 18e57db8 found the same).
+//!
+//! If asked for (`VICTORY_COMPUTE_WAIT_MS`), the first use of a compute
+//! pass waits for its host pipeline by a budget of its own
+//! ([`compute_budget`]), not within the frame's budget: the table a
+//! character's face is deformed by is filled once on the card when the
+//! character is made; dropped, it is not run again, and without it the
+//! face's vertices all lie in one point (docs/linux-wine.md, "People
+//! without a head"). Upstream's switch; here off by default (our
+//! [`compute_waits`] mechanism is the default), and it takes the pass out
+//! of the frame's budget and of that mechanism's bookkeeping.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -43,6 +53,17 @@ pub(crate) struct Pending {
     used: AtomicBool,
     /// A pass over the screen ([`GraphicsState::screen_pass`]).
     screen: bool,
+    /// A compute pipeline whose dispatches wait for it ([`compute_waits`]),
+    /// whether a dropped dispatch of it was logged, and whether one that
+    /// gave up waiting for it was.
+    compute: bool,
+    compute_dropped: AtomicBool,
+    compute_given_up: AtomicBool,
+    /// When a worker began making it.
+    making_since: OnceLock<Instant>,
+    /// A first use that went without it was written down (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    noted: AtomicBool,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -61,6 +82,12 @@ impl Pending {
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
         Pending {
             screen: graphics.as_ref().is_some_and(|g| g.screen_pass()),
+            compute: graphics.is_none() && shaders.first().is_some_and(|s| s.stage == "compute") && compute_waits(),
+            compute_dropped: AtomicBool::new(false),
+            compute_given_up: AtomicBool::new(false),
+            making_since: OnceLock::new(),
+            #[cfg(feature = "diagnostics")]
+            noted: AtomicBool::new(false),
             shaders,
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
@@ -73,6 +100,13 @@ impl Pending {
 
     pub(super) fn key(&self) -> &str {
         &self.key
+    }
+
+    /// A compute pass where those wait apart from the frame's budget
+    /// (`VICTORY_COMPUTE_WAIT_MS` asked for one; a pass of one shader, of
+    /// that stage).
+    fn waits_alone(&self) -> bool {
+        matches!(self.shaders.as_slice(), [cs] if cs.stage == "compute") && !compute_budget().is_zero()
     }
 
     fn make(&self) {
@@ -168,6 +202,15 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     if p.made.get().is_none() {
         start(p, REQUESTED);
         wait(p, crate::frame::current());
+        // (Which first uses go without: once a pipeline.)
+        #[cfg(feature = "diagnostics")]
+        if p.made.get().is_none() && !p.noted.swap(true, Ordering::Relaxed) {
+            tracing::info!(
+                shaders = ?p.shaders,
+                frame = crate::frame::current(),
+                "a first use goes without its host pipeline, which is still being made: dropped"
+            );
+        }
     }
     p.made.get()?.as_ref()
 }
@@ -201,8 +244,120 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
+/// Under Wine, a dispatch of a compute pipeline not made yet waits for it
+/// outside the frame's budget, within [`COMPUTE_BUDGET`]
+/// (`VICTORY_COMPUTE_WAIT`: unset, on under Wine only; `0` never; `1` on
+/// any host). A dropped draw loses one frame's picture; a dropped dispatch
+/// the title issues once loses its output for the session. With a cold
+/// driver shader cache the head blend-shape map (61e54e90adccaf6a) was
+/// made 1 to 21 s after its one dispatch, behind hundreds of graphics
+/// pipelines, and every head of the session had no skin (runs r2 and r6,
+/// vkd3d-proton 3.2.0 and 71cae09 alike; a warm cache had skin). A timing
+/// race, not a Wine one (the fork's issue #75 saw heads without skin on
+/// Windows), but on Windows it is untried, so it is off there by default.
+fn compute_waits() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = crate::wine::on_under_wine("VICTORY_COMPUTE_WAIT");
+        if on {
+            tracing::info!(secs = COMPUTE_BUDGET.as_secs(), "compute dispatches wait for their pipelines");
+        }
+        on
+    })
+}
+
+/// What compute dispatches ([`compute_waits`]) may hold one frame, from
+/// its first such wait, and wait for one pipeline over all frames. Bounded
+/// per frame: with no bound the title's first world frame waited for 670
+/// compute pipelines one after another on a cold driver cache, 33 s, and
+/// the title's own watchdog (about 30 s) ended the run (run r5). Bounded
+/// per pipeline: a dispatch waits only while its pipeline is queued or a
+/// worker has been making it for less than this, so one that is never made
+/// (six were, with vkd3d-proton 3.2.0) holds one frame, not every frame
+/// that dispatches it (as the fork's #73 asks of every wait). With the
+/// screen passes' 10 s and the ordinary half second, a frame stays below
+/// the watchdog.
+const COMPUTE_BUDGET: Duration = Duration::from_secs(10);
+
+/// What a compute dispatch may wait now: what is left of the frame's
+/// [`COMPUTE_BUDGET`] (`since` the frame's first compute wait began) and
+/// of the pipeline's (`making` since a worker began it).
+fn compute_left(since: Duration, making: Duration) -> Duration {
+    COMPUTE_BUDGET.saturating_sub(since).min(COMPUTE_BUDGET.saturating_sub(making))
+}
+
+/// What the first use of a compute pass may wait for its pipeline, apart
+/// from the frame's budget and whatever else waits in the frame
+/// (`VICTORY_COMPUTE_WAIT_MS`, read here; set, on under Wine or Windows, to
+/// the milliseconds; unset: not used, [`compute_waits`]; `0`: as before
+/// under Wine too).
+///
+/// Upstream (PR #440, `d9ee5f2f`) defaults this to 10 s under Wine and
+/// replaces the frame's budget for compute passes with it; here it is an
+/// opt-in beside [`compute_waits`], whose per-pipeline cap of 10 s of
+/// making and its per-frame bound it joins: a pass that is not made within
+/// the budget is dropped by the caller, as the frame's budget drops.
+fn compute_budget() -> Duration {
+    static BUDGET: OnceLock<Duration> = OnceLock::new();
+    *BUDGET.get_or_init(|| match std::env::var("VICTORY_COMPUTE_WAIT_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        Some(millis) if millis != 0 => {
+            tracing::info!(millis, "compute passes wait for their host pipeline by a budget of their own (VICTORY_COMPUTE_WAIT_MS)");
+            Duration::from_millis(millis)
+        }
+        _ => Duration::ZERO,
+    })
+}
+
+/// Waits for a compute pass's pipeline ([`compute_budget`]) until it is
+/// made or `budget` after the frame's first such wait, whichever thread
+/// that was: all of a frame's waits end together, and none takes another's
+/// time (a thread that came while another waited found nothing left of a
+/// budget counted as [`wait`] counts it, and dropped its pass at once).
+fn wait_compute(p: &Pending, frame: u64, budget: Duration) {
+    // The frame the waiting belongs to and when it ends.
+    static UNTIL: Mutex<(u64, Option<Instant>)> = Mutex::new((u64::MAX, None));
+    let until = {
+        let mut until = UNTIL.lock().unwrap_or_else(|e| e.into_inner());
+        if until.0 != frame {
+            *until = (frame, None);
+        }
+        *until.1.get_or_insert_with(|| Instant::now() + budget)
+    };
+    let waiting = crate::timeline::span("pipeline: first use waits for a host pipeline");
+    let started = Instant::now();
+    let (lock, done) = &DONE;
+    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while p.made.get().is_none() {
+        let rest = until.saturating_duration_since(Instant::now());
+        if rest.is_zero() {
+            break;
+        }
+        held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
+    }
+    drop(held);
+    let waited = started.elapsed();
+    waiting.end();
+    if waited > Duration::from_millis(100) {
+        tracing::info!(
+            ms = waited.as_millis() as u64,
+            made = p.made.get().is_some(),
+            shaders = ?p.shaders,
+            frame,
+            "a compute pass was waited for (VICTORY_COMPUTE_WAIT_MS: dropped past its own budget)"
+        );
+    }
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::PipelineWaitUs, waited.as_micros() as u64);
+}
+
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
+    if p.waits_alone() {
+        return wait_compute(p, frame, compute_budget());
+    }
     let screen = p.screen && screens_first();
     let budget = if screen { screen_budget() } else { wait_budget() };
     if budget.is_zero() {
