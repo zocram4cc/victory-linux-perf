@@ -8451,7 +8451,7 @@ impl<'a> Lower<'a> {
         }
         if from_memory {
             if std::env::var_os("VICTORY_WHY_FROM_MEMORY").is_some() {
-                eprintln!("FROM-MEMORY scalar load at {:?}: {} {:?} layout {:?}", load, li.name(), a, self.x.native.layout.iter().map(|p| (p.root, p.slot)).collect::<Vec<_>>());
+                eprintln!("FROM-MEMORY scalar load at {:?}: {} {:?} layout {:?}", load, li.name(), a, self.x.native.layout.iter().map(|p| (p.root, p.slot, p.user_data, p.sgprs)).collect::<Vec<_>>());
             }
             addr = self.less_heap_start(addr, sampler);
         }
