@@ -2233,6 +2233,42 @@ fn send_changed() -> bool {
     })
 }
 
+/// Whether a refresh of a copy in the card's memory that shaders have
+/// landed into sends up only the dwords title memory changed, as
+/// [`send_changed`] does for every copy (`VICTORY_LANDED_RUNS=0`: whole
+/// pages, and the look for echoes, as before).
+///
+/// A page of such a copy goes up when the watch says it was written, and
+/// whole: by the title (a dword of it, as far as the counters of a run in
+/// the prison corridor tell: of 4 KiB pages sent up again, 2 to 5 % of the
+/// bytes differed from the CPU's side), by our own landing, or both. The rest
+/// of the page is what the CPU's side holds, and in a copy shaders write that
+/// can be older than the card: what a flight wrote and has not landed yet, or
+/// what a landing left out because a send went up after its fetch (the
+/// relay's merge skips those bytes, `card_merge_relay`, `land_card`). So the
+/// card's newer bytes were put back to older ones every frame, and as the
+/// landing that would bring them into title memory was skipped each time,
+/// they stayed old: the character vertices of the corridor's stray sheets,
+/// skinned right on the card and overwritten by the next send, in runs.
+///
+/// What it cannot know is [`send_changed`]'s: that the title wrote a value
+/// over the same value while the card held another. The waited-for merge and
+/// every landing put the card's bytes into the CPU's side, so that is only so
+/// where the card wrote after the last landing.
+fn landed_runs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LANDED_RUNS").is_none_or(|v| v != "0"))
+}
+
+/// Whether a refresh of a copy sends up only changed dwords (else the pages
+/// written, whole, looking for echoes where it may): of a copy in the card's
+/// memory, if shaders store in it what is not declared (`changes_only`),
+/// with [`send_changed`], or when shaders have landed into it or were
+/// declared to write it (`landed`), with [`landed_runs`] (`runs`).
+fn sends_runs(card: bool, changes_only: bool, send_changed: bool, landed: bool, runs: bool) -> bool {
+    card && (changes_only || send_changed || landed && runs)
+}
+
 /// Since the last frame-rate line, of pages taken into copies in the
 /// card's memory ([`send_changed`]): bytes compared, those of pages that
 /// held the same, bytes to go up, and the runs they are.
@@ -2873,6 +2909,51 @@ mod landing_tests {
         copy.take_landed(from, to);
         assert_eq!(copy.take_dirty(), []);
         drop(room);
+    }
+
+    /// A copy shaders landed into: a refresh of pages the watch says were
+    /// written sends up the dwords the title changed, and nothing else of
+    /// them. The rest of a page is what the CPU's side holds, which can be
+    /// older than what the card holds: sent up whole, it put the card's
+    /// newer bytes back (the corridor's stray sheets). A real CPU write
+    /// still goes up, and the CPU's side takes it.
+    #[test]
+    fn a_refresh_of_a_landed_copy_sends_what_the_title_changed_and_no_more() {
+        const PAGES: usize = 4;
+        let room = vec![5u8; (PAGES + 1) * KERNEL_PAGE];
+        let title = (room.as_ptr() as usize).next_multiple_of(KERNEL_PAGE);
+        // The CPU's side and title memory alike, as after a refresh.
+        let mut side = vec![5u8; PAGES * KERNEL_PAGE];
+        let copy = Shadow::unbacked(title as u64, side.as_mut_ptr(), side.len() as u64, true);
+        copy.note_landing(KERNEL_PAGE, 2 * KERNEL_PAGE);
+        // The title writes one dword of page 1 and one of page 3.
+        for at in [KERNEL_PAGE + 64, 3 * KERNEL_PAGE + 8] {
+            // SAFETY: in `room`.
+            unsafe { ((title + at) as *mut u32).write_volatile(0x1234_5678) };
+        }
+        assert!(super::landed_runs(), "on unless VICTORY_LANDED_RUNS=0");
+        copy.take(title, title + PAGES * KERNEL_PAGE, true);
+        let mut dirty = copy.take_dirty();
+        dirty.sort_unstable();
+        assert_eq!(dirty, [(KERNEL_PAGE + 64, KERNEL_PAGE + 68), (3 * KERNEL_PAGE + 8, 3 * KERNEL_PAGE + 12)]);
+        assert_eq!(&side[KERNEL_PAGE + 64..KERNEL_PAGE + 68], &0x1234_5678u32.to_le_bytes());
+        // Nothing changed since: nothing goes up.
+        copy.take(title, title + PAGES * KERNEL_PAGE, true);
+        assert_eq!(copy.take_dirty(), []);
+        drop(room);
+    }
+
+    /// Which copies a refresh sends changed dwords of.
+    #[test]
+    fn changed_dwords_go_up_for_copies_shaders_write() {
+        use super::sends_runs;
+        // (card, changes_only, send_changed, landed, landed_runs)
+        assert!(!sends_runs(false, true, true, true, true), "a copy in the PC's memory sends nothing up");
+        assert!(sends_runs(true, false, false, true, true), "landed into, with the switch");
+        assert!(!sends_runs(true, false, false, true, false), "landed into, without it: pages, as before");
+        assert!(!sends_runs(true, false, false, false, true), "never written by shaders: pages, as before");
+        assert!(sends_runs(true, true, false, false, false));
+        assert!(sends_runs(true, false, true, false, false));
     }
 }
 
@@ -4312,6 +4393,27 @@ impl Shadow {
         resent::note(self.start, self.len, resent::Resent { missed: pages, ..Default::default() });
     }
 
+    /// Whether a landing is noted in a 4 KiB page of title memory
+    /// `[from, to)`; the notes of the pages it holds whole go.
+    fn landing_taken(&self, from: usize, to: usize) -> bool {
+        let first = self.start as usize / KERNEL_PAGE;
+        let mut bits = self.landings.lock().unwrap_or_else(|e| e.into_inner());
+        let mut any = false;
+        let mut at = from;
+        while at < to {
+            let next = ((at / KERNEL_PAGE + 1) * KERNEL_PAGE).min(to);
+            let page = at / KERNEL_PAGE - first;
+            if let Some(word) = bits.get_mut(page / 64) {
+                any |= *word >> (page % 64) & 1 != 0;
+                if next - at == KERNEL_PAGE {
+                    *word &= !(1 << (page % 64));
+                }
+            }
+            at = next;
+        }
+        any
+    }
+
     /// Whether a landing is noted in the 4 KiB page that holds title address
     /// `at`, left noted.
     fn landing_noted(&self, at: usize) -> bool {
@@ -4356,7 +4458,12 @@ impl Shadow {
             /// A page of title memory, as read.
             static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
-        let Some(card) = self.card.as_ref().filter(|_| self.changes_only.load(Ordering::Relaxed) || send_changed()) else {
+        // Written by shaders: landed into (noted by the relay's landings),
+        // or declared written (the waited-for merge notes nothing).
+        let landed_into = self.card.is_some() && (self.landing.load(Ordering::Acquire) || self.written());
+        let Some(card) = self.card.as_ref().filter(|_| {
+            sends_runs(true, self.changes_only.load(Ordering::Relaxed), send_changed(), landed_into, landed_runs())
+        }) else {
             let landed = self.card.is_some() && self.landing.load(Ordering::Acquire);
             if known && landed && land_echo() && !crate::host::upcheck::on() {
                 return self.take_landed(from, to);
@@ -4389,8 +4496,9 @@ impl Shadow {
                     self.changed(at - start + a, at - start + a + len);
                 }
                 self.card_changed_runs(runs.iter().map(|&(a, len)| (at - start + a, at - start + a + len)));
-                if !runs.is_empty() && self.landing.load(Ordering::Acquire) {
-                    let noted = self.landing_noted(at);
+                // (The landings noted are looked at here: done with.)
+                let noted = landed_into && self.landing_taken(at, at + n);
+                if !runs.is_empty() && landed_into {
                     resent::note(
                         self.start,
                         self.len,
