@@ -7039,10 +7039,22 @@ impl HostList {
             return;
         }
         let mut deferred = self.deferred();
-        if !deferred.back_wanted.iter().any(|target| target.owner() == resource as usize)
-            && let Some(target) = crate::texback::Target::new(resource)
-        {
-            deferred.back_wanted.push(target);
+        // A target whose ticket went stale (the title reused or remapped the
+        // memory it tiles into) must be re-registered, or the read-back
+        // would be dropped as one of memory the texture no longer holds
+        // (fxceless 86d446b, PR #1376).
+        let existing = deferred
+            .back_wanted
+            .iter_mut()
+            .find(|target| target.owner() == resource as usize);
+        match existing {
+            Some(entry) if !entry.fresh() => {
+                if let Some(target) = crate::texback::Target::new(resource) {
+                    *entry = target;
+                }
+            }
+            None => deferred.back_wanted.extend(crate::texback::Target::new(resource)),
+            Some(_) => {}
         }
     }
 
@@ -7068,6 +7080,24 @@ impl HostList {
             u.behind[0] = Some(true);
             self.changed_something();
         }
+    }
+
+    /// For tests: whether the list's read-back wants a *fresh* target for
+    /// `resource` — one whose ticket has not gone stale. A stale target is
+    /// one the title's memory reuse invalidated, which the list must
+    /// re-register on the next write of `resource`.
+    #[cfg(test)]
+    pub(crate) fn back_wanted_fresh(&self, resource: crate::object::This) -> bool {
+        self.deferred()
+            .back_wanted
+            .iter()
+            .any(|t| t.owner() == resource as usize && t.fresh())
+    }
+
+    /// For tests: how many texture read-backs the list recorded at its close.
+    #[cfg(test)]
+    pub(crate) fn texture_back_count(&self) -> usize {
+        self.deferred().texture_backs.len()
     }
 
     /// At submission: the list that moves each texture this list uses from

@@ -26,8 +26,18 @@ use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::object::This;
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_KINDS: std::cell::Cell<Option<&'static [(u64, u32, u32)]>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// The kinds copied back: (width, height, format).
 fn kinds() -> &'static [(u64, u32, u32)] {
+    #[cfg(test)]
+    if let Some(kinds) = TEST_KINDS.get() {
+        return kinds;
+    }
     static KINDS: OnceLock<Vec<(u64, u32, u32)>> = OnceLock::new();
     KINDS.get_or_init(|| {
         const DEFAULT: &str = "256x256f41,256x256f16,64x64f16,128x128f36";
@@ -123,6 +133,12 @@ impl Target {
     }
 
     pub(crate) fn owner(&self) -> usize { self.ticket.owner }
+
+    /// Whether the ticket is still valid: the texture's memory has not been
+    /// reused or remapped since it was registered. A stale target is
+    /// re-registered so the read-back tracks the memory the texture is in
+    /// now, not where it was when it was last written.
+    pub(crate) fn fresh(&self) -> bool { self.ticket.valid.load(Ordering::Acquire) }
 }
 
 /// The readback resources and the allocation the pixels belong to.
