@@ -268,8 +268,10 @@ fn a_counter_texture_is_set_by_a_store_of_one_channel() {
     }
     // Sixteen bits of a number only the card knows may be signed.
     assert!(program([0xF020_1108, 0x8002_0300], 0x7E06_0302).is_err()); // v3 = v2
-    // A store of two channels says nothing about the view.
-    assert!(program([0xF020_1308, 0x0002_0300], 0x7E06_0289).is_err());
+    // A store of two channels translates too (royale 6195af78e: the rest of the view is filled
+    // with 0); other partial masks are refused.
+    program([0xF020_1308, 0x0002_0300], 0x7E06_0289).expect("translates");
+    assert!(program([0xF020_1508, 0x0002_0300], 0x7E06_0289).is_err());
 }
 
 /// A load past the wave's cache (GLC) of a buffer other groups write: its
