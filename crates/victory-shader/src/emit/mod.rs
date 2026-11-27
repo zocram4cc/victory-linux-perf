@@ -904,8 +904,10 @@ fn widen(
     loop {
         let st = structure::structure_wide(p, &wide)?;
         // Branches around scalars the wave writes once (`lower::scalar_splits`) that this
-        // round's structure still has per lane: wave-wide too.
-        if scalar_splits() {
+        // round's structure still has per lane: wave-wide too. (For a console wave run as two
+        // host waves, where each such branch costs group barriers, only with `VICTORY_WAVE_WIDE=1`,
+        // as in `emit_forms`: the archived kernels and the lane-mask retry reach `widen` without it.)
+        if scalar_splits() && (!(native.wave64 && lower::host_max_wave() == 32) || lower::wave_wide_on()) {
             let scalars: Vec<usize> =
                 lower::scalar_splits(p, &st).unwrap_or_default().into_iter().filter(|b| !wide.contains(b)).collect();
             if !scalars.is_empty() {
