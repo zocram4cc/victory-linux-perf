@@ -129,8 +129,9 @@ impl Tables {
     /// alpha 64 B and colour 256 B, BC4 64 B, BC5 64 B), 512 u16 BC7 control
     /// words, then 255 dictionary entries per format in format order: BC1
     /// 6 + 16 B, BC3 8 + 32 B, BC4 2 + 16 B, BC5 4 + 32 B, BC6H (u8 mode,
-    /// 12 u16, u8 mode, 16 i16), BC7 (u16 control, 24 u16, 2 u8, 2 B,
-    /// 16 + 15 i16). Little-endian, no padding. Every model must tile 65536.
+    /// 12 u16, u8 mode, 16 i16), BC7 (u16 control, 24 u16, 2 u8, then for
+    /// entry 0 32 i16, for the others 2 B and 16 + 15 i16). Little-endian, no
+    /// padding. Every model must tile 65536.
     pub fn parse(bytes: &[u8]) -> Result<Tables, Error> {
         if bytes.len() != TABLES_SIZE {
             return Err(Error("table file has the wrong size"));
@@ -210,7 +211,7 @@ impl Tables {
             })
             .collect();
         let bc7 = (0..DICTIONARY)
-            .map(|_| {
+            .map(|k| {
                 let mut ep = Bc7Ep {
                     ctrl: r.u16(),
                     ..Default::default()
@@ -222,10 +223,20 @@ impl Tables {
                     bits: [r.u8(), r.u8()],
                     ..Default::default()
                 };
-                // Unused: the widths again in all entries but the first.
-                r.u16();
-                // Only 15 slots for set 1, which no entry uses (0 bits).
-                for v in &mut ix.ix.as_flattened_mut()[..31] {
+                // Entry 0 holds all 32 indices right after its widths; the
+                // others repeat the widths (unused) and hold 31, as set 1
+                // has only 15 slots, which no entry uses (0 bits). Reading
+                // the widths again for entry 0 too dropped its first index
+                // and shifted the rest: wrong 4x4 blocks wherever a texture
+                // used it (found by xcl-dev/xcl 7881dbc9; as in TaynanGT's
+                // Vice-Tay d15d8e7 and Neptune_VI 8a04d57).
+                let n = if k == 0 {
+                    32
+                } else {
+                    r.u16();
+                    31
+                };
+                for v in &mut ix.ix.as_flattened_mut()[..n] {
                     *v = r.u16() as i16;
                 }
                 (ep, ix)
@@ -1599,10 +1610,44 @@ mod tests {
     #[test]
     fn bc7_dictionary_indices_line_up() {
         let t = Tables::builtin().unwrap();
+        // Entry 0 keeps its leading index (no repeated widths before it).
+        let (ep0, ix0) = &t.bc7[0];
+        assert_eq!(ep0.ctrl, 0);
+        assert_eq!(ix0.bits, [4, 0]);
+        assert_eq!(ix0.ix[0], [2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(ix0.ix[1], [0; 16]);
         for (k, (_, ix)) in t.bc7.iter().enumerate() {
             let anchor = 0..1 << (ix.bits[0] - 1);
             let ok = (ix.bits[1] != 0 || ix.ix[1] == [0; 16]) && anchor.contains(&ix.ix[0][0]);
             assert!(ok, "entry {k}: {:?}", ix.ix);
         }
+    }
+
+    /// BC7 dictionary entry 0, crafted: its 32 indices follow its widths
+    /// directly and all of them are read in order, set 1's last slot too;
+    /// entry 1 skips its repeated widths and reads 31.
+    #[test]
+    fn bc7_dictionary_entry_0_reads_its_32_indices() {
+        const ENTRY: usize = 2 + 48 + 2 + 2 + 62;
+        let mut bytes = include_bytes!("bcpack-tables.bin").to_vec();
+        let first = TABLES_SIZE - DICTIONARY * ENTRY;
+        // Entry 0: indices 1..=32 right after control, rows and widths.
+        for k in 0..32u16 {
+            let at = first + 2 + 48 + 2 + 2 * k as usize;
+            bytes[at..at + 2].copy_from_slice(&(k + 1).to_le_bytes());
+        }
+        // Entry 1: repeated widths (0xEEEE, skipped), then 101..=131.
+        let second = first + ENTRY;
+        bytes[second + 52..second + 54].copy_from_slice(&0xEEEEu16.to_le_bytes());
+        for k in 0..31u16 {
+            let at = second + 54 + 2 * k as usize;
+            bytes[at..at + 2].copy_from_slice(&(k + 101).to_le_bytes());
+        }
+        let t = Tables::parse(&bytes).unwrap();
+        let want0: Vec<i16> = (1..=32).collect();
+        assert_eq!(t.bc7[0].1.ix.as_flattened(), &want0[..]);
+        let mut want1: Vec<i16> = (101..=131).collect();
+        want1.push(0);
+        assert_eq!(t.bc7[1].1.ix.as_flattened(), &want1[..]);
     }
 }
