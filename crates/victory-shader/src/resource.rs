@@ -1224,9 +1224,18 @@ impl<'a> Tracer<'a> {
                 return false;
             }
             if let Some((b, i)) = self.phis[v.0 as usize] {
-                todo.extend(self.p.blocks[b].phis[i].args.iter().map(|&a| self.origin(a)));
-            } else if let Some(ops) = self.xor_operands(v) {
-                todo.extend(ops);
+                // Only the edges some lane that reaches the access can have
+                // come by: on the others the register may hold anything (a
+                // lane mask where the compiler reuses it, P.4).
+                for (j, &a) in self.p.blocks[b].phis[i].args.iter().enumerate() {
+                    if self.edge_reaches(b, j) {
+                        todo.push(self.origin(a));
+                    }
+                }
+            } else if let Some(left) = self.xor_leaves(v) {
+                // An XOR tree: the leaves that appear an odd number of times
+                // are what it is (a swap's partner cancels out).
+                todo.extend(left);
             } else if let Some(t) = self.plus_scc(v) {
                 // `0 + carry` of the low half's add: a table address's high
                 // half, as `high_half` takes it (heap addresses fit in 32
@@ -1234,6 +1243,7 @@ impl<'a> Tracer<'a> {
                 todo.push(t);
             } else {
                 if std::env::var_os("VICTORY_WHY_HIGH").is_some() {
+                    eprintln!("WHY-ZERO at access block {:?}, lanes {}", self.at.get(), self.lanes.is_some());
                     if let Some((b, i)) = self.defs[v.0 as usize] {
                         let d = &self.p.blocks[b].insts[i];
                         eprintln!("WHY-ZERO inst at {:#x}: {}", d.machine.offset, d.name());
@@ -1248,6 +1258,47 @@ impl<'a> Tracer<'a> {
             }
         }
         true
+    }
+
+    /// The leaves of the XOR tree at `v` (through `s_xor_b32`/`s_xor_b64`
+    /// dwords and copies) that appear an odd number of times; `None` if `v`
+    /// is no XOR or the tree is too large.
+    fn xor_leaves(&self, v: Value) -> Option<Vec<Term>> {
+        self.xor_operands(v)?;
+        let mut count: std::collections::BTreeMap<String, (Term, u32)> = Default::default();
+        let mut todo = vec![Term::Value(v)];
+        let mut n = 0;
+        while let Some(t) = todo.pop() {
+            n += 1;
+            if n > 64 {
+                return None;
+            }
+            match t {
+                Term::Value(x) if self.xor_operands(x).is_some() => todo.extend(self.xor_operands(x)?),
+                Term::Const(0) => {}
+                t => count.entry(format!("{t:?}")).or_insert((t, 0)).1 += 1,
+            }
+        }
+        Some(count.into_values().filter(|&(_, c)| c % 2 == 1).map(|(t, _)| t).collect())
+    }
+
+    /// Whether some lane that reaches the access being traced can have come
+    /// into `block` by its edge `j` (true when that is not known: no access
+    /// or no lanes' paths).
+    fn edge_reaches(&self, block: usize, j: usize) -> bool {
+        let (Some(at), Some(lanes)) = (self.at.get(), self.lanes) else {
+            return true;
+        };
+        let Some(&q) = self.p.blocks[block].preds.get(j) else {
+            return true;
+        };
+        let mut known = vec![(lanes.reach[at], true), (lanes.reach[q], true)];
+        if let LaneExit::Branch { when, taken, not_taken } = lanes.exits[q]
+            && taken != not_taken
+        {
+            known.push((when, taken == block));
+        }
+        self.meet(lanes, &known)
     }
 
     /// `x` where `v` is `s_add_u32 v, x, src_scc` (either way round): the
