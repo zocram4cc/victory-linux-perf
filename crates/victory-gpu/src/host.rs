@@ -10323,6 +10323,15 @@ impl Meter {
                          with less than was mapped (looked at again)"
                     );
                 }
+                let [read, wait] =
+                    [0, 1].map(|i| crate::texture::EXACT_UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+                if read + wait > 0.0 {
+                    tracing::info!(
+                        "exact texture refreshes (uploads before a bake) that found title memory being remapped, per frame: \
+                         {read:.1} read whole through the kernel without waiting, {wait:.1} waited (a page was not there) \
+                         (VICTORY_EXACT_NO_WAIT=1: read first; unset: no wait under VICTORY_TEXTURE_NO_WAIT=1)"
+                    );
+                }
             }
             {
                 let [copies, joined] = [0, 1].map(|i| COPIES_JOINED[i].swap(0, Ordering::Relaxed) as f64 / frames);
