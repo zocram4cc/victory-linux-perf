@@ -184,7 +184,12 @@ fn default_card_limits_mb(local_vram_budget: Option<u64>) -> (u64, u64) {
     const TWELVE_GIB_MB: u64 = 12 * 1024;
     const TWENTY_GIB_MB: u64 = 20 * 1024;
     if budget_mb <= TWELVE_GIB_MB {
-        (16, 512)
+        // 1 MiB and 1 GiB on 8-12 GB cards: on an RTX 4060 Ti 8 GB (Series S,
+        // the opening cutscene) 17.0 -> 19.1 fps, preparing ~30 -> ~21 ms and
+        // copying back ~22 -> ~11 ms a frame, the card at 5.2 of 6.8 GB as
+        // before; 1.5 GiB gave no more (after trustno1-coder/VIctory-NVIDIA,
+        // which runs 1 MiB / 1536 MiB on 12 GB).
+        (1, 1024)
     } else if budget_mb < TWENTY_GIB_MB {
         (4, 2048)
     } else {
@@ -211,7 +216,7 @@ fn resolve_card_limits(
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes:
 /// `VICTORY_CARD_BUFFERS_MIN_MB` and `VICTORY_CARD_BUFFERS_MB`.
-/// Defaults scale with the adapter's local VRAM budget (16 MiB / 512 MiB on
+/// Defaults scale with the adapter's local VRAM budget (1 MiB / 1024 MiB on
 /// `<= 12 GiB` budgets, 4 MiB / 2048 MiB on 16 GB cards, 1 MiB / up to 8192 MiB
 /// on `>= 20 GiB` budgets), and explicit env vars always override.
 fn card_limits() -> (u64, u64) {
@@ -6339,11 +6344,12 @@ mod window_tests {
         const GIB: u64 = 1 << 30;
         const MIB: u64 = 1 << 20;
 
-        // Unknown (WARP / query failure) and <= 12 GiB keep the 12 GB baseline.
+        // Unknown (WARP / query failure) keeps the old baseline; 8-12 GiB copy
+        // buffers from 1 MiB, up to 1 GiB.
         assert_eq!(default_card_limits_mb(None), (16, 512));
-        assert_eq!(default_card_limits_mb(Some(8 * GIB)), (16, 512));
-        assert_eq!(default_card_limits_mb(Some(11 * GIB)), (16, 512));
-        assert_eq!(default_card_limits_mb(Some(12 * GIB)), (16, 512));
+        assert_eq!(default_card_limits_mb(Some(8 * GIB)), (1, 1024));
+        assert_eq!(default_card_limits_mb(Some(11 * GIB)), (1, 1024));
+        assert_eq!(default_card_limits_mb(Some(12 * GIB)), (1, 1024));
 
         // 16 GB tier (> 12 GiB, < 20 GiB), including WDDM budgets around 13.5–15 GiB.
         assert_eq!(default_card_limits_mb(Some(13 * GIB)), (4, 2048));
