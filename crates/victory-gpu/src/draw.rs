@@ -3022,14 +3022,14 @@ impl State {
         }
         let required = PASS_BUDGET.get().is_some_and(|(_, _, bake)| bake);
         let (mut due, census) =
-            host.texture_slots_due(frame, if only { 0 } else if baking { 1 << 16 } else { 4096 });
+            host.texture_slots_due(frame, if only { 0 } else if baking { 1 << 16 } else { 4096 }, room);
         // (Those that are due later after all that are due.)
         let on_time = due.len();
         if baking && !only {
             let known: std::collections::HashSet<u32> = due.iter().map(|&(index, _)| index).collect();
             static AHEAD: AtomicU64 = AtomicU64::new(u64::MAX);
             let again = AHEAD.swap(frame, Ordering::Relaxed) == frame;
-            let (ahead, _) = host.texture_slots_due(frame + BAKE_AHEAD[usize::from(again)], 1 << 16);
+            let (ahead, _) = host.texture_slots_due(frame + BAKE_AHEAD[usize::from(again)], 1 << 16, room);
             due.extend(ahead.into_iter().filter(|(index, _)| !known.contains(index)));
         }
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
