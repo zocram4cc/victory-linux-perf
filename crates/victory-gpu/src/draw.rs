@@ -176,6 +176,11 @@ thread_local! {
     /// ([`State::complete_bake`]): its sources go up whatever
     /// `VICTORY_BAKE_SOURCES_MB` and the card's budget say.
     static COMPLETING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The slots such a run recorded an upload for. Into a list not run
+    /// yet the host copy's contents are noted only when it is submitted
+    /// (`crate::texture` `note_held`): a look before then cannot tell
+    /// them current.
+    static COMPLETED: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
     /// The tables a pixel shader reads as a decoration bake does
     /// ([`bake_tables`]), by the shader's hash: asked at every draw.
     static BAKE_TABLES: std::cell::RefCell<std::collections::HashMap<String, Option<BakeTables>>> =
@@ -433,47 +438,59 @@ impl Halt {
 }
 
 /// Whether another run makes a bake draw complete: `None` if so, else
-/// why not. `short`: its sources still short; `rounds`: runs made;
-/// `spent` of `left` milliseconds.
-fn complete_next(short: usize, rounds: u32, spent: u64, left: u64) -> Option<Halt> {
+/// why not. `short`: its sources still short; `rounds`: runs made for
+/// this draw; `spent` of the frame's `per_frame` (all its bakes), and
+/// `expect`, the longest run the frame has had (0: none yet). A run is
+/// begun only if one as long as that still fits: the budget is checked
+/// before a run and a run is not cut short, so without it a frame could
+/// take its whole budget and one run more (and a second bake one more
+/// again). The frame's first run always may: the most a frame takes is
+/// its budget or its first run, whichever is longer, and a little.
+fn complete_next(short: usize, rounds: u32, spent: u64, per_frame: u64, expect: u64) -> Option<Halt> {
     if short == 0 {
         Some(Halt::Complete)
     } else if rounds >= BAKE_COMPLETE_ROUNDS {
         Some(Halt::Rounds)
-    } else if spent >= left {
+    } else if spent >= per_frame || spent.saturating_add(expect) > per_frame {
         Some(Halt::Time)
     } else {
         None
     }
 }
 
-/// The milliseconds a frame's bake draws have taken to be made complete
-/// ([`bake_complete`]).
+/// The time a frame's bake draws have taken to be made complete
+/// ([`bake_complete`]), in microseconds, and the longest run of the
+/// texture pass for it in the frame. Shared by the threads that record:
+/// each run is added when it ends, so a bake on another thread sees it.
 #[derive(Debug, PartialEq, Eq)]
 struct FrameMs {
     frame: u64,
     spent: u64,
+    longest: u64,
 }
 
 impl FrameMs {
-    /// What is left of `per_frame` in `frame` (a new frame starts at 0).
-    fn left(&mut self, frame: u64, per_frame: u64) -> u64 {
+    /// What `frame` has spent so far and its longest run (a new frame
+    /// starts at 0).
+    fn now(&mut self, frame: u64) -> (u64, u64) {
         if self.frame != frame {
-            (self.frame, self.spent) = (frame, 0);
+            (self.frame, self.spent, self.longest) = (frame, 0, 0);
         }
-        per_frame.saturating_sub(self.spent)
+        (self.spent, self.longest)
     }
 
-    /// `ms` more taken in `frame`.
-    fn spend(&mut self, frame: u64, ms: u64) {
-        if self.frame != frame {
-            (self.frame, self.spent) = (frame, 0);
+    /// `us` more taken in `frame`; `run`: by one run of the pass.
+    fn spend(&mut self, frame: u64, us: u64, run: bool) {
+        self.now(frame);
+        self.spent = self.spent.saturating_add(us);
+        if run {
+            self.longest = self.longest.max(us);
         }
-        self.spent = self.spent.saturating_add(ms);
     }
 }
 
-static COMPLETE_MS: std::sync::Mutex<FrameMs> = std::sync::Mutex::new(FrameMs { frame: u64::MAX, spent: 0 });
+static COMPLETE_MS: std::sync::Mutex<FrameMs> =
+    std::sync::Mutex::new(FrameMs { frame: u64::MAX, spent: 0, longest: 0 });
 
 /// What making a bake draw complete did ([`State::complete_bake`]).
 #[derive(Debug, Default)]
@@ -530,7 +547,9 @@ struct BakeEnd {
     /// Shown, of a texture the title fills, whose host copy holds other
     /// bytes than title memory holds now (`crate::texture::current`).
     behind: Vec<u32>,
-    /// Shown, and whether the host copy is current cannot be told.
+    /// Shown, and whether the host copy is current cannot be told (or
+    /// not yet: uploaded by a run that completes the draw into a list not
+    /// run yet, [`State::complete_bake`]).
     unknown: u64,
     /// Of `missing`: on the card at the draw's first look.
     were_ready: u64,
@@ -3069,20 +3088,40 @@ impl State {
         frame: u64,
     ) -> BakeCompletion {
         let began = std::time::Instant::now();
-        let left = COMPLETE_MS.lock().unwrap_or_else(|e| e.into_inner()).left(frame, bake_complete().1);
+        let per_frame = bake_complete().1.saturating_mul(1000);
         let kept = PASS_SOURCED.get();
         let mut out = BakeCompletion::default();
+        // Slots a run uploaded into `list` (no synchronous list): not yet
+        // known current, and not run for again ([`COMPLETED`]).
+        let mut unconfirmed: Vec<u32> = Vec::new();
+        // Since the time last added to the frame's ([`COMPLETE_MS`]).
+        let mut mark = began;
+        let spend = |mark: &mut std::time::Instant, run: bool| {
+            let us = mark.elapsed().as_micros() as u64;
+            *mark = std::time::Instant::now();
+            let mut ms = COMPLETE_MS.lock().unwrap_or_else(|e| e.into_inner());
+            ms.spend(frame, us, run);
+            ms.now(frame)
+        };
         loop {
-            let end = Self::bake_end(sources, host, true);
+            let mut end = Self::bake_end(sources, host, true);
+            if !unconfirmed.is_empty() {
+                let behind = end.behind.len();
+                end.behind.retain(|slot| !unconfirmed.contains(slot));
+                end.unknown += (behind - end.behind.len()) as u64;
+            }
             let short = end.short();
             if out.rounds == 0 {
                 out.found = short.len() as u64;
             }
-            if let Some(halt) = complete_next(short.len(), out.rounds, began.elapsed().as_millis() as u64, left) {
+            // (The look's time is the frame's too.)
+            let (spent, longest) = spend(&mut mark, false);
+            if let Some(halt) = complete_next(short.len(), out.rounds, spent, per_frame, longest) {
                 (out.halt, out.end) = (halt, end);
                 break;
             }
             out.rounds += 1;
+            COMPLETED.with(|c| c.borrow_mut().clear());
             // Back in the queue (those out of it), and first in a run for
             // them alone.
             host.texture_slots_requeue(&short, frame);
@@ -3117,10 +3156,12 @@ impl State {
                 }
                 None => {
                     let _ = self.heap_textures(list, heap, host, None);
+                    unconfirmed.extend(COMPLETED.with(|c| std::mem::take(&mut *c.borrow_mut())));
                 }
             }
             crate::texture::BAKING.set(false);
             COMPLETING.set(false);
+            COMPLETED.with(|c| c.borrow_mut().clear());
             PASS_BUDGET.set(None);
             PASS_SOURCES.set(None);
             let done = PASS_SOURCED.get();
@@ -3128,10 +3169,10 @@ impl State {
                 *total += now;
             }
             out.done[sourced::STOPPED_BY] = done[sourced::STOPPED_BY];
+            spend(&mut mark, true);
         }
         PASS_SOURCED.set(kept);
         out.ms = began.elapsed().as_millis() as u64;
-        COMPLETE_MS.lock().unwrap_or_else(|e| e.into_inner()).spend(frame, out.ms);
         out
     }
 
@@ -3168,7 +3209,7 @@ impl State {
             as_far_as_mapped_already = before[sourced::AS_BEFORE] + done[sourced::AS_BEFORE],
             no_host_texture = before[sourced::NOT_MADE] + done[sourced::NOT_MADE],
             not_reached = before[sourced::NOT_REACHED] + done[sourced::NOT_REACHED],
-            stopped_by = sourced::why(done[sourced::STOPPED_BY].max(before[sourced::STOPPED_BY])),
+            stopped_by = sourced::why(if completion.rounds > 0 { done[sourced::STOPPED_BY] } else { before[sourced::STOPPED_BY] }),
             unpublished = completion.unpublished,
             "a decoration bake draw runs with some of its textures short: what it bakes of them stays for the scene (VICTORY_BAKE_COMPLETE=0: not made complete)"
         );
@@ -3301,7 +3342,7 @@ impl State {
     ) {
         static DRAWS: AtomicU64 = AtomicU64::new(0);
         static SHORT: AtomicU64 = AtomicU64::new(0);
-        static TOTALS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+        static TOTALS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
         let n = DRAWS.fetch_add(1, Ordering::Relaxed) + 1;
         let waiting = sources.queued.len() as u64;
         let unmade = sources.unmade.len() as u64;
@@ -3320,6 +3361,8 @@ impl State {
             behind,
             done[sourced::UNCHANGED],
             done[sourced::NOT_REACHED],
+            completion.found,
+            completion.done[sourced::UPLOADED],
         ]) {
             total.fetch_add(now, Ordering::Relaxed);
         }
@@ -3340,6 +3383,8 @@ impl State {
             behind_so_far,
             unchanged_so_far,
             not_reached_so_far,
+            completed_short_so_far,
+            completion_uploaded_so_far,
         ] = TOTALS.each_ref().map(|t| t.load(Ordering::Relaxed));
         tracing::info!(
             frame = crate::frame::current(),
@@ -3378,6 +3423,10 @@ impl State {
             behind_so_far,
             unchanged_so_far,
             not_reached_so_far,
+            completed_short_so_far,
+            completion_uploaded_so_far,
+            // (Of the forced runs and the completing ones both; the
+            // `uploaded` counts are each their own.)
             megabytes_so_far = BAKE_SOURCED_BYTES.load(Ordering::Relaxed) >> 20,
             waited_so_far = waited,
             uploaded_so_far = uploads,
@@ -4088,6 +4137,9 @@ impl State {
                 sourced_add(sourced::UPLOADED, 1);
                 sourced_add(sourced::BYTES, if tabled { 0 } else { bytes });
                 sourced_bytes += bytes;
+                if completing {
+                    COMPLETED.with(|c| c.borrow_mut().push(index));
+                }
             }
             if tabled {
                 // Nothing was staged here, so nothing is counted or spent,
@@ -6063,34 +6115,53 @@ mod bake_tests {
     use super::{BAKE_COMPLETE_ROUNDS, BAKE_CONSTANT_INDICES, BAKE_RECORD_INDICES, BakeEnd, FrameMs, Halt, bake_named, complete_next};
 
     /// A bake is made complete while some of its sources are short, for
-    /// at most so many runs and within the frame's milliseconds; nothing
-    /// short ends it at once, whatever is left.
+    /// at most so many runs and within the frame's time; nothing short
+    /// ends it at once, whatever is left.
     #[test]
     fn a_bake_is_made_complete_within_its_rounds_and_milliseconds() {
-        assert_eq!(complete_next(0, 0, 0, 300), Some(Halt::Complete));
-        assert_eq!(complete_next(0, BAKE_COMPLETE_ROUNDS, 999, 0), Some(Halt::Complete));
-        assert_eq!(complete_next(3, 0, 0, 300), None);
-        assert_eq!(complete_next(3, BAKE_COMPLETE_ROUNDS - 1, 299, 300), None);
-        assert_eq!(complete_next(3, BAKE_COMPLETE_ROUNDS, 0, 300), Some(Halt::Rounds));
-        assert_eq!(complete_next(3, 1, 300, 300), Some(Halt::Time));
-        // The frame's milliseconds already spent: not even one run.
-        assert_eq!(complete_next(1, 0, 0, 0), Some(Halt::Time));
+        assert_eq!(complete_next(0, 0, 0, 300, 0), Some(Halt::Complete));
+        assert_eq!(complete_next(0, BAKE_COMPLETE_ROUNDS, 999, 0, 999), Some(Halt::Complete));
+        assert_eq!(complete_next(3, 0, 0, 300, 0), None);
+        assert_eq!(complete_next(3, BAKE_COMPLETE_ROUNDS - 1, 299, 300, 0), None);
+        assert_eq!(complete_next(3, BAKE_COMPLETE_ROUNDS, 0, 300, 0), Some(Halt::Rounds));
+        assert_eq!(complete_next(3, 1, 300, 300, 0), Some(Halt::Time));
+        // The frame's time already spent: not even one run.
+        assert_eq!(complete_next(1, 0, 0, 0, 0), Some(Halt::Time));
+        assert_eq!(complete_next(1, 0, 301, 300, 0), Some(Halt::Time));
     }
 
-    /// The frame's milliseconds for making bakes complete are shared by
-    /// its bakes, and start again with the next frame.
+    /// A run is begun only if one as long as the frame's longest so far
+    /// still fits: the budget is not overrun by a whole run each time
+    /// (the frame's first run, with none to go by, always may).
+    #[test]
+    fn a_run_is_begun_only_if_the_longest_so_far_still_fits() {
+        assert_eq!(complete_next(2, 0, 0, 300, 0), None, "the frame's first");
+        assert_eq!(complete_next(2, 1, 150, 300, 150), None, "one more as long fits exactly");
+        assert_eq!(complete_next(2, 1, 151, 300, 150), Some(Halt::Time));
+        // Another bake of the frame, none of its own run yet: the same.
+        assert_eq!(complete_next(2, 0, 200, 300, 150), Some(Halt::Time));
+        assert_eq!(complete_next(2, 0, 100, 300, 150), None);
+        // A first run longer than the budget: nothing more that frame.
+        assert_eq!(complete_next(2, 1, 400, 300, 400), Some(Halt::Time));
+    }
+
+    /// The frame's time for making bakes complete is shared by its bakes,
+    /// with its longest run, and starts again with the next frame.
     #[test]
     fn a_frame_s_bakes_share_its_milliseconds() {
-        let mut ms = FrameMs { frame: u64::MAX, spent: 0 };
-        assert_eq!(ms.left(7, 300), 300);
-        ms.spend(7, 120);
-        assert_eq!(ms.left(7, 300), 180);
-        ms.spend(7, 400);
-        assert_eq!(ms.left(7, 300), 0);
-        assert_eq!(ms.left(8, 300), 300, "a new frame");
+        let mut ms = FrameMs { frame: u64::MAX, spent: 0, longest: 0 };
+        assert_eq!(ms.now(7), (0, 0));
+        ms.spend(7, 20, false);
+        ms.spend(7, 120, true);
+        assert_eq!(ms.now(7), (140, 120));
+        ms.spend(7, 90, true);
+        assert_eq!(ms.now(7), (230, 120), "the longest run is kept");
+        ms.spend(7, 400, false);
+        assert_eq!(ms.now(7), (630, 120), "a look is no run");
+        assert_eq!(ms.now(8), (0, 0), "a new frame");
         // Spent in a frame nothing asked about yet counts for that frame.
-        ms.spend(9, 50);
-        assert_eq!(ms.left(9, 300), 250);
+        ms.spend(9, 50, true);
+        assert_eq!(ms.now(9), (50, 50));
     }
 
     /// What a bake would sample wrong or out of date, each slot once.
