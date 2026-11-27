@@ -311,7 +311,27 @@ fn note_before(index: u32, was: u64, by: &'static str) {
     }
 }
 
-/// A 1x1 gray texture, in the place of one that is not there yet.
+/// The texel of [`neutral`]: mid gray, and the alpha
+/// `VICTORY_NEUTRAL_ALPHA` sets (0-255; default 0). The gray keeps an opaque
+/// surface whose texture has not arrived from flashing black; an alpha of 0
+/// keeps one that is blended or alpha-tested (smoke, glass, foliage cards)
+/// from becoming a flat rectangle for the frames it waits. At 128, the old
+/// half alpha, the police lights' smoke was drawn as pink and lavender boxes
+/// (runs 20261126-235437 and 20261127-000808 showed the neutral texture
+/// about 2,400 times a second while textures were evicted and made again).
+fn neutral_texel() -> [u8; 4] {
+    static ALPHA: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let alpha = *ALPHA.get_or_init(|| neutral_alpha(std::env::var("VICTORY_NEUTRAL_ALPHA").ok().as_deref()));
+    [0x80, 0x80, 0x80, alpha]
+}
+
+/// The neutral texture's alpha for a value of `VICTORY_NEUTRAL_ALPHA`.
+fn neutral_alpha(value: Option<&str>) -> u8 {
+    value.and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+}
+
+/// A 1x1 gray texture, in the place of one that is not there yet
+/// ([`neutral_texel`]).
 fn neutral() -> Option<&'static ID3D12Resource> {
     static TEXTURE: std::sync::OnceLock<Option<ID3D12Resource>> = std::sync::OnceLock::new();
     TEXTURE
@@ -322,7 +342,8 @@ fn neutral() -> Option<&'static ID3D12Resource> {
             // SAFETY: the buffer's mapping; plain creation and recording,
             // waited for before what it names goes.
             unsafe {
-                std::ptr::write_bytes(data, 0x80, 256);
+                std::ptr::write_bytes(data, 0, 256);
+                std::ptr::copy_nonoverlapping(neutral_texel().as_ptr(), data, 4);
                 let mut made: Option<ID3D12Resource> = None;
                 device
                     .CreateCommittedResource(
@@ -6037,6 +6058,18 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         // Long after the last table, a write is due at once.
         heap.queue_texture(2, true, false, frame + 3 + TABLED_FRAMES);
         assert_eq!(slots(frame + 3 + TABLED_FRAMES), [2]);
+    }
+
+    /// The neutral texture is transparent unless `VICTORY_NEUTRAL_ALPHA`
+    /// says otherwise (128: the old half alpha); its gray stays.
+    #[test]
+    fn the_neutral_texture_is_transparent_gray_unless_asked() {
+        assert_eq!(neutral_alpha(None), 0);
+        assert_eq!(neutral_alpha(Some("128")), 128);
+        assert_eq!(neutral_alpha(Some(" 255 ")), 255);
+        assert_eq!(neutral_alpha(Some("opaque")), 0);
+        assert_eq!(neutral_alpha(Some("300")), 0);
+        assert_eq!(&neutral_texel()[..3], &[0x80, 0x80, 0x80]);
     }
 
     #[test]
