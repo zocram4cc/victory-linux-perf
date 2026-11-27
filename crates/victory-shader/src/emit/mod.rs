@@ -209,6 +209,16 @@ pub fn dpp_console_rows() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_DPP_CONSOLE_ROWS").is_none_or(|v| v != "0"))
 }
 
+/// Whether, in the exchange form (a console wave64 program in two host waves of 32), the
+/// last console wave of a group of 64n + 1..32 threads takes 0 for its absent upper half
+/// instead of reading the exchange dword no thread writes; on unless
+/// `VICTORY_EXCHANGE_ABSENT_ZERO=0` (that dword read as before). Part of the translation:
+/// the shader cache keys on it.
+pub fn exchange_absent_zero() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EXCHANGE_ABSENT_ZERO").is_none_or(|v| v != "0"))
+}
+
 /// Whether a first-lane read (`v_readfirstlane_b32`) of a value the lanes may hold
 /// differently makes a console wave64 compute program on host waves of 32 one whose lanes
 /// cross halves (the exchange form), so that lanes 32..63 read the console wave's first lane,

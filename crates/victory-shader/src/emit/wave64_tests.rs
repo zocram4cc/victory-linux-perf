@@ -1537,3 +1537,35 @@ fn a_first_lane_read_of_a_wave64_program_reads_console_lane_0() {
     assert_eq!(got, vec![5; 64], "{wrong} of 64 threads read another first lane");
     eprintln!("ran on the hardware device: console lane 0's value in all 64 threads");
 }
+
+/// On the card, a console wave64 program of 96 threads (two console waves, the second
+/// without an upper half) in the exchange form: each thread stores the bit count of its
+/// wave's `v_cmp` mask, true in every lane, so 64 in the first console wave and 32 in the
+/// second (from the ISA's definitions; the console's lanes 32..63 of that wave do not
+/// exist). With `VICTORY_EXCHANGE_ABSENT_ZERO=0` the second wave adds whatever the exchange
+/// dword no thread writes holds: zero LDS would hide that, so a pass says less than a failure.
+#[test]
+fn a_console_wave_without_an_upper_half_counts_only_its_lanes() {
+    let native = native_of(
+        &[
+            0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+            0xBE94_106A, // s_bcnt1_i32_b64 s20, vcc
+            0x7E06_0214, // v_mov_b32 v3, s20
+            0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+            0xE070_1000,
+            0x8002_0302, // buffer_store_dword v3, v2, s[8:11], 0 offen
+        ],
+        true,
+        96,
+    );
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(got) = words_on_the_card(&shader, 1000, 96, 1) else { return };
+    let want: Vec<u32> = (0..96).map(|t| if t < 64 { 64 } else { 32 }).collect();
+    assert_eq!(got, want);
+    eprintln!("ran on the hardware device: 64 and 32 lanes counted");
+}

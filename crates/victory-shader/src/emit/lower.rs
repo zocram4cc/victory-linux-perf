@@ -4534,9 +4534,22 @@ impl<'a> Lower<'a> {
         let p0 = self.s.m.element(at, lds, pair);
         let p1 = self.s.m.element(at, lds, k1);
         let lo = self.s.m.load(at, p0);
-        let hi = self.s.m.load(at, p1);
+        let mut hi = self.s.m.load(at, p1);
         // the slots are written again only after every thread read them
         self.group_sync(at);
+        // The last console wave of a group of 64n + 1..32 threads has no upper half, and no
+        // thread writes its slot: that half gives nothing, as a group with no upper half
+        // (bonaza's audit D5).
+        let group: u32 = self.s.threads.map_or(0, |t| t.iter().product());
+        if group > 32 && (1..=32).contains(&(group % 64)) && super::exchange_absent_zero() {
+            let thread = self.console_thread();
+            let six = self.s.m.i32(6);
+            let wave = self.s.m.bin(at, Bin::LShr, thread, six);
+            let last = self.s.m.i32(group / 64);
+            let absent = self.s.m.cmp(at, pred::EQ, wave, last);
+            let z = self.s.m.i32(0);
+            hi = self.s.m.select(at, absent, z, hi);
+        }
         (lo, hi)
     }
 
