@@ -16,6 +16,67 @@ type Up = (usize, u32, u32, u64, u64);
 /// is brought.
 type Word = (u64, [u32; 3]);
 
+/// Whether a submission's lists do nothing but the host layer's compare
+/// after lists: every command that makes the card run shaders is a dispatch
+/// of a pipeline in `compares` with a mode (its sixth constant) other than
+/// 0 (0 hashes again what was just sent up), and there is one.
+fn compare_only(lists: &[Vec<Cmd>], compares: &HashSet<u32>) -> bool {
+    let mut found = false;
+    for cmds in lists {
+        let (mut bound, mut mode) = (NONE, 0);
+        for c in cmds {
+            match c {
+                Cmd::Pipeline { pso } => bound = *pso,
+                Cmd::Constants {
+                    graphics: false,
+                    param: 0,
+                    values,
+                    ..
+                } => mode = values.get(5).copied().unwrap_or(0),
+                Cmd::Dispatch { .. } if compares.contains(&bound) && mode != 0 => found = true,
+                c if c.works() && !matches!(c, Cmd::Dispatch { .. } if compares.contains(&bound)) => return false,
+                _ => {}
+            }
+        }
+    }
+    found
+}
+
+/// Whether a submission's lists bind a compare pipeline at all.
+fn any_compare(lists: &[Vec<Cmd>], compares: &HashSet<u32>) -> bool {
+    lists
+        .iter()
+        .flatten()
+        .any(|c| matches!(c, Cmd::Pipeline { pso } if compares.contains(pso)))
+}
+
+/// For each submission, the later one whose compares stand for what its
+/// shaders were declared to write. The host layer cuts a submission into
+/// parts, each sent on its own, and sends the compare of all of them on its
+/// own after the last (`crate::host`, `compare_at`): in a capture, the parts
+/// follow one another with no compare, then a submission of compares alone.
+/// So the search goes on past submissions without a compare and takes the
+/// first one of compares alone; one with other compares in it (another
+/// submission's start) ends it.
+///
+/// shortcut: a submission that declared nothing (no compare) followed by
+/// another whose own start has no compare either is given that one's.
+fn compared_later(submits: &[Vec<Vec<Cmd>>], compares: &HashSet<u32>) -> Vec<Option<usize>> {
+    (0..submits.len())
+        .map(|i| {
+            for (j, lists) in submits.iter().enumerate().skip(i + 1) {
+                if compare_only(lists, compares) {
+                    return Some(j);
+                }
+                if any_compare(lists, compares) {
+                    return None;
+                }
+            }
+            None
+        })
+        .collect()
+}
+
 impl Player {
     /// The copies up in a submission's lists.
     fn ups(&self, submit: usize, lists: &[Vec<Cmd>]) -> Vec<Up> {
@@ -182,6 +243,7 @@ impl Player {
             shown.values().sum::<u64>() >> 20
         ));
         let states = self.start_states();
+        let later = compared_later(&submits, &self.pipelines_named(COMPARE));
         let mut runs: Vec<Vec<(Up, Vec<Word>)>> = Vec::new();
         for run in 0..2 {
             self.restore(true)?;
@@ -245,6 +307,13 @@ impl Player {
                 }
                 let now = self.hashes_now(&reader, &states)?;
                 let mut declared = self.declared(&submits[i]);
+                // (What the compare sent on its own after this one says.)
+                if let Some(j) = later[i] {
+                    for (id, (skew, pieces)) in self.declared(&submits[j]) {
+                        let e = declared.entry(id).or_insert((skew, HashSet::new()));
+                        e.1.extend(pieces);
+                    }
+                }
                 for (_, _, dst, at, len) in &ups {
                     let e = declared.entry(*dst).or_default();
                     let skew = e.0;
@@ -338,5 +407,48 @@ impl Player {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const COMPARE_PSO: u32 = 7;
+
+    fn compare(mode: u32) -> Vec<Cmd> {
+        vec![
+            Cmd::Pipeline { pso: COMPARE_PSO },
+            Cmd::Constants { graphics: false, param: 0, offset: 0, values: vec![0, 0, 1 << 20, 16, 0, mode] },
+            Cmd::Dispatch { groups: [16, 1, 1] },
+        ]
+    }
+
+    fn work() -> Vec<Cmd> {
+        vec![Cmd::Pipeline { pso: 3 }, Cmd::Dispatch { groups: [1, 1, 1] }]
+    }
+
+    #[test]
+    fn the_compare_sent_after_a_cut_submission_stands_for_all_its_parts() {
+        let compares: HashSet<u32> = [COMPARE_PSO].into();
+        // 0: a part with its prelude (copies up, hashed again: mode 0), 1:
+        // the next part, 2: the compare of both, alone; 3: the next
+        // submission's start, with a hash pass of its own; 4: its compare.
+        let submits = vec![
+            vec![compare(0), work()],
+            vec![work()],
+            vec![vec![Cmd::Barriers { all: Vec::new() }], compare(2)],
+            vec![compare(0), work()],
+            vec![compare(1)],
+        ];
+        assert!(compare_only(&submits[2], &compares));
+        assert!(!compare_only(&submits[0], &compares), "a hash pass and work is no compare");
+        assert!(!compare_only(&submits[3], &compares));
+        assert_eq!(compared_later(&submits, &compares), [Some(2), Some(2), None, Some(4), None]);
+        // A submission that runs anything else beside its compares is another one.
+        let mixed = vec![compare(2), work()];
+        assert!(!compare_only(&mixed, &compares));
+        // Nothing but barriers is not a compare.
+        assert!(!compare_only(&[vec![Cmd::Barriers { all: Vec::new() }]], &compares));
     }
 }
