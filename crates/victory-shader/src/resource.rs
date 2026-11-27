@@ -1189,6 +1189,9 @@ impl<'a> Tracer<'a> {
         if let Some(source) = self.loaded(words) {
             return Ok(source);
         }
+        if let Some(source) = self.raw_view_of_loaded(words) {
+            return Ok(source);
+        }
         if let [lo, hi, Term::Const(w2), Term::Const(w3)] = *words {
             let (mut hi, mut bits) = (hi, 0);
             while let Term::Value(v) = hi
@@ -2149,6 +2152,39 @@ impl<'a> Tracer<'a> {
     }
 
     /// Consecutive dwords of one scalar load.
+    /// A loaded buffer descriptor made into a byte-address (raw) view of the
+    /// same buffer: `[d0, d1 & 0xc000ffff, d2 * n, (d3 & m) | 0x30000000]`
+    /// (the stride cleared, the record count in bytes, OOB_SELECT raw), all
+    /// from one scalar load `d0..d3`. The title's own compute programs (P.4,
+    /// device method 0x218: 975 of them) read structured buffers so. The
+    /// source is the loaded descriptor: accesses without an index are raw
+    /// already, at the byte offset, whatever the stride (the record count
+    /// only bounds them).
+    fn raw_view_of_loaded(&self, words: &[Term]) -> Option<Source> {
+        let [Term::Value(d0), Term::Value(w1), Term::Value(w2), Term::Value(w3)] = *words else {
+            return None;
+        };
+        // `op(value, constant)` either way round: the value.
+        let with = |v: Value, name: &str, k: Option<u32>| -> Option<Value> {
+            let (_, [a, b]) = self.sop2(v, &[name])?;
+            match (a, b, k) {
+                (Term::Value(x), Term::Const(c), Some(k)) | (Term::Const(c), Term::Value(x), Some(k)) if c == k => Some(x),
+                (Term::Value(x), _, None) | (_, Term::Value(x), None) => Some(x),
+                _ => None,
+            }
+        };
+        let d1 = with(w1, "s_and_b32", Some(0xc000_ffff))?;
+        let d3_masked = with(w3, "s_or_b32", Some(0x3000_0000))?;
+        let d3 = with(d3_masked, "s_and_b32", None).unwrap_or(d3_masked);
+        // The record count: one factor is dword 2 of the same load.
+        let (_, [a, b]) = self.sop2(w2, &["s_mul_i32"])?;
+        let source = |d2: Value| self.loaded(&[Term::Value(d0), Term::Value(d1), Term::Value(d2), Term::Value(d3)]);
+        [a, b].into_iter().find_map(|t| match t {
+            Term::Value(d2) => source(d2),
+            Term::Const(_) => None,
+        })
+    }
+
     fn loaded(&self, words: &[Term]) -> Option<Source> {
         let Term::Value(v0) = words[0] else {
             return None;
