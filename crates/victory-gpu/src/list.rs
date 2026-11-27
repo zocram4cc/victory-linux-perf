@@ -846,9 +846,112 @@ pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: 
     if let Some((texture, before)) = list.transition(resource, state) {
         let state = crate::host::legal_state(texture, state);
         let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
-        // SAFETY: an open list and a live texture (the list's states hold
-        // it).
-        unsafe { list.list.barriers(&[barrier]) };
+        // After its upload's copies: held while uploads are held.
+        let barrier = if before == COPY_DEST && upload_barriers_held() { hold_read(texture, barrier) } else { Some(barrier) };
+        if let Some(barrier) = barrier {
+            // SAFETY: an open list and a live texture (the list's states hold
+            // it).
+            unsafe { list.list.barriers(&[barrier]) };
+        }
+    }
+}
+
+/// `VICTORY_UPLOAD_BARRIERS=1`: in the pass that uploads the textures of
+/// the slots shaders read (`crate::draw`'s heap textures), the barriers
+/// that leave each uploaded texture readable after its copies are recorded
+/// all together after the last copy, not each between one texture's copies
+/// and the next one's (which kept the card from overlapping the copies).
+/// After upstream Marvisak/VIctory ea812894 (GPL-3), written anew for our
+/// uploads. Off (the default): one barrier after each texture, as before.
+#[cfg(windows)]
+pub(crate) fn upload_barriers_held() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let on = std::env::var("VICTORY_UPLOAD_BARRIERS").is_ok_and(|v| v.trim() == "1");
+        tracing::info!(on, "uploaded textures made readable in one batch (VICTORY_UPLOAD_BARRIERS)");
+        on
+    });
+    *ON
+}
+
+#[cfg(windows)]
+type Held = Vec<(usize, windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER)>;
+
+#[cfg(windows)]
+thread_local! {
+    /// The barriers held by [`HoldReads`] on this thread, by texture.
+    static HELD: std::cell::RefCell<Option<Held>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Holds `barrier` (of `texture`, leaving the copy destination state) if
+/// barriers are held on this thread; gives it back otherwise.
+#[cfg(windows)]
+fn hold_read(
+    texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    barrier: windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER,
+) -> Option<windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER> {
+    use windows::core::Interface;
+    HELD.with_borrow_mut(|held| match held {
+        Some(held) => {
+            held.push((texture.as_raw() as usize, barrier));
+            None
+        }
+        None => Some(barrier),
+    })
+}
+
+/// Before `list` records anything else about `texture`: the held barriers,
+/// all of them, if one is `texture`'s (its real state is still the copy
+/// destination one).
+#[cfg(windows)]
+pub(crate) fn release_held(list: &crate::host::HostList, texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) {
+    use windows::core::Interface;
+    if !upload_barriers_held() {
+        return;
+    }
+    let key = texture.as_raw() as usize;
+    let barriers: Vec<_> = HELD.with_borrow_mut(|held| match held {
+        Some(held) if held.iter().any(|(k, _)| *k == key) => held.drain(..).map(|(_, b)| b).collect(),
+        _ => Vec::new(),
+    });
+    if !barriers.is_empty() {
+        // SAFETY: an open list; the barriers name live textures.
+        unsafe { list.list.barriers(&barriers) };
+    }
+}
+
+/// While it lives (and [`upload_barriers_held`]), barriers that leave
+/// uploaded textures readable are held; recorded together into the list
+/// when it goes.
+#[cfg(windows)]
+pub(crate) struct HoldReads<'a>(Option<&'a crate::host::HostList>);
+
+#[cfg(windows)]
+impl<'a> HoldReads<'a> {
+    pub(crate) fn new(list: &'a crate::host::HostList) -> Self {
+        if !upload_barriers_held() {
+            return Self(None);
+        }
+        HELD.with_borrow_mut(|held| *held = Some(Vec::new()));
+        Self(Some(list))
+    }
+}
+
+#[cfg(windows)]
+impl Drop for HoldReads<'_> {
+    fn drop(&mut self) {
+        let Some(list) = self.0 else {
+            return;
+        };
+        let barriers: Vec<_> = HELD
+            .with_borrow_mut(|held| held.take())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(_, b)| b)
+            .collect();
+        if !barriers.is_empty() {
+            // SAFETY: an open list; the barriers name live textures.
+            unsafe { list.list.barriers(&barriers) };
+        }
     }
 }
 
