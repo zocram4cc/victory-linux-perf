@@ -8424,7 +8424,7 @@ impl<'a> Lower<'a> {
             _ if from_memory => {}
             r => {
                 if std::env::var_os("VICTORY_WHY_OUTSIDE").is_some() {
-                    eprintln!("OUTSIDE {:?} root {:?} layout {:?}", a, r, self.x.native.layout.iter().map(|p| (p.root, p.slot, p.user_data, p.sgprs)).collect::<Vec<_>>());
+                    eprintln!("OUTSIDE at {:?} {} {:?} root {:?} layout {:?}", load, self.x.p.blocks[load.0].insts[load.1].name(), a, r, self.x.native.layout.iter().map(|p| (p.root, p.slot, p.user_data, p.sgprs)).collect::<Vec<_>>());
                 }
                 return Err("a descriptor outside the heaps");
             }

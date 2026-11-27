@@ -496,7 +496,10 @@ fn view_heap_sgpr(code: &[u8], user_sgprs: u8) -> Option<u8> {
     for (i, s) in st.iter_mut().enumerate().take(usize::from(user_sgprs)) {
         *s = S::User(i as u8);
     }
-    for inst in insts.iter().take(96) {
+    // In code order over the whole program (the base can be used first
+    // deep inside branches, e.g. `218_0000000f005f3e00` at 0x8a0); only the
+    // last two user SGPRs count, the only places the census found.
+    for inst in insts.iter() {
         let w = inst.words[0];
         let sdst = ((w >> 16) & 0x7f) as usize;
         match inst.name() {
@@ -519,9 +522,11 @@ fn view_heap_sgpr(code: &[u8], user_sgprs: u8) -> Option<u8> {
             Some("s_load_dwordx4" | "s_load_dwordx8") if inst.words.len() >= 2 => {
                 let base = ((w & 0x3f) * 2) as usize;
                 let soffset = (inst.words[1] >> 25) as usize;
-                if let (S::User(x), S::Zero) = (st[base], st[base + 1])
+                if base + 1 < st.len()
+                    && let (S::User(x), S::Zero) = (st[base], st[base + 1])
                     && soffset < st.len()
                     && st[soffset] == S::Times32
+                    && x + 2 >= user_sgprs
                 {
                     return Some(x);
                 }
@@ -531,7 +536,6 @@ fn view_heap_sgpr(code: &[u8], user_sgprs: u8) -> Option<u8> {
                     *s = S::Other;
                 }
             }
-            Some(name) if name.starts_with("s_cbranch") || name == "s_branch" || name == "s_endpgm" => return None,
             Some(name) if name.starts_with("s_") && !name.starts_with("s_waitcnt") && !name.starts_with("s_clause") => {
                 // Another scalar instruction: whatever it writes is no
                 // longer what was tracked (SOP1/SOP2/SOPK keep sdst there).
@@ -543,6 +547,14 @@ fn view_heap_sgpr(code: &[u8], user_sgprs: u8) -> Option<u8> {
                     for s in st.iter_mut().skip(sdata).take(16) {
                         *s = S::Other;
                     }
+                }
+            }
+            Some(name) if name.starts_with("v_readlane") || name.starts_with("v_readfirstlane") || (name.starts_with("v_cmp") && inst.words.len() >= 2) => {
+                // VOP3 writes its SGPR result in bits 0-7.
+                let d = (w & 0xff) as usize;
+                if d + 1 < st.len() {
+                    st[d] = S::Other;
+                    st[d + 1] = S::Other;
                 }
             }
             _ => {}
