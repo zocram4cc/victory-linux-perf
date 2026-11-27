@@ -5572,7 +5572,9 @@ impl<'a> Lower<'a> {
     /// the first pass and leaves; what a helper lane computes only feeds
     /// derivatives, and its stores are dropped.
     fn helper_reads_own(&mut self, own: V, first: V) -> V {
-        if !self.s.pixel {
+        // (`VICTORY_HELPER_OWN=0` turns this off with `first_lane`'s, which
+        // the shader cache keys on.)
+        if !self.s.pixel || !super::helper_own() {
             return first;
         }
         let c = self.cur;
