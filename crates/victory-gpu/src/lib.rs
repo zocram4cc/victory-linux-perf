@@ -161,7 +161,7 @@ pub use watch::{
     writing as kernel_will_write,
 };
 #[cfg(windows)]
-pub use watch::title_view_space;
+pub use watch::{title_view_space, title_view_space_committed};
 #[cfg(windows)]
 pub use inplace::{opens_heap_by_handle, title_memory_home, title_memory_home_handle};
 #[cfg(windows)]

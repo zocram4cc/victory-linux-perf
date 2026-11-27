@@ -200,6 +200,11 @@ pub extern "system" fn XMemVirtualAlloc(
     if !at.is_null() && direct {
         wine_map::spaces().made(at as usize, size);
     }
+    // Memory of its own in a reservation that stands for a placeholder: the
+    // GPU side's books no longer take what is mapped there for views alone.
+    if !at.is_null() && kind & MEM_COMMIT != 0 && wine_map::holds(at as usize) {
+        victory_gpu::title_view_space_committed(at as usize, size);
+    }
     if !at.is_null() && !placeholder {
         victory_gpu::title_memory_allocated(at as usize, size);
     }

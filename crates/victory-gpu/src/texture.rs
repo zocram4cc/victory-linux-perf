@@ -2233,6 +2233,36 @@ fn committed_by_query(at: *const u8, len: usize) -> bool {
     true
 }
 
+/// Whether the heap passes ask what of a texture is mapped of the runtime's
+/// books where those know ([`mapped_by_books`]), not of the host
+/// (`VICTORY_HEAP_MAP_BOOKS=1`; off by default).
+fn map_books() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("VICTORY_HEAP_MAP_BOOKS").is_some_and(|v| v == "1"));
+    *ON
+}
+
+/// [`mapped_bytes`] for the heap passes: from the books with
+/// `VICTORY_HEAP_MAP_BOOKS=1` where they know.
+pub(crate) fn heap_mapped_bytes(at: *const u8, len: usize) -> u64 {
+    map_books().then(|| mapped_by_books(at as usize, len)).flatten().unwrap_or_else(|| mapped_bytes(at, len))
+}
+
+/// [`committed`] of the byte at `at`, for the heap passes: as
+/// [`heap_mapped_bytes`].
+pub(crate) fn heap_committed(at: *const u8) -> bool {
+    map_books().then(|| mapped_by_books(at as usize, 1)).flatten().map_or_else(|| committed(at, 1), |there| there == 1)
+}
+
+/// How many bytes of `[at, at + len)` are mapped, by the runtime's books
+/// alone: what its views show, and none where only its views put memory
+/// and none is noted (`crate::watch::only_views`); `None` where the host is
+/// to be asked. A view is noted after its pages are shown and forgotten
+/// before they go, so a byte counted here is mapped.
+fn mapped_by_books(at: usize, len: usize) -> Option<u64> {
+    crate::inplace::shown_bytes(at, len).or_else(|| crate::watch::only_views(at, at.saturating_add(len)).then_some(0))
+}
+
 /// How many bytes of `[at, at + len)` are committed memory: all of a
 /// texture that is there, some of one streaming in (its smaller mips lie
 /// at the start of its memory, and their pages are mapped first), none of
@@ -2781,6 +2811,112 @@ mod allocation_costs {
             }
             crate::inplace::views_gone(noted, blocks * BLOCK);
         }
+    }
+
+    const SPACE_BLOCK: usize = 64 << 10;
+
+    /// The bytes of `[at, at + len)` the host says are committed, region by
+    /// region (`VirtualQuery`).
+    fn host_committed(at: usize, len: usize) -> u64 {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+        let (mut p, end, mut there) = (at, at + len, 0u64);
+        while p < end {
+            // SAFETY: plain data filled in by the query.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid out pointer of the right size.
+            if unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) } == 0 {
+                break;
+            }
+            let next = (info.BaseAddress as usize + info.RegionSize).min(end);
+            if info.State == MEM_COMMIT {
+                there += (next - p) as u64;
+            }
+            p = next;
+        }
+        there
+    }
+
+    /// A reservation of `blocks` in which pages come only as views, as
+    /// `victory-hle`'s `wine_map` makes one, with the blocks `shown` shown
+    /// (committed, and told as views of `section`).
+    fn view_space(blocks: usize, shown: &[usize], section: usize) -> usize {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        // SAFETY: a reservation of our own.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), blocks * SPACE_BLOCK, MEM_RESERVE, PAGE_READWRITE) } as usize;
+        crate::title_view_space(at, blocks * SPACE_BLOCK, true);
+        for &block in shown {
+            let here = at + block * SPACE_BLOCK;
+            // SAFETY: inside the reservation.
+            assert!(!unsafe { VirtualAlloc(here as *const _, SPACE_BLOCK, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+            crate::title_memory_view(here, SPACE_BLOCK, section, (block * SPACE_BLOCK) as u64);
+        }
+        at
+    }
+
+    fn view_space_gone(at: usize, blocks: usize) {
+        crate::inplace::views_gone(at, blocks * SPACE_BLOCK);
+        crate::title_view_space(at, blocks * SPACE_BLOCK, false);
+        // SAFETY: the reservation of `view_space`.
+        unsafe { windows_sys::Win32::System::Memory::VirtualFree(at as *mut _, 0, windows_sys::Win32::System::Memory::MEM_RELEASE) };
+    }
+
+    /// What the books say is mapped is what the host says, in reservations of
+    /// views (all, none, part, from inside a block); elsewhere the host is
+    /// asked.
+    #[test]
+    fn the_books_tell_what_is_mapped_as_the_host_does() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        const B: usize = SPACE_BLOCK;
+        let space = view_space(8, &[0, 1, 2, 5], 0x6a01);
+        assert_eq!(host_committed(space, 8 * B), 4 * B as u64);
+        for (at, len) in [
+            (space, 8 * B),
+            (space, 3 * B),
+            (space + 3 * B, 2 * B),
+            (space + B + 100, 3 * B),
+            (space + 4 * B + 7, B),
+            (space + 6 * B, 2 * B),
+            (space + 5 * B + 9, 1),
+        ] {
+            assert_eq!(super::mapped_by_books(at, len), Some(host_committed(at, len)), "at {:#x}, {len} bytes", at - space);
+        }
+        // SAFETY: memory of our own.
+        let plain = unsafe { VirtualAlloc(std::ptr::null(), 4 * B, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        for (at, len) in [(plain, 4 * B), (plain + 100, B)] {
+            assert_eq!(super::mapped_by_books(at, len), None, "memory of no reservation of views");
+            assert_eq!(super::mapped_bytes(at as *const u8, len), host_committed(at, len));
+        }
+        // SAFETY: the memory just allocated.
+        unsafe { VirtualFree(plain as *mut _, 0, MEM_RELEASE) };
+        view_space_gone(space, 8);
+    }
+
+    /// After the runtime tells of an unmapping, a remapping or memory of its
+    /// own in a reservation of views, the books do not answer as before.
+    #[test]
+    fn the_books_answer_after_what_the_runtime_tells() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_DECOMMIT, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        const B: usize = SPACE_BLOCK;
+        let space = view_space(4, &[0, 1], 0x6a02);
+        assert_eq!(super::mapped_by_books(space, 4 * B), Some(2 * B as u64));
+        // Unmapped: told before it goes.
+        crate::title_memory_unmapping(space, B);
+        // SAFETY: inside the reservation.
+        unsafe { VirtualFree(space as *mut _, B, MEM_DECOMMIT) };
+        assert_eq!(super::mapped_by_books(space, 2 * B), Some(B as u64));
+        assert_eq!(host_committed(space, 2 * B), B as u64);
+        // Remapped: not mapped until the new view is told.
+        crate::title_memory_remapped(space + B, B);
+        assert_eq!(super::mapped_by_books(space + B, B), Some(0));
+        crate::title_memory_view(space + B, B, 0x6a02, 7 * B as u64);
+        assert_eq!(super::mapped_by_books(space + B, B), Some(B as u64));
+        // Memory of the runtime's own: the host is asked.
+        // SAFETY: inside the reservation.
+        assert!(!unsafe { VirtualAlloc((space + 2 * B) as *const _, B, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+        crate::title_view_space_committed(space + 2 * B, B);
+        assert_eq!(super::mapped_by_books(space + 2 * B, 2 * B), None);
+        assert_eq!(super::mapped_bytes((space + 2 * B) as *const u8, 2 * B), B as u64);
+        view_space_gone(space, 4);
     }
 
     /// The digest tells every length and every changed byte apart, zeros

@@ -3198,7 +3198,7 @@ impl State {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
                 let first = crate::resource::first_mip(&desc);
                 let len = crate::resource::placed_bytes_from(&resource, first).unwrap_or(1);
-                let mapped = texture_split(2, || crate::texture::mapped_bytes(address as *const u8, len as usize));
+                let mapped = texture_split(2, || crate::texture::heap_mapped_bytes(address as *const u8, len as usize));
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
                     // Streamed out: what the slot showed is let go.
@@ -3214,7 +3214,7 @@ impl State {
                         host.texture_slot_later(index, write, frame, most);
                         continue;
                     }
-                    if !texture_split(2, || crate::texture::committed(address as *const u8, 1)) {
+                    if !texture_split(2, || crate::texture::heap_committed(address as *const u8)) {
                         HEAP_TEXTURES_PARTLY[2].fetch_add(1, Ordering::Relaxed);
                     }
                     partly = Some(mapped);

@@ -3917,6 +3917,43 @@ pub(crate) fn in_view_space(at: usize) -> bool {
     n > 0 && at < spaces[n - 1].1
 }
 
+/// Ranges of [`VIEW_SPACE`] in which the runtime committed memory of its
+/// own, no view ([`title_view_space_committed`]), (start, end); kept.
+/// ponytail: never pruned, a commit in a placeholder's stead is rare; prune
+/// on [`title_view_space`] if they grow.
+static SPACE_COMMITTED: RwLock<Vec<(usize, usize)>> = RwLock::new(Vec::new());
+
+/// The runtime committed memory at `[at, at + len)` in a reservation of
+/// [`VIEW_SPACE`] (`victory-hle`'s xmem, memory asked for in a
+/// placeholder's place): memory there is not only views ([`only_views`]).
+pub fn title_view_space_committed(at: usize, len: usize) {
+    if len != 0 {
+        SPACE_COMMITTED.write().unwrap_or_else(|e| e.into_inner()).push((at, at.saturating_add(len)));
+    }
+}
+
+/// Whether all of `[start, end)` lies in [`VIEW_SPACE`] and the runtime
+/// committed none of it as memory of its own: what is mapped there is the
+/// views it told of, and nothing else.
+pub(crate) fn only_views(start: usize, end: usize) -> bool {
+    if start >= end || !VIEW_SPACE_ANY.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    let spaces = VIEW_SPACE.read().unwrap_or_else(|e| e.into_inner());
+    let n = spaces.partition_point(|s| s.0 <= start);
+    if n == 0 {
+        return false;
+    }
+    let mut reached = start;
+    for &(a, b) in &spaces[n - 1..] {
+        if a > reached || reached >= end {
+            break;
+        }
+        reached = reached.max(b);
+    }
+    reached >= end && !SPACE_COMMITTED.read().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, b)| a < end && start < b)
+}
+
 /// Whether the guards take only view memory (`VICTORY_GUARD_VIEWS_ONLY`; on
 /// by default, `0`: as before). Committed memory that is no view (a thread's
 /// stack, the layer's own heap, an image) is never made read-only by our hand
