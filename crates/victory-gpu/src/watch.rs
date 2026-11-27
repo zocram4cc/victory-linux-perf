@@ -293,6 +293,9 @@ impl Held<'_> {
 /// the asking it took the page at): the parts to take again, a bit for each
 /// 4 KiB, in the same order.
 pub(crate) fn parts_written(pages: &[(usize, u64)]) -> Vec<u16> {
+    // (With [`journal_shared_2`], the askings in flight over these pages are in the journal first.)
+    let span = journal_shared_2().then(|| pages.iter().fold((usize::MAX, 0), |(lo, hi), &(page, _)| (lo.min(page), hi.max(page + 1))));
+    let _answering = span.filter(|&(lo, hi)| lo < hi).map(|(lo, hi)| answering(lo, hi));
     let j = journal();
     pages.iter().map(|&(page, taken)| j.notes.parts_since(page, taken)).collect()
 }
@@ -477,6 +480,32 @@ pub(crate) fn port_journal() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_PORT_JOURNAL").is_ok_and(|v| v.trim() == "1"))
 }
 
+/// `VICTORY_JOURNAL_SHARED=2` (off by default): an answer from the journal (`asked`, `writes` of a
+/// range asked ahead, `nothing_new`, `parts_written`) waits for the askings in flight over its pages
+/// and reads the journal while it holds [`ASKING`] ([`answering`]). Without it an answer reads the
+/// journal as it stands: a page an asking has reset and not noted yet is missing from it, so a copy
+/// taken on that answer stays stale until a later check sees the note. `=1` is what answers to ranges
+/// asked ahead do already (the shared lock, always): nothing to switch.
+fn journal_shared_2() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_JOURNAL_SHARED") {
+        return on;
+    }
+    #[cfg(test)]
+    if JOURNAL_SHARED_IN_TEST.get() {
+        return true;
+    }
+    // Read here: the switch of the journal's answers.
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("VICTORY_JOURNAL_SHARED").is_ok_and(|v| v.trim() == "2"));
+    *ON
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`journal_shared_2`], for what this thread does.
+    pub(crate) static JOURNAL_SHARED_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 #[cfg(test)]
 thread_local! {
     /// [`port_journal`], for what this thread does.
@@ -592,21 +621,38 @@ pub(crate) fn lock_waits(frames: f64) -> String {
 /// Taken before the journal's lock, never under it.
 static ASKING: (Mutex<Vec<(usize, usize)>>, Condvar) = (Mutex::new(Vec::new()), Condvar::new());
 
+/// Waits, with `held` (the lock of [`ASKING`]), until no range in it overlaps `[first, last)`.
+fn clear_of(
+    mut held: std::sync::MutexGuard<'static, Vec<(usize, usize)>>,
+    first: usize,
+    last: usize,
+) -> std::sync::MutexGuard<'static, Vec<(usize, usize)>> {
+    if held.iter().any(|&(a, b)| a < last && first < b) {
+        held = waited(0, || {
+            let mut held = held;
+            while held.iter().any(|&(a, b)| a < last && first < b) {
+                held = ASKING.1.wait(held).unwrap_or_else(|e| e.into_inner());
+            }
+            held
+        });
+    }
+    held
+}
+
+/// The askings in flight over `[first, last)` are waited for, and [`ASKING`] is returned held: an
+/// answer read while it is held has their pages in the journal, and no asking begins over the pages
+/// meanwhile. Taken before the journal's lock and never under it: no holder of the journal's lock
+/// takes [`ASKING`].
+fn answering(first: usize, last: usize) -> std::sync::MutexGuard<'static, Vec<(usize, usize)>> {
+    clear_of(ASKING.0.lock().unwrap_or_else(|e| e.into_inner()), first, last)
+}
+
 /// Pages `[first, last)` held in [`ASKING`] until dropped.
 struct Asking(usize, usize);
 
 impl Asking {
     fn hold(first: usize, last: usize) -> Asking {
-        let mut held = ASKING.0.lock().unwrap_or_else(|e| e.into_inner());
-        if held.iter().any(|&(a, b)| a < last && first < b) {
-            held = waited(0, || {
-                let mut held = held;
-                while held.iter().any(|&(a, b)| a < last && first < b) {
-                    held = ASKING.1.wait(held).unwrap_or_else(|e| e.into_inner());
-                }
-                held
-            });
-        }
+        let mut held = clear_of(ASKING.0.lock().unwrap_or_else(|e| e.into_inner()), first, last);
         held.push((first, last));
         Asking(first, last)
     }
@@ -1713,8 +1759,20 @@ fn ask_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: 
 /// it). `None` if the kernel would have to be asked.
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let j = journal();
+    ahead_answer(first, last)
+}
+
+/// What [`asked`] answers from the journal for `[first, last)` lying in the asking standing ahead.
+fn ahead_known(j: &Journal, first: usize, last: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     j.ahead.holds(first, last).then(|| (j.ahead_asked, j.notes.range(first, last)))
+}
+
+/// [`ahead_known`] read as an answer: with [`journal_shared_2`], after the askings in flight over the
+/// range are in the journal ([`answering`]).
+fn ahead_answer(first: usize, last: usize) -> Option<(u64, Vec<(usize, u64)>)> {
+    let covered = journal_shared_2() && journal().ahead.holds(first, last);
+    let _answering = covered.then(|| answering(first, last));
+    ahead_known(&journal(), first, last)
 }
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
@@ -1727,7 +1785,6 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     // Asked ahead with the submission's other ranges: the journal has it.
     // (The standing number changes only with the journal held alone, so its
     // notes are all in: a part at a time will do.)
-    let ahead = |j: &Journal| j.ahead.holds(first, last).then(|| (j.ahead_asked, j.notes.range(first, last)));
     // A fresh number and the notes of the range, its parts held meanwhile
     // (renderer port #7, switch or not: who notes shared takes its number
     // holding the parts it notes in).
@@ -1736,7 +1793,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         let held = j.notes.hold(shards_of(first, last), false);
         (next_asking(), held.range(first, last))
     };
-    if let Some(known) = ahead(&journal()) {
+    if let Some(known) = ahead_answer(first, last) {
         return Some(known);
     }
     // Read-only since an asking noted it: the bits first, then the journal.
@@ -1757,7 +1814,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     // Asked, and the answer noted, with the range held: nothing else asks
     // about any of it in between.
     let _range = Asking::hold(first, last);
-    if let Some(known) = ahead(&journal()) {
+    if let Some(known) = ahead_known(&journal(), first, last) {
         return Some(known);
     }
     ASKED_HERE.with(|c| c.set(c.get() + 1));
@@ -1896,6 +1953,9 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
     if known {
         crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
     }
+    // (With [`journal_shared_2`], the journal is read after the askings in flight over the range are in it.)
+    let covered = !known && journal_shared_2() && journal().ahead.holds(first, last);
+    let _answering = covered.then(|| answering(first, last));
     let j = journal();
     if !known && !j.ahead.holds(first, last) {
         return false;
@@ -8524,5 +8584,59 @@ mod rearm_tests {
         assert_eq!(NOT_REARMED.load(Relaxed), before + 2);
         // SAFETY: our allocation.
         unsafe { VirtualFree(page as *mut _, 0, MEM_RELEASE) };
+    }
+}
+
+#[cfg(test)]
+mod journal_shared_tests {
+    use super::*;
+    use std::sync::mpsc::channel;
+    use std::time::Duration;
+
+    /// An asking in flight over page `first + 1` (it finds that page written a moment later, then lets
+    /// go), and the answer `answer` gives for `[first, first + 4)` while it is in flight: the number of
+    /// the asking that found the page, and the answer's pages.
+    fn answer_with_an_asking_in_flight(
+        first: usize,
+        answer: impl FnOnce(usize, usize) -> Option<(u64, Vec<(usize, u64)>)>,
+    ) -> (u64, Vec<(usize, u64)>) {
+        {
+            let mut j = journal_mut();
+            j.ahead_asked = next_asking();
+            j.ahead.set(vec![(first, first + 4)]);
+        }
+        let page = first + 1;
+        let (held_tx, held_rx) = channel();
+        let (go_tx, go_rx) = channel::<()>();
+        let kernel = std::thread::spawn(move || {
+            let asking = Asking::hold(page, page + 1);
+            held_tx.send(()).expect("the answer waits for the asking");
+            go_rx.recv().expect("the answer is made");
+            std::thread::sleep(Duration::from_millis(100));
+            let now = next_asking();
+            journal_mut().notes.note(page, WHOLE, now);
+            drop(asking);
+            now
+        });
+        held_rx.recv().expect("the asking is in flight");
+        go_tx.send(()).expect("the asking waits for the answer");
+        let (_, pages) = answer(first * PAGE, (first + 4) * PAGE).expect("the range is asked ahead");
+        let now = kernel.join().expect("the asking ends");
+        journal_mut().ahead.clear();
+        (now, pages)
+    }
+
+    /// `VICTORY_JOURNAL_SHARED=2`: an answer for a range asked ahead waits for the asking in flight over
+    /// its pages, so it has the page that asking found written. Pages of their own: nothing is read from
+    /// memory, the answers come from the journal.
+    #[test]
+    fn an_answer_waits_for_the_asking_in_flight_over_its_pages() {
+        JOURNAL_SHARED_IN_TEST.set(true);
+        let first = usize::MAX / (4 * PAGE);
+        let (now, pages) = answer_with_an_asking_in_flight(first, |start, end| writes(start, end, false));
+        assert!(pages.contains(&(first + 1, now)), "writes: the answer {pages:?} lacks page {} found by the asking in flight, number {now}", first + 1);
+        let (now, pages) = answer_with_an_asking_in_flight(first + 8, asked);
+        assert!(pages.contains(&(first + 9, now)), "asked: the answer {pages:?} lacks page {} found by the asking in flight, number {now}", first + 9);
+        JOURNAL_SHARED_IN_TEST.set(false);
     }
 }
