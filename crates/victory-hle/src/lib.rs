@@ -29,6 +29,9 @@ pub use victory_gpu::replay;
 
 #[cfg(windows)]
 pub use victory_gpu::pipeline::known as known_pipelines;
+/// The host D3D12 check before a title starts, and the Agility SDK version.
+#[cfg(windows)]
+pub use victory_gpu::requirements as host_gpu;
 /// Renderer port #2's switch and marks, for the launcher.
 #[cfg(windows)]
 pub use victory_gpu::port_descriptors;

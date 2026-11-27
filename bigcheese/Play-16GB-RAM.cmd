@@ -24,6 +24,10 @@ if not exist "%runner%" (
   echo victory.exe is missing next to this file. Extract the whole zip first.
   goto :fail
 )
+if not exist "%~dp0D3D12\D3D12Core.dll" (
+  echo The D3D12 folder with D3D12Core.dll is missing next to this file.
+  echo Windows 10 cannot run the game without it: extract the whole zip again.
+)
 
 rem ---------------------------------------------------------------- game folder
 rem Dragged onto this file, GAME_EXE / GAME_DIR above, remembered, next to this

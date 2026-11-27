@@ -56,6 +56,10 @@ What you need
 -------------
 - Windows 10 or 11, 64-bit, and a CPU with AVX2.
 - A Direct3D 12 GPU with shader model 6.6 and mesh shaders, recent driver.
+  Windows 10's own Direct3D 12 stops at shader model 6.5, so the zip brings
+  a newer one: the D3D12 folder (Microsoft's DirectX 12 Agility SDK). Keep it
+  next to victory.exe. Without it the game crashes on Windows 10 a few
+  seconds in; victory.exe now says so instead.
   FSR 4 needs an RX 9000 card; the FidelityFX SDK picks FSR 3.1 on older ones.
   Resizable BAR (AMD: Smart Access Memory) on in the BIOS helps a lot on 16 GB.
 - The Windows page file on "System managed size" on an SSD with 30+ GB free

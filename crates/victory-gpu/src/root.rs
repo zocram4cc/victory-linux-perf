@@ -78,6 +78,28 @@ fn host_export(cache: &OnceLock<Option<usize>>, name: &CStr) -> Option<usize> {
     })
 }
 
+/// `D3D12_ROOT_SIGNATURE_FLAG_{CBV_SRV_UAV,SAMPLER}_HEAP_DIRECTLY_INDEXED`.
+const HEAP_DIRECTLY_INDEXED: u32 = 0x400 | 0x800;
+
+/// Says once why a root signature with the heaps directly indexed was
+/// refused: the runtime predates shader model 6.6 (Windows 10's own does),
+/// and the title, given no root signature, will crash.
+fn note_refused(hr: HRESULT, flags: u32) {
+    if hr >= 0 || flags & HEAP_DIRECTLY_INDEXED == 0 {
+        return;
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tracing::error!(
+            hresult = format_args!("{:#010x}", hr as u32),
+            flags = format_args!("{flags:#x}"),
+            "the host D3D12 runtime refuses root signatures that index the heaps directly: \
+             it has no shader model 6.6. Windows 10 needs the Agility SDK's D3D12\\D3D12Core.dll \
+             beside victory.exe"
+        );
+    });
+}
+
 fn without_console_flags(desc: Desc) -> Desc {
     if desc.flags & CONSOLE_FLAGS != 0 {
         tracing::debug!(
@@ -108,14 +130,16 @@ pub extern "system" fn serialize(
         return E_NOTIMPL;
     };
     // SAFETY: the export has this signature; it takes what the title passed.
-    unsafe {
+    let hr = unsafe {
         std::mem::transmute::<usize, Serialize>(address)(
             &without_console_flags(desc),
             version,
             blob,
             error,
         )
-    }
+    };
+    note_refused(hr, desc.flags);
+    hr
 }
 
 /// `d3d12_xs!D3D12SerializeVersionedRootSignature`.
@@ -138,7 +162,9 @@ pub extern "system" fn serialize_versioned(
         ..desc
     };
     // SAFETY: the export has this signature; it takes what the title passed.
-    unsafe { std::mem::transmute::<usize, SerializeVersioned>(address)(&desc, blob, error) }
+    let hr = unsafe { std::mem::transmute::<usize, SerializeVersioned>(address)(&desc, blob, error) };
+    note_refused(hr, desc.desc.flags);
+    hr
 }
 
 type Deserialize =

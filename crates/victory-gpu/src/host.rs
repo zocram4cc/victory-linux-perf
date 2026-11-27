@@ -1123,6 +1123,8 @@ fn create() -> windows::core::Result<Host> {
             crate::tdr::log();
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        // Windows' own D3D12Core.dll or the Agility SDK's beside the exe.
+        crate::requirements::log_runtime();
         // Before anything is made with it (`VICTORY_RECORD`).
         #[cfg(feature = "diagnostics")]
         crate::replay::record::from_env(&device);

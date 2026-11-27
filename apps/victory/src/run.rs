@@ -35,6 +35,28 @@ fn check_cpu_features() -> Result<()> {
     check_cpu_features_with(has_avx2, skip.as_deref())
 }
 
+/// Pre-flight check of the host's D3D12: shader model 6.6, mesh shaders and
+/// directly indexed heaps, or a message saying what is missing instead of a
+/// crash seconds in (every pipeline refused, the title reading through a
+/// null pointer). `VICTORY_SKIP_GPU_CHECK=1` skips it.
+#[cfg(windows)]
+fn check_host_gpu() -> Result<()> {
+    if std::env::var("VICTORY_SKIP_GPU_CHECK").as_deref() == Ok("1") {
+        return Ok(());
+    }
+    match victory_hle::host_gpu::check() {
+        Ok(report) => {
+            println!("d3d12          {}", report.summary());
+            tracing::info!(runtime = %report.summary(), "host D3D12 checked");
+            Ok(())
+        }
+        Err(message) => {
+            tracing::error!("{message}");
+            anyhow::bail!("{message} (VICTORY_SKIP_GPU_CHECK=1 starts anyway)")
+        }
+    }
+}
+
 #[cfg(windows)]
 pub fn run(
     exe: &Path,
@@ -49,6 +71,7 @@ pub fn run(
 
     if execute {
         check_cpu_features()?;
+        check_host_gpu()?;
     }
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
