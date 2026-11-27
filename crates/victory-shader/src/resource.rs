@@ -61,6 +61,13 @@ const RAW: [&str; 5] = [
     "an address from a phi",
 ];
 
+/// [`Address::offset`] of a [`MEMORY`] address that was loaded from memory
+/// (a table address the title keeps in its data), as opposed to one in an
+/// SGPR no root parameter fills (0 in game: a descriptor "loaded" there
+/// read near address 0 and its culling program dropped half of Jason's
+/// house, 27 Nov).
+pub const MEMORY_LOADED: u32 = 3;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
     /// Dwords `first..` of what the scalar load at `load` reads (see
@@ -887,7 +894,10 @@ impl<'a> Tracer<'a> {
         if self.stage == HwStage::Cs && RAW.contains(&why) {
             Ok(Address {
                 param: MEMORY,
-                offset: 0,
+                // Not an offset here: which of `RAW` it was (descriptors
+                // are taken from memory only through an address that was
+                // itself loaded, [`MEMORY_LOADED`]).
+                offset: RAW.iter().position(|r| *r == why).unwrap_or(0) as u32,
                 dynamic: None,
                 dynamic2: None,
             })

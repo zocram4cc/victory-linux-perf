@@ -8368,7 +8368,7 @@ impl<'a> Lower<'a> {
             .scalar
             .get(&load)
             .ok_or("an untracked descriptor load")?;
-        let from_memory = a.param == crate::resource::MEMORY;
+        let from_memory = a.param == crate::resource::MEMORY && a.offset == crate::resource::MEMORY_LOADED;
         match self.x.native.layout.get(a.param).map(|p| p.root) {
             Some(RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap) => {}
             _ if from_memory => {}
@@ -8400,6 +8400,9 @@ impl<'a> Lower<'a> {
             .i32((offset as i32 as u32).wrapping_add(4 * u32::from(first)));
         at = self.s.m.bin(c, Bin::Add, at, k);
         if from_memory {
+            if std::env::var_os("VICTORY_WHY_FROM_MEMORY").is_some() {
+                eprintln!("FROM-MEMORY lane load at {:?}: {}", load, li.name());
+            }
             at = self.less_heap_start(at, sampler);
         }
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
@@ -8415,7 +8418,7 @@ impl<'a> Lower<'a> {
             .ok_or("an untracked descriptor load")?;
         // From memory: an address the code read from data, a console
         // address in the heap (`USER_VIEW_HEAP_START`).
-        let from_memory = a.param == crate::resource::MEMORY;
+        let from_memory = a.param == crate::resource::MEMORY && a.offset == crate::resource::MEMORY_LOADED;
         match self.x.native.layout.get(a.param).map(|p| p.root) {
             Some(RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap) => {}
             _ if from_memory => {}
@@ -8447,6 +8450,9 @@ impl<'a> Lower<'a> {
             addr = self.s.m.bin(c, Bin::Add, addr, so);
         }
         if from_memory {
+            if std::env::var_os("VICTORY_WHY_FROM_MEMORY").is_some() {
+                eprintln!("FROM-MEMORY scalar load at {:?}: {} {:?} layout {:?}", load, li.name(), a, self.x.native.layout.iter().map(|p| (p.root, p.slot)).collect::<Vec<_>>());
+            }
             addr = self.less_heap_start(addr, sampler);
         }
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
