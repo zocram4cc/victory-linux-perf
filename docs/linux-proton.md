@@ -21,7 +21,8 @@ Tested on: AMD RX 6800 XT (RDNA2), Mesa RADV, CachyOS, our Proton build (see
 | GPU: the ray-tracing builder is its 52 programs, not any program that spills its user data | with ray tracing off, every compute program whose user data spills was dropped as a builder stage; now the builder is the 52 programs of `XboxBvhBuilder.dll` (by hash, build 1.0.2.1), and other spilled programs run (logged once each) |
 | Linux: Proton fork at 5fc510e2 | its Wine imports section memory as dma-bufs (udmabuf): `VICTORY_PORT_CONSTANTS` needs it (see below) |
 | FidelityFX: under Wine FSR 4.1.2 only when its code loads | Proton's builtin `amdxc64` makes AMD's SDK offer FSR 4.1.2 although its code (`amdxcffx64.dll`) is missing; the context made on it upscaled wrongly (doubled, smeared outlines). Without the DLL the newest FSR 3.1 is used |
-| GPU: raw twins of buffer views off 16 bytes begin at the view's own dword (lloyd's change from avatarmanz's fork, #437; views beginning inside a dword stay as before; `VICTORY_TWIN_EXACT=0` turns it off) | under D3D12's 16-byte rule such twins were null views and shaders read zeros (about 370 a frame in the jail): trees and palms dropped out for single frames (the intro's title shot) and the print on the back of Lucia's jumpsuit was missing. Known issue: in about one run in five the diner waitress's face shows coloured speckles; the cause is not found yet |
+| GPU: raw twins of buffer views off 16 bytes begin at the view's own dword (lloyd's change from avatarmanz's fork, #437; views beginning inside a dword stay as before; `VICTORY_TWIN_EXACT=0` turns it off) | under D3D12's 16-byte rule such twins were null views and shaders read zeros (about 370 a frame in the jail): trees and palms dropped out for single frames (the intro's title shot) and the print on the back of Lucia's jumpsuit was missing. Known issue: in about half of the runs the diner waitress's face shows coloured speckles; the cause is not found yet |
+| GPU: under Wine the first use of a compute pass waits for its pipeline by a budget of its own, and those pipelines are made first (borntofrag's change from avatarmanz's fork, #440; `VICTORY_COMPUTE_WAIT_MS`, half a second; 0: as before) | a pass the title runs once when a character is made (it fills the table the face is deformed by) was dropped while its pipeline was still being made: on a first run with cold caches Lucia and Jason showed only eyes and teeth to the end of the run. The intro with cold caches: eyes and teeth without the change, normal faces with it |
 
 What earlier Wine fixes of the fork's `linux` branch became here:
 
@@ -60,7 +61,7 @@ Measured in the jail scene with our Proton build, one run each (2026-11-26/27):
 - Known issues: at normal priority the game's ~150 busy threads made the
   desktop's audio crackle (`scripts/play-linux.sh` runs it at nice 10, at the
   same frame times); the game's own sound is still choppy at times (under
-  investigation); frame pacing is uneven; in about one run in five the diner
+  investigation); frame pacing is uneven; in about half of the runs the diner
   waitress's face shows coloured speckles (since the raw-twin change above;
   `VICTORY_TWIN_EXACT=0` turns it off); video memory peaks near 15 GB
   (Belobug's texture budget fills up to nine tenths of what the system grants,
