@@ -169,9 +169,13 @@ cd "$repo"   # victory.toml is looked for in the working directory
 # work as they are, since the working directory is on Wine's Z: drive.
 win_exe="$(winpath "$exe")"
 
-# Both faces: under Proton character heads and hair are culled away otherwise.
-# Set before `shaders` and `warm` too: warm makes the pipelines with it.
-[[ -n "${VICTORY_CULL_NONE:-}" ]] || export VICTORY_CULL_NONE=1
+# Back faces culled as the title asks (VICTORY_CULL_NONE=0). Drawing both
+# faces (=1, from meeyao's tree) was the default while heads and hair went
+# missing; that was the face network's zeroed 16-bit data (fxceless PR #927),
+# and with culling back heads, hair and hands drew and frames cost the same
+# (run 20261126-235437). Set before `shaders` and `warm` too: warm makes the
+# pipelines with it.
+[[ -n "${VICTORY_CULL_NONE:-}" ]] || export VICTORY_CULL_NONE=0
 
 case "${1:-}" in
   shaders|warm) exec umu-run "$win_exe" "$@" ;;
