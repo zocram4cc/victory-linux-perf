@@ -104,6 +104,12 @@ pub(crate) struct Replay {
     /// recorded one (may be given several times).
     #[arg(long)]
     bias: Vec<String>,
+    /// Bytes put over a buffer's wherever the replay loads them from the
+    /// capture (never into its files): `<resource>+<offset>=<f32>` or
+    /// `=#<hex bytes in memory order>`, offset `0x..` or decimal
+    /// (may be given several times).
+    #[arg(long)]
+    poke: Vec<String>,
     /// Find the commands that make identical runs differ: each list is run
     /// this often from the same memory.
     #[arg(long, num_args = 0..=1, default_missing_value = "3")]
@@ -298,6 +304,7 @@ pub(crate) fn run(r: Replay) -> Result<()> {
         until,
         skip_shaders: r.skip_shader,
         bias: r.bias.iter().map(|b| play::BiasEdit::parse(b)).collect::<Result<_>>()?,
+        pokes: r.poke.iter().map(|p| play::Poke::parse(p)).collect::<Result<_>>()?,
         shaders: r.shaders,
         shaders_b: r.shaders_b,
         compare: r.compare,

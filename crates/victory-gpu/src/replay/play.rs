@@ -98,6 +98,9 @@ pub struct Options {
     pub skip_shaders: Vec<String>,
     /// Depth bias of pipelines named, as given (`--bias`).
     pub bias: Vec<BiasEdit>,
+    /// Bytes put over the capture's contents and deltas as they are loaded
+    /// (`--poke`).
+    pub pokes: Vec<Poke>,
     /// Shaders taken from this folder where it has them: `<hash>.dxil`, by
     /// the hash the runtime names the title's shader by (ours: by their own).
     pub shaders: Option<PathBuf>,
@@ -137,6 +140,7 @@ impl Default for Options {
             until: None,
             skip_shaders: Vec::new(),
             bias: Vec::new(),
+            pokes: Vec::new(),
             shaders: None,
             shaders_b: None,
             compare: false,
@@ -336,6 +340,65 @@ pub fn find(folder: &Path) -> Result<PathBuf> {
     }
     best.map(|b| b.1)
         .ok_or_else(|| anyhow!("no capture (frame.bin) in {}", folder.display()))
+}
+
+/// `--poke <resource>+<offset>=<value>`: bytes put over a buffer's bytes
+/// wherever the replay loads them from the capture (its contents at the
+/// frame's start and what the CPU put there by each submission), never into
+/// the capture's files. `<offset>` is hexadecimal with `0x`, else decimal;
+/// `<value>` is an f32 (`472`, `-1.5`) or `#` and bytes in memory order
+/// (`#0000ec43`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Poke {
+    pub res: u32,
+    pub at: u64,
+    pub bytes: Vec<u8>,
+}
+
+impl Poke {
+    /// From `<resource>+<offset>=<value>`.
+    pub fn parse(s: &str) -> Result<Poke> {
+        let usage = "--poke wants <resource>+<offset>=<f32 or #hex bytes>";
+        let (place, value) = s.split_once('=').context(usage)?;
+        let (res, at) = place.split_once('+').context(usage)?;
+        let res = res.trim().trim_start_matches('#').parse().context(usage)?;
+        let at = at.trim();
+        let at = match at.strip_prefix("0x") {
+            Some(h) => u64::from_str_radix(h, 16),
+            None => at.parse(),
+        }
+        .context(usage)?;
+        let value = value.trim();
+        let bytes = if let Some(h) = value.strip_prefix('#') {
+            if h.is_empty() || h.len() % 2 != 0 {
+                bail!("{usage}: an even number of hex digits after #");
+            }
+            (0..h.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&h[i..i + 2], 16))
+                .collect::<Result<Vec<u8>, _>>()
+                .context(usage)?
+        } else {
+            value.parse::<f32>().context(usage)?.to_le_bytes().to_vec()
+        };
+        Ok(Poke { res, at, bytes })
+    }
+
+    /// Puts what of the pokes falls into `buf` (the bytes of `res` from
+    /// `start` on) there; how many bytes it put.
+    pub fn apply(pokes: &[Poke], res: u32, start: u64, buf: &mut [u8]) -> usize {
+        let end = start + buf.len() as u64;
+        let mut put = 0;
+        for p in pokes.iter().filter(|p| p.res == res) {
+            let (a, b) = (p.at.max(start), (p.at + p.bytes.len() as u64).min(end));
+            if a < b {
+                buf[(a - start) as usize..(b - start) as usize]
+                    .copy_from_slice(&p.bytes[(a - p.at) as usize..(b - p.at) as usize]);
+                put += (b - a) as usize;
+            }
+        }
+        put
+    }
 }
 
 /// `--bias <text>=<constant>,<clamp>,<slope>`: the depth bias of pipelines
@@ -639,6 +702,8 @@ pub struct Player {
     /// States as the last run left them (`diverge`).
     at: States,
     notes: Vec<String>,
+    /// `Options::pokes`.
+    pokes: Vec<Poke>,
 }
 
 /// What a command of a list is timed as.
@@ -714,6 +779,7 @@ impl Player {
                 .map(|n| format!("recorder: {n}"))
                 .collect(),
             frame,
+            pokes: options.pokes.clone(),
         };
         player.check()?;
         let mut steps: Vec<(&str, std::time::Duration)> = Vec::new();
@@ -1455,8 +1521,11 @@ impl Player {
         &mut self,
         parts: &[(T, u64, u64)],
         file: &File,
+        place: impl Fn(&T) -> Option<(u32, u64)> + Sync,
         mut copy: impl FnMut(&Player, &ID3D12GraphicsCommandList, &[(&T, u64, u64)], &ID3D12Resource),
     ) -> Result<()> {
+        let pokes = &self.pokes.clone();
+        let poked = AtomicUsize::new(0);
         // Batches of parts with their place in the buffer.
         let mut batches: Vec<Vec<(usize, u64)>> = vec![Vec::new()];
         let (mut at, mut most) = (0u64, 0u64);
@@ -1511,6 +1580,11 @@ impl Player {
                                     .unwrap_or_else(|e| e.into_inner())
                                     .get_or_insert(e);
                             }
+                            if !pokes.is_empty()
+                                && let Some((res, start)) = place(&parts[i].0)
+                            {
+                                poked.fetch_add(Poke::apply(pokes, res, start, to), Ordering::Relaxed);
+                            }
                         }
                     });
                 }
@@ -1531,6 +1605,10 @@ impl Player {
             stagings[k].2 = sent?;
         }
         self.worker.idle()?;
+        let poked = poked.into_inner();
+        if poked > 0 {
+            self.note(format!("--poke put {poked} bytes over the capture's"));
+        }
         Ok(())
     }
 
@@ -1573,7 +1651,15 @@ impl Player {
             }
         })?;
         let file = File::open(self.folder.join("contents.bin"))?;
-        self.upload(&textures, &file, |player, list, parts, staging| {
+        let buffers: HashSet<u32> = self
+            .frame
+            .resources
+            .iter()
+            .filter(|r| r.desc.dimension == D3D12_RESOURCE_DIMENSION_BUFFER.0)
+            .map(|r| r.id)
+            .collect();
+        let of_buffer = |c: &Content| buffers.contains(&c.res).then_some((c.res, c.first));
+        self.upload(&textures, &file, of_buffer, |player, list, parts, staging| {
             for (c, len, at) in parts {
                 let Some(o) = player.objects.get(&c.res) else {
                     continue;
@@ -1668,7 +1754,7 @@ impl Player {
             .into_iter()
             .map(|d| (d.clone(), d.len, d.file))
             .collect();
-        self.upload(&first, &file, |player, list, parts, staging| {
+        self.upload(&first, &file, |d: &Delta| Some((d.res, d.at)), |player, list, parts, staging| {
             for (d, len, at) in parts {
                 if let Some(o) = player.objects.get(&d.res) {
                     // SAFETY: an open list; live buffers.
@@ -1695,7 +1781,7 @@ impl Player {
                 D3D12_RESOURCE_FLAG_NONE,
             )?;
             self.deltas = Some(buffer.clone());
-            self.upload(&later, &file, |_, list, parts, staging| {
+            self.upload(&later, &file, |(_, d): &(u64, Delta)| Some((d.res, d.at)), |_, list, parts, staging| {
                 for ((to, _), len, at) in parts {
                     // SAFETY: an open list; live buffers.
                     unsafe { list.CopyBufferRegion(&buffer, *to, staging, *at, *len) };
@@ -3594,6 +3680,39 @@ fn debug_messages(q: &ID3D12InfoQueue) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pokes_are_read() {
+        let p = Poke::parse("86816+0x26b18=472").unwrap();
+        assert_eq!(p, Poke { res: 86816, at: 0x26b18, bytes: 472f32.to_le_bytes().to_vec() });
+        let p = Poke::parse("#7+16=#0a0BfF").unwrap();
+        assert_eq!(p, Poke { res: 7, at: 16, bytes: vec![0x0a, 0x0b, 0xff] });
+        for bad in ["7=1", "7+1", "x+1=1", "7+1=#abc", "7+1=#", "7+0xzz=1", "7+1=one"] {
+            assert!(Poke::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn pokes_land_where_their_bytes_meet_a_part() {
+        let pokes = [
+            Poke { res: 1, at: 6, bytes: vec![1, 2, 3, 4] },
+            Poke { res: 2, at: 0, bytes: vec![9; 16] },
+        ];
+        // Inside, across the start, across the end, outside.
+        let mut buf = [0u8; 16];
+        assert_eq!(Poke::apply(&pokes, 1, 0, &mut buf), 4);
+        assert_eq!(&buf[6..10], &[1, 2, 3, 4]);
+        let mut buf = [0u8; 4];
+        assert_eq!(Poke::apply(&pokes, 1, 8, &mut buf), 2);
+        assert_eq!(buf, [3, 4, 0, 0]);
+        let mut buf = [0u8; 4];
+        assert_eq!(Poke::apply(&pokes, 1, 4, &mut buf), 2);
+        assert_eq!(buf, [0, 0, 1, 2]);
+        let mut buf = [0u8; 4];
+        assert_eq!(Poke::apply(&pokes, 1, 10, &mut buf), 0);
+        assert_eq!(Poke::apply(&pokes, 3, 0, &mut buf), 0);
+        assert_eq!(buf, [0; 4]);
+    }
 
     #[test]
     fn captures_are_found() {
