@@ -3864,6 +3864,28 @@ mod tests {
         }
     }
 
+    /// A guard made between a view's mapping and the runtime's word about it
+    /// is forgotten by that word; the page must get its write access back in
+    /// the same step. Otherwise the title's next plain write to its own view
+    /// faults with no guard to open it: an unhandled access violation
+    /// (fxceless PR #1447; ours opens the range in `title_memory_remapped`).
+    #[test]
+    fn a_guard_forgotten_by_the_remap_gives_its_page_back() {
+        const SIZE: usize = BLOCK;
+        let (section, view, other) = two_views(SIZE);
+        assert_eq!(guard(view, view + SIZE), Some(vec![view / PAGE]));
+        assert_eq!(protection(view), windows_sys::Win32::System::Memory::PAGE_READONLY);
+        // The runtime mapped the pages and only now tells the guard.
+        title_memory_remapped(view, SIZE);
+        crate::inplace::title_memory_view(view, SIZE, section, 0);
+        assert_eq!(protection(view), PAGE_READWRITE);
+        let g = guards();
+        assert!(!g.protected.contains(view / BLOCK) && !g.clean.contains(view / BLOCK));
+        drop(g);
+        assert!(!PROTECTED.any(view / BLOCK, view / BLOCK + 1));
+        drop_views(section, &[view, other], SIZE);
+    }
+
     /// The section of [`two_views`] is closed and its views unmapped; the
     /// guard is told they are gone first.
     fn drop_views(section: usize, views: &[usize], bytes: usize) {
