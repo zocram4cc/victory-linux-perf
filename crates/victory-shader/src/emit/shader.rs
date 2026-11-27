@@ -112,6 +112,14 @@ pub const USER_ROOT_ADDRESS: u32 = 0x104;
 /// ([`crate::spill::is_spilled`]).
 pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
 
+/// [`RootType::Other`] user words the host fills with the console address
+/// of the bound view heap's (and sampler heap's) first descriptor, low 32
+/// bits: a descriptor the code loads through an address it read from memory
+/// (a table the title keeps in its constant data, P.4) is at
+/// `(address - start) / size` in that heap.
+pub const USER_VIEW_HEAP_START: u32 = 0x108;
+pub const USER_SAMPLER_HEAP_START: u32 = 0x109;
+
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     /// ForceEarlyDepthStencil ([`super::lower::early_depth`]).
