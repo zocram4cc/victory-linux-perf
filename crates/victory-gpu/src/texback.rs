@@ -26,7 +26,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::object::This;
 
-mod readback;
+pub(crate) mod readback;
 use readback::Readback;
 
 #[cfg(test)]

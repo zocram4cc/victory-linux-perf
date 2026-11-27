@@ -23,7 +23,7 @@ thread_local! {
 /// Whether a read-back buffer goes back to a pool when its list has reset,
 /// for the next list to take (`VICTORY_READBACK_POOL=1`; off by default: each
 /// copy back creates a buffer of its own, and frees it after its list).
-pub(super) fn pooling() -> bool {
+pub(crate) fn pooling() -> bool {
     #[cfg(test)]
     if let Some(on) = TEST_POOLING.get() {
         return on;
