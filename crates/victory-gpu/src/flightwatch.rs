@@ -6,7 +6,11 @@
 //! Each address names a copy by the title address it starts at. When a
 //! submission declares shader writes to such a copy, the pages of the
 //! declared ranges are made read-only right after the submission's refreshes
-//! took title memory, and stay so until the first landing of the copy begins.
+//! took title memory. The watch lasts until the copy's next refresh: a write
+//! is placed before the lists were sent, in the air, or after the flight's
+//! first landing (then: whether its block is one the landing wrote into).
+//! Pages made read-only here are opened when the landing begins (it writes
+//! them); after it, only the guards' blocks a landing left read-only tell.
 //! Pages the write watch's guards hold (memory the kernel cannot write-watch:
 //! a copy leaves each 64 KiB block it took read-only, and their handler takes
 //! the first write) are not touched: their faults are looked at instead, a
@@ -111,6 +115,35 @@ struct Caught {
     /// Fences set for the title since the pages were made read-only.
     fences: u64,
     after_us: u64,
+    /// When it came, by our events.
+    window: Window,
+    /// Of a write after the landing: whether its 64 KiB block was one the
+    /// flight just landed wrote into.
+    in_landed: bool,
+    /// The 16 bytes after, read when the flight landed (for a write before
+    /// that: what the title had put there, before any landing's bytes).
+    after: Option<[u8; 16]>,
+}
+
+/// When a write came, by our events.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Window {
+    /// Before the submission's lists went to the card.
+    BeforeSent,
+    /// While the flight was in the air: sent, not landed.
+    InAir,
+    /// After the flight's first landing, before the next refresh of the copy.
+    AfterLanding,
+}
+
+/// The window of a write, by whether the lists were sent and the flight
+/// landed.
+pub(crate) fn window_of(sent: bool, landed: bool) -> Window {
+    match (sent, landed) {
+        (_, true) => Window::AfterLanding,
+        (true, false) => Window::InAir,
+        (false, false) => Window::BeforeSent,
+    }
 }
 
 /// Pages read-only for a copy (title addresses of 4 KiB pages), since when,
@@ -129,6 +162,12 @@ struct Armed {
     /// Pages left alone, and why.
     left: Left,
     caught: Vec<Caught>,
+    /// When the flight's first landing began, and the 64 KiB blocks its
+    /// landings wrote into.
+    landed: Option<std::time::Instant>,
+    landed_blocks: std::collections::BTreeSet<usize>,
+    /// As armed: pages made read-only here, blocks left to the guards.
+    armed: (usize, usize),
 }
 
 /// What a page of a declared range is to the watch.
@@ -230,7 +269,7 @@ pub(crate) fn arm(copy: u64, ranges: &[(usize, usize)], submission: u64) {
     // gives its pages back after two seconds.
     let (stale, keep): (Vec<Armed>, Vec<Armed>) = std::mem::take(&mut *armed)
         .into_iter()
-        .partition(|a| a.copy == copy && a.since.elapsed() > std::time::Duration::from_secs(2));
+        .partition(|a| a.copy == copy && (a.landed.is_some() || a.since.elapsed() > std::time::Duration::from_secs(2)));
     *armed = keep;
     for a in &stale {
         for &page in &a.pages {
@@ -254,7 +293,13 @@ pub(crate) fn arm(copy: u64, ranges: &[(usize, usize)], submission: u64) {
         guarded,
         left,
         caught: Vec::new(),
+        landed: None,
+        landed_blocks: std::collections::BTreeSet::new(),
+        armed: (0, 0),
     });
+    if let Some(a) = armed.last_mut() {
+        a.armed = (a.pages.len(), a.guarded.len());
+    }
     ANY.store(true, Ordering::Release);
     drop(armed);
     for a in stale {
@@ -272,15 +317,62 @@ pub(crate) fn sent() {
     }
 }
 
-/// A landing of `copy` begins: its pages are made writable again, and what
-/// was caught is said.
-pub(crate) fn landing(copy: u64) {
+/// A landing of `copy` begins, into title memory `[from, to)`: the pages
+/// made read-only here are made writable again (the landing writes them),
+/// the flight is marked landed, and from here until the copy's next refresh
+/// ([`refreshed`]) what is caught counts as after the landing. Blocks the
+/// guards hold stay theirs: a landing put beside the guards leaves them
+/// read-only and the title's next write faults; one put through a fault
+/// opens them, and later writes there are not seen.
+pub(crate) fn landing(copy: u64, from: usize, to: usize) {
+    if !ANY.load(Ordering::Acquire) {
+        return;
+    }
+    let now = std::time::Instant::now();
+    let mut opened = Vec::new();
+    {
+        let mut armed = ARMED.lock().unwrap_or_else(|e| e.into_inner());
+        // The landings of one flight come in a burst: a flight of the copy
+        // that began landing in the last 50 ms takes these too; else the
+        // oldest flight of the copy not landed yet lands now.
+        let recent = armed
+            .iter()
+            .rposition(|a| a.copy == copy && a.landed.is_some_and(|t| now.duration_since(t) < std::time::Duration::from_millis(50)));
+        let at = recent.or_else(|| armed.iter().position(|a| a.copy == copy && a.landed.is_none()));
+        let Some(at) = at else {
+            return;
+        };
+        let a = &mut armed[at];
+        if a.landed.is_none() {
+            a.landed = Some(now);
+            opened.extend(std::mem::take(&mut a.pages));
+            for c in a.caught.iter_mut().filter(|c| c.after.is_none()) {
+                let mut after = [0u8; 16];
+                if crate::host::read_into(c.at as *const u8, &mut after) {
+                    c.after = Some(after);
+                }
+            }
+        }
+        if from < to {
+            let (first, last) = (from / crate::watch::PAGE, (to - 1) / crate::watch::PAGE);
+            a.landed_blocks.extend(first..=last);
+        }
+    }
+    for page in opened {
+        protect(page, PAGE, false);
+    }
+}
+
+/// A refresh of `copy` begins: the flights of it that landed are done, and
+/// what was caught is said.
+pub(crate) fn refreshed(copy: u64) {
     if !ANY.load(Ordering::Acquire) {
         return;
     }
     let done: Vec<Armed> = {
         let mut armed = ARMED.lock().unwrap_or_else(|e| e.into_inner());
-        let (done, keep): (Vec<Armed>, Vec<Armed>) = std::mem::take(&mut *armed).into_iter().partition(|a| a.copy == copy);
+        let (done, keep): (Vec<Armed>, Vec<Armed>) =
+            std::mem::take(&mut *armed).into_iter().partition(|a| a.copy == copy && a.landed.is_some());
         *armed = keep;
         ANY.store(!armed.is_empty(), Ordering::Release);
         done
@@ -303,30 +395,50 @@ fn say(a: Armed) {
     let Some(left_out) = lines.may(now) else {
         return;
     };
-    let before_sent = a.caught.iter().filter(|c| !c.sent).count();
+    let count = |w: Window| a.caught.iter().filter(|c| c.window == w).count();
     let after_fence = a.caught.iter().filter(|c| c.fences > 0).count();
+    let after_landing: Vec<&Caught> = a.caught.iter().filter(|c| c.window == Window::AfterLanding).collect();
+    let read_after = |c: &Caught| {
+        c.after.or_else(|| {
+            let mut b = [0u8; 16];
+            crate::host::read_into(c.at as *const u8, &mut b).then_some(b)
+        })
+    };
+    let landing_pattern = after_landing.iter().filter(|c| read_after(c).is_some_and(|b| has_pattern(&b))).count();
+    let landing_in_landed = after_landing.iter().filter(|c| c.in_landed).count();
     tracing::info!(
         copy = format_args!("{:#x}", a.copy),
         submission = a.submission,
-        watching = if a.pages.is_empty() && a.guarded.is_empty() { "NOTHING: every page left" } else { "yes" },
-        pages_read_only_here = a.pages.len(),
-        blocks_by_the_guards = a.guarded.len(),
+        watching = if a.armed == (0, 0) { "NOTHING: every page left" } else { "yes" },
+        pages_read_only_here = a.armed.0,
+        blocks_by_the_guards = a.armed.1,
         left_not_committed = a.left.absent,
         left_other_protection = a.left.other,
         left_held_by_another_flight = a.left.held,
         caught = a.caught.len(),
-        before_lists_sent = before_sent,
+        before_lists_sent = count(Window::BeforeSent),
+        in_the_air = count(Window::InAir),
+        after_landing_before_refresh = count(Window::AfterLanding),
+        after_landing_with_record = landing_pattern,
+        after_landing_in_blocks_it_landed = landing_in_landed,
         after_a_fence_set = after_fence,
-        in_air_ms = a.since.elapsed().as_millis() as u64,
+        landed = a.landed.is_some(),
+        blocks_landed = a.landed_blocks.len(),
+        armed_ms = a.since.elapsed().as_millis() as u64,
         lines_left_out = left_out,
-        "flight write watch: title writes into a copy's pages while a flight that writes them is in the air"
+        "flight write watch: title writes into a copy's pages from a refresh to the next, around a flight that writes them"
     );
-    for c in a.caught.iter().take(6) {
+    // A few of each window.
+    let shown: Vec<&Caught> = [Window::BeforeSent, Window::InAir, Window::AfterLanding]
+        .into_iter()
+        .flat_map(|w| a.caught.iter().filter(move |c| c.window == w).take(3))
+        .collect();
+    for c in shown {
         let Some(left_out) = lines.may(now) else {
             return;
         };
-        let mut after = [0u8; 16];
-        let pattern = crate::host::read_into(c.at as *const u8, &mut after) && has_pattern(&after);
+        let after = read_after(c).unwrap_or_default();
+        let pattern = has_pattern(&after);
         tracing::info!(
             copy = format_args!("{:#x}", a.copy),
             thread = c.thread,
@@ -336,6 +448,8 @@ fn say(a: Armed) {
             before = %hex(&c.before),
             after = %hex(&after),
             pattern,
+            window = ?c.window,
+            in_blocks_landed = c.in_landed,
             lists_sent = c.sent,
             fences_set_since = c.fences,
             us_after_read_only = c.after_us,
@@ -407,6 +521,9 @@ fn caught(at: usize, rip: usize) -> bool {
             sent: a.sent,
             fences: FENCES.load(Ordering::Relaxed) - a.fences,
             after_us: a.since.elapsed().as_micros() as u64,
+            window: window_of(a.sent, a.landed.is_some()),
+            in_landed: a.landed_blocks.contains(&(at / crate::watch::PAGE)),
+            after: None,
         });
     }
     true
@@ -440,6 +557,9 @@ pub(crate) fn guard_fault(at: usize, rip: usize) {
             sent: a.sent,
             fences: FENCES.load(Ordering::Relaxed) - a.fences,
             after_us: a.since.elapsed().as_micros() as u64,
+            window: window_of(a.sent, a.landed.is_some()),
+            in_landed: a.landed_blocks.contains(&(at / crate::watch::PAGE)),
+            after: None,
         });
     }
 }
@@ -532,6 +652,15 @@ mod tests {
         assert_eq!(ours.into_iter().collect::<Vec<_>>(), [from]);
         assert_eq!(guarded.into_iter().collect::<Vec<_>>(), [(from + PAGE) / block]);
         assert_eq!((left.absent, left.other), (1, 1));
+    }
+
+    #[test]
+    fn a_write_falls_in_the_window_of_our_events() {
+        assert_eq!(window_of(false, false), Window::BeforeSent);
+        assert_eq!(window_of(true, false), Window::InAir);
+        assert_eq!(window_of(true, true), Window::AfterLanding);
+        // A landing with the lists not marked sent (another queue's) is a landing all the same.
+        assert_eq!(window_of(false, true), Window::AfterLanding);
     }
 
     #[test]
