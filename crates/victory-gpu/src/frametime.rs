@@ -95,7 +95,7 @@ fn file() -> Option<&'static Mutex<std::fs::File>> {
 
 const HEADER: &str = "t_ms,frame,frames,fps,ms_per_frame,frame_ms_max,frame_ms_avg,\
 cpu_prepare_ms,gpu_ms,gpu_pct,copies_ms,copies_mb,textures_ms,textures_mb,\
-copyback_ms,copyback_mb,draws,dropped,making,indirect,heap_passes,heap_ms,\
+copyback_ms,copyback_mb,draws,dropped,making,indirect,heap_passes,heap_ms,heap_wait_ms,\
 texture_refresh_ms,card_passes,card_compares,card_sent_mb,card_ranges,\
 card_pieces,card_fetched,card_fetched_mb,card_waits,card_wait_ms,\
 twins_into_depth,twins_into_colour,depth_planes,ram_mb,cpu_pct,map_n,map_ms,map_mb,\
@@ -349,6 +349,7 @@ pub(crate) struct Row {
     pub indirect: f64,
     pub heap_passes: f64,
     pub heap_ms: f64,
+    pub heap_wait_ms: f64,
     pub texture_refresh_ms: f64,
     pub card_passes: f64,
     pub card_compares: f64,
@@ -384,6 +385,7 @@ fn write_row(out: &mut impl Write, t_ms: u128, r: &Row) -> std::io::Result<()> {
          {cpu:.3},{gpu:.3},{gpu_pct:.3},{copies_ms:.3},{copies_mb:.3},\
          {textures_ms:.3},{textures_mb:.3},{copyback_ms:.3},{copyback_mb:.3},\
          {draws:.3},{dropped:.3},{making:.3},{indirect:.3},{heap_passes:.3},{heap_ms:.3},\
+         {heap_wait_ms:.3},\
          {texture_refresh_ms:.3},{card_passes:.3},{card_compares:.3},{card_sent_mb:.3},\
          {card_ranges:.3},{card_pieces:.3},{card_fetched:.3},{card_fetched_mb:.3},\
          {card_waits:.3},{card_wait_ms:.3},{twins_into_depth:.3},{twins_into_colour:.3},\
@@ -411,6 +413,7 @@ fn write_row(out: &mut impl Write, t_ms: u128, r: &Row) -> std::io::Result<()> {
         indirect = r.indirect,
         heap_passes = r.heap_passes,
         heap_ms = r.heap_ms,
+        heap_wait_ms = r.heap_wait_ms,
         texture_refresh_ms = r.texture_refresh_ms,
         card_passes = r.card_passes,
         card_compares = r.card_compares,
@@ -463,7 +466,7 @@ mod tests {
     /// dumps), in order.
     const COLUMNS: &str = "t_ms,frame,frames,fps,ms_per_frame,frame_ms_max,frame_ms_avg,\
         cpu_prepare_ms,gpu_ms,gpu_pct,copies_ms,copies_mb,textures_ms,textures_mb,\
-        copyback_ms,copyback_mb,draws,dropped,making,indirect,heap_passes,heap_ms,\
+        copyback_ms,copyback_mb,draws,dropped,making,indirect,heap_passes,heap_ms,heap_wait_ms,\
         texture_refresh_ms,card_passes,card_compares,card_sent_mb,card_ranges,\
         card_pieces,card_fetched,card_fetched_mb,card_waits,card_wait_ms,\
         twins_into_depth,twins_into_colour,depth_planes,ram_mb,cpu_pct,map_n,map_ms,map_mb,\
@@ -474,18 +477,19 @@ mod tests {
     fn header_then_row_carry_the_columns() {
         let mut out = Vec::new();
         write_header(&mut out).unwrap();
-        let row = Row { fps: 60.0, draws: 3.0, ..Row::default() };
+        let row = Row { fps: 60.0, draws: 3.0, heap_wait_ms: 1.5, ..Row::default() };
         write_row(&mut out, 1_700_000_000_000, &row).unwrap();
         let text = String::from_utf8(out).unwrap();
         let mut lines = text.lines();
         assert_eq!(lines.next(), Some(COLUMNS));
         let names: Vec<&str> = COLUMNS.split(',').collect();
-        assert_eq!(names.len(), 50);
+        assert_eq!(names.len(), 51);
         let values: Vec<&str> = lines.next().unwrap_or_default().split(',').collect();
         assert_eq!(values.len(), names.len(), "one value per column: {values:?}");
         let at = |name: &str| values[names.iter().position(|n| *n == name).unwrap()];
         assert_eq!(at("t_ms"), "1700000000000");
         assert_eq!(at("fps"), "60.000");
         assert_eq!(at("draws"), "3.000");
+        assert_eq!(at("heap_wait_ms"), "1.500");
     }
 }

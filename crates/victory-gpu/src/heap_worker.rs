@@ -49,6 +49,10 @@ pub(crate) fn on() -> bool {
 /// ahead in them.
 pub(crate) static STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
+/// For the frame line, since the last one: microseconds the submissions
+/// waited for the passes begun before them ([`take_ready`]).
+pub(crate) static WAIT_US: AtomicU64 = AtomicU64::new(0);
+
 /// One upload list holds at most this much texture memory, or this many
 /// milliseconds of work, so that its textures show soon.
 const LIST_BYTES: u64 = 48 << 20;
@@ -219,7 +223,9 @@ pub(crate) fn take_ready() -> Vec<HostList> {
     if !on() {
         return Vec::new();
     }
+    let waited = Instant::now();
     PASSES.wait_for_begun();
+    WAIT_US.fetch_add(waited.elapsed().as_micros() as u64, Relaxed);
     lock(&READY).drain(..).map(|Closed(list)| list).collect()
 }
 

@@ -10365,6 +10365,8 @@ impl Meter {
             let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;
             let picked_ms =
                 crate::draw::HEAP_BUFFER_MICROS.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
+            let heap_wait_ms =
+                crate::heap_worker::WAIT_US.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
             let [hp_slots, hp_spans, hp_textures, hp_mirrors, hp_readable] =
                 [0, 1, 2, 3, 4].map(|i| crate::draw::HEAP_SPLIT_US[i].swap(0, Ordering::Relaxed) as f64 / 1e3 / frames);
             if picked_ms >= 1.0 {
@@ -10382,10 +10384,10 @@ impl Meter {
                 let [busy, detiling, lists, textures] = std::array::from_fn::<f64, 4, _>(|i| {
                     crate::heap_worker::STATS[i].swap(0, Ordering::Relaxed) as f64 / frames
                 });
-                if busy > 0.0 {
+                if crate::heap_worker::on() {
                     tracing::info!(
                         "textures picked by index, their own thread (VICTORY_HEAP_WORKER), per frame: {:.1} ms at work, of them {:.1} detiling; \
-                         {lists:.1} lists, {textures:.0} textures detiled ahead",
+                         {lists:.1} lists, {textures:.0} textures detiled ahead; title submissions waited {heap_wait_ms:.2} ms for them",
                         busy / 1e6,
                         detiling / 1e6
                     );
@@ -10449,6 +10451,7 @@ impl Meter {
                 indirect,
                 heap_passes: picked,
                 heap_ms: picked_ms,
+                heap_wait_ms,
                 texture_refresh_ms: all,
                 card_passes: passes,
                 card_compares: compares,
