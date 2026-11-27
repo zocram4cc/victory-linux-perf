@@ -2895,7 +2895,9 @@ pub(crate) fn late() -> bool {
 fn late_stage() -> u8 {
     static STAGE: OnceLock<u8> = OnceLock::new();
     *STAGE.get_or_init(|| {
-        if std::env::var_os("VICTORY_GPU_TIMING").is_some() {
+        // Only the mode that runs each list on its own requires settling.
+        #[cfg(feature = "diagnostics")]
+        if timing() {
             return 0;
         }
         match std::env::var("VICTORY_LATE_WAIT").as_deref() {
