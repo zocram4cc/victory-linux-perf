@@ -1702,6 +1702,29 @@ fn packed_half(
     })
 }
 
+/// Whether a pixel program runs its depth and stencil tests before the
+/// shader on the console (`DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER`, bit 12:
+/// HLSL `[earlydepthstencil]`), so the host is told too (ShaderFlags
+/// ForceEarlyDepthStencil). Without it the host tests after the shader, and
+/// a program that writes unordered views writes them for pixels the depth
+/// test then rejects: the title's glass prepass wrote its depth and motion
+/// for every pixel of a window pane, the character standing in front of it
+/// too, and a later pass copied those over the character's. Not for a
+/// program that exports depth, stencil or coverage (bits 0-2 and 8, or such
+/// an output), which cannot test before it runs.
+pub(super) fn early_depth(io: &StageIo, outputs: &[SigElement]) -> bool {
+    const DEPTH_BEFORE_SHADER: u32 = 1 << 12;
+    const EXPORTS: u32 = 0b111 | 1 << 8;
+    let StageIo::Ps { db_shader_control, .. } = io else {
+        return false;
+    };
+    // SV_Depth, SV_DepthLessEqual, SV_DepthGreaterEqual, SV_Coverage,
+    // SV_StencilRef.
+    db_shader_control & DEPTH_BEFORE_SHADER != 0
+        && db_shader_control & EXPORTS == 0
+        && !outputs.iter().any(|o| matches!(o.kind, 14 | 17 | 18 | 19 | 20))
+}
+
 /// The pixel inputs packing two 16-bit rows per dword, as (first row,
 /// second row) ([`packed_layout`]).
 fn input_packs(io: &StageIo, inputs: &[SigElement]) -> Vec<(u8, Option<u8>)> {
@@ -1807,6 +1830,9 @@ impl<'a> Lower<'a> {
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
+        if early_depth(&x.native.io, &x.outputs) {
+            s.flags |= flags::EARLY_DEPTH;
+        }
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let writes_uavs = insts().any(|i| {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
