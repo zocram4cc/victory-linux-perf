@@ -34,7 +34,7 @@
 - **CPU 提交与回读优化：** write-combined 着色器写入保留在显存（`27 -> 0.5 MB/帧`）；128 字节 AVX2 `vptest` 快速跳过与向量化 `merge_piece`；无锁 work-stealing `land` 线程池；64 字节对齐 write-watch 分片；单遍融合 `ask_once`/`stale_under_flights`；无锁描述符 `mirror`；`OnceLock` 命令签名；栈分配 `Few<Barrier, 16>`；64 分片 `PLACED_TEXTURES`；`unfold` 解锁与无锁 `wake()`；锁外 `upload::ARENAS` 清零；6 核辅助线程优先级提升；thin 预规划；detile 前哈希校验；上传缓冲复用。
 - **动态 DXGI 自适应显存与共享显存削减：** 基于 `DedicatedVideoMemory` 与实时 `DXGI_QUERY_VIDEO_MEMORY_INFO` 自动分档 8 / 12 / 16 / 24+ GB 显卡（`VICTORY_VRAM_MODE=auto|8gb|12gb|16gb|24gb|legacy`，支持 `"auto"` 与全部手动环境变量覆写、UMA 识别与 Commit 余量阶梯保护）。16 GB 显卡按主机内存自适应：`<=20 GB` 内存采用 `84%` keep / `90%` room（`12.11 GB` VRAM、`2.18 GB` 共享内存，避免 Windows 工作集换页，1% low 提升 `+55%`），`>=32 GB` 内存解锁 `91%` keep / `95%` room（`~13.2–14.2 GB` VRAM）。零 staging 直连 VRAM 窗口（`CardCpu::Direct`）、紧凑 CPU 影子（`CardCpu::Cpu`）、`DIRTY_CARDED` O(dirty) 脏队列、带迟滞的渐进窗口淘汰（每秒最多 8 个）、深度模板共享 scratch（上游 `#2162`）、16 GB 内存 `host_pressure` 阈值修复（`send_allocs` `117/15s -> 0/15s`）、NVMe 自动检测（`VICTORY_FILE_PHYSICAL=auto`）及仅统计游戏本体的 `XMemGetWorkingSetStatistics`。
 - **原生帧步调与卡顿消除（无 FG）：** 异步增量 `sweep()`（`victory-sweep`，`VICTORY_SWEEP_ASYNC=1`）移除每 1.5 秒的同步 `settle(WHY_SYNC)` 停顿；节流后台 `bury()` 回收线程（`victory-bury`，`VICTORY_BURY_ASYNC=1`）；relay 下基于 `Line.seq` 的无锁 `WHY_FENCE`/`WHY_VALUE` 等待；`execute_own` 呈现跳过冗余 `sync_heaps`（`0.0` 无标记轮次）；`port_descriptors::take()` 64 位 `AtomicU64` 扫描（提速 2–3×）；高精度 `frame::wait` 避免 `Sleep(0)` 让出；内置逐帧 `present pacing` 遥测（`avg / p50 / p95 / p99 / 1% low / max / >50 ms / >100 ms`，`VICTORY_FRAME_TIMES_FILE`）与平坦化 `heap buffers`（`VICTORY_TEXTURE_STAGE_MS=4`，`VICTORY_TEXTURE_CATCHUP=0`，0 次 >50 ms 尖峰）。
-- **第二阶段 CPU 提交与描述符优化（`feat/phase2-30fps`）：** `card_steps` 跨提交区间粒度失效 `VirtualQuery` `MappedCache`（`12.56 ms / 36 次 -> 0.00 ms / 0 次`，`own_cs` `15.1 -> 2.7 ms`）；无锁逐槽原子代号表 `ENTRY_GENS` 与 8192 槽 TLS `descriptor::VIEWS` / `words_for` 缓存（`100.0%` 命中率）；按拷贝增量 `BufferSweep` 与 `heap_buffer_pass` 跳过未变更存活槽位（`HBP_SPANS` `10.94 -> 0.82 ms`）；扩容 `PRELUDES_MOST` `(256, 64)`、`send::SPARE` `(256/128 MiB)` 与 `VICTORY_LIST_IDLE_MOST=320` 消除每帧 D3D12 列表/缓冲重建抖动；`Batch::last_ahead` 单槽热缓存；64 KiB 分页粒度 `gpu_written_pages` 位图（`PORT_CBV`）；HUD 移至右上角（`VICTORY_PANEL_POS=top-right`）；可选深度性能剖析器（`VICTORY_PHASE2_PROFILE=1`）。
+- **第二阶段 CPU 提交与描述符优化（`feat/phase2-30fps`）：** `card_steps` 跨提交区间粒度失效 `VirtualQuery` `MappedCache`（`12.56 ms / 36 次 -> 0.00 ms / 0 次`，`own_cs` `15.1 -> 2.5 ms`）；无锁逐槽原子代号表 `ENTRY_GENS` 与 8192 槽 TLS `descriptor::VIEWS` / `words_for` 缓存（`100.0%` 命中率）；`draw_bind::tables` 内联 CBV 快速路径与每线程 `RETIRE_TLS` 批量回收；增量 `BufferSweep` 与 `heap_buffer_pass` 跳过未变更存活槽位（`HBP_SPANS` `10.94 -> 0.51 ms`）；扩容 `PRELUDES_MOST` `(512, 128)`、`SPARE_BATCH` `(128/256)`、`send::SPARE` `(256/128 MiB)` 与 `VICTORY_LIST_IDLE_MOST=1024`；compute PSO 优先队列 + 4 个 compute/screen 专用线程与共享预算（`p99.9` `-71%`，`1% low` `2×`）；16 GB 内存 `residency` 阈值修复（0 次误报压力，`unmap_null` `-97%`，`VICTORY_KEEP_SHOWN=2`）；64 KiB 分页粒度 `gpu_written_pages` 位图；右上角 HUD（`VICTORY_PANEL_POS=top-right`）与内置 Frame Generation 开关勾选框。
 - **修复与输入：** 5000 ms compute 管线等待预算修复人物面部缺失；RDNA4 崩溃着色器屏蔽（`240cb516c1af0bc3`）；紫色异常探针过滤；安全异步描述符翻转；纹理 detile 失败重试；PC 键鼠控制（`F2`/`~` 鼠标视角，`F3` 右上角 FPS 面板）。
 
 ## 当前已知限制（`dev` 分支正在处理）
@@ -78,7 +78,7 @@ $env:RUSTFLAGS = "-C target-cpu=znver3"
 cargo build --release --locked -p victory
 ```
 
-预编译 `RAZDA4A_XEN.exe` SHA-256: `044366d1ddc3e72c815273f600d1fce5ce6efad3af42ac3a5d0155080964be77`
+预编译 `RAZDA4A_XEN.exe` SHA-256: `7b2d7b7a5059ec41c423c60c34d0fd0025dc141239fe81a645fbfe4f2307376b`
 
 ## 分支与协议
 

@@ -2,3 +2,5 @@ cache/
 data/
 saves-backup/
 *.log
+
+launcher_prefs.bat

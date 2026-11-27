@@ -2,8 +2,9 @@
 setlocal
 
 REM ============================================================================
-REM  RAZDA4A XEN — Budget & 16 GB RAM Edition
+REM  RAZDA4A XEN — Budget & 16 GB RAM Edition (Wave 4)
 REM  Pure --release Zen 3 build | Win10 Agility SDK | FSR 4.1.2 ML + HUDLess FG
+REM  Run with --no-gui to skip the Frame Generation / profile dialog.
 REM ============================================================================
 
 set "ROOT=%~dp0"
@@ -26,6 +27,18 @@ if not exist "%GAME_EXE%" (
     exit /b 1
 )
 
+set "XEN_FRAMEGEN=1"
+set "XEN_PROFILE=balanced"
+if exist "%ROOT%\launcher_prefs.bat" call "%ROOT%\launcher_prefs.bat"
+
+if /I not "%~1"=="--no-gui" (
+    if exist "%ROOT%\launcher_ui.ps1" (
+        powershell -NoProfile -ExecutionPolicy Bypass -STA -File "%ROOT%\launcher_ui.ps1" -PrefsFile "%ROOT%\launcher_prefs.bat"
+        if errorlevel 2 exit /b 0
+        if exist "%ROOT%\launcher_prefs.bat" call "%ROOT%\launcher_prefs.bat"
+    )
+)
+
 if not exist "%ROOT%\cache" mkdir "%ROOT%\cache"
 if not exist "%ROOT%\data" mkdir "%ROOT%\data"
 
@@ -45,14 +58,12 @@ set "VICTORY_AMBIENT_AIR=1.5"
 set "VICTORY_AMBIENT_REFLECT=1.0"
 set "VICTORY_SCALAR_SPLITS=0"
 
-REM === AMD FIDELITYFX FRAME GENERATION (2x FPS, HUDLess + Tearing / No-VSync) ===
-set "VICTORY_FIDELITYFX_FRAMEGEN=1"
+REM === AMD FIDELITYFX FRAME GENERATION (chosen in launcher checkbox) ===
+set "VICTORY_FIDELITYFX_FRAMEGEN=%XEN_FRAMEGEN%"
 set "VICTORY_FRAMEGEN_AHEAD=1"
 set "VICTORY_FRAMEGEN_HUDLESS=1"
 set "VICTORY_ALLOW_TEARING=1"
 set "VICTORY_VSYNC=0"
-REM Optional borderless fullscreen:
-REM set "VICTORY_WINDOW_MODE=borderless"
 set "VICTORY_FRAME_INTERVAL_MS=16.667"
 
 REM === FACE FIX + MAX CPU FPS (6-core friendly) ===
@@ -76,6 +87,8 @@ set "VICTORY_INDIRECT_BATCH=2"
 set "VICTORY_MAP_THREADS=1"
 set "VICTORY_CARD_AWAKE=1"
 set "VICTORY_SHOW_AFTER=1"
+set "VICTORY_KEEP_SHOWN=2"
+set "VICTORY_TEXTURE_AWAY_MS=10000"
 set "VICTORY_THIN=1"
 set "VICTORY_THIN_THREADS=4"
 set "VICTORY_LAND_THREADS=3"
@@ -89,20 +102,18 @@ set "VICTORY_CLOSED_PLAN=1"
 set "VICTORY_PORT_JOURNAL=1"
 set "VICTORY_PORT_GUARD=1"
 set "VICTORY_PORT_DESCRIPTORS=1"
-REM Uncomment on Windows 11 (WDDM 3.0+) with Resizable BAR / SAM enabled:
-REM set "VICTORY_PORT_CONSTANTS=1"
+set "VICTORY_SWEEP_ASYNC=1"
 
-REM === PSO PIPELINE CACHE ===
+REM === PSO PIPELINE CACHE (4 general + 4 compute/screen workers) ===
 set "VICTORY_LIBRARY=1"
 set "VICTORY_LIBRARY_STORE_LATER=1"
 set "VICTORY_LIBRARY_SAVE_S=60"
 set "VICTORY_PIPELINE_BOOK=1"
-set "VICTORY_PIPELINE_WORKERS=2"
+set "VICTORY_PIPELINE_WORKERS=4"
 
 REM === 16 GB RAM + ZERO-OOM (0x8007000E) + DYNAMIC AUTO-VRAM ===
 set "VICTORY_RESIDENCY=1"
 set "VICTORY_SEGMENT_TIGHT=92"
-set "VICTORY_SWEEP_ASYNC=1"
 set "VICTORY_STAGING_IDLE_MS=1500"
 set "VICTORY_WINDOW_IDLE_MS=2500"
 set "VICTORY_SCRATCH_SPARE_MB=16"
@@ -110,18 +121,49 @@ set "VICTORY_READ_KEEP_MB=16"
 set "VICTORY_WAIT_RESIDENT=textures"
 set "VICTORY_CARD_BUFFERS_MIN_KB=64"
 set "VICTORY_KEEP_FREED=0"
-set "VICTORY_LIST_IDLE_MOST=320"
-set "VICTORY_LIST_IDLE_TRIM_S=30"
+set "VICTORY_LIST_IDLE_MOST=1024"
+set "VICTORY_LIST_IDLE_TRIM_S=60"
 set "VICTORY_LATE_WAIT_LISTS=160"
 set "VICTORY_BURY_LAG=4"
 set "VICTORY_SNAPSHOT_POOL=32"
 set "VICTORY_MEMORY_MAP=0"
-REM Auto-enables delete-on-close NVMe physical pages ONLY on <=20 GB RAM + NVMe SSD:
 set "VICTORY_FILE_PHYSICAL=auto"
-
-REM === PCIe BAR UPLOAD (0 = avoids CPU write-combine stalls when CPU-bound) ===
 set "VICTORY_STAGING_BAR=0"
 set "VICTORY_SEND_BAR=0"
+
+REM === APPLY SELECTED LAUNCHER PROFILE ===
+if /I "%XEN_PROFILE%"=="low_commit" (
+    set "VICTORY_FILE_PHYSICAL=1"
+)
+if /I "%XEN_PROFILE%"=="cbv_exp" (
+    set "VICTORY_PORT_CBV=1"
+    set "VICTORY_PORT_CBV_PLACE=1"
+    set "VICTORY_PORT_CBV_SHADOW=2"
+)
+if /I "%XEN_PROFILE%"=="safe" (
+    set "VICTORY_ALLOW_TEARING=0"
+    set "VICTORY_VSYNC=1"
+    set "VICTORY_SUBMIT_FRAMES=1"
+    set "VICTORY_JOIN_PARTS=12"
+    set "VICTORY_PORT_DESCRIPTORS=0"
+    set "VICTORY_PIPELINE_WORKERS=2"
+    set "VICTORY_SEGMENT_TIGHT=85"
+    set "VICTORY_TEXTURE_KEEP_PERCENT=40"
+    set "VICTORY_TEXTURE_STAGE_MB=64"
+    set "VICTORY_STAGING_MAX_MB=96"
+    set "VICTORY_STAGING_IDLE_MS=1000"
+    set "VICTORY_WINDOW_BUDGET_MB=96"
+    set "VICTORY_WINDOW_IDLE_MS=2000"
+    set "VICTORY_SEND_SPARE_MB=24"
+    set "VICTORY_CARD_BUFFERS_MIN_KB=128"
+    set "VICTORY_CARD_BUFFERS_MB=1536"
+    set "VICTORY_CARD_ROOM_FOR_TARGETS_MB=1536"
+    set "VICTORY_LIST_IDLE_MOST=128"
+    set "VICTORY_LIST_IDLE_TRIM_S=30"
+    set "VICTORY_LATE_WAIT_LISTS=128"
+    set "VICTORY_SNAPSHOT_POOL=24"
+    set "VICTORY_FILE_PHYSICAL=1"
+)
 
 REM RDNA4 crash-shader shield
 set "VICTORY_SKIP_PIPELINES=240cb516c1af0bc3"
@@ -131,9 +173,12 @@ set "VICTORY_KBM_PC=1"
 set "VICTORY_PANEL=1"
 set "VICTORY_PANEL_POS=top-right"
 
+set "FG_LABEL=ON (HUDLess 2x FPS)"
+if "%XEN_FRAMEGEN%"=="0" set "FG_LABEL=OFF (Native Zero-Latency)"
+
 echo ============================================================================
 echo  RAZDA4A XEN — Budget & 16 GB RAM Edition
-echo  FSR 4.1.2 ML + HUDLess FSR 3.1.6 Frame Gen ^| Win10 Ready ^| Zero-OOM
+echo  Profile: %XEN_PROFILE% ^| Frame Generation: %FG_LABEL%
 echo  Controls: F2 or ~ = toggle mouse-look ^| F3 = toggle FPS HUD
 echo ============================================================================
 pushd "%ROOT%"
