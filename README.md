@@ -151,7 +151,9 @@ The dump comes from one game run with `VICTORY_NATIVE_PSO_DUMP=Z:\…\pso-dump` 
   The real program (`218_0000000f00431000`) takes one entry per thread of a list of texels (x, y packed in 16 bits each). Then either it stores RGBA with alpha 1, or it stores alpha alone as half 1.0 (`0x3c00`, `d16`) into the same texture, leaving RGB.
 
   *shortcut*: right where each texel has one writing thread per dispatch, as there. `VICTORY_PARTIAL_IMAGE_STORES=0` refuses them as before. **1,228 → 1,239**, none lost.
-- Next wall: "a descriptor's address or format read as data" (481), then "an opaque lane mask" (209), "a lane mask holding lanes elsewhere read as data" (150), "lane conditions too large" (128).
+- 28, **dead descriptor dwords in joins are 0** (joins are per register; the compiler reuses a register whose descriptor dword is dead, here as a lane mask: `218_0000000f002d6300` at 0x14e50, `s_and_b32 s37, s37, exec_lo`), and **buffer dword 1 carries the stride** (`s_bfe_u32 x, d1, 0xe0010`). **1,239 → 1,304**, none lost.
+- **Shortcuts that rest on assumptions are listed, with their switches and how to verify them in game, in [docs/royale/p4-shortcuts.md](docs/royale/p4-shortcuts.md).** The user rightly asked that the programs get correct data: a program that translates is not proven right.
+- Next wall: "a descriptor's address or format read as data" (405 left), then "an opaque lane mask" (209), "a lane mask holding lanes elsewhere read as data" (150), "lane conditions too large" (128).
 
 ### Deferred on purpose (done 27 Nov, step 27): image stores of the alpha channel alone (69 programs then, 553 later)
 
