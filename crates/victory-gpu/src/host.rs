@@ -10349,10 +10349,29 @@ impl Meter {
                 crate::draw::HEAP_BUFFER_MICROS.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
             let [hp_slots, hp_spans, hp_textures, hp_mirrors, hp_readable] =
                 [0, 1, 2, 3, 4].map(|i| crate::draw::HEAP_SPLIT_US[i].swap(0, Ordering::Relaxed) as f64 / 1e3 / frames);
+            let [tp_queue, tp_looks, tp_mapped, tp_made, tp_same, tp_early] =
+                [0, 1, 2, 3, 4, 5].map(|i| crate::draw::HEAP_TEXTURE_SPLIT_NS[i].swap(0, Ordering::Relaxed) as f64 / 1e6 / frames);
+            let tp_slots = crate::draw::HEAP_TEXTURE_SLOTS.swap(0, Ordering::Relaxed) as f64 / frames;
             if picked_ms >= 1.0 {
+                // The texture passes' time in all, the early ones too, less
+                // what each part named took.
+                let tp_rest = (hp_textures + tp_early
+                    - hp_mirrors
+                    - hp_readable
+                    - tp_queue
+                    - tp_looks
+                    - tp_mapped
+                    - tp_made
+                    - tp_same)
+                    .max(0.0);
                 tracing::info!(
                     "heap passes per frame: {hp_slots:.1} ms looking at slots, {hp_spans:.1} ms on the spans of their copies, \
-                     {hp_textures:.1} ms on textures picked by index ({hp_mirrors:.1} ms making their host views, {hp_readable:.1} ms making them readable)"
+                     {hp_textures:.1} ms on textures picked by index ({hp_mirrors:.1} ms making their host views, {hp_readable:.1} ms making them readable); \
+                     of all texture passes, {tp_early:.1} ms of early ones before a draw included, {tp_slots:.0} slots looked at: \
+                     {tp_queue:.1} ms making slots due and taking them, {tp_looks:.1} ms looking at uploaded textures again (reading \
+                     and hashing title memory), {tp_mapped:.1} ms asking what is mapped, {tp_made:.1} ms making title and host textures, \
+                     {tp_same:.1} ms finding the host copy holds the bytes (reading and hashing whole textures), {tp_rest:.1} ms the rest \
+                     (the queue's lock, view lookups, showing and noting)"
                 );
             }
             if crate::draw::plan_reuse() {

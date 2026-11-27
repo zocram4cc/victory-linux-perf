@@ -769,6 +769,25 @@ pub(crate) static HEAP_SPLIT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// index; and of those, making the slots' host views (`mirror`: host
 /// textures made) and making them readable (uploads recorded).
 pub(crate) static HEAP_SPLIT_US: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// Of every texture pass ([`State::heap_textures`], the early ones too),
+/// nanoseconds since the last frame line: making slots due and taking the
+/// due ones, looking at uploaded textures again (reading and hashing title
+/// memory), asking what of a texture's memory is mapped, making title and
+/// host textures on first use, and finding a host copy holds the bytes
+/// already (reading and hashing whole textures); and the early passes' own
+/// time ([`State::early_textures`], which the third of [`HEAP_SPLIT_US`]
+/// leaves out).
+pub(crate) static HEAP_TEXTURE_SPLIT_NS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+/// Slots the texture passes looked at, since the last frame line.
+pub(crate) static HEAP_TEXTURE_SLOTS: AtomicU64 = AtomicU64::new(0);
+
+/// `f`, its nanoseconds added to [`HEAP_TEXTURE_SPLIT_NS`]`[i]`.
+fn texture_split<T>(i: usize, f: impl FnOnce() -> T) -> T {
+    let began = std::time::Instant::now();
+    let out = f();
+    HEAP_TEXTURE_SPLIT_NS[i].fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    out
+}
 
 /// Passes after which every buffer slot of the heap was looked at again.
 const HEAP_ROUND: u64 = 16;
@@ -2808,7 +2827,7 @@ impl State {
         let began = std::time::Instant::now();
         PASS_BUDGET.set(Some((budget.0, budget.1, bake)));
         crate::texture::BAKING.set(bake && bake_exact());
-        self.heap_textures(list, heap, host);
+        texture_split(5, || self.heap_textures(list, heap, host));
         crate::texture::BAKING.set(false);
         PASS_BUDGET.set(None);
         if bake {
@@ -2915,6 +2934,7 @@ impl State {
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
             return;
         }
+        let entered = std::time::Instant::now();
         let memory = crate::host::host().and_then(|h| h.video_memory());
         // `VICTORY_TEXTURE_STAGE_MB` sets it: a backlog of tens of thousands of
         // textures (a scene's first minutes) then drains in fewer frames.
@@ -3062,6 +3082,7 @@ impl State {
             )
         };
         let began = std::time::Instant::now();
+        HEAP_TEXTURE_SPLIT_NS[0].fetch_add((began - entered).as_nanos() as u64, Ordering::Relaxed);
         BAKE_SERVED.store(0, Ordering::Relaxed);
         let mut served = true;
         let _held = crate::list::HoldReads::new(list);
@@ -3070,6 +3091,7 @@ impl State {
                 served = false;
                 break;
             }
+            HEAP_TEXTURE_SLOTS.fetch_add(1, Ordering::Relaxed);
             // A placed texture whose memory is not mapped (not streamed in
             // yet, or streamed out again: the heap keeps tens of thousands
             // of such views) gets no host texture; looked at again soon (a
@@ -3114,7 +3136,7 @@ impl State {
                     HEAP_TEXTURES_FULL_RECHECK[0].fetch_add(1, Ordering::Relaxed);
                     HEAP_TEXTURES_FULL_RECHECK[1].fetch_add(len, Ordering::Relaxed);
                 }
-                if recheck_fingerprint(at, len) == fingerprint {
+                if texture_split(1, || recheck_fingerprint(at, len)) == fingerprint {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                     let keep_longest = recheck_forever() || (checked.changed_in_place && persistent_heap_recheck());
                     match next_texture_recheck(unchanged_looks, keep_longest) {
@@ -3163,7 +3185,7 @@ impl State {
                     TextureRecheck {
                         address,
                         bytes,
-                        fingerprint: recheck_fingerprint(address, bytes),
+                        fingerprint: texture_split(1, || recheck_fingerprint(address, bytes)),
                         unchanged_looks: 0,
                         uploaded: frame,
                         changed_in_place,
@@ -3176,7 +3198,7 @@ impl State {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
                 let first = crate::resource::first_mip(&desc);
                 let len = crate::resource::placed_bytes_from(&resource, first).unwrap_or(1);
-                let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
+                let mapped = texture_split(2, || crate::texture::mapped_bytes(address as *const u8, len as usize));
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
                     // Streamed out: what the slot showed is let go.
@@ -3192,7 +3214,7 @@ impl State {
                         host.texture_slot_later(index, write, frame, most);
                         continue;
                     }
-                    if !crate::texture::committed(address as *const u8, 1) {
+                    if !texture_split(2, || crate::texture::committed(address as *const u8, 1)) {
                         HEAP_TEXTURES_PARTLY[2].fetch_add(1, Ordering::Relaxed);
                     }
                     partly = Some(mapped);
@@ -3277,7 +3299,7 @@ impl State {
                     let _ = host.mirror(index, handle, true);
                 }
             };
-            let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
+            let placed = texture_split(3, || view.as_ref().and_then(crate::descriptor::host::placed_texture));
             let resource = match placed.as_ref().or(view.as_ref()) {
                 Some(&View::Shader(resource, _)) => resource as This,
                 _ => {
@@ -3286,7 +3308,7 @@ impl State {
                     continue;
                 }
             };
-            let texture = crate::resource::host_resource(resource);
+            let texture = texture_split(3, || crate::resource::host_resource(resource));
             let title_fills = texture.is_some_and(crate::texture::title_written);
             if !title_fills {
                 at_once();
@@ -3303,7 +3325,7 @@ impl State {
                 (Some(_), Some(View::Placed(_, _, desc))) => crate::resource::first_mip(desc),
                 _ => 0,
             };
-            let same = !tabled && crate::texture::unchanged(resource, first);
+            let same = !tabled && texture_split(4, || crate::texture::unchanged(resource, first));
             if same {
                 HEAP_TEXTURES_SAME.fetch_add(1, Ordering::Relaxed);
                 if shows_other && let Some(handle) = heap.handle(index) {
