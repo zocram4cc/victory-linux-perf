@@ -51,7 +51,13 @@ pub struct Settings {
     pub gap: std::time::Duration,
     /// The automatic trigger for stretched geometry, if on.
     pub sheets: Option<super::trigger::Sheets>,
+    /// How long a capture may hold the title (none: no limit).
+    pub limit: Option<std::time::Duration>,
 }
+
+/// How long a capture may hold the title, by default: the title's own
+/// watchdog ended a run whose capture took 31 s.
+pub const LIMIT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// The rest after a capture, by default.
 pub const GAP: std::time::Duration = std::time::Duration::from_secs(5);
@@ -71,8 +77,9 @@ impl Settings {
     /// From `VICTORY_RECORD`, `VICTORY_RECORD_AT` (seconds, or `f<frame>`),
     /// `VICTORY_RECORD_FRAMES`, `VICTORY_RECORD_ALWAYS=1`,
     /// `VICTORY_RECORD_GAP` (seconds of rest after a capture; 5) and
-    /// `VICTORY_RECORD_SHEETS=1` (the automatic trigger, with
-    /// `VICTORY_RECORD_SHEETS_ROW`, `_MIN` and `_MAX`: see [`sheets_from`]).
+    /// `VICTORY_RECORD_SHEETS=1` (the watch, its log lines and the automatic
+    /// trigger, with `VICTORY_RECORD_SHEETS_JUMP`, `_MIN` and `_MAX`: see
+    /// [`sheets_from`]).
     pub fn from_env() -> Option<Settings> {
         let folder = PathBuf::from(std::env::var_os("VICTORY_RECORD").filter(|v| !v.is_empty())?);
         let at = parse_at(&std::env::var("VICTORY_RECORD_AT").unwrap_or_default());
@@ -93,15 +100,26 @@ impl Settings {
             always,
             gap,
             sheets: sheets_from(|name| std::env::var(name).ok()),
+            limit: limit_from(std::env::var("VICTORY_RECORD_LIMIT").ok().as_deref()),
         })
     }
 }
 
+/// `VICTORY_RECORD_LIMIT`: seconds a capture may hold the title (20); 0: no
+/// limit.
+pub fn limit_from(text: Option<&str>) -> Option<std::time::Duration> {
+    match text.map(str::trim).and_then(|t| t.parse::<f64>().ok()) {
+        Some(s) if s == 0.0 => None,
+        Some(s) if s.is_finite() && s > 0.0 => Some(std::time::Duration::from_secs_f64(s)),
+        _ => Some(LIMIT),
+    }
+}
+
 /// The automatic trigger's settings from the variables `var` gives:
-/// `VICTORY_RECORD_SHEETS=1` turns it on; `VICTORY_RECORD_SHEETS_ROW` the
-/// least span counted (row of `victory_shader::emit::SHEET_SPANS`),
-/// `VICTORY_RECORD_SHEETS_MIN` the waves a frame needs,
-/// `VICTORY_RECORD_SHEETS_MAX` the captures a run takes (2).
+/// `VICTORY_RECORD_SHEETS=1` turns it on; `VICTORY_RECORD_SHEETS_JUMP` the
+/// jump that counts (clip units), `VICTORY_RECORD_SHEETS_MIN` the draws a
+/// frame needs, `VICTORY_RECORD_SHEETS_MAX` the captures a run takes (2;
+/// 0: the watch's log lines only).
 pub fn sheets_from(var: impl Fn(&str) -> Option<String>) -> Option<super::trigger::Sheets> {
     if var("VICTORY_RECORD_SHEETS").as_deref().map(str::trim) != Some("1") {
         return None;
@@ -111,20 +129,20 @@ pub fn sheets_from(var: impl Fn(&str) -> Option<String>) -> Option<super::trigge
             .and_then(|v| v.trim().parse::<u32>().ok())
             .unwrap_or(default)
     };
-    let rows = victory_shader::emit::SHEET_BUCKETS;
+    let jump = var("VICTORY_RECORD_SHEETS_JUMP")
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|j| j.is_finite() && *j >= 0.0)
+        .unwrap_or(SHEETS_JUMP);
     Some(super::trigger::Sheets {
-        row: number("VICTORY_RECORD_SHEETS_ROW", SHEETS_ROW).min(rows - 1) as usize,
+        jump,
         min: number("VICTORY_RECORD_SHEETS_MIN", SHEETS_MIN).max(1),
         most: number("VICTORY_RECORD_SHEETS_MAX", 2),
     })
 }
 
-/// The automatic trigger's defaults: see [`sheets_from`]. Waves spanning
-/// more than the screen's width, at least 8 in a frame: in replays of five
-/// captures (two loops each) 37-41 and 49-50 where sheets show, 5-6 where few
-/// do, 0 in one without.
-pub const SHEETS_ROW: u32 = 3;
-pub const SHEETS_MIN: u32 = 8;
+/// The automatic trigger's defaults: see [`sheets_from`].
+pub const SHEETS_JUMP: f32 = 1.0;
+pub const SHEETS_MIN: u32 = 1;
 
 fn parse_at(text: &str) -> At {
     let text = text.trim();
@@ -391,6 +409,9 @@ pub(super) struct Recorder {
     /// A capture was asked for and is not over: what cannot be recorded is
     /// noted for it alone (`this`), not for all (`problems`).
     pending: AtomicBool,
+    /// How long a capture may hold the title, in nanoseconds (`u64::MAX`:
+    /// no limit): the settings', or [`set_limit`]'s.
+    limit: std::sync::atomic::AtomicU64,
     pub(super) began: std::time::Instant,
     next: AtomicU32,
     ids: Ids,
@@ -482,12 +503,14 @@ impl Recorder {
             .truncate(true)
             .open(&path)?;
         let gap = settings.gap;
+        let limit = settings.limit;
         Ok(Recorder {
             settings,
             first: folder,
             last: Mutex::default(),
             capture: AtomicU32::new(0),
             pending: AtomicBool::new(false),
+            limit: std::sync::atomic::AtomicU64::new(nanos(limit)),
             began: std::time::Instant::now(),
             next: AtomicU32::new(1),
             ids: Ids::default(),
@@ -559,6 +582,12 @@ impl Recorder {
                 }
             })
             .collect()
+    }
+
+    /// How long a capture may hold the title.
+    pub(super) fn limit(&self) -> Option<std::time::Duration> {
+        let n = self.limit.load(Ordering::Relaxed);
+        (n != u64::MAX).then(|| std::time::Duration::from_nanos(n))
     }
 
     pub(super) fn arm(&self, on: bool) {
@@ -1043,6 +1072,17 @@ pub fn name(object: &impl Interface, text: &str) {
 pub fn present(texture: &ID3D12Resource, state: D3D12_RESOURCE_STATES) {
     if let Some(r) = recorder() {
         snap::present(r, texture, state.0 as u32);
+    }
+}
+
+fn nanos(limit: Option<std::time::Duration>) -> u64 {
+    limit.map_or(u64::MAX, |l| u64::try_from(l.as_nanos()).unwrap_or(u64::MAX - 1))
+}
+
+/// Sets how long the next captures may hold the title (tests).
+pub fn set_limit(limit: Option<std::time::Duration>) {
+    if let Some(r) = recorder() {
+        r.limit.store(nanos(limit), Ordering::Relaxed);
     }
 }
 
@@ -2939,6 +2979,16 @@ mod tests {
     }
 
     #[test]
+    fn the_limit_is_twenty_seconds_unless_set() {
+        use std::time::Duration;
+        assert_eq!(limit_from(None), Some(LIMIT));
+        assert_eq!(limit_from(Some("x")), Some(LIMIT));
+        assert_eq!(limit_from(Some("-3")), Some(LIMIT));
+        assert_eq!(limit_from(Some("0")), None);
+        assert_eq!(limit_from(Some(" 12.5 ")), Some(Duration::from_secs_f64(12.5)));
+    }
+
+    #[test]
     fn the_automatic_trigger_is_off_unless_asked() {
         let vars = |set: &'static [(&'static str, &'static str)]| {
             move |name: &str| set.iter().find(|v| v.0 == name).map(|v| v.1.to_owned())
@@ -2946,15 +2996,17 @@ mod tests {
         assert_eq!(sheets_from(vars(&[])), None);
         assert_eq!(sheets_from(vars(&[("VICTORY_RECORD_SHEETS", "0")])), None);
         let on = sheets_from(vars(&[("VICTORY_RECORD_SHEETS", "1")])).unwrap();
-        assert_eq!((on.row, on.min, on.most), (SHEETS_ROW as usize, SHEETS_MIN, 2));
+        assert_eq!((on.jump, on.min, on.most), (SHEETS_JUMP, SHEETS_MIN, 2));
         let set = sheets_from(vars(&[
             ("VICTORY_RECORD_SHEETS", "1"),
-            ("VICTORY_RECORD_SHEETS_ROW", "9"),
+            ("VICTORY_RECORD_SHEETS_JUMP", "2.5"),
             ("VICTORY_RECORD_SHEETS_MIN", "0"),
-            ("VICTORY_RECORD_SHEETS_MAX", "5"),
+            ("VICTORY_RECORD_SHEETS_MAX", "0"),
         ]))
         .unwrap();
-        assert_eq!((set.row, set.min, set.most), (3, 1, 5), "the row is a row there is, at least one wave");
+        assert_eq!((set.jump, set.min, set.most), (2.5, 1, 0), "at least one draw; no captures, lines only");
+        let bad = sheets_from(vars(&[("VICTORY_RECORD_SHEETS", "1"), ("VICTORY_RECORD_SHEETS_JUMP", "-1")])).unwrap();
+        assert_eq!(bad.jump, SHEETS_JUMP);
     }
 
     #[test]

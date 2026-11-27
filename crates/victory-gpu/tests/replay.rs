@@ -10,7 +10,7 @@
 
 use std::mem::ManuallyDrop;
 
-use victory_gpu::replay::play::{self, Buffers, Options, Player};
+use victory_gpu::replay::play::{self, Options, Player};
 use victory_gpu::replay::record::{self, At, Settings};
 use windows::Win32::Foundation::{HANDLE, HWND, RECT};
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
@@ -1655,6 +1655,7 @@ fn a_frame_is_recorded_and_replayed() {
         always: false,
         gap: std::time::Duration::ZERO,
         sheets: None,
+        limit: None,
     };
     let folder = record::start(settings, &device).unwrap();
     assert!(record::on());
@@ -1668,6 +1669,7 @@ fn a_frame_is_recorded_and_replayed() {
                 always: false,
                 gap: record::GAP,
                 sheets: None,
+                limit: None,
             },
             &device
         )
@@ -1704,6 +1706,32 @@ fn a_frame_is_recorded_and_replayed() {
     assert_ne!(second, folder, "a second capture, in a folder of its own");
     assert!(!dir.path().join("go").exists(), "the trigger file is taken");
     let expected_second = scene.outcome();
+    // A capture that would hold the program past its limit stops, says so,
+    // and the program goes on; the last capture written is still the second.
+    record::set_limit(Some(std::time::Duration::from_nanos(1)));
+    std::fs::write(dir.path().join("go"), "").unwrap();
+    let failed = |n: u32| {
+        std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.path().join("failed.txt"))
+            .find(|f| f.exists())
+            .map(|f| (n, f))
+    };
+    let mut stopped = None;
+    for n in n..n + 15 {
+        scene.frame(n);
+        stopped = failed(n);
+        if stopped.is_some() {
+            break;
+        }
+    }
+    let (n, why) = stopped.expect("the capture past its limit wrote failed.txt");
+    let why = std::fs::read_to_string(&why).unwrap();
+    assert!(why.contains("VICTORY_RECORD_LIMIT"), "{why}");
+    assert_eq!(record::finished().as_ref(), Some(&second));
+    record::set_limit(None);
+    scene.frame(n + 1);
     drop(scene);
     record::unhook(&device);
     assert_eq!(table_of(&device), own, "the device is as it was");
@@ -1734,13 +1762,7 @@ fn a_frame_is_recorded_and_replayed() {
         // The folder's last capture: the second.
         let mut player = Player::load(dir.path(), &plain).unwrap();
         check(&mut player, &plain, &expected_second, "the second capture");
-        // (Not with buffers in the card: see the loop below.)
-        let pc = Options {
-            buffers: Buffers::Pc,
-            ..plain.clone()
-        };
-        let mut player = Player::load(&second, &pc).unwrap();
-        check(&mut player, &pc, &expected_second, "the second capture, buffers in the PC");
+        // (Not with --buffers: see below.)
     }
     let detailed = Options {
         detailed: true,
@@ -1843,17 +1865,10 @@ fn a_frame_is_recorded_and_replayed() {
     player.run(&kept).unwrap();
     check(&mut player, &plain, &expected, "unchanged again");
     drop(player);
-    // Not Buffers::Card for now: on this machine that replay faults the
-    // card (NVIDIA Xid 31, an MMU fault of the graphics engine), its fence
-    // never comes, and a fault of the card can take other programs down.
-    for buffers in [Buffers::Pc] {
-        let o = Options {
-            buffers,
-            ..plain.clone()
-        };
-        let mut player = Player::load(&folder, &o).unwrap();
-        check(&mut player, &o, &expected, &format!("buffers {buffers:?}"));
-    }
+    // Not with --buffers for now: on this machine a replay with buffers in
+    // the card's memory, and one with them in the PC's, faulted the card
+    // (NVIDIA Xid 31, a write by the graphics engine to no mapping), its
+    // fence never came, and a fault of the card can take other programs down.
     let o = Options {
         compare: true,
         merge_barriers: true,

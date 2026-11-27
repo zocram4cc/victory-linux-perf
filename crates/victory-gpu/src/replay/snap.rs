@@ -14,7 +14,7 @@ use windows::core::Interface;
 
 use super::gpu::{self, Seen, Worker};
 use super::record::{At, Heap, Ours, Recorder, Res, lock, not_recorded_calls, read};
-use super::trigger::{self, Gate, Verdict};
+use super::trigger::{self, Deadline, Gate, Verdict};
 use super::states::{COMMON, COPY_SOURCE, Change, States};
 use super::wire::{
     self, ALL, Cmd, Content, Delta, Loc, MISSING, NONE, Place, Slot, Va, ZERO, slot,
@@ -142,12 +142,16 @@ pub(super) fn present(r: &Recorder, texture: &ID3D12Resource, state: u32) {
     let mut finished = None;
     // Taken whenever it is there: an ask that is not followed is not kept.
     let asked = trigger::take(&r.settings.folder);
-    // Read (and cleared) at every present: what the frames since saw.
-    let sheets = r
-        .settings
-        .sheets
-        .and_then(|s| Some((s, crate::sheets::take()?)))
-        .and_then(|(s, rows)| Some((s, s.seen(&rows)?, rows)));
+    // Read (and cleared) at every present: what the draws since noted, each
+    // a line in the log; enough of them ask for a capture.
+    let sheets = r.settings.sheets.and_then(|s| {
+        let draws = crate::sheets::take()?;
+        note_sheets(presents, s.jump, &draws);
+        let jumps: Vec<f32> = draws.iter().map(|d| d.2.jump()).collect();
+        let seen = s.seen(&jumps)?;
+        let largest = jumps.iter().copied().fold(0.0, f32::max);
+        Some((s, seen, largest))
+    });
     match &mut phase.stage {
         Stage::Waiting => {
             // The time or frame set asks for the first capture only.
@@ -157,31 +161,39 @@ pub(super) fn present(r: &Recorder, texture: &ID3D12Resource, state: u32) {
                     At::Frame(f) => presents >= f,
                     At::Trigger => false,
                 };
-            if due || asked {
+            let kept = phase.gate.queued();
+            if due || asked || kept {
                 match phase.gate.ask(Instant::now()) {
                     Verdict::Take(n) => {
                         tracing::info!(
                             presents,
                             capture = n,
-                            why = if asked { "the trigger file" } else { "the time set" },
+                            why = if asked {
+                                "the trigger file"
+                            } else if kept {
+                                "the trigger file, kept from before"
+                            } else {
+                                "the time set"
+                            },
                             "frame recorder: lists are recorded from now on"
                         );
                         r.asked();
                         phase.stage = Stage::Armed(presents, n);
                     }
-                    Verdict::Resting(left) => tracing::info!(
-                        "frame recorder: the trigger is not followed: {:.1} s of rest after the last capture remain; touch it again then",
+                    Verdict::Resting(left) if asked => tracing::info!(
+                        "frame recorder: the trigger is kept: followed when the rest after the last capture ends, in {:.1} s",
                         left.as_secs_f64()
                     ),
-                    Verdict::Busy => tracing::info!("frame recorder: the trigger is not followed: a capture is under way"),
+                    Verdict::Resting(_) => {}
+                    Verdict::Busy => tracing::info!("frame recorder: the trigger is kept: a capture is under way"),
                     Verdict::Spent => {}
                 }
-            } else if let Some((s, waves, rows)) = sheets {
+            } else if let Some((s, draws, largest)) = sheets {
                 match phase.gate.ask_auto(Instant::now(), s.most) {
                     Verdict::Take(n) => {
                         let why = format!(
-                            "stretched geometry: {waves} waves of the pre-skinned programs spanning over {} of the screen (rows {rows:?})",
-                            victory_shader::emit::SHEET_SPANS[s.row] / 2.0
+                            "stretched geometry: {draws} draws of the pre-skinned programs with a vertex {largest:.2} (clip units, over {}) from both neighbours; their lines are above",
+                            s.jump
                         );
                         tracing::info!(presents, capture = n, why = %why, "frame recorder: lists are recorded from now on");
                         r.asked();
@@ -202,7 +214,8 @@ pub(super) fn present(r: &Recorder, texture: &ID3D12Resource, state: u32) {
             }
         }
         _ if asked => {
-            tracing::info!("frame recorder: the trigger is not followed: a capture is under way");
+            phase.gate.queue();
+            tracing::info!("frame recorder: the trigger is kept: followed after the capture under way and its rest");
         }
         _ => {}
     }
@@ -257,6 +270,19 @@ pub(super) fn present(r: &Recorder, texture: &ID3D12Resource, state: u32) {
     drop(phase);
     // What was kept alive goes without a lock held.
     drop(finished);
+}
+
+/// The sheet watch's notes of draws with a jump over `jump` as log lines:
+/// at most 16 a present and 2000 a run, so that a run full of them still
+/// has a readable log.
+fn note_sheets(presents: u64, jump: f32, draws: &[(u64, String, crate::sheets::Draw)]) {
+    static LINES: AtomicUsize = AtomicUsize::new(0);
+    for (at, what, d) in draws.iter().filter(|d| d.2.jump() > jump).take(16) {
+        if LINES.fetch_add(1, Ordering::Relaxed) >= 2000 {
+            return;
+        }
+        tracing::info!(presents, "frame recorder: sheet: {}", crate::sheets::line(*at, what, d));
+    }
 }
 
 /// What a submission reads of buffers, by id: parts of them (copied from),
@@ -396,6 +422,8 @@ struct Capture {
     calls: Vec<(String, u64)>,
     began: Instant,
     took: BTreeMap<&'static str, std::time::Duration>,
+    /// How long it may hold the title, from its first submission on.
+    deadline: Deadline,
 }
 
 impl Capture {
@@ -439,6 +467,7 @@ impl Capture {
             calls: not_recorded_calls(),
             began: Instant::now(),
             took: BTreeMap::new(),
+            deadline: Deadline::new(Instant::now(), r.limit()),
         })
     }
 
@@ -456,6 +485,7 @@ impl Capture {
     /// Before the first submission of the frame: what the card holds.
     fn start(&mut self, r: &Recorder) -> Result<(), Fault> {
         self.began = Instant::now();
+        self.deadline = Deadline::new(self.began, r.limit());
         r.capture.store(self.number, Ordering::SeqCst);
         r.watching.store(true, Ordering::SeqCst);
         self.started = true;
@@ -681,6 +711,7 @@ impl Capture {
                 if pieces.is_empty() {
                     continue;
                 }
+                self.deadline.check(Instant::now(), "the reading of the card's memory")?;
                 let i = freed.recv()?;
                 let value = self
                     .worker
@@ -822,11 +853,15 @@ impl Capture {
             .clamp(1, 16)
             .min(chunks.len().max(1));
         let (buffers, file, end) = (&self.buffers, &self.deltas, &self.delta_at);
+        let deadline = self.deadline;
         std::thread::scope(|scope| {
             for _ in 0..threads {
                 scope.spawn(|| {
                     let mut mine = Vec::new();
                     loop {
+                        if deadline.passed(Instant::now()) {
+                            break;
+                        }
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         let Some(&(b, at, len)) = chunks.get(i) else {
                             break;
@@ -861,6 +896,7 @@ impl Capture {
         if let Some(e) = lock(&failed).take() {
             return Err(e.into());
         }
+        deadline.check(Instant::now(), "the comparison of what the CPU changed")?;
         let mut out = out.into_inner().unwrap_or_else(|e| e.into_inner());
         out.sort_by_key(|d| (d.res, d.at));
         Ok(out)
@@ -877,6 +913,7 @@ impl Capture {
             self.start(r)?;
         } else {
             self.timed("waiting for the card", |c| Ok(c.worker.idle()?))?;
+            self.deadline.check(Instant::now(), "a submission of the frame")?;
         }
         // Descriptors first: what they name is looked at below.
         let mut written = std::mem::take(&mut *lock(&r.writes));
@@ -951,6 +988,7 @@ impl Capture {
     }
 
     fn present(&mut self, r: &Recorder, texture: &ID3D12Resource, state: u32) -> Result<(), Fault> {
+        self.deadline.check(Instant::now(), "the present")?;
         self.worker.idle()?;
         // SAFETY: a live texture.
         let desc = unsafe { texture.GetDesc() };
