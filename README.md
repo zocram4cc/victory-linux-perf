@@ -145,7 +145,15 @@ The dump comes from one game run with `VICTORY_NATIVE_PSO_DUMP=Z:\…\pso-dump` 
 
   **Next:** prove the high half only over the paths that reach the access, as `classify` does for descriptors (`known`, `lanes.reach`, `only_edge`). A phi edge no lane that uses the address comes by does not count. `VICTORY_WHY_HIGH=1` prints the offset where the proof stops.
 
-### Deferred on purpose: image stores of the alpha channel alone (69 programs)
+- 26, **the high-half proof over the paths that matter** (`Tracer::edge_reaches`: a phi edge no lane that reaches the access can come by is ignored), and **XOR trees cancelled as multisets** (`Tracer::xor_leaves`: the leaves that appear an odd number of times are what the XOR is, so a swap partner cancels out even when it is a lane mask). "An address with an untracked high half" **511 → 0**.
+- 27, **image stores of any channel mask** (the deferred item below, now done): the texel is read (typed UAV load), the masked channels replaced (the data registers hold them packed in order), and all four written. 553 of the 566 refused stores were alpha alone (`dmask 0x8`).
+
+  The real program (`218_0000000f00431000`) takes one entry per thread of a list of texels (x, y packed in 16 bits each). Then either it stores RGBA with alpha 1, or it stores alpha alone as half 1.0 (`0x3c00`, `d16`) into the same texture, leaving RGB.
+
+  *shortcut*: right where each texel has one writing thread per dispatch, as there. `VICTORY_PARTIAL_IMAGE_STORES=0` refuses them as before. **1,228 → 1,239**, none lost.
+- Next wall: "a descriptor's address or format read as data" (481), then "an opaque lane mask" (209), "a lane mask holding lanes elsewhere read as data" (150), "lane conditions too large" (128).
+
+### Deferred on purpose (done 27 Nov, step 27): image stores of the alpha channel alone (69 programs then, 553 later)
 
 **What the console code does.** `image_store v0, v[2:3], s[16:23] dmask:0x8 dim:SQ_RSRC_IMG_2D unorm d16` (e.g. `218_0000000f00419900` at 0x175ec): it writes **only the fourth channel (A)** of a texel of an RGBA texture and leaves R, G and B as they are. The same program also stores all four channels elsewhere (`dmask:0xf`), so the format does have four.
 
