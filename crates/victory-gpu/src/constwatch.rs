@@ -256,9 +256,11 @@ impl Tracker {
         out
     }
 
-    /// The counts line, and the counts started again.
-    pub(crate) fn counts_line(&mut self, w: &Watch, draws: u64) -> String {
-        let c = std::mem::take(&mut self.counts);
+    /// The counts line, and the counts started again (`missed`: fills
+    /// that did not match, counted outside the lock).
+    pub(crate) fn counts_line(&mut self, w: &Watch, draws: u64, missed: u64) -> String {
+        let mut c = std::mem::take(&mut self.counts);
+        c.fills += missed;
         let of = w.hash.as_ref().map_or(String::new(), |h| format!(", {draws} draws recorded with a pipeline named {h}"));
         format!(
             "constants watch: in {} s: {} fills looked at, {} matched; {} placed constant buffers looked at, {} matched{of}",
@@ -273,6 +275,8 @@ impl Tracker {
 
 static TRACKER: Mutex<Option<Tracker>> = Mutex::new(None);
 static DRAWS: AtomicU64 = AtomicU64::new(0);
+/// Fills that did not match: counted without the lock.
+static MISSED: AtomicU64 = AtomicU64::new(0);
 
 fn with<T>(f: impl FnOnce(&mut Tracker) -> T) -> T {
     f(TRACKER.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Tracker::default))
@@ -303,9 +307,13 @@ pub(crate) fn pipeline(name: &str) {
 /// `len` bytes of title memory at `src` are copied to `list`'s upload
 /// memory now (a `Step::Fill` at submission).
 pub(crate) fn fill(list: usize, src: usize, len: usize) {
-    if let Some(w) = watch() {
-        log(with(|t| t.fill(w, list, src, len, crate::frame::current(), read)));
+    let Some(w) = watch() else { return };
+    // Most fills are not the one: no lock for them.
+    if !w.matches(u32::try_from(len).unwrap_or(u32::MAX), |at| read(src + at as usize)) {
+        MISSED.fetch_add(1, Relaxed);
+        return;
     }
+    log(with(|t| t.fill(w, list, src, len, crate::frame::current(), read)));
 }
 
 /// A constant buffer that a title copy earlier in `list` wrote is copied on
@@ -338,7 +346,7 @@ pub(crate) fn presented() {
     };
     let mut lines = with(|t| t.presented(crate::frame::current(), read));
     if due {
-        lines.push(with(|t| t.counts_line(w, DRAWS.swap(0, Relaxed))));
+        lines.push(with(|t| t.counts_line(w, DRAWS.swap(0, Relaxed), MISSED.swap(0, Relaxed))));
     }
     log(lines);
 }
@@ -414,8 +422,8 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("frame 100: 1 copied (was none) at 0x2018"), "{}", lines[0]);
         assert_eq!(t.counts, Counts { fills: 2, fills_matched: 1, placed: 0, placed_matched: 0 });
-        let line = t.counts_line(&w, 3);
-        assert!(line.contains("2 fills looked at, 1 matched") && line.contains("3 draws"), "{line}");
+        let line = t.counts_line(&w, 3, 5);
+        assert!(line.contains("7 fills looked at, 1 matched") && line.contains("3 draws"), "{line}");
         assert_eq!(t.counts, Counts::default());
     }
 
