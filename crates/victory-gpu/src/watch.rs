@@ -4393,6 +4393,16 @@ fn open_given(g: &Guards, start: usize, end: usize, given: Option<&[usize]>) -> 
     if first >= last {
         return 0;
     }
+    if spans_walk() && first + 1 == last {
+        let protected = g.protected.contains(first);
+        if !g.aliased.contains(first) {
+            if protected {
+                unguard(g, &[first]);
+                return 1;
+            }
+            return 0;
+        }
+    }
     let mut blocks: Vec<usize> = g.protected.range(first..last).collect();
     let here = blocks.len();
     let aliased: Vec<usize> = g.aliased.range(first..last).collect();
