@@ -16,6 +16,7 @@ use victory_shader::resource::RootIndexedView;
 use victory_shader::{ResourceType, RootType, UsedResource};
 
 use crate::descriptor::View;
+use crate::descriptor::host::TextureRecheck;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -763,6 +764,11 @@ pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
 /// the spans and refreshes of their copies, the texture side.
 #[cfg(feature = "diagnostics")]
 pub(crate) static HEAP_SPLIT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Of the heap passes' microseconds, since the last frame line: the slots
+/// looked at, the spans of the copies they show, the textures picked by
+/// index; and of those, making the slots' host views (`mirror`: host
+/// textures made) and making them readable (uploads recorded).
+pub(crate) static HEAP_SPLIT_US: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
 /// Passes after which every buffer slot of the heap was looked at again.
 const HEAP_ROUND: u64 = 16;
@@ -794,6 +800,18 @@ fn sweep_per_heap() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_SWEEP_PER_HEAP").is_some_and(|v| v == "1"))
 }
 
+/// Whether the heap buffer pass keeps each host copy's span from one pass to
+/// the next (`VICTORY_PLAN_REUSE=1`; off by default: merged afresh each pass).
+pub(crate) fn plan_reuse() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("VICTORY_PLAN_REUSE").is_some_and(|v| v == "1"));
+    *ON
+}
+
+/// Under `VICTORY_PLAN_REUSE=1`, since the last frame line: passes that kept
+/// the span plan, and the exact rebuilds of it.
+pub(crate) static PLAN_SPANS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 /// What the heap buffer pass keeps of a view heap, on the heap
 /// ([`crate::descriptor::host::HostHeap`]), so that a heap made where one was
 /// let go starts afresh (codec-d/cool_fox c64fc9b4).
@@ -802,11 +820,14 @@ pub(crate) struct BufferSweep {
     ranges: HeapRanges<std::sync::Arc<crate::shadow::Shadow>>,
     // Last refresh frame and covered interval for throttled, unwatched copies.
     unwatched: std::collections::HashMap<u64, (u64, u64, u64)>,
+    /// The merged span of each host copy, kept from pass to pass under
+    /// `VICTORY_PLAN_REUSE=1` ([`SpanPlan`]).
+    plan: SpanPlan<std::sync::Arc<crate::shadow::Shadow>>,
 }
 
 impl Default for BufferSweep {
     fn default() -> Self {
-        Self { passes: 0, ranges: HeapRanges(Vec::new()), unwatched: Default::default() }
+        Self { passes: 0, ranges: HeapRanges(Vec::new()), unwatched: Default::default(), plan: SpanPlan::default() }
     }
 }
 
@@ -822,6 +843,10 @@ impl<T> HeapRanges<T> {
         self.0[slot] = range;
     }
 
+    fn get(&self, slot: u32) -> Option<&(T, u64, u64)> {
+        self.0.get(slot as usize).and_then(Option::as_ref)
+    }
+
     /// Forgets the slots of one of `parts` parts
     /// (`HostHeap::buffer_slots_of`).
     fn forget_part(&mut self, part: u32, parts: u32) {
@@ -833,9 +858,83 @@ impl<T> HeapRanges<T> {
     }
 }
 
+/// The merged span of each host copy that the views of a [`HeapRanges`]
+/// cover, kept from pass to pass under `VICTORY_PLAN_REUSE=1`
+/// ([`heap_buffer_pass`]). A range that comes or changes widens its copy's
+/// span at once; one that moved or went leaves the span as it was, wider
+/// than the views, until [`SpanPlan::rebuild`] builds it afresh.
+struct SpanPlan<T> {
+    spans: crate::host::ByCopy<(T, u64, u64)>,
+    /// Built from the ranges at least once.
+    valid: bool,
+    /// A range moved or went since the last rebuild.
+    loose: bool,
+    last_compact: u64,
+}
+
+/// Frames after which a [`SpanPlan`] with moved ranges is built afresh.
+const PLAN_COMPACT_FRAMES: u64 = 8;
+
+impl<T> Default for SpanPlan<T> {
+    fn default() -> Self {
+        Self { spans: Default::default(), valid: false, loose: false, last_compact: 0 }
+    }
+}
+
+impl<X> SpanPlan<std::sync::Arc<X>> {
+    fn widen(&mut self, shadow: &std::sync::Arc<X>, from: u64, to: u64) {
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
+        let span = self.spans.entry(key).or_insert_with(|| (shadow.clone(), from, to));
+        span.1 = span.1.min(from);
+        span.2 = span.2.max(to);
+    }
+
+    /// A slot's range was `old` and is `new`.
+    fn moved(&mut self, old: Option<&(std::sync::Arc<X>, u64, u64)>, new: Option<&(std::sync::Arc<X>, u64, u64)>) {
+        if let Some((shadow, from, to)) = new {
+            self.widen(shadow, *from, *to);
+        }
+        let same = match (old, new) {
+            (Some((os, of, ot)), Some((ns, nf, nt))) => std::sync::Arc::ptr_eq(os, ns) && of == nf && ot == nt,
+            _ => false,
+        };
+        if old.is_some() && !same {
+            self.loose = true;
+        }
+    }
+
+    /// The slots of a part are forgotten: their spans may be wider now.
+    fn loosen(&mut self) {
+        self.loose = true;
+    }
+
+    /// Every range is forgotten.
+    fn clear(&mut self) {
+        self.spans.clear();
+        self.loose = false;
+    }
+
+    /// Built afresh from `ranges`; returns the number of views.
+    fn rebuild<'a>(&mut self, ranges: impl Iterator<Item = &'a (std::sync::Arc<X>, u64, u64)>, frame: u64) -> u32
+    where
+        X: 'a,
+    {
+        self.spans.clear();
+        let mut views = 0;
+        for (shadow, from, to) in ranges {
+            views += 1;
+            self.widen(shadow, *from, *to);
+        }
+        self.valid = true;
+        self.loose = false;
+        self.last_compact = frame;
+        views
+    }
+}
+
 #[cfg(test)]
 mod heap_range_tests {
-    use super::{HEAP_ROUND, HeapRanges};
+    use super::{HEAP_ROUND, HeapRanges, SpanPlan};
 
     /// Round by round every slot is looked at again once, whatever was
     /// written between, and what a slot holds is what was found last.
@@ -902,6 +1001,37 @@ mod heap_range_tests {
             best(&mut || join::<std::hash::BuildHasherDefault<crate::host::AddressHash>>(&mut slots.ranges())),
         );
     }
+
+    /// A span plan covers every view's range through views that come, move
+    /// and go, and its rebuild covers exactly the views.
+    #[test]
+    fn a_span_plan_covers_its_views_and_rebuilds_exactly() {
+        use std::sync::Arc;
+        fn set(ranges: &mut HeapRanges<Arc<u8>>, plan: &mut SpanPlan<Arc<u8>>, slot: u32, range: Option<(Arc<u8>, u64, u64)>) {
+            plan.moved(ranges.get(slot), range.as_ref());
+            ranges.set(slot, range);
+        }
+        fn covered(ranges: &HeapRanges<Arc<u8>>, plan: &SpanPlan<Arc<u8>>) {
+            for (shadow, from, to) in ranges.ranges() {
+                let span = plan.spans.get(&(Arc::as_ptr(shadow) as usize)).expect("a view's copy has a span");
+                assert!(span.1 <= *from && *to <= span.2, "view {from}..{to} outside its span {}..{}", span.1, span.2);
+            }
+        }
+        let (a, b) = (Arc::new(1u8), Arc::new(2u8));
+        let (ka, kb) = (Arc::as_ptr(&a) as usize, Arc::as_ptr(&b) as usize);
+        let (mut ranges, mut plan) = (HeapRanges(Vec::new()), SpanPlan::default());
+        set(&mut ranges, &mut plan, 0, Some((a.clone(), 0, 16)));
+        set(&mut ranges, &mut plan, 1, Some((a.clone(), 16, 32)));
+        set(&mut ranges, &mut plan, 2, Some((b.clone(), 100, 120)));
+        covered(&ranges, &plan);
+        set(&mut ranges, &mut plan, 0, None);
+        covered(&ranges, &plan);
+        set(&mut ranges, &mut plan, 1, Some((a.clone(), 8, 40)));
+        covered(&ranges, &plan);
+        assert_eq!(plan.rebuild(ranges.ranges(), 1), 2);
+        assert_eq!((plan.spans[&ka].1, plan.spans[&ka].2), (8, 40));
+        assert_eq!((plan.spans[&kb].1, plan.spans[&kb].2), (100, 120));
+    }
 }
 
 /// Textures brought up to date for shaders that pick them by index
@@ -917,6 +1047,29 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 /// Frames after a whole upload of a texture picked by index at which its
 /// memory is looked at again, each counted from the look before.
 const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
+
+/// Whether a slot found changed in place without a notice keeps the longest
+/// wait of [`RECHECK_FRAMES`] after its schedule ended, as the slots
+/// [`recheck_forever`] keeps do (`VICTORY_HEAP_RECHECK_PERSISTENT=1`; off by
+/// default: out of the queue after the fifth look, as before).
+fn persistent_heap_recheck() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("VICTORY_HEAP_RECHECK_PERSISTENT").is_some_and(|v| v == "1"));
+    *ON
+}
+
+/// The wait of the next look at an uploaded texture after `unchanged_looks`
+/// looks that found it unchanged, with that look's count. After the last
+/// wait of [`RECHECK_FRAMES`] there is none, unless `keep_longest`: then the
+/// longest wait again.
+fn next_texture_recheck(unchanged_looks: u8, keep_longest: bool) -> Option<(u8, u64)> {
+    let next = usize::from(unchanged_looks) + 1;
+    if let Some(&wait) = RECHECK_FRAMES.get(next) {
+        Some((next as u8, wait))
+    } else {
+        keep_longest.then_some((unchanged_looks, RECHECK_FRAMES[RECHECK_FRAMES.len() - 1]))
+    }
+}
 
 /// Whether a slot stays on the longest wait of [`RECHECK_FRAMES`] after the
 /// schedule ended, for as long as it lives (`VICTORY_HEAP_RECHECK_FOREVER=1`;
@@ -1277,16 +1430,19 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     // released resource goes stale without a write, and a slot written
     // before its memory had a host copy is only made then.
     let mut kept = host.buffer_sweep.lock().unwrap_or_else(|e| e.into_inner());
-    let BufferSweep { passes, ranges, unwatched } = &mut *kept;
+    let BufferSweep { passes, ranges, unwatched, plan } = &mut *kept;
+    let reuse = plan_reuse();
     let changed = host.buffer_changes();
     let all = *passes == 0 || (*passes % HEAP_ROUND == 0 && !heap_spread());
     let slots = if all {
         ranges.0.clear();
+        plan.clear();
         host.buffer_slots()
     } else if heap_spread() {
         // The written ones, and this pass's part of the others.
         let (part, parts) = ((*passes % HEAP_ROUND) as u32, HEAP_ROUND as u32);
         ranges.forget_part(part, parts);
+        plan.loosen();
         let mut slots = host.buffer_slots_of::<{ HEAP_ROUND as u32 }>(part);
         slots.extend(changed);
         slots
@@ -1356,23 +1512,30 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
             }
             range
         });
+        if reuse {
+            plan.moved(ranges.get(index), range.as_ref());
+        }
         ranges.set(index, range);
     }
     if crate::picked::on() {
         crate::picked::shown(unordered, all);
     }
-    #[cfg(feature = "diagnostics")]
     let looked = std::time::Instant::now();
-    // Per host copy, the span its picked views cover.
-    let mut spans: crate::host::ByCopy<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> = Default::default();
-    let mut views = 0u32;
-    for (shadow, from, to) in ranges.ranges() {
-        views += 1;
-        let key = std::sync::Arc::as_ptr(shadow) as usize;
-        let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
-        span.1 = span.1.min(*from);
-        span.2 = span.2.max(*to);
-    }
+    // Per host copy, the span its picked views cover: merged afresh, or kept
+    // from the passes before (`VICTORY_PLAN_REUSE=1`).
+    let mut fresh = SpanPlan::default();
+    let (plan, views) = if reuse {
+        if !plan.valid || (plan.loose && frame >= plan.last_compact + PLAN_COMPACT_FRAMES) {
+            plan.rebuild(ranges.ranges(), frame);
+            PLAN_SPANS[1].fetch_add(1, Ordering::Relaxed);
+        }
+        PLAN_SPANS[0].fetch_add(1, Ordering::Relaxed);
+        (plan, ranges.ranges().count() as u32)
+    } else {
+        let views = fresh.rebuild(ranges.ranges(), frame);
+        (&mut fresh, views)
+    };
+    let spans = &plan.spans;
     let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
     // Memory that is not write-watched is copied whole by every refresh.
     // It was once refreshed only every 120 frames (unmapped pages read
@@ -1400,15 +1563,17 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         }
         found.push((shadow.clone(), *from, (*to).min(*from + shadow.left(*from))));
     }
+    let copies = spans.len();
     *unwatched = next_unwatched;
     drop(kept);
-    #[cfg(feature = "diagnostics")]
     let refreshed = std::time::Instant::now();
     crate::watch::look_at_holes();
     #[cfg(feature = "diagnostics")]
     for (sum, time) in HEAP_SPLIT.iter().zip([looked - started, refreshed - looked]) {
         sum.fetch_add(time.as_nanos() as u64, Ordering::Relaxed);
     }
+    HEAP_SPLIT_US[0].fetch_add((looked - started).as_micros() as u64, Ordering::Relaxed);
+    HEAP_SPLIT_US[1].fetch_add((refreshed - looked).as_micros() as u64, Ordering::Relaxed);
     static LOGGED: AtomicU64 = AtomicU64::new(0);
     // The first pass and every growth of the set by half.
     let seen = LOGGED.load(Ordering::Relaxed);
@@ -1417,7 +1582,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         tracing::info!(
             slots = slots.len(),
             views,
-            copies = spans.len(),
+            copies,
             mb = bytes >> 20,
             ms = started.elapsed().as_millis(),
             "buffer views of the heap made ready for shaders that pick them by index"
@@ -2565,11 +2730,11 @@ impl State {
                 shadow.refresh(list, from, to - from);
             }
         }
-        #[cfg(feature = "diagnostics")]
         let refreshed = std::time::Instant::now();
         stage.next("the heap pass: textures");
         self.heap_textures(list, heap, host);
         stage.end();
+        HEAP_SPLIT_US[2].fetch_add(refreshed.elapsed().as_micros() as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         HEAP_SPLIT[2].fetch_add(refreshed.elapsed().as_nanos() as u64, Ordering::Relaxed);
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
@@ -2899,6 +3064,7 @@ impl State {
         let began = std::time::Instant::now();
         BAKE_SERVED.store(0, Ordering::Relaxed);
         let mut served = true;
+        let _held = crate::list::HoldReads::new(list);
         for (index, write) in due {
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
                 served = false;
@@ -2933,7 +3099,9 @@ impl State {
             // (all their blocks are shown at other addresses too), and each
             // was shown four frames late, over and over.
             let mut again_in = RECHECK_FRAMES[0];
-            if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
+            let mut changed_in_place = false;
+            if let Some(mut checked) = host.texture_slot_checked(index, write) {
+                let TextureRecheck { address: at, bytes: len, fingerprint, unchanged_looks, uploaded, .. } = checked;
                 // A whole look reads all of the texture: this frame's bytes
                 // bound how many; the slots over it stay due for a later
                 // pass, which reads them once the next frame has begun.
@@ -2946,27 +3114,22 @@ impl State {
                     HEAP_TEXTURES_FULL_RECHECK[0].fetch_add(1, Ordering::Relaxed);
                     HEAP_TEXTURES_FULL_RECHECK[1].fetch_add(len, Ordering::Relaxed);
                 }
-                if recheck_fingerprint(at, len) == print {
+                if recheck_fingerprint(at, len) == fingerprint {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
-                    match RECHECK_FRAMES.get(usize::from(looks) + 1) {
-                        Some(wait) => {
-                            host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
+                    let keep_longest = recheck_forever() || (checked.changed_in_place && persistent_heap_recheck());
+                    match next_texture_recheck(unchanged_looks, keep_longest) {
+                        Some((looks, wait)) => {
+                            checked.unchanged_looks = looks;
+                            host.texture_slot_recheck(index, write, frame + wait, checked);
                         }
-                        // The schedule has ended: the slot stays on its
-                        // longest wait (`recheck_forever`).
-                        None if recheck_forever() => host.texture_slot_recheck(
-                            index,
-                            write,
-                            frame + RECHECK_FRAMES[RECHECK_FRAMES.len() - 1],
-                            (at, len),
-                            print,
-                            looks,
-                            uploaded,
-                        ),
+                        // The schedule has ended: the slot stays on its longest
+                        // wait if kept (`recheck_forever`, or
+                        // `VICTORY_HEAP_RECHECK_PERSISTENT` for one changed in place).
                         None => host.texture_slot_done(index, write, None),
                     }
                     continue;
                 }
+                changed_in_place = true;
                 if recheck_soon() {
                     again_in = 1;
                 }
@@ -2986,12 +3149,27 @@ impl State {
                         address = format_args!("{at:#x}"),
                         bytes = len,
                         frames_after_upload = frame.saturating_sub(uploaded),
-                        looks,
+                        looks = unchanged_looks,
                         changed = n + 1,
                         "a texture picked by index changed after its upload with nothing to tell of it: uploaded again"
                     );
                 }
             }
+            let schedule_recheck = |address, bytes| {
+                host.texture_slot_recheck(
+                    index,
+                    write,
+                    frame + again_in,
+                    TextureRecheck {
+                        address,
+                        bytes,
+                        fingerprint: recheck_fingerprint(address, bytes),
+                        unchanged_looks: 0,
+                        uploaded: frame,
+                        changed_in_place,
+                    },
+                );
+            };
             let mut partly = None;
             let mut there = None;
             if let Some(View::Placed(false, resource, desc)) = heap.handle(index).and_then(crate::descriptor::view) {
@@ -3089,9 +3267,11 @@ impl State {
                 && !baking
                 && crate::descriptor::host::show_after()
                 && heap.handle(index).is_some_and(|handle| !host.texture_slot_made_from(index, handle));
+            let mirroring = std::time::Instant::now();
             let view = heap.handle(index).and_then(|handle| {
                 if shows_other || late { crate::descriptor::view(handle) } else { host.mirror(index, handle, true) }
             });
+            HEAP_SPLIT_US[3].fetch_add(mirroring.elapsed().as_micros() as u64, Ordering::Relaxed);
             let at_once = || {
                 if late && let Some(handle) = heap.handle(index) {
                     let _ = host.mirror(index, handle, true);
@@ -3140,10 +3320,7 @@ impl State {
                 let again = partly.map(|mapped| (frame + 1, mapped));
                 let memory = if again.is_none() && heap_recheck() { crate::texture::title_span(resource, first) } else { None };
                 match memory {
-                    Some((at, len)) => {
-                        let print = recheck_fingerprint(at, len);
-                        host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
-                    }
+                    Some((at, len)) => schedule_recheck(at, len),
                     None => host.texture_slot_done(index, write, again),
                 }
                 continue;
@@ -3175,7 +3352,9 @@ impl State {
                 let _ = crate::residency::take_staging_deferred();
                 #[cfg(feature = "diagnostics")]
                 NOW_PIPELINE.with(|p| p.set(self.pipeline as usize));
+                let readable_since = std::time::Instant::now();
                 readable(list, sampled.kind, view);
+                HEAP_SPLIT_US[4].fetch_add(readable_since.elapsed().as_micros() as u64, Ordering::Relaxed);
                 crate::texture::PICKING.set(None);
             }
             // A staging buffer refused or put off (`crate::residency`) leaves
@@ -3267,10 +3446,7 @@ impl State {
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
             match memory {
                 // Whole and uploaded: looked at again (see above).
-                Some((at, len)) => {
-                    let print = recheck_fingerprint(at, len);
-                    host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
-                }
+                Some((at, len)) => schedule_recheck(at, len),
                 None => host.texture_slot_done(index, write, again),
             }
         }
@@ -5740,7 +5916,19 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::staging_budget_per_frame;
+    use super::{next_texture_recheck, staging_budget_per_frame};
+
+    #[test]
+    fn keeping_the_final_recheck_interval_is_asked_for() {
+        for keep in [false, true] {
+            assert_eq!(next_texture_recheck(0, keep), Some((1, 12)));
+            assert_eq!(next_texture_recheck(1, keep), Some((2, 40)));
+            assert_eq!(next_texture_recheck(2, keep), Some((3, 120)));
+            assert_eq!(next_texture_recheck(3, keep), Some((4, 400)));
+        }
+        assert_eq!(next_texture_recheck(4, false), None);
+        assert_eq!(next_texture_recheck(4, true), Some((4, 400)));
+    }
 
     /// A look that reads the whole texture sees a square written between
     /// the three windows the short look reads; both find memory left alone
