@@ -117,16 +117,27 @@ pub(crate) fn back(address: usize, bytes: u64) {
     }
 }
 
-/// With the frame-rate line: MB per frame by kind since the last, and the
-/// title memory noted of each kind.
-pub(crate) fn log(frames: f64) {
+/// MB per frame, by kind, copied up and copied back.
+pub(crate) type Sample = Option<([f64; KINDS], [f64; KINDS])>;
+
+/// Takes the counters as the frame-rate line takes its own (every second,
+/// over the same frames), so that the line printed beside it matches it.
+pub(crate) fn take(frames: f64) -> Sample {
     if !on() {
-        return;
+        return None;
     }
     let take = |a: &[AtomicU64; KINDS]| -> [f64; KINDS] {
         std::array::from_fn(|i| a[i].swap(0, Ordering::Relaxed) as f64 / 1e6 / frames.max(1.0))
     };
-    let (up, back) = (take(&UP), take(&BACK));
+    Some((take(&UP), take(&BACK)))
+}
+
+/// With the frame-rate line: what [`take`] took, and the title memory
+/// noted of each kind.
+pub(crate) fn log(sample: Sample) {
+    let Some((up, back)) = sample else {
+        return;
+    };
     let mut noted = [0u64; KINDS];
     for (start, (end, k)) in ranges().read().unwrap_or_else(|e| e.into_inner()).iter() {
         noted[*k as usize] += (end - start) as u64;

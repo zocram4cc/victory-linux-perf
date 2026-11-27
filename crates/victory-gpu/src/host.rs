@@ -5050,7 +5050,7 @@ impl Host {
                     // them; the copy into it has run, and the next waits
                     // for this call.
                     let landed = unsafe { run[0].0.land_card(&addressed, after, &mut notes) };
-                    crate::wc::back(run[0].1, landed);
+                    crate::wc::back(run[0].0.span().0 as usize + run[0].1, landed);
                     put.fetch_add(landed, Ordering::Relaxed);
                 }
                 notes.flush();
@@ -5070,7 +5070,7 @@ impl Host {
                 let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
                 let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
                 shadow.walls_merged(gpu.len(), merged);
-                crate::wc::back(*lo, merged as u64);
+                crate::wc::back(shadow.span().0 as usize + *lo, merged as u64);
                 written += merged as u64;
             }
         }
@@ -9373,6 +9373,7 @@ impl Meter {
             let [back_ms, back_mb] = [0, 1].map(|i| {
                 COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
             });
+            let wc_sample = crate::wc::take(frames);
             let dropped = crate::draw::take_dropped() as f64 / frames;
             let indirect = crate::list::take_indirect() as f64 / frames;
             let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
@@ -9549,7 +9550,7 @@ impl Meter {
                         per_frame(6) / 1e3
                     );
                 }
-                crate::wc::log(frames);
+                crate::wc::log(wc_sample);
                 tracing::info!(
                     "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                      {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
