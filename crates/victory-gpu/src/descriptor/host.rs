@@ -7291,7 +7291,7 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         heap.raw_at(raw, &buffer, 0, 1024);
         assert_eq!(heap.kept_in(raw).as_ref(), Some(&buffer));
         assert_eq!(reclaim_dynamic(), requested && staged(false, 0).is_some());
-        heap.release_many(&[(first, 1), (raw, 1)], true);
+        heap.release_many(heap.id, &[(first, 1), (raw, 1)], true);
         assert_eq!(heap.kept_in(first).is_none(), reclaim_dynamic(), "a texture SRV is nulled on release only when reclaimed");
         assert_eq!(heap.kept_in(raw).is_none(), reclaim_dynamic(), "a raw SRV is nulled on release only when reclaimed");
         let release: extern "system" fn(crate::object::This) -> u32 = crate::object::slot(texture, 16);
