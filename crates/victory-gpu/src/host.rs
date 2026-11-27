@@ -3255,11 +3255,46 @@ fn joins_asked() -> (usize, usize) {
     static MOST: OnceLock<(usize, usize)> = OnceLock::new();
     let of = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<usize>().ok());
     let (parts, lists) = *MOST.get_or_init(|| (of("VICTORY_JOIN_PARTS").unwrap_or(1).max(1), of("VICTORY_JOIN_LISTS").unwrap_or(48).max(1)));
+    // Only in frames of the world, if asked for ([`join_from_draws`]).
+    if join_from_draws().is_some_and(|least| FRAME_DRAWS.load(Ordering::Relaxed) < least) {
+        return (1, lists);
+    }
     #[cfg(feature = "diagnostics")]
     if let Some(on) = crate::ab::pick("VICTORY_JOIN_PARTS") {
         return (if on { 8 } else { 1 }, lists);
     }
     (parts, lists)
+}
+
+/// `VICTORY_JOIN_PARTS_DRAWS=<n>` (read here; unset: parts are joined whatever
+/// the frame is): parts are joined only after a frame that ran `n` draws or
+/// more.
+///
+/// A frame of the title's opening videos has a dozen draws and three
+/// submissions, two of them joined to the one before; joined, the videos show
+/// three new pictures and then the same three again, under Wine at least
+/// (docs/linux-wine.md, "The intro videos go forwards and back"; why is not
+/// known). `VICTORY_JOIN_PARTS=1` puts that right and costs the world's
+/// frames, which are each a new picture joined, what the joining gains
+/// there: 6 ms of the submitting thread's 30 a frame with every title
+/// buffer's copy in the card's memory (runs 61 and 64). With this the videos'
+/// and the menus' frames go part by part and the world's joined.
+fn join_from_draws() -> Option<u64> {
+    static LEAST: OnceLock<Option<u64>> = OnceLock::new();
+    *LEAST.get_or_init(|| std::env::var("VICTORY_JOIN_PARTS_DRAWS").ok().and_then(|v| v.trim().parse::<u64>().ok()))
+}
+
+/// The draws the frame presented last ran on the host ([`frame_drew`]); none
+/// until a frame was presented.
+static FRAME_DRAWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A frame is presented; `total` is `crate::draw::drawn` now. (The draws of a
+/// frame are counted as its lists are translated, which may run on into the
+/// frame after: near enough to tell a frame of the world from a video's.)
+pub(crate) fn frame_drew(total: u64) {
+    static BEFORE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let before = BEFORE.swap(total, Ordering::Relaxed);
+    FRAME_DRAWS.store(total.saturating_sub(before), Ordering::Relaxed);
 }
 
 /// Whether the part `next` can be prepared together with `ahead`, which goes

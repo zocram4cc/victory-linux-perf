@@ -944,6 +944,9 @@ extern "system" fn present(
         release_held(forces());
     }
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    // (For `VICTORY_JOIN_PARTS_DRAWS`: how many draws this frame ran.)
+    #[cfg(windows)]
+    crate::host::frame_drew(crate::draw::drawn());
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]
