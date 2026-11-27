@@ -515,7 +515,94 @@ fn bury(finished: u64) {
         }
         retired.drain(..n).collect()
     };
-    drop(done);
+    if bury_aside_on() {
+        bury_aside(done);
+    } else {
+        drop(done);
+    }
+}
+
+/// Whether what [`bury`] lets go is dropped by a thread of its own, in the
+/// order let go (`VICTORY_BURY_ASIDE=1`; off by default: by the caller).
+/// From olivertgwalton/victory-rx6600 91c7ba8. The caller is often the
+/// thread that lands flights: there, releasing host objects took 7.3 ms a
+/// frame between two landings in the source fork's run (landing in all
+/// 12.3 -> 5.3 ms), and the title hears that the card is done only from
+/// the next landing.
+///
+/// Why later is safe: what comes here has already waited for every
+/// submission that may name it and [`bury_lag`] more. Dropping it later
+/// still, on another thread, can only hold memory a little longer. The
+/// objects are D3D12 objects and the wrappers holding them (host copies,
+/// host textures), whose drops take only locks and atomics of their own
+/// (pools, byte counts): no thread-bound state. What the aside thread owns
+/// is only what it was sent, and it drops each batch whole, in order. If
+/// the thread cannot be made, or is gone, the caller drops the batch as
+/// before. What changes: memory and the retiring byte counts
+/// (`RETIRING_TEXTURE_BYTES`) go down a moment after `bury` returns, not
+/// when it does.
+fn bury_aside_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BURY_ASIDE").is_some_and(|v| v == "1"))
+}
+
+/// [`bury_aside_on`]: `done` goes to the thread that drops what is sent to
+/// it, in order; dropped here if there is no such thread.
+fn bury_aside<T: Send + 'static>(done: T) {
+    static TO: OnceLock<Option<std::sync::mpsc::Sender<Box<dyn Send>>>> = OnceLock::new();
+    let to = TO.get_or_init(|| {
+        let (to, from) = std::sync::mpsc::channel::<Box<dyn Send>>();
+        std::thread::Builder::new()
+            .name("victory-bury".into())
+            .spawn(move || {
+                // Each batch is dropped as it comes; the loop ends with the
+                // process.
+                for batch in from {
+                    drop(batch);
+                }
+            })
+            .ok()
+            .map(|_| to)
+    });
+    let done: Box<dyn Send> = Box::new(done);
+    match to {
+        Some(to) => {
+            if let Err(back) = to.send(done) {
+                drop(back.0);
+            }
+        }
+        None => drop(done),
+    }
+}
+
+#[cfg(test)]
+mod bury_aside_tests {
+    use std::sync::{Arc, Mutex};
+
+    /// Records the thread that dropped it, in order.
+    struct Mark(usize, Arc<Mutex<Vec<(usize, std::thread::ThreadId)>>>);
+    impl Drop for Mark {
+        fn drop(&mut self) {
+            self.1.lock().unwrap().push((self.0, std::thread::current().id()));
+        }
+    }
+
+    /// What is sent aside is dropped, by another thread, every batch whole
+    /// and in the order sent.
+    #[test]
+    fn batches_are_dropped_aside_in_order() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        for batch in 0..20usize {
+            super::bury_aside((0..5).map(|i| Mark(batch * 5 + i, seen.clone())).collect::<Vec<_>>());
+        }
+        let began = std::time::Instant::now();
+        while seen.lock().unwrap().len() < 100 && began.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::yield_now();
+        }
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.iter().map(|s| s.0).collect::<Vec<_>>(), (0..100).collect::<Vec<_>>());
+        assert!(seen.iter().all(|s| s.1 != std::thread::current().id()));
+    }
 }
 
 /// Objects [`retire`] dropped at once (no submission was running) and
