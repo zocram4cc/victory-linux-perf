@@ -1217,6 +1217,7 @@ mod host {
                     // SAFETY: plain queries.
                     .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
                     .collect();
+                record(&held);
                 down.extend(held);
             }
             down.into_iter()
@@ -1241,15 +1242,79 @@ mod host {
         }
     }
 
+    /// The clock of [`scripted`] and [`record`]: from the first time input
+    /// is read.
+    fn input_clock() -> Instant {
+        static START: LazyLock<Instant> = LazyLock::new(Instant::now);
+        *START
+    }
+
+    /// The name `VICTORY_KEYS` has for a virtual key, if it has one.
+    fn key_name(vk: u8) -> Option<String> {
+        Some(match vk {
+            0x0D => "Enter".into(),
+            0x1B => "Esc".into(),
+            0x09 => "Tab".into(),
+            0x08 => "Back".into(),
+            0x26 => "Up".into(),
+            0x28 => "Down".into(),
+            0x25 => "Left".into(),
+            0x27 => "Right".into(),
+            0x20 => "Space".into(),
+            0xA0 => "Shift".into(),
+            0xA2 => "Ctrl".into(),
+            b'0'..=b'9' | b'A'..=b'Z' => char::from(vk).to_string(),
+            _ => return None,
+        })
+    }
+
+    /// Debugging aid: `VICTORY_KEYS_RECORD=<file>` writes the keys a player
+    /// holds (with the title's window in front) as `VICTORY_KEYS` entries,
+    /// one a line, `<from>-<to>:<key>` on the clock [`scripted`] plays them
+    /// back by: a session played once can be run again as a script.
+    fn record(held: &[u8]) {
+        use std::io::Write;
+        static FILE: LazyLock<Option<Mutex<(std::fs::File, Vec<(u8, Duration)>)>>> = LazyLock::new(|| {
+            let path = std::env::var_os("VICTORY_KEYS_RECORD")?;
+            let file = std::fs::OpenOptions::new().create(true).append(true).open(path).ok()?;
+            Some(Mutex::new((file, Vec::new())))
+        });
+        let Some(state) = &*FILE else { return };
+        let now = input_clock().elapsed();
+        let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+        let (file, down) = &mut *state;
+        let mut released = Vec::new();
+        down.retain(|&(vk, from)| {
+            let still = held.contains(&vk);
+            if !still {
+                released.push((vk, from));
+            }
+            still
+        });
+        for (vk, from) in released {
+            if let Some(name) = key_name(vk) {
+                let _ = writeln!(file, "{:.2}-{:.2}:{name}", from.as_secs_f64(), now.as_secs_f64().max(from.as_secs_f64() + 0.05));
+                let _ = file.flush();
+            }
+        }
+        for &vk in held {
+            if !down.iter().any(|&(k, _)| k == vk) {
+                down.push((vk, now));
+            }
+        }
+    }
+
     /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
     /// 0.2 s that long after input starts (`<from>-<to>:<key>`: all that
     /// time), with or without focus. A key is a
     /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
-    /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
+    /// `Left`, `Right`, `Space`, `Shift`, `Ctrl` (the stand-in pad's table
+    /// maps them to buttons). Entries may be separated by new lines too
+    /// ([`record`] writes them so).
     fn scripted() -> Vec<u8> {
         static SCRIPT: LazyLock<(Instant, Vec<(Duration, Duration, u8)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
-            let keys = list.split(',').filter_map(|entry| {
+            let keys = list.split([',', '\n']).filter_map(|entry| {
                 let (at, key) = entry.split_once(':')?;
                 let vk = match key.trim() {
                     "Enter" => 0x0D,
@@ -1260,6 +1325,9 @@ mod host {
                     "Down" => 0x28,
                     "Left" => 0x25,
                     "Right" => 0x27,
+                    "Space" => 0x20,
+                    "Shift" => 0xA0,
+                    "Ctrl" => 0xA2,
                     k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
                         k.as_bytes()[0].to_ascii_uppercase()
                     }
@@ -1272,7 +1340,7 @@ mod host {
                 };
                 Some((from, to, vk))
             });
-            (Instant::now(), keys.collect())
+            (input_clock(), keys.collect())
         });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
