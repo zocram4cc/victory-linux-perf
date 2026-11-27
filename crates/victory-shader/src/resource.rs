@@ -975,10 +975,22 @@ impl<'a> Tracer<'a> {
                 dynamic2: second,
             });
         }
-        let reg = self.inputs[base.0 as usize].ok_or("an address not from a root parameter")?;
-        let (param, _) = self
-            .param_of(reg)
-            .ok_or("an address not from a root parameter")?;
+        let why = std::env::var_os("VICTORY_WHY_ADDRESS").is_some();
+        let Some(reg) = self.inputs[base.0 as usize] else {
+            if why {
+                eprintln!(
+                    "WHY-ADDRESS base made by {}",
+                    self.def(base).map_or("?".to_owned(), |i| i.name().to_owned())
+                );
+            }
+            return Err("an address not from a root parameter");
+        };
+        let Some((param, _)) = self.param_of(reg) else {
+            if why {
+                eprintln!("WHY-ADDRESS input register {reg:?} is no root parameter's");
+            }
+            return Err("an address not from a root parameter");
+        };
         let high = match self.layout[param].root {
             RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap => None,
             RootType::Descriptor => {
@@ -1084,7 +1096,25 @@ impl<'a> Tracer<'a> {
         match self.def(v).map(|i| i.name()) {
             Some(n) if n.starts_with("s_load_") => "an address loaded from memory",
             None => "an address from a phi",
-            _ => "an address not from a root parameter",
+            _ => {
+                if std::env::var_os("VICTORY_WHY_ADDRESS").is_some() {
+                    let inst = self.def(v);
+                    let leaves: Vec<String> = self
+                        .leaves(v)
+                        .map(|l| match (self.def(l), self.inputs[l.0 as usize]) {
+                            (_, Some(r)) => format!("input {r:?}"),
+                            (Some(i), None) => i.name().to_owned(),
+                            (None, None) => "phi".to_owned(),
+                        })
+                        .collect();
+                    eprintln!(
+                        "WHY-ADDRESS made by {} from leaves [{}]",
+                        inst.map_or("?", |i| i.name()),
+                        leaves.join(", ")
+                    );
+                }
+                "an address not from a root parameter"
+            }
         }
     }
 
