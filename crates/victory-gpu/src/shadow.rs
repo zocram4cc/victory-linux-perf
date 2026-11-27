@@ -724,6 +724,25 @@ pub(crate) fn stale_pages(most: usize, say: &mut dyn FnMut(&Shadow, usize, usize
 /// Copies of memory (from, to, bytes: apart), on several threads if they are
 /// many.
 pub(crate) fn copy_all(copies: Vec<(usize, usize, usize)>) {
+    // (V2, `VICTORY_SOFT_VIEWS`) Title memory in views the runtime keeps in
+    // its books alone is read from its pages ([`crate::host::read_into`]);
+    // the rest as before.
+    let copies: Vec<(usize, usize, usize)> = if copies.iter().any(|&(src, _, len)| crate::watch::soft_any(src, len)) {
+        copies
+            .into_iter()
+            .filter(|&(src, dst, len)| {
+                if !crate::watch::soft_any(src, len) {
+                    return true;
+                }
+                // SAFETY: the caller's destination range.
+                let to = unsafe { std::slice::from_raw_parts_mut(dst as *mut u8, len) };
+                // (Not read whole: as before, a fault our handler takes.)
+                !crate::host::read_into(src as *const u8, to)
+            })
+            .collect()
+    } else {
+        copies
+    };
     let bytes: usize = copies.iter().map(|c| c.2).sum();
     if bytes > 4 << 20 {
         wide(copy_jobs(copies));

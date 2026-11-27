@@ -16,7 +16,7 @@ use std::time::Duration;
 use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
 use windows_sys::Win32::UI::WindowsAndMessaging::{self as wm, HMENU};
-use windows_sys::core::{PCSTR, PCWSTR, w};
+use windows_sys::core::{PCSTR, PCWSTR, s, w};
 
 use crate::{HleModule, hle_export};
 
@@ -111,7 +111,12 @@ pub extern "system" fn CreateWindowExW(
     param: *const c_void,
 ) -> HWND {
     let (x, y, width, height) = fit(parent, x, y, width, height);
-    // SAFETY: the title's own arguments, forwarded (the size fitted).
+    // A top-level window is made with our text, the caption's first field
+    // (`victory_gpu::shell::caption_for`): the game's name is not shown
+    // before the first frame-rate line either.
+    let name = if parent.is_null() { w!("RYUKI") } else { name };
+    // SAFETY: the title's own arguments, forwarded (the size fitted, a
+    // top-level window's text ours).
     let hwnd = unsafe {
         wm::CreateWindowExW(
             ex_style, class, name, style, x, y, width, height, parent, menu, instance, param,
@@ -137,7 +142,12 @@ pub extern "system" fn CreateWindowExA(
     param: *const c_void,
 ) -> HWND {
     let (x, y, width, height) = fit(parent, x, y, width, height);
-    // SAFETY: the title's own arguments, forwarded (the size fitted).
+    // A top-level window is made with our text, the caption's first field
+    // (`victory_gpu::shell::caption_for`): the game's name is not shown
+    // before the first frame-rate line either.
+    let name = if parent.is_null() { s!("RYUKI") } else { name };
+    // SAFETY: the title's own arguments, forwarded (the size fitted, a
+    // top-level window's text ours).
     let hwnd = unsafe {
         wm::CreateWindowExA(
             ex_style, class, name, style, x, y, width, height, parent, menu, instance, param,

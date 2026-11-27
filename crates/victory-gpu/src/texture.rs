@@ -1351,7 +1351,12 @@ impl Staging {
             }
             return size;
         }
-        if through_copy() {
+        // (V2, `VICTORY_SOFT_VIEWS`) A texture with pages in views the runtime
+        // keeps in its books alone has no memory to read in place there: its
+        // bytes come from the pages, through the copy ([`with_title`]).
+        // `_mapped` is held: no view becomes one of those before the read
+        // below is done.
+        if through_copy() || crate::watch::soft_any(start, size) {
             return with_title(self.memory, size, |tiled| {
                 let hash = digest(tiled);
                 #[cfg(feature = "diagnostics")]
@@ -1731,7 +1736,12 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
             // SAFETY: plain data the query filled in.
             let valid = asked && unsafe { entry.VirtualAttributes.Flags } & 1 != 0;
             let mut byte = [0u8];
-            if valid || crate::host::read_into(((page + i) * KERNEL_PAGE) as *const u8, &mut byte) {
+            // (V2, `VICTORY_SOFT_VIEWS`) A view in the runtime's books alone is
+            // there, as far as the title goes (its pages are committed).
+            if valid
+                || crate::watch::soft_any((page + i) * KERNEL_PAGE, 1)
+                || crate::host::read_into(((page + i) * KERNEL_PAGE) as *const u8, &mut byte)
+            {
                 there += 1;
             } else if all {
                 return (there, of);
