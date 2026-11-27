@@ -115,33 +115,34 @@ pub(crate) struct Shadow {
 /// them, ahead of its lists (`VICTORY_FLIGHT_HOLD_BACK=1`; off unless asked
 /// for). Bytes of other pieces go up as before.
 ///
-/// The console's order: what the CPU writes before a list is submitted lies
-/// under what that list's shaders write, as the card runs the list later. In
-/// the prison corridor the title writes a 12-byte record into the pre-skinned
-/// vertex buffer every frame after the skinning was submitted; the refresh
-/// of the next submission sent it up over the skinned vertices, after the
-/// skinning had run on the card and before the draws read them (captures:
-/// skinning in lists 9 and 36, the copies in list 45, the draws in 58 to 60):
-/// the stray sheets. Held back, it goes up ahead of the next frame's
-/// skinning, which stores over it as the console's would.
+/// The console's order: what the CPU writes after a list is submitted lies
+/// under what that list's shaders write if the card runs the list later, as
+/// it does there. The title writes a 12-byte record (`ff 03 fe ff 00 f8 ff
+/// 0f 00 3c 00 f8`) into the packed pre-skinned position buffer after the
+/// frame's skinning was submitted; the next refresh sent it up over the
+/// skinned vertices, after the skinning had run on the card and before the
+/// draws read them (captures: skinning in lists 9 and 36 or 42, the copies in
+/// list 45 or 55, the draws in 58 to 70): the stray sheets, and the giant
+/// ones where the record lands on vertices hidden on purpose (all ones),
+/// which it turns into far corners of the encoding's box. Held back, it goes
+/// up ahead of the next skinning, which stores over it. In the seven frames
+/// captured with this on, no character vertex held the record; in eleven
+/// captured without it, 653 to 849 did.
 ///
-/// Bounded: a byte held for [`HOLD_FRAMES`] frames with no submission
-/// declaring writes to it goes up as before (a character that leaves the
-/// view is skinned no more, and the title may give its range to something
-/// the CPU fills). What it can hide: a title write in such a piece that a
-/// shader reads before the next submission that declares writes there.
+/// No bound: a held byte lies in a piece the card wrote, and goes up when a
+/// submission declares writes there (the skinning declares its whole buffer
+/// every frame). What it can hide: a title write in such a piece that a
+/// shader reads before the next submission that declares writes there, or
+/// one in a copy no submission declares writes to again.
 fn hold_back() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_FLIGHT_HOLD_BACK").is_some_and(|v| v == "1"))
 }
 
-/// The copies (by title start) that hold title bytes back ([`hold_back`]).
-static HOLDERS: Mutex<std::collections::BTreeSet<u64>> = Mutex::new(std::collections::BTreeSet::new());
-
 /// [`hold_back`], before a submission's copies go up (after its refreshes,
 /// ahead of the plan of what goes to the card): the held bytes `declared`
 /// (this submission's declared shader writes, by copy) overlaps go up ahead
-/// of its lists, and every copy's bytes held [`HOLD_FRAMES`] frames go up.
+/// of its lists.
 pub(crate) fn release_held_back(declared: &[(Arc<Shadow>, Vec<(usize, usize)>)]) {
     if !hold_back() {
         return;
@@ -149,22 +150,7 @@ pub(crate) fn release_held_back(declared: &[(Arc<Shadow>, Vec<(usize, usize)>)])
     for (shadow, ranges) in declared {
         shadow.release_held(ranges);
     }
-    let holders: Vec<u64> = HOLDERS.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().collect();
-    for start in holders {
-        let shadow = find(start, 1).filter(|s| s.start == start);
-        if let Some(s) = &shadow {
-            s.release_held(&[]);
-        }
-        if shadow.is_none_or(|s| !s.holds_back()) {
-            HOLDERS.lock().unwrap_or_else(|e| e.into_inner()).remove(&start);
-        }
-    }
 }
-
-/// Frames a held byte waits for a submission that declares writes to it. The
-/// skinning runs every frame for the characters in view: a range two frames
-/// without one is no character's being drawn.
-const HOLD_FRAMES: u64 = 2;
 
 /// Whether a landing put shaders' bytes into a piece at `landed` that counts
 /// at frame `now` ([`hold_back`]): this frame or the one before.
@@ -173,73 +159,75 @@ fn landed_lately(landed: Option<u64>, now: u64) -> bool {
 }
 
 /// The title's changed bytes held back by [`hold_back`]: offsets `[from,
-/// to)` of a copy and the frame they were first held in, apart and in order.
+/// to)` of a copy, apart, by where they begin. Adding and taking a range
+/// look at the ranges it meets only (a refresh adds up to some 175,000 runs
+/// a frame).
 #[derive(Default, Debug)]
 pub(crate) struct HeldBack {
-    ranges: Vec<(usize, usize, u64)>,
+    ranges: BTreeMap<usize, usize>,
+    /// Bytes held.
+    total: usize,
 }
 
 impl HeldBack {
-    /// `[from, to)` is held from frame `frame` on (joined with what touches
-    /// it; a joined range keeps the earliest frame).
-    pub(crate) fn add(&mut self, from: usize, to: usize, frame: u64) {
+    /// `[from, to)` is held (joined with what it meets or touches). Returns
+    /// the bytes of it not held before.
+    pub(crate) fn add(&mut self, from: usize, to: usize) -> usize {
         if from >= to {
-            return;
+            return 0;
         }
-        let (mut from, mut to, mut frame) = (from, to, frame);
-        self.ranges.retain(|&(a, b, f)| {
-            if b < from || a > to {
-                return true;
-            }
-            from = from.min(a);
-            to = to.max(b);
-            frame = frame.min(f);
-            false
-        });
-        let at = self.ranges.partition_point(|r| r.0 < from);
-        self.ranges.insert(at, (from, to, frame));
+        let met: Vec<(usize, usize)> =
+            self.ranges.range(..=to).rev().take_while(|&(_, &end)| end >= from).map(|(&a, &b)| (a, b)).collect();
+        let (mut lo, mut hi, mut before) = (from, to, 0);
+        for (a, b) in met {
+            before += b.min(to).saturating_sub(a.max(from));
+            lo = lo.min(a);
+            hi = hi.max(b);
+            self.ranges.remove(&a);
+            self.total -= b - a;
+        }
+        self.ranges.insert(lo, hi);
+        self.total += hi - lo;
+        (to - from) - before
     }
 
     pub(crate) fn is_empty(&self) -> bool {
         self.ranges.is_empty()
     }
 
-    /// What is to go up now: the parts of held ranges that `declared` (offsets,
-    /// a submission's declared shader writes) overlaps, to go ahead of its
-    /// lists; and whole ranges held since `frame - HOLD_FRAMES` or earlier,
-    /// released by the bound. Both leave the held.
-    pub(crate) fn due(&mut self, declared: &[(usize, usize)], frame: u64) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
-        let (mut ahead, mut released) = (Vec::new(), Vec::new());
-        let mut keep = Vec::with_capacity(self.ranges.len());
-        for (a, b, f) in std::mem::take(&mut self.ranges) {
-            if frame.saturating_sub(f) >= HOLD_FRAMES {
-                released.push((a, b));
+    /// Bytes held.
+    #[cfg(test)]
+    pub(crate) fn bytes(&self) -> usize {
+        self.total
+    }
+
+    /// The parts of held ranges that `declared` (offsets, a submission's
+    /// declared shader writes) overlaps, in order: they go up ahead of its
+    /// lists and leave the held.
+    pub(crate) fn due(&mut self, declared: &[(usize, usize)]) -> Vec<(usize, usize)> {
+        let mut ahead = Vec::new();
+        for &(d, e) in declared {
+            if d >= e {
                 continue;
             }
-            let mut rest = vec![(a, b)];
-            for &(d, e) in declared {
-                let mut next = Vec::new();
-                for (x, y) in rest {
-                    if e <= x || d >= y {
-                        next.push((x, y));
-                        continue;
-                    }
-                    ahead.push((x.max(d), y.min(e)));
-                    if x < d {
-                        next.push((x, d));
-                    }
-                    if e < y {
-                        next.push((e, y));
-                    }
+            let met: Vec<(usize, usize)> =
+                self.ranges.range(..e).rev().take_while(|&(_, &end)| end > d).map(|(&a, &b)| (a, b)).collect();
+            for (a, b) in met {
+                self.ranges.remove(&a);
+                self.total -= b - a;
+                ahead.push((a.max(d), b.min(e)));
+                if a < d {
+                    self.ranges.insert(a, d);
+                    self.total += d - a;
                 }
-                rest = next;
+                if e < b {
+                    self.ranges.insert(e, b);
+                    self.total += b - e;
+                }
             }
-            keep.extend(rest.into_iter().map(|(x, y)| (x, y, f)));
         }
-        keep.sort_unstable();
-        self.ranges = keep;
         ahead.sort_unstable();
-        (ahead, released)
+        ahead
     }
 }
 
@@ -2243,11 +2231,10 @@ pub(crate) mod resent {
         /// Bytes of the title's that took the card's value at a landing
         /// ([`super::card_wins`]).
         pub(crate) won: u64,
-        /// [`super::hold_back`]: title bytes held back, sent ahead of a
-        /// submission that declared writes to them, released by the bound.
+        /// [`super::hold_back`]: title bytes newly held back, and sent ahead
+        /// of a submission that declared writes to them.
         pub(crate) held: u64,
         pub(crate) ahead: u64,
-        pub(crate) released: u64,
     }
 
     impl Resent {
@@ -2262,7 +2249,6 @@ pub(crate) mod resent {
             self.won += o.won;
             self.held += o.held;
             self.ahead += o.ahead;
-            self.released += o.released;
         }
 
         pub(crate) fn is_empty(&self) -> bool {
@@ -2275,8 +2261,7 @@ pub(crate) mod resent {
             format!(
                 "pages sent up {:.1} (title-written {:.1}, landing noted and differing {:.1}; whole {:.1}, as runs {:.1}), \
                  {:.1} KB differing from the card, echo pages left {:.1}, landing pages title memory missed {:.1}, \
-                 card won over title bytes {:.1} KB, held back {:.1} KB, sent ahead of a declaring submission {:.1} KB, \
-                 released by the bound {:.1} KB",
+                 card won over title bytes {:.1} KB, held back {:.1} KB, sent ahead of a declaring submission {:.1} KB",
                 f(self.title + self.landed),
                 f(self.title),
                 f(self.landed),
@@ -2287,8 +2272,7 @@ pub(crate) mod resent {
                 f(self.missed),
                 f(self.won) / 1024.0,
                 f(self.held) / 1024.0,
-                f(self.ahead) / 1024.0,
-                f(self.released) / 1024.0
+                f(self.ahead) / 1024.0
             )
         }
     }
@@ -3251,26 +3235,29 @@ mod landing_tests {
         drop(room);
     }
 
-    /// The bound: what no declaring submission took goes up after
-    /// [`super::HOLD_FRAMES`] frames; declared parts go ahead, the rest waits.
+    /// Held ranges join what they meet, count only bytes not held before,
+    /// and leave by the parts a declaration overlaps; the rest stays held
+    /// with no bound.
     #[test]
-    fn held_bytes_are_released_by_the_bound_and_declared_parts_go_ahead() {
+    fn held_ranges_join_and_leave_by_the_declared_parts() {
         let mut back = super::HeldBack::default();
-        back.add(100, 200, 10);
-        back.add(150, 260, 11);
-        back.add(1000, 1010, 11);
-        assert_eq!(back.ranges, [(100, 260, 10), (1000, 1010, 11)], "joined, with the earliest frame");
-        // Frame 11: a submission declares [180, 220): that part goes ahead.
-        let (ahead, released) = back.due(&[(180, 220)], 11);
-        assert_eq!((ahead, released), (vec![(180, 220)], vec![]));
-        assert_eq!(back.ranges, [(100, 180, 10), (220, 260, 10), (1000, 1010, 11)]);
-        // Frame 12: what was held since frame 10 goes up by the bound.
-        let (ahead, released) = back.due(&[], 12);
-        assert_eq!((ahead, released), (vec![], vec![(100, 180), (220, 260)]));
-        assert_eq!(back.ranges, [(1000, 1010, 11)]);
-        let (_, released) = back.due(&[], 13);
-        assert_eq!(released, [(1000, 1010)]);
-        assert!(back.is_empty());
+        assert_eq!(back.add(100, 200), 100);
+        assert_eq!(back.add(150, 260), 60, "only what was not held");
+        assert_eq!(back.add(260, 270), 10, "touching: joined");
+        assert_eq!(back.add(1000, 1010), 10);
+        assert_eq!(back.add(120, 130), 0);
+        assert_eq!(back.ranges.iter().map(|(&a, &b)| (a, b)).collect::<Vec<_>>(), [(100, 270), (1000, 1010)]);
+        assert_eq!(back.bytes(), 180);
+        // A declaration over the middle of the first and all of the second.
+        assert_eq!(back.due(&[(180, 220), (900, 2000)]), [(180, 220), (1000, 1010)]);
+        assert_eq!(back.ranges.iter().map(|(&a, &b)| (a, b)).collect::<Vec<_>>(), [(100, 180), (220, 270)]);
+        assert_eq!(back.bytes(), 130);
+        // Nothing declared: nothing leaves, however long it waits.
+        assert_eq!(back.due(&[]), []);
+        assert_eq!(back.bytes(), 130);
+        // The whole copy declared (the skinning binds its whole buffer).
+        assert_eq!(back.due(&[(0, usize::MAX)]), [(100, 180), (220, 270)]);
+        assert!(back.is_empty() && back.bytes() == 0);
         assert!(super::landed_lately(Some(5), 6) && !super::landed_lately(Some(5), 7) && !super::landed_lately(None, 5));
     }
 
@@ -4779,8 +4766,8 @@ impl Shadow {
     /// [`hold_back`], before a submission's copies go up: of the title's bytes
     /// held back, those `declared` (title addresses, this submission's
     /// declared shader writes to the copy) overlaps go up now, ahead of its
-    /// lists, and so do those held [`HOLD_FRAMES`] frames. Title memory as it
-    /// is now is taken there (the title may have written again since).
+    /// lists. Title memory as it is now is taken there (the title may have
+    /// written again since).
     pub(crate) fn release_held(&self, declared: &[(usize, usize)]) {
         if self.card.is_none() {
             return;
@@ -4793,43 +4780,42 @@ impl Shadow {
                 (from < to).then_some((from, to))
             })
             .collect();
-        let (ahead, released) = {
+        let ahead = {
             let mut back = self.held_back.lock().unwrap_or_else(|e| e.into_inner());
             if back.is_empty() {
                 return;
             }
-            back.due(&declared, crate::frame::current())
+            back.due(&declared)
         };
-        if ahead.is_empty() && released.is_empty() {
+        if ahead.is_empty() {
             return;
         }
         // The landings are kept out while the CPU's side takes them.
         let _merging = self.merging.write().unwrap_or_else(|e| e.into_inner());
         let mut title = Vec::new();
-        let mut sent = [0u64; 2];
-        for (k, list) in [ahead, released].into_iter().enumerate() {
-            for (from, to) in list {
-                title.clear();
-                title.resize(to - from, 0);
-                if !crate::host::read_into((start + from) as *const u8, &mut title) {
-                    continue;
-                }
-                // SAFETY: inside the mapping of the CPU's side; the landings
-                // are kept out, and the refreshes of this submission are done.
-                let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(from), to - from) };
-                let runs = dword_runs(start + from, held, &title, 0);
-                for &(a, len) in &runs {
-                    held[a..a + len].copy_from_slice(&title[a..a + len]);
-                    self.changed(from + a, from + a + len);
-                }
-                self.card_changed_runs(runs.iter().map(|&(a, len)| (from + a, from + a + len)));
-                sent[k] += runs.iter().map(|r| r.1 as u64).sum::<u64>();
+        let mut sent = 0u64;
+        for (from, to) in ahead {
+            title.clear();
+            title.resize(to - from, 0);
+            if !crate::host::read_into((start + from) as *const u8, &mut title) {
+                continue;
             }
+            // SAFETY: inside the mapping of the CPU's side; the landings are
+            // kept out, and the refreshes of this submission are done.
+            let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(from), to - from) };
+            let runs = dword_runs(start + from, held, &title, 0);
+            for &(a, len) in &runs {
+                held[a..a + len].copy_from_slice(&title[a..a + len]);
+                self.changed(from + a, from + a + len);
+            }
+            self.card_changed_runs(runs.iter().map(|&(a, len)| (from + a, from + a + len)));
+            sent += runs.iter().map(|r| r.1 as u64).sum::<u64>();
         }
-        resent::note(self.start, self.len, resent::Resent { ahead: sent[0], released: sent[1], ..Default::default() });
+        resent::note(self.start, self.len, resent::Resent { ahead: sent, ..Default::default() });
     }
 
     /// Whether title bytes are held back ([`hold_back`]).
+    #[cfg(test)]
     pub(crate) fn holds_back(&self) -> bool {
         !self.held_back.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
@@ -4954,18 +4940,10 @@ impl Shadow {
                         crate::frame::current(),
                     );
                 if held_now {
-                    HOLDERS.lock().unwrap_or_else(|e| e.into_inner()).insert(self.start);
-                    let frame = crate::frame::current();
                     let mut back = self.held_back.lock().unwrap_or_else(|e| e.into_inner());
-                    for &(a, len) in &runs {
-                        back.add(at - start + a, at - start + a + len, frame);
-                    }
+                    let fresh: usize = runs.iter().map(|&(a, len)| back.add(at - start + a, at - start + a + len)).sum();
                     drop(back);
-                    resent::note(
-                        self.start,
-                        self.len,
-                        resent::Resent { held: runs.iter().map(|r| r.1 as u64).sum(), ..Default::default() },
-                    );
+                    resent::note(self.start, self.len, resent::Resent { held: fresh as u64, ..Default::default() });
                     SEND[0].fetch_add(n as u64, Ordering::Relaxed);
                     at += n;
                     continue;
