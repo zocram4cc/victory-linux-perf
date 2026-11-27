@@ -285,16 +285,16 @@ fn unspill(
             _ => None,
         };
         match (inst.name()?, v.dst?, v.src.as_slice()) {
-            // SGPRs and VCC (106/107: a scalar pair like any other; the
+            // SGPRs s0-s105 (s105 was left out: `< 105`) and VCC (106/107: a scalar pair like any other; the
             // console compiler parks it beside the rest, and one such save
             // used to keep the whole VGPR from being unspilled).
             ("v_writelane_b32", Operand::Vector { reg, .. }, [Operand::Scalar { code, .. }, k])
-                if *code < 105 || matches!(*code, VCC | 107) =>
+                if *code <= 105 || matches!(*code, VCC | 107) =>
             {
                 Some((true, reg, *code, lane(k)?))
             }
             ("v_readlane_b32", Operand::Scalar { code, .. }, [Operand::Vector { reg, .. }, k])
-                if code < 105 || matches!(code, VCC | 107) =>
+                if code <= 105 || matches!(code, VCC | 107) =>
             {
                 Some((false, *reg, code, lane(k)?))
             }
@@ -314,6 +314,9 @@ fn unspill(
         let fields = inst.fields(wave64);
         let park = parked(inst, &fields);
         let Ok(effects) = effects(inst, &fields, name, lanes, vgprs) else {
+            if std::env::var_os("VICTORY_WHY_UNSPILL").is_some() {
+                eprintln!("WHY-UNSPILL none: effects unknown for {name}");
+            }
             return Vec::new();
         };
         let mut codes = Vec::new();
@@ -369,6 +372,14 @@ fn unspill(
                 })
         });
         let from = if late { first.unwrap_or(0) } else { parks.len() };
+        if std::env::var_os("VICTORY_WHY_UNSPILL").is_some() && stores[reg] {
+            let first_name = first.and_then(|f| list[f].name()).unwrap_or("-");
+            let other_name = list[last].name().unwrap_or("?");
+            eprintln!(
+                "WHY-UNSPILL v{reg}: other use {other_name} at {last}, first save at {first:?} ({first_name}): {}",
+                if late { "from the first save on" } else { "not parked" }
+            );
+        }
         for park in &mut parks[..from] {
             if of(park).is_some() {
                 *park = None;
