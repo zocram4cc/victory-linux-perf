@@ -2088,6 +2088,10 @@ fn rdna_forms_give_what_the_spelled_out_ones_give() {
         }
     }
     for (name, body, exact) in bodies {
+        if name == "mad_legacy" && super::legacy_fma() {
+            // Fused, it is written the same for every host (`legacy_fmad`).
+            continue;
+        }
         let mut got: Vec<Vec<u32>> = Vec::new();
         let mut written = Vec::new();
         for bits in [0, super::rdna::ALL] {
@@ -2932,4 +2936,41 @@ fn a_format_load_read_as_halves_loads_the_integer() {
         ran += 1;
     }
     assert!(ran > 0, "no SM 6.6 device available");
+}
+
+/// `v_mad_legacy_f32` as RDNA 2 runs it: fused (`v_fma_legacy_f32`), with
+/// flushed subnormal sources and the legacy zero-factor rule. (fxceless
+/// f6a09d3, avatarmanz PR #454.)
+#[test]
+fn legacy_mad_fuses_its_product_and_flushes_its_sources() {
+    if !super::legacy_fma() {
+        eprintln!("VICTORY_LEGACY_FMA=0; skipped");
+        return;
+    }
+    let mad = build_valu_cs(&vop3(0x140, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let cases = [
+        // (1 + 2^-23) * (1 - 2^-23) - 1 is -2^-46 exactly: kept by one
+        // rounding, lost when the product is rounded before the add.
+        [0x3f80_0001, 0x3f7f_fffe, 0xbf80_0000, 0],
+        // A subnormal source flushes to zero: subnormal * 1.0 + 0.0 == 0.0.
+        [0x0000_0001, 0x3f80_0000, 0x0000_0000, 0],
+        // A flushed subnormal factor triggers the legacy zero-factor rule with +inf.
+        [0x0000_0001, 0x7f80_0000, 0x3f80_0000, 0],
+        // A zero factor gives a +0 product even with an infinite factor.
+        [0, 0x7f80_0000, 0x3f80_0000, 0],
+    ];
+    let want = [0xa880_0000u32, 0x0000_0000, 0x3f80_0000, 0x3f80_0000];
+    if Host::new(false).is_err() && Host::new(true).is_err() {
+        eprintln!("no SM 6.6 host or WARP device; skipped");
+        return;
+    }
+    run_cases(&mad, &cases, |backend, i, _, got| {
+        if backend == "warp" && i == 0 {
+            // WARP rounds the product before the add; hardware's single
+            // rounding is the reference for the fused form.
+            eprintln!("{backend}: fused rounding differs on WARP; skipped");
+            return;
+        }
+        assert_eq!(got, want[i], "{backend}: case {i}");
+    });
 }
