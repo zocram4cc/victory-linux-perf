@@ -26,23 +26,25 @@ or publisher.
 | Display | 2560x1440 |
 | Page file | 32 GB initial, 88 GB most |
 
-## Where it stands (2026-11-27)
+## Where it stands (2026-11-28)
 
 Release build, free roam from a fixed save (standing, then walking), pipelines
-built ahead, `scripts\play.ps1 -FrameGen`:
+built ahead, `scripts\play.ps1 -FrameGen`. "Rendered" is what the window's
+caption shows (the title's own frames); "shown" adds the generated ones.
 
 | | Rendered | Shown (frame generation) |
 |---|---|---|
-| Free roam, 6 minutes | median 26.7 fps | **median 51.6 fps, slowest 1 % 37.6, every second at 30 or more** |
-| Free roam, 10 minutes (four list threads) | median 21.3 fps | median 42.6 fps, 99 % of seconds at 30 or more |
+| Free roam, 6 minutes (ten list threads below normal priority, list holds, table memo) | **median 28.8 fps: 30.5 standing, 27.2 walking** | median 47.4 fps, 99.6 % of seconds at 30 or more |
+| The same with six list threads at normal priority (2026-11-27) | median 26.7 fps | median 51.6 fps, slowest 1 % 37.6, every second at 30 or more |
 | The older RYUKI line, no frame generation | 16-17 standing, 14.5-15.6 walking | the same |
 
 - **Frame generation** is AMD's, through its swap chain, fed by the title's own
   FidelityFX upscale. It needs the **Series S profile**: in the Series X profile
   the title has no FidelityFX upscale and nothing is generated. Fast motion
   ghosts: the frames between are guessed from about 25 real ones.
-- About 20 ms of every frame is the title's own CPU work; rendering itself is not
-  at 30 fps yet.
+- Rendering reaches 30 fps standing, not yet walking. A frame waits by turns on
+  the threads that translate the title's command lists, on the card, and on the
+  title's own CPU work (CHANGELOG.md has where the list threads' time goes).
 - The first run after a new build or driver stutters while pipelines are made:
   build them ahead (below).
 
@@ -70,7 +72,7 @@ while it plays):
 ```powershell
 $env:VICTORY_PORT_CONSTANTS='1'; $env:VICTORY_PORT_DESCRIPTORS='1'; $env:VICTORY_PORT_CBV='1'
 $env:VICTORY_PORT_GUARD='1'; $env:VICTORY_PORT_JOURNAL='1'
-targeteleaseictory.exe shaders --jobs 14 <your game folder>
+target\release\victory.exe shaders --jobs 14 <your game folder>
 ```
 
 Then play:
@@ -79,7 +81,7 @@ Then play:
 scripts\play.ps1 -Build release -FrameGen -Exe <your game folder>\<the game's .exe> -FidelityFxDir <FidelityFX SDK>\Kits\FidelityFX\signedbin
 ```
 
-After a first session, `targeteleaseictory.exe warm --jobs 10` (with the same
+After a first session, `target\release\victory.exe warm --jobs 10` (with the same
 port switches set) builds every pipeline the game used, so later sessions start
 smooth.
 
@@ -90,7 +92,7 @@ then `Unblock-File scripts\play.ps1`.
 
 | | |
 |---|---|
-| `-FrameGen` | Series S, renderer ports 1, 2, 5, 6 and 7, the 60 fps unlock, AMD frame generation, Resizable BAR windows, six list threads and the RX 7900 XT settings below, in one switch |
+| `-FrameGen` | Series S, renderer ports 1, 2, 5, 6 and 7, the 60 fps unlock, AMD frame generation, Resizable BAR windows, ten list threads below normal priority (`VICTORY_THIN_PRIORITY=-1`), list holds (`VICTORY_LIST_HOLDS=1`), the descriptor-table memo (`VICTORY_TABLE_MEMO=1`) and the RX 7900 XT settings below, in one switch |
 | Audio as a console has it | The title talks to Windows audio itself and expects a console's output: always there, 48 kHz. With a monitor's HDMI audio (it will not open), a 44.1 kHz Bluetooth speaker or no output at all, its loading screen never ended. `modules::endpoint` gives it an output that opens, read as 48 kHz with Windows converting, else a silent one. `VICTORY_AUDIO_DEVICE=<part of a name>` or `silent` picks one; `VICTORY_AUDIO_CONSOLE=0` turns it off. |
 | Frame generation | `VICTORY_FRAMEGEN=1` (from gleaf-6, after MrSkelee): AMD's swap chain, fed by the host upscaler that answers the title's FidelityFX calls. `VICTORY_FFX_HOST=1`: the host upscaler alone. |
 | Copy-back | `VICTORY_SKIP_WC_BACK` (on; from PastiiJay/klbf-lab, after fxceless/victory-fork #868 and #1268): shader writes to memory the title reserved write-combined are not fetched back, for buffers of 1 MiB and more. 9.6 to 4.4 ms a frame. |
@@ -102,7 +104,7 @@ The RX 7900 XT settings `-FrameGen` sets are listed in `scripts\play.ps1`: memor
 windows of 1 MiB with 12 MB at roots, shader-write compares on the card for buffers
 of 1 MiB and more, title memory in place, texture steps of 80 ms at scene cuts,
 the list threads joined, among others. All measurements and what was tried and not
-kept: CHANGELOG.md on the `xtx-2026-11-27` branch.
+kept: [CHANGELOG.md](CHANGELOG.md) (the older line's on the `xtx-2026-11-27` branch).
 
 ## Changing it, or forking it
 
