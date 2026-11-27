@@ -11862,10 +11862,17 @@ impl<'a> Lower<'a> {
                 let c = self.cur;
                 if name == "v_interp_p1ll_f16" {
                     // An f32 result from 16-bit vertex values.
-                    let f = half(self, h)?.ok_or("a packed input half no element holds")?;
-                    self.as_int(f)
+                    // A padding half no element holds reads as zero
+                    // (upstream #1291).
+                    match half(self, h)? {
+                        Some(f) => self.as_int(f),
+                        None => self.s.m.i32(0),
+                    }
                 } else if f16 {
-                    let mut f = half(self, h)?.ok_or("a packed input half no element holds")?;
+                    let mut f = match half(self, h)? {
+                        Some(f) => f,
+                        None => self.s.m.f32(0),
+                    };
                     if let Fields::Valu(v) = &inst.fields {
                         // omod, then clamp, before the one rounding to 16 bits; op_sel[3]
                         // picks the destination half (VIctory e29391f: the low half was
