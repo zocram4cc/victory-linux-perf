@@ -97,6 +97,29 @@ fn small(bits: u32, mantissa: u32) -> f32 {
     }
 }
 
+/// How a texel of `format` is read where it is the depth plane (or, with
+/// `stencil`, the stencil plane) of a 32-bit depth and 8-bit stencil
+/// format: as R32_FLOAT (R8_UINT), copied as R32_TYPELESS (R8_TYPELESS).
+/// A copy of one plane holds that plane alone, 4 (1) bytes a texel: read
+/// as the 8-byte format, a texel was two depths of the plane side by side,
+/// and the one asked for came from twice its column.
+fn plane_format(format: i32, stencil: bool) -> i32 {
+    match format {
+        19..=22 if stencil => 62,
+        19..=22 => 41,
+        _ => format,
+    }
+}
+
+/// The format a copy of a [`plane_format`] texel is placed in.
+fn copied_format(shown: i32) -> i32 {
+    match shown {
+        41 => 39,
+        62 => 60,
+        other => other,
+    }
+}
+
 /// Bytes of a texel of a format; 0 for formats not read.
 fn texel_bytes(format: i32) -> usize {
     match format {
@@ -452,7 +475,7 @@ impl Player {
                     y,
                     z: 0,
                     point: OWN,
-                    format: r.desc.format,
+                    format: plane_format(r.desc.format, at >= u32::from(r.desc.mips.max(1)) * u32::from(r.desc.depth.max(1))),
                     depth,
                 });
             }
@@ -472,7 +495,7 @@ impl Player {
                     y,
                     z: 0,
                     point,
-                    format: r.desc.format,
+                    format: plane_format(r.desc.format, false),
                     depth,
                 });
             }
@@ -547,7 +570,14 @@ impl Player {
                 dst: Loc::Placed {
                     res: SCRATCH,
                     offset: 0,
-                    format: t.copied_as.get(&s.res).copied().unwrap_or(r.desc.format),
+                    format: if s.format == plane_format(r.desc.format, false)
+                        && s.format != r.desc.format
+                        || s.format == plane_format(r.desc.format, true) && s.format != r.desc.format
+                    {
+                        copied_format(s.format)
+                    } else {
+                        t.copied_as.get(&s.res).copied().unwrap_or(r.desc.format)
+                    },
                     size: [w, h, 1],
                     pitch,
                 },
@@ -649,7 +679,7 @@ impl Player {
                             y,
                             z,
                             point,
-                            format,
+                            format: plane_format(format, false),
                             depth,
                         };
                         let view = view.unwrap_or([0.0, 0.0, size.0 as f32, size.1 as f32]);
@@ -796,6 +826,22 @@ mod tests {
         );
         let beside = [1920.0, 0.0, 1920.0, 1080.0];
         assert_eq!(texel((1920, 1080), picture, beside, (1920, 1080)), None);
+    }
+
+    /// The planes of a 32-bit depth and 8-bit stencil texture are read as
+    /// their own formats, a depth plane texel as one float.
+    #[test]
+    fn depth_planes_are_read_as_their_own_formats() {
+        for f in 19..=22 {
+            assert_eq!(plane_format(f, false), 41);
+            assert_eq!(plane_format(f, true), 62);
+        }
+        assert_eq!(copied_format(41), 39);
+        assert_eq!(copied_format(62), 60);
+        assert_eq!(plane_format(28, false), 28);
+        assert_eq!(texel_bytes(plane_format(19, false)), 4);
+        assert_eq!(texel_bytes(plane_format(19, true)), 1);
+        assert!(texel_text(41, &0.25f32.to_le_bytes()).starts_with("0.25000"));
     }
 
     #[test]
