@@ -8422,7 +8422,12 @@ impl<'a> Lower<'a> {
         match self.x.native.layout.get(a.param).map(|p| p.root) {
             Some(RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap) => {}
             _ if from_memory => {}
-            _ => return Err("a descriptor outside the heaps"),
+            r => {
+                if std::env::var_os("VICTORY_WHY_OUTSIDE").is_some() {
+                    eprintln!("OUTSIDE {:?} root {:?} layout {:?}", a, r, self.x.native.layout.iter().map(|p| (p.root, p.slot, p.user_data, p.sgprs)).collect::<Vec<_>>());
+                }
+                return Err("a descriptor outside the heaps");
+            }
         }
         let li: &Inst = &self.x.p.blocks[load.0].insts[load.1];
         let Fields::Smem {

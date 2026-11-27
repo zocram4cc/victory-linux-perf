@@ -480,6 +480,77 @@ pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
 ///         u8 resource kind (DXIL's), u8 0, u32 register
 ///   0x43  the shader hash (16 B); the last record
 /// ```
+/// The user SGPR a program uses as its view heap's 32-bit base, if its
+/// first straight-line instructions show it: a scalar load of 4 or 8 dwords
+/// from the pair (that SGPR, 0) at an offset shifted left by 5.
+fn view_heap_sgpr(code: &[u8], user_sgprs: u8) -> Option<u8> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum S {
+        User(u8),
+        Zero,
+        Times32,
+        Other,
+    }
+    let insts = crate::gfx10::decode(code).ok()?;
+    let mut st = [S::Other; 106];
+    for (i, s) in st.iter_mut().enumerate().take(usize::from(user_sgprs)) {
+        *s = S::User(i as u8);
+    }
+    for inst in insts.iter().take(96) {
+        let w = inst.words[0];
+        let sdst = ((w >> 16) & 0x7f) as usize;
+        match inst.name() {
+            Some("s_mov_b32") => {
+                let src = (w & 0xff) as usize;
+                let v = match src {
+                    0..=105 => st[src],
+                    128 => S::Zero,
+                    _ => S::Other,
+                };
+                if sdst < st.len() {
+                    st[sdst] = v;
+                }
+            }
+            Some("s_lshl_b32") if (w >> 8) & 0xff == 133 => {
+                if sdst < st.len() {
+                    st[sdst] = S::Times32;
+                }
+            }
+            Some("s_load_dwordx4" | "s_load_dwordx8") if inst.words.len() >= 2 => {
+                let base = ((w & 0x3f) * 2) as usize;
+                let soffset = (inst.words[1] >> 25) as usize;
+                if let (S::User(x), S::Zero) = (st[base], st[base + 1])
+                    && soffset < st.len()
+                    && st[soffset] == S::Times32
+                {
+                    return Some(x);
+                }
+                let sdata = ((w >> 6) & 0x7f) as usize;
+                let n = if inst.name() == Some("s_load_dwordx8") { 8 } else { 4 };
+                for s in st.iter_mut().skip(sdata).take(n) {
+                    *s = S::Other;
+                }
+            }
+            Some(name) if name.starts_with("s_cbranch") || name == "s_branch" || name == "s_endpgm" => return None,
+            Some(name) if name.starts_with("s_") && !name.starts_with("s_waitcnt") && !name.starts_with("s_clause") => {
+                // Another scalar instruction: whatever it writes is no
+                // longer what was tracked (SOP1/SOP2/SOPK keep sdst there).
+                if sdst < st.len() && !name.starts_with("s_cmp") && !name.starts_with("s_buffer") && !name.starts_with("s_load") {
+                    st[sdst] = S::Other;
+                }
+                if name.starts_with("s_load") || name.starts_with("s_buffer_load") {
+                    let sdata = ((w >> 6) & 0x7f) as usize;
+                    for s in st.iter_mut().skip(sdata).take(16) {
+                        *s = S::Other;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
     if u32_at(part, 4)? != FSPX_VERSION {
         return Err(Malformed("unknown FSPX version"));
@@ -584,8 +655,37 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
             .iter()
             .any(|p| (p.user_data..p.user_data.saturating_add(p.sgprs as u8)).contains(&r))
     };
+    // Where the code shows it, the view heap's place: the user SGPR it uses
+    // as a 32-bit base with an index times 32 (`s_mov sA, sX; s_mov sA+1, 0;
+    // s_lshl sI, sJ, 5; s_load_dwordx4/x8 …, s[A:A+1], sI`). It is s[n-1] in
+    // 187 of the 2,680 programs and s[n-2] in 59: the fixed rule below got
+    // the first kind wrong, and a root-constants record sized by its
+    // descriptor dwords (`e[20]`) could cover it (family 0x33cb3490: half of
+    // Jason's house culled, `docs/royale/p4-house-bug.md`).
+    let view_heap = view_heap_sgpr(code, user_sgprs);
+    if let Some(x) = view_heap
+        && !layout.iter().any(|p| matches!(p.root, RootType::Table | RootType::Descriptor) && p.user_data == x)
+    {
+        for p in layout.iter_mut() {
+            if p.root == RootType::Constants && p.user_data < x && u32::from(p.user_data) + p.sgprs > u32::from(x) {
+                p.sgprs = u32::from(x - p.user_data);
+            }
+        }
+        layout.push(RootParam {
+            root: RootType::ResourceHeap,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: x,
+            slot: 0xFE,
+        });
+    }
     for (root, at, slot) in [(RootType::ResourceHeap, 2, 0xFE), (RootType::SamplerHeap, 1, 0xFF)] {
+        if root == RootType::ResourceHeap && view_heap.is_some() {
+            continue;
+        }
         if let Some(r) = user_sgprs.checked_sub(at)
+            && Some(r) != view_heap
             && !covered(&layout, r)
             && layout.iter().any(|p| p.user_data < r)
         {
