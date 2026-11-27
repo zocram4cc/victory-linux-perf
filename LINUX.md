@@ -13,10 +13,13 @@ Experimental, and this repository makes that work and keeps it fast.
 |---|---|
 | Tested on | RX 7900 XT 20 GB, Ryzen 7 5800X3D, 32 GB RAM, Proton Experimental 11.0, Mesa/RADV |
 | Menus, videos | 30 fps (the title's cap) |
-| Open world (5,000-8,000 draws) | **~16-17 fps** (59-63 ms a frame) |
-| Very heavy views (10,000+ draws) | ~12-15 fps |
+| Open world (4,000-5,000 draws) | **~18-19 fps** (53-57 ms a frame) |
+| Very heavy views (8,000-10,000 draws) | **~16-17 fps** |
 | Processor | all 16 threads of a 5800X3D at 65-80 % |
 | Stability | long sessions without GPU hangs; saving and loading work |
+
+The numbers need the huge pages of [`linux/thp/`](linux/thp/) (one `setcap`, see Setup); without
+them it is luck, between ~9 and ~18 fps in the same scene.
 
 Not tested: NVIDIA (proprietary or NVK), Intel, AMD cards other than RDNA 3.
 **On Windows** use [avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)
@@ -38,6 +41,10 @@ with its `scripts\play.ps1` (and a page file of 32 GB or more with 32 GB of RAM)
 - **`VICTORY_COPY_COMPARE`**: only the 4 KiB pieces whose bytes changed are sent up.
 - **`VICTORY_WIDE_THREADS`**, per-site counters of memory calls in the log
   ("memory calls by site"), **`VICTORY_LOG_FILE`** (a log file under Proton).
+- **Huge pages for renderer port 1** ([`linux/thp/`](linux/thp/)): amdgpu checks the port-1 heap
+  (a userptr, ~185 MB) page by page on every submission, and with 4 KiB pages that kept the
+  `vkd3d_queue` thread at 100 % of a core. The start script collapses it into 2 MiB pages from
+  outside the process (`process_madvise(MADV_COLLAPSE)`): ~9 -> ~18-19 fps in the same scene.
 - **[`linux/victory-proton.sh`](linux/victory-proton.sh)**: a start script with the
   settings that worked best.
 
@@ -65,6 +72,15 @@ cargo xwin build --release -p victory --target x86_64-pc-windows-msvc
 
 The first build downloads the Windows SDK headers and libraries (accept the license prompt).
 
+### Huge pages (once, recommended)
+
+```
+cc -O2 -o linux/thp/victory-thp-collapse linux/thp/victory-thp-collapse.c
+sudo setcap cap_sys_nice+ep linux/thp/victory-thp-collapse
+```
+
+The helper gets one capability (`CAP_SYS_NICE`), not root. Details in [`linux/thp/README.md`](linux/thp/README.md).
+
 ### Run
 
 1. Edit the paths at the top of `linux/victory-proton.sh`:
@@ -77,6 +93,12 @@ faster. `VICTORY_HUD=1 ./linux/victory-proton.sh` shows a MangoHud overlay.
 
 ## Settings that matter
 
+- **Huge pages for port 1** (above): the biggest single factor here after the renderer ports.
+  `run-*.thp` next to the log says whether they took (`88 collapsed, 0 not`).
+- **Optional: a wineserver with a view tree** ([`linux/wineserver/`](linux/wineserver/)). The stock server
+  walks all of the process's views on every map and unmap; with the title's tens of thousands of views
+  that was 11-24 % of all CPU samples here. Patched, on GE-Proton11-14: 8.3 -> 17.7 fps, write watch
+  17-26 -> 4.6 ms. It has to be built against your Proton's own Wine.
 - **Do not set `RADV_DEBUG=hang`.** It turns on syncshaders and makes the GPU the
   bottleneck: ~205 ms of GPU time a frame, about 4 fps.
 - The script turns on the fork's renderer ports 1, 2, 5, 6 and 7

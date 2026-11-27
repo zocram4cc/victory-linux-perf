@@ -3,7 +3,8 @@
 # Part of this repository (avatarmanz/VIctory-7900XTX + the Linux/Proton changes).
 # Tested with Proton Experimental (Wine 11, vkd3d-proton), RADV, RX 7900 XT,
 # Ryzen 7 5800X3D,
-# 32 GB: ~16-17 fps in the open world, ~12-15 fps in 10,000+ draw views.
+# 32 GB: ~18-19 fps in the open world, ~16-17 fps in 8,000-10,000 draw views
+# (with the huge pages of linux/thp/).
 #
 # Usage:  victory-proton.sh [extra args for `victory run`]
 # Every VICTORY_* / VKD3D_* / RADV_* variable you set yourself wins.
@@ -71,6 +72,37 @@ if [ "${VICTORY_HUD:-0}" != 0 ]; then export MANGOHUD=1; fi
 stamp=$(date +%Y%m%d-%H%M%S)
 log="$LOGDIR/run-$stamp.txt"
 echo "log: $log ($PROFILE build)"
+
+# --- Huge pages for renderer port 1 (AMD) ---------------------------------------
+# amdgpu checks the port-1 heap (a userptr, ~185 MB) page by page on every
+# submission; as 2 MiB pages that is 512 times shorter: ~9 -> ~18-19 fps here.
+# See linux/thp/README.md. Needs the helper built and given CAP_SYS_NICE once.
+# VICTORY_THP=0 turns it off.
+thp_watch() {
+    set +eu +o pipefail
+    local helper="$REPO/linux/thp/victory-thp-collapse" out="${log%.txt}.thp" pid ranges r last=""
+    if ! getcap "$helper" 2>/dev/null | grep -q cap_sys_nice; then
+        echo "huge pages: off (see linux/thp/README.md: build $helper, then sudo setcap cap_sys_nice+ep on it)"
+        return
+    fi
+    while kill -0 "$1" 2>/dev/null; do
+        sleep 15
+        # the Windows process: the one of them with the most threads
+        pid=$(for p in $(pgrep -f 'victory\.exe run'); do echo "$(ls /proc/$p/task 2>/dev/null | wc -l) $p"; done \
+            | sort -rn | awk 'NR==1{print $2}')
+        [ -n "$pid" ] || continue
+        ranges=$(grep -aoE "32-bit heap are private memory.*at=0x[0-9a-f]+ len=[0-9]+" "$log" 2>/dev/null \
+            | sed -E 's/.*at=0x([0-9a-f]+) len=([0-9]+)/\1 \2/' | sort -u \
+            | while read -r a l; do printf "%x %x " $((16#$a)) $((16#$a + l)); done)
+        [ -n "$ranges" ] || continue
+        # shellcheck disable=SC2086
+        r=$("$helper" "$pid" $ranges 2>&1)
+        if [ "$r" != "$last" ]; then echo "$(date +%T) $r" >> "$out"; last="$r"; fi
+    done
+}
+if [ "${VICTORY_THP:-1}" != 0 ]; then
+    thp_watch $$ &
+fi
 cd "$REPO"
 cp -u "$D3DCOMPILER" "target/x86_64-pc-windows-msvc/$PROFILE/"
 # Without a terminal the exe dies on its first println: its output goes
