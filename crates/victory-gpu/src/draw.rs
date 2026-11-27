@@ -3197,6 +3197,25 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        // P.4 (`VICTORY_HEAP_TRACE=N`): the first N dispatches of any
+        // pipeline: the view heap's console address range beside the table
+        // values the list holds (are tables console addresses in that range?).
+        {
+            static LEFT: std::sync::OnceLock<std::sync::atomic::AtomicU32> = std::sync::OnceLock::new();
+            let left = LEFT.get_or_init(|| {
+                std::sync::atomic::AtomicU32::new(std::env::var("VICTORY_HEAP_TRACE").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+            });
+            if left.load(Ordering::Relaxed) > 0 && left.fetch_sub(1, Ordering::Relaxed) > 0 && self.heaps[0] != 0 {
+                let heap = crate::descriptor::heap(self.heaps[0] as This);
+                tracing::info!(
+                    start = format_args!("{:#x}", heap.start),
+                    count = heap.desc.count,
+                    end = format_args!("{:#x}", heap.start + u64::from(heap.desc.count) * 32),
+                    roots = format_args!("{:x?}", self.compute),
+                    "P.4 heap trace"
+                );
+            }
+        }
         // P.4 (`VICTORY_NATIVE_TRACE=N`): the first N dispatches of pipelines
         // made from 0x218's pieces: the root values the title's list holds,
         // its heaps, the groups.
