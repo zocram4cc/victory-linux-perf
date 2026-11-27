@@ -1009,15 +1009,48 @@ impl Flights {
 /// read, could undo that write. (The merge of a waited-for submission
 /// stores every byte of a differing stretch back into the copy.)
 fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+    merge_piece_won(now, held, title, false).0
+}
+
+/// [`merge_piece`]; with `wins` ([`card_wins`]) every byte is the card's,
+/// and the second is how many bytes of the title's (where title memory held
+/// another value than the CPU's side and the card did not change it) took
+/// the card's value.
+fn merge_piece_won(now: &[u8], held: &mut [u8], title: &mut [u8], wins: bool) -> (bool, u64) {
     let mut differs = 0u8;
+    let mut won = 0u64;
     for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
-        let wrote = if *n != *h { 0xffu8 } else { 0 };
+        let wrote = if *n != *h || wins { 0xffu8 } else { 0 };
+        won += u64::from(wins && *n == *h && *t != *h);
         let merged = (*t & !wrote) | (*n & wrote);
         differs |= merged ^ *t;
         *t = merged;
         *h = (*h & !wrote) | (*n & wrote);
     }
-    differs != 0
+    (differs != 0, won)
+}
+
+/// Whether at a landing of a copy in the card's memory, in a piece the
+/// compare found the card changed, the title's bytes written while the flight
+/// was in the air take the card's value too (`VICTORY_FLIGHT_CARD_WINS=1`;
+/// off unless asked for: an experiment).
+///
+/// A merge keeps a byte of the title's where the card's byte is what it was
+/// when the flight began: the title may have written it after the shaders
+/// did. In the prison corridor the title (or something) writes a 12-byte
+/// record into the pre-skinned vertex buffer while the skinning is in the
+/// air; the skinning stores every byte of its vertices, and those that come
+/// out as they were keep the record's bytes in title memory, which the next
+/// refresh sends up over the card (the stray sheets). On the console the
+/// card, running later, would have stored over the record.
+///
+/// What it can hide: a real write of the title's, made while a flight was in
+/// the air, into a 64 KiB piece that flight's shaders changed somewhere: the
+/// title's value is lost for the card's there. The per-copy lines count the
+/// bytes it took ("card won over title bytes").
+pub(crate) fn card_wins() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FLIGHT_CARD_WINS").is_some_and(|v| v == "1"))
 }
 
 /// `[from, to)` without the ranges of `skip`, in order.
@@ -2068,6 +2101,9 @@ pub(crate) mod resent {
         /// took the card's bytes all the same (`take`): from then on title
         /// memory and the CPU's side differ there.
         pub(crate) missed: u64,
+        /// Bytes of the title's that took the card's value at a landing
+        /// ([`super::card_wins`]).
+        pub(crate) won: u64,
     }
 
     impl Resent {
@@ -2079,6 +2115,7 @@ pub(crate) mod resent {
             self.whole += o.whole;
             self.runs += o.runs;
             self.missed += o.missed;
+            self.won += o.won;
         }
 
         pub(crate) fn is_empty(&self) -> bool {
@@ -2090,7 +2127,8 @@ pub(crate) mod resent {
             let f = |n: u64| n as f64 / per.max(1.0);
             format!(
                 "pages sent up {:.1} (title-written {:.1}, landing noted and differing {:.1}; whole {:.1}, as runs {:.1}), \
-                 {:.1} KB differing from the card, echo pages left {:.1}, landing pages title memory missed {:.1}",
+                 {:.1} KB differing from the card, echo pages left {:.1}, landing pages title memory missed {:.1}, \
+                 card won over title bytes {:.1} KB",
                 f(self.title + self.landed),
                 f(self.title),
                 f(self.landed),
@@ -2098,7 +2136,8 @@ pub(crate) mod resent {
                 f(self.runs),
                 f(self.bytes) / 1024.0,
                 f(self.echo),
-                f(self.missed)
+                f(self.missed),
+                f(self.won) / 1024.0
             )
         }
     }
@@ -2137,7 +2176,7 @@ pub(crate) mod resent {
             return Vec::new();
         };
         let mut v: Vec<(u64, u64, Resent)> = all.by_copy.drain().map(|(s, (l, r))| (s, l, r)).collect();
-        v.sort_by_key(|(s, _, r)| (std::cmp::Reverse(r.bytes), std::cmp::Reverse(r.title + r.landed), *s));
+        v.sort_by_key(|(s, _, r)| (std::cmp::Reverse(r.bytes + r.won), std::cmp::Reverse(r.title + r.landed), *s));
         v.truncate(most);
         v
     }
@@ -2968,6 +3007,52 @@ mod landing_tests {
         assert_eq!(super::run_pages(at, &[(4, 4), (100, 8)]), [p(0)]);
         assert_eq!(super::run_pages(at, &[(KERNEL_PAGE - 4, 8), (3 * KERNEL_PAGE, 4)]), [p(0), p(1), p(3)]);
         assert_eq!(super::run_pages(at + 8, &[(0, 2 * KERNEL_PAGE)]), [p(0), p(1), p(2)]);
+    }
+
+    /// With the card winning: a byte the title wrote while the flight was in
+    /// the air, which the card left as it was, takes the card's value; one
+    /// the card changed does in any case; the rest stay. Without: the title's
+    /// stays, as before.
+    #[test]
+    fn the_card_wins_over_title_bytes_only_when_asked() {
+        // Byte 0: the card changed it. Byte 1: the title wrote it, the card
+        // did not. Byte 2: nobody.
+        let now = [9u8, 5, 5];
+        let fresh = || ([1u8, 5, 5], [1u8, 7, 5]);
+        let (mut held, mut title) = fresh();
+        assert_eq!(super::merge_piece_won(&now, &mut held, &mut title, false), (true, 0));
+        assert_eq!((title, held), ([9, 7, 5], [9, 5, 5]));
+        let (mut held, mut title) = fresh();
+        assert_eq!(super::merge_piece_won(&now, &mut held, &mut title, true), (true, 1));
+        assert_eq!((title, held), ([9, 5, 5], [9, 5, 5]));
+    }
+
+    /// Ahead of a landing that the card wins, the title's bytes to be taken
+    /// are counted and the CPU's side differs from the card everywhere in the
+    /// parts, and nowhere else.
+    #[test]
+    fn ahead_of_a_landing_the_card_wins_every_byte_of_the_parts_differs() {
+        const LEN: usize = 2 * KERNEL_PAGE;
+        let room = vec![3u8; LEN + KERNEL_PAGE];
+        let title = (room.as_ptr() as usize).next_multiple_of(KERNEL_PAGE);
+        let mut side = vec![3u8; LEN];
+        let copy = Shadow::unbacked(title as u64, side.as_mut_ptr(), side.len() as u64, true);
+        // The title wrote two bytes of the first part while in the air.
+        // SAFETY: in `room`.
+        unsafe {
+            ((title + 10) as *mut u8).write_volatile(4);
+            ((title + 11) as *mut u8).write_volatile(4);
+        }
+        // The card holds what the CPU's side does, but for byte 20.
+        let mut card = vec![3u8; LEN];
+        card[20] = 8;
+        // SAFETY: `card` holds the piece; the parts lie in the copy.
+        let won = unsafe { copy.all_the_cards(0, card.as_ptr(), &[(0, 64), (100, 200)]) };
+        assert_eq!(won, 2);
+        assert!(side[..64].iter().zip(&card[..64]).all(|(h, c)| h != c));
+        assert!(side[100..200].iter().zip(&card[100..200]).all(|(h, c)| h != c));
+        assert!(side[64..100].iter().all(|&h| h == 3), "outside the parts: as it was");
+        drop(room);
     }
 
     /// Which copies a refresh sends changed dwords of.
@@ -4414,6 +4499,39 @@ impl Shadow {
         to - from
     }
 
+    /// For [`card_wins`], ahead of a landing's merge of `parts` (offsets from
+    /// `lo` in the copy) of a piece the card's bytes of which are at `now`:
+    /// counts the title's bytes that are to take the card's value (title
+    /// memory holds another than the CPU's side, and the card holds what the
+    /// CPU's side does), then makes every byte of the CPU's side there differ
+    /// from the card's, so that the merge puts all of them.
+    ///
+    /// # Safety
+    /// `now` holds the piece's bytes from `lo` on, to the parts' end; the
+    /// parts lie in the copy, in a range no refresh writes (a landing's).
+    unsafe fn all_the_cards(&self, lo: usize, now: *const u8, parts: &[(usize, usize)]) -> u64 {
+        let mut won = 0u64;
+        let mut title = Vec::new();
+        for &(a, b) in parts {
+            if a >= b {
+                continue;
+            }
+            // SAFETY: the caller's.
+            let card = unsafe { std::slice::from_raw_parts(now.add(a), b - a) };
+            // SAFETY: inside the mapping of the CPU's side (the caller's).
+            let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(lo + a), b - a) };
+            title.clear();
+            title.resize(b - a, 0);
+            if crate::host::read_into((self.start as usize + lo + a) as *const u8, &mut title) {
+                won += card.iter().zip(held.iter()).zip(&title).filter(|((c, h), t)| c == h && t != h).count() as u64;
+            }
+            for (h, c) in held.iter_mut().zip(card) {
+                *h = !*c;
+            }
+        }
+        won
+    }
+
     /// For [`resent`]: `pages` of a landing were not put into title memory,
     /// and the CPU's side took the card's bytes there.
     pub(crate) fn resent_missed(&self, pages: u64) {
@@ -4823,8 +4941,11 @@ impl Shadow {
             // was before the submission, else the title's.
             let mut differs = 0u8;
             let was = title.clone();
+            let wins = card_wins();
+            let mut won = 0u64;
             for ((t, g), o) in title.iter_mut().zip(gpu).zip(old.iter_mut()) {
-                let wrote = if *g != *o { 0xffu8 } else { 0 };
+                won += u64::from(wins && *g == *o && *t != *o);
+                let wrote = if *g != *o || wins { 0xffu8 } else { 0 };
                 let merged = (*t & !wrote) | (*g & wrote);
                 differs |= merged ^ *t;
                 *t = merged;
@@ -4832,6 +4953,9 @@ impl Shadow {
             }
             if differs != 0 {
                 written = put_changed(start + at, &was, title);
+            }
+            if won > 0 {
+                resent::note(self.start, self.len, resent::Resent { won, ..Default::default() });
             }
         } else {
             // Title memory is not mapped there: the copy keeps what the
@@ -4896,11 +5020,17 @@ impl Shadow {
         let mapped = crate::host::read_into((start + at) as *const u8, title);
         let was = title.clone();
         let mut changed = false;
+        let mut won = 0u64;
         for (a, b) in outside(at, at + n, skip) {
             let (a, b) = (a - at, b - at);
             // Title memory that is not mapped: the CPU's side keeps what
             // the card wrote, as before; `title` is scratch then.
-            changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
+            let (c, w) = merge_piece_won(&gpu[a..b], &mut held[a..b], &mut title[a..b], card_wins() && mapped);
+            changed |= c;
+            won += w;
+        }
+        if won > 0 {
+            resent::note(self.start, self.len, resent::Resent { won, ..Default::default() });
         }
         if !mapped && changed {
             // The CPU's side took the card's bytes; title memory did not.
@@ -4999,6 +5129,15 @@ impl Shadow {
             }
             let near: Vec<(usize, usize)> = skip.iter().copied().filter(|&(a, b)| a < hi && b > lo).collect();
             let parts: Vec<(usize, usize)> = outside(lo, hi, near).into_iter().map(|(a, b)| (a - lo, b - lo)).collect();
+            if card_wins() {
+                // Every byte of the parts goes as the card has it: the
+                // CPU's side is made to differ from it everywhere first.
+                // SAFETY: as below; `now` stays as it is during the call.
+                let won = unsafe { self.all_the_cards(lo, now as *const u8, &parts) };
+                if won > 0 {
+                    resent::note(self.start, self.len, resent::Resent { won, ..Default::default() });
+                }
+            }
             // SAFETY: inside the mapping (checked above), in a range
             // declared and not done with, which no refresh writes; the
             // title's bytes are kept out by the lock; the caller's.
