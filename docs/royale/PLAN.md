@@ -48,3 +48,14 @@ Not carried over: our copy model's fixes (S.x, I.1/I.2, C.1 switches). Their tre
 - Each step: a switch where it changes behaviour, measured against the baseline, written in the journal, then on by default if it holds.
 - Nothing is published to the author's repository (issues, PRs, comments) unless asked; public messages are written in the first person singular.
 - The game folder is never touched; the game is never started while the user plays.
+
+## P.4 translator plan (27 Nov)
+
+Why: device method 0x218 gives ~2,680 compute programs (and 0x1c8 ~10,200 graphics ones) that no fork makes; the title drops their work today, which shows as missing objects, black patches and flicker while moving. Rebuilt as FSPX programs they run correctly when they translate, but the title's programs work in chains: a family made in part breaks the picture (a consumer reads what a producer that does not translate never wrote). Only 2 of 30 families translate whole today.
+
+Steps:
+1. **Offline coverage, family by family** (`cargo run --release -p victory-shader --example p4_fspx -- ~/Games/victory-data/pso-dump`): fix the translator's gaps in order of how many programs they block. First "an address with two computed terms" (1,366), then "an address not from a root parameter" (226), "an image store of some channels" (166), then the small groups.
+2. Each fix: the unit tests of `victory-shader` stay green; the harness count goes up; the per-family table shows which families became whole.
+3. **A family goes to the game only when it translates whole**: `VICTORY_NATIVE_COMPUTE_ONLY=<that family>`, judged by screenshots (contrast, the world-entry window region) and fps against plain runs, plus the user's eyes.
+4. Families that hold become on by default; `0f01a73b00` (greys the picture) stays out until understood.
+5. Then 0x1c8 (graphics) the same way.
