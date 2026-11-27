@@ -2,7 +2,7 @@
 """The skinned vertices a captured frame's character draws read, counted for
 spikes: vertices thrown out of their mesh (the stretched "sheets").
 
-    scripts/victory-skins.py <survey log> <dump folder> [--all]
+    scripts/victory-skins.py <survey log> <dump folder> [--start <dump folder>] [--all]
 
 The survey log is what `victory replay <capture> --root-reach 0..2000` prints:
 its "skin" lines name, for each draw of a pre-skinned character mesh program
@@ -26,6 +26,13 @@ character), and the vertices that are both
         the range (the vertex before and the one after);
 and, apart, those whose record differs from a neighbour's in one byte only
 (the signature of the title's bytes landing over a skinned vertex).
+
+With --start, a second dump of the position buffers taken at the frame's
+start (`--until 0:0`) says for each draw whether its range was written in
+the frame before the draw ("written this frame") or holds the bytes it held
+when the frame began ("as at the start": skinned in an earlier frame, or
+skinned again to the very same bytes). Lists on queues other than the drawing
+one are not in a capture: a range written there shows as at the start.
 """
 import os
 import re
@@ -68,7 +75,7 @@ def apart(a, b):
     return max(abs(a[k] - b[k]) for k in range(3))
 
 
-def draw(folder, m):
+def draw(folder, m, start=None):
     rec = load(folder, int(m.group(3)))
     if rec is None:
         return 'no dump of the record buffer %s' % m.group(3)
@@ -82,11 +89,16 @@ def draw(folder, m):
     if magic != 0xdeadbeef or not 0 < n < 70000:
         return 'word %08x: %d+%#x holds no skinned range (%08x %08x)' % (word, res, base, n, magic)
     kind = 'float3' if word & 0x20000000 else '10:10:10' if word & 0x10000000 else '24:24:16'
+    span = 32 + {'float3': 12, '10:10:10': 4, '24:24:16': 8}[kind] * n
+    fresh = None
+    if start:
+        old = load(start, res)
+        fresh = None if old is None else old[base:base + span] != buf[base:base + span]
     vs = vertices(buf, base, n, kind)
     pos = [p for _, p in vs]
     shown = [p for p in pos if p]
     if not shown:
-        return (word, res, base, kind, n, n, [], [])
+        return (word, res, base, kind, n, n, [], [], fresh)
     med = [sorted(p[k] for p in shown)[len(shown) // 2] for k in range(3)]
     bad, byte = [], []
     for i, (raw, p) in enumerate(vs):
@@ -97,31 +109,39 @@ def draw(folder, m):
             bad.append(i)
         if any(sum(x != y for x, y in zip(raw, vs[j][0])) == 1 and apart(p, pos[j]) > JUMP for j in near):
             byte.append(i)
-    return (word, res, base, kind, n, n - len(shown), bad, byte)
+    return (word, res, base, kind, n, n - len(shown), bad, byte, fresh)
 
 
 def main():
     if len(sys.argv) < 3:
         sys.exit(__doc__)
     log, folder, every = sys.argv[1], sys.argv[2], '--all' in sys.argv
+    start = sys.argv[sys.argv.index('--start') + 1] if '--start' in sys.argv else None
     draws, broken, spikes, failed = 0, 0, 0, 0
+    stale, stale_bad = [], 0
     for line in open(log):
         m = SKIN.match(line)
         if not m:
             continue
         draws += 1
-        r = draw(folder, m)
+        r = draw(folder, m, start)
         if isinstance(r, str):
             failed += 1
             print(m.group(1), m.group(2), r)
             continue
-        word, res, base, kind, n, hidden, bad, byte = r
+        word, res, base, kind, n, hidden, bad, byte, fresh = r
         broken += bool(bad)
         spikes += len(bad)
-        if bad or every:
-            print('%s %s word %08x %d+%#x %s: %d vertices, %d hidden, %d spikes, %d one-byte; first spikes %s' % (
-                m.group(1), m.group(2), word, res, base, kind, n, hidden, len(bad), len(byte), bad[:8]))
+        if fresh is False:
+            stale.append(m.group(1))
+            stale_bad += bool(bad)
+        when = '' if fresh is None else ', written this frame' if fresh else ', AS AT THE START'
+        if bad or every or fresh is False:
+            print('%s %s word %08x %d+%#x %s: %d vertices, %d hidden, %d spikes, %d one-byte%s; first spikes %s' % (
+                m.group(1), m.group(2), word, res, base, kind, n, hidden, len(bad), len(byte), when, bad[:8]))
     print('%d draws, %d not decoded, %d with spikes, %d spike vertices' % (draws, failed, broken, spikes))
+    if start:
+        print("%d draws of ranges as at the frame's start (%d of them with spikes)" % (len(stale), stale_bad))
 
 
 if __name__ == '__main__':
