@@ -116,3 +116,28 @@ No program gained: the 75 need other joins too. **What those other joins' reader
 - **To gain these programs correctly:**
   - give descriptor dwords values that answer comparisons as on the console: the view's identity in dwords 0-1, for waterfall and change tests;
   - prove the float-op cases dead per path.
+
+
+### Real data instead of assumptions (27 Nov, ~23:45; the user: "the assumptions do not help us; we should rely on real data")
+
+Two steps that use only real values or proofs:
+
+1. **View identity** (`Lower::compare_only` / `ident_dword`, `VICTORY_VIEW_IDENTITY=0` turns it off). Descriptor dwords 0-1 get the view's heap slot in dword 0 and 0 in dword 1, only where every use is proven to be one of:
+   - a use as a descriptor;
+   - an equality comparison (`s_cmp_eq/lg`, `v_cmp(x)_eq/ne`, 32-bit integers) whose other side is also dwords 0-1 of a traced descriptor load. A comparison with a constant (a null check, say) is not accepted.
+
+   Equality answers as on the console: the same view gives the same number. Two slots naming one texture compare unequal; a waterfall loop then takes one more pass and a change test reloads, both still right.
+2. **The buffer stride in dword 1 from the host's table** (`SLOT_STRIDES` via `slot_stride`), where the program's metadata does not give it.
+
+Result: **1,265 → 1,267.** The census (`VICTORY_WHY_IDENTITY=1`) of what still blocks:
+
+| use | count | note |
+|---|---|---|
+| `s_bfe_u32 x, d1, 0xe0010` | 47,385 | **the buffer stride**, of descriptors not picked by heap slot (tables, built descriptors) |
+| `s_and_b32` | 6,374 | mostly the raw-view conversion `d1 & 0xc000ffff` |
+| `s_nand_b32` | 2,932 | |
+| `s_xor_b32` | 432 | |
+| `v_cvt_f32_ubyte0` | 392 | a byte of a descriptor dword as a float: a real numeric use |
+| others | < 300 each | |
+
+**Next with real data: the stride for every buffer descriptor, not only heap-picked ones.** The FSPX metadata record of the table entry gives it (`e[16..20]`, step 9) where the load is from a table at a known entry, and the layer knows every view's stride. Pass it through the same host word mechanism (`RootType::Other`) per table entry, or look it up by the descriptor's slot computed from the table address (`heap_index`), which is the same as for heap-picked ones once the table base is known.
