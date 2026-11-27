@@ -134,14 +134,31 @@ scripts\play.ps1 -Exe <exe> -More @{VICTORY_PORT_JOURNAL='1'; VICTORY_PORT_CONST
 | Platform | Switches | Status |
 |---|---|---|
 | Windows (this machine) | `VICTORY_PORT_JOURNAL=1 VICTORY_PORT_CONSTANTS=1` | measured twice (ab2, ab3: 48.6 ms both), world drawn in the intro |
-| Wine / Proton | the same switches; **the code now leaves `PORT_CONSTANTS` off under Wine** unless `VICTORY_PORT_CONSTANTS_WINE=1`, so they act as journal alone there | `PORT_CONSTANTS` reported to draw a black world there (PR #380, RX 7900 XT, Wine 11.22, RADV, vkd3d-proton); not verified either way on this PC, which has no Wine. Journal alone: prepare −6.0 %, frame −3.5 % here (ab1) |
+| Wine / Proton | the same switches; **the code now leaves `PORT_CONSTANTS` off under Wine** unless `VICTORY_PORT_CONSTANTS_WINE=1`, so they act as journal alone there | `PORT_CONSTANTS` **confirmed** to draw a black world there by a same-binary control on the PR (RX 7900 XT, Wine 11.22, RADV 26.3.1, vkd3d-proton): the cause is the imported heap not sharing bytes between CPU and GPU under that stack (see *Wine finding* below). Not run on this PC, which has no Wine. Journal alone: prepare −6.0 %, frame −3.5 % here (ab1) |
 
-**Wine guard (code).** `constants_switch` (victory-gpu `port.rs`, used by both halves of port #1, the GPU's and xmem's): `VICTORY_PORT_CONSTANTS=1` turns it on, but under Wine (ntdll exports `wine_get_version`) only together with `VICTORY_PORT_CONSTANTS_WINE=1`; a warning says so. Test `the_constants_port_stays_off_under_wine_unless_asked_for_there`: red against the old rule ("on under Wine without VICTORY_PORT_CONSTANTS_WINE=1"), green after. On Windows nothing changes: a check run on the new build drew port 1's log lines and measured frame 47.9 ms, prepare 40.3 ms, copy-back 23.8 ms. The final configuration is therefore the same two switches on every platform, and on Wine it cannot turn on the unverified port by accident.
+**Wine guard (code).** `constants_switch` (victory-gpu `port.rs`, used by both halves of port #1, the GPU's and xmem's): `VICTORY_PORT_CONSTANTS=1` turns it on, but under Wine (ntdll exports `wine_get_version`) only together with `VICTORY_PORT_CONSTANTS_WINE=1`; a warning says so. Test `the_constants_port_stays_off_under_wine_unless_asked_for_there`: red against the old rule ("on under Wine without VICTORY_PORT_CONSTANTS_WINE=1"), green after. On Windows nothing changes: a check run on the new build drew port 1's log lines and measured frame 47.9 ms, prepare 40.3 ms, copy-back 23.8 ms. The final configuration is therefore the same two switches on every platform, and on Wine it cannot turn on by accident a port that draws a black world there.
 
 Picture check (after a report on the PR of a black world with `PORT_CONSTANTS` alone under Wine
 11.22 / RADV / vkd3d-proton on an RX 7900 XT): one run each of base and journal + constants on
 this Windows build, frames saved in the world. With journal + constants the world is drawn as
 in base (frame 3000: the lit street with the credits; 3400: the car's interior) [fact]. Only this
 cutscene was looked at. A third run with `PORT_CONSTANTS` **alone** (the reported configuration) on Windows draws the world too (frame 2600: the street with the police officer; frame median 48.4 ms) [fact]. So on Windows the switch does not black out the world alone or with journal; what remains of the report points to Wine/RADV/vkd3d-proton or that save [deduction], neither of which this PC can run.
+
+**Wine finding (from the PR, then checked on Windows here).** UwUCammie ran the same executable on
+copies of the same save with the same caches and timed inputs, journal off in both runs [their
+report]: with `VICTORY_PORT_CONSTANTS=0` the character, porch and waterfront showed at 125, 135,
+145 and 155 s; with it on, all four captures were a HUD over a black world (in-place indirect
+draws 0 against a peak of 5,536 a frame). Their standalone fixture (jtrudeau1530/VIctory-7900XTX#23,
+`preferred_adapter_*reserved_section_round_trip`) maps a reserved section through two views, opens
+it as a heap and copies to and from it on the GPU: under Wine 11.22 / RADV 26.3.1 with vkd3d-proton
+GE cae8353e and upstream 71cae091, a second CPU mapping matched all 320 KiB the CPU wrote, the GPU
+read zeros over the whole range (also with every page written before the import), and the GPU's
+own 256-byte write was not seen by either CPU mapping [their report]. The same fixture at af245c3
+**passes on native Windows** here, both variants, on the RX 9070 XT (driver 32.0.32029.2010; the
+default high-performance pick and `VICTORY_D3D12_ADAPTER=RX 9070 XT`) and on the 9800X3D's
+integrated Radeon Graphics (driver 32.0.21045.29003) [fact]. So the black world is the Wine stack
+not sharing an opened heap's memory with the GPU, not the constants port's logic [deduction]; the
+Wine guard above stays the right default, and their jtrudeau1530/VIctory-7900XTX#25 proposes a
+fallback to copied constants when the heap does not share bytes.
 Not measured here: `VICTORY_PORT_CBV=1` (it changes translated shaders: needs its own translate
 and warm run), Series S with FidelityFX, the street-chase scene, longer sessions, other CPUs.
