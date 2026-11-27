@@ -161,7 +161,9 @@ The dump comes from one game run with `VICTORY_NATIVE_PSO_DUMP=Z:\…\pso-dump` 
   Why it is right: the console compiler's lane-mask merge is `s16 = (s16 & ~exec) | (s37 & exec)`. On this path, the variable s37 stands for was never set (to the compiler it is undefined, any value goes), and the register still holds a dead descriptor dword. That falls under shortcut #2 in `p4-shortcuts.md`, with the same switch `VICTORY_DEAD_DESCRIPTOR_JOINS=0`.
 
   The wall is gone from the top; **1,304 → 1,324**, none lost.
-- Next walls:
+- 30, **cube images sized from their descriptor** (kind 5, DEPTH 0 cubes less one as RADV computes it, type 11), as the image lowering already takes cubes. Then the dead-dword rule extended to sampler and constant-buffer dwords: **1,324 → 1,340**.
+- **The dead-dword rule is being tightened from an assumption to a proof.** Why, the risk, the plan and how to test it with real values: [p4-shortcuts.md, "Shortcut #2 in depth"](docs/royale/p4-shortcuts.md).
+- Next walls (before step 30):
   - "an image dimension (cube or MSAA)" (261, first);
   - "a lane mask holding lanes elsewhere read as data" (224);
   - "an opaque lane mask" (207);
