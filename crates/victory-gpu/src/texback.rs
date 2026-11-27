@@ -26,6 +26,9 @@ use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::object::This;
 
+mod readback;
+use readback::Readback;
+
 /// The kinds copied back: (width, height, format).
 fn kinds() -> &'static [(u64, u32, u32)] {
     static KINDS: OnceLock<Vec<(u64, u32, u32)>> = OnceLock::new();
@@ -126,7 +129,7 @@ impl Target {
 
 /// The readback resources and the allocation the pixels belong to.
 pub(crate) struct Back {
-    buffer: ID3D12Resource,
+    buffer: Readback,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     mips: u32,
@@ -137,6 +140,12 @@ pub(crate) struct Back {
 impl Back {
     pub(crate) fn range(&self) -> (usize, usize) {
         (self.ticket.at, self.ticket.end)
+    }
+
+    /// The list has finished and reset, so it can neither write this buffer
+    /// again nor still be waiting for its bytes to be landed.
+    pub(crate) fn recycle(self) {
+        self.buffer.recycle();
     }
 }
 
@@ -177,11 +186,13 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
             .checked_mul(u64::from(format.Depth))?;
         total = total.max(footprint.Offset.checked_add(pitched)?);
     }
-    let buffer = host.read_back_buffer(total)?;
+    // Each copy overwrites an entire subresource. The tiler only reads its
+    // texels, so neither old contents nor row padding need to be cleared.
+    let buffer = Readback::acquire(host, total)?;
     for (i, footprint) in footprints.iter().enumerate() {
         let to = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: a borrowed pointer the location never releases.
-            pResource: unsafe { std::mem::transmute_copy(&buffer) },
+            pResource: unsafe { std::mem::transmute_copy(&buffer.resource) },
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *footprint },
         };
@@ -220,7 +231,7 @@ pub(crate) fn land(back: &Back) {
     let mut data = std::ptr::null_mut();
     // SAFETY: our read-back buffer, written by the list that has run.
     unsafe {
-        if back.buffer.Map(0, None, Some(&mut data)).is_err() || data.is_null() {
+        if back.buffer.resource.Map(0, None, Some(&mut data)).is_err() || data.is_null() {
             return;
         }
     }
@@ -235,19 +246,18 @@ pub(crate) fn land(back: &Back) {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(?e, mip, slice, "a texture copied back could not be tiled"));
             // SAFETY: mapped above.
-            unsafe { back.buffer.Unmap(0, None) };
+            unsafe { back.buffer.resource.Unmap(0, None) };
             return;
         }
     }
     // SAFETY: mapped above.
-    unsafe { back.buffer.Unmap(0, None) };
+    unsafe { back.buffer.resource.Unmap(0, None) };
     crate::host::copy_mapped(at as *mut u8, tiled.as_ptr(), size, true);
     let copied = COPIED.fetch_add(1, Ordering::Relaxed) + 1;
     if copied == 1 || copied.is_multiple_of(128) {
         tracing::info!(copied, bytes = size, "texture readback landed");
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -269,5 +279,110 @@ mod tests {
         released(93);
         assert!(!far.valid.load(Ordering::Acquire));
         assert!(track(94, 0x2000, 0x3000).valid.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn texture_readback_reuses_the_buffer_only_after_the_list_resets() {
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32_FLOAT;
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        const SIDE: u32 = 64;
+        const PITCH: u32 = SIDE * 8;
+        const SIZE: usize = (PITCH * SIDE) as usize;
+        let words = [
+            3u32, 0, 0, 0, SIDE, 0, SIDE, 0x1_0001, 16, 1, 0, 0x105, 0, 0,
+        ];
+        let mut title = vec![0u8; crate::resource::placed_bytes(&words).unwrap() as usize];
+        let mut texture = std::ptr::null();
+        // SAFETY: the 14 words are a synthetic resource description.
+        let desc = unsafe {
+            words
+                .as_ptr()
+                .cast::<crate::resource::ResourceDesc>()
+                .read_unaligned()
+        };
+        let iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        assert_eq!(
+            crate::resource::create_at_address(
+                std::ptr::null(),
+                title.as_mut_ptr() as u64,
+                &desc,
+                0,
+                std::ptr::null(),
+                &iid,
+                &mut texture
+            ),
+            0
+        );
+        let layout = crate::resource::title_texture(texture).unwrap().0;
+        let copy = crate::resource::host_copy(texture).unwrap();
+        let (upload, mapped) = host.upload_buffer(SIZE as u64).unwrap();
+        let buffer = Readback::acquire(host, SIZE as u64).unwrap();
+        let identity = buffer.resource.clone();
+        buffer.recycle();
+
+        let list = host.new_list().unwrap();
+        let mut linear = vec![0; SIZE];
+        for value in [0x12u8, 0x34] {
+            crate::list::ensure_state(&list, texture, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
+            // SAFETY: `upload` is live and its mapping holds SIZE bytes. The
+            // previous submission, if any, has completed.
+            unsafe { mapped.write_bytes(value, SIZE) };
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: a borrowed resource pointer, as in `record`.
+                pResource: unsafe { std::mem::transmute_copy(&upload) },
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: DXGI_FORMAT_R32G32_FLOAT,
+                            Width: SIDE,
+                            Height: SIDE,
+                            Depth: 1,
+                            RowPitch: PITCH,
+                        },
+                    },
+                },
+            };
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: a borrowed resource pointer, as in `record`.
+                pResource: unsafe { std::mem::transmute_copy(&copy.texture) },
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    SubresourceIndex: 0,
+                },
+            };
+            // SAFETY: both resources outlive the submission and the upload
+            // footprint covers the single subresource.
+            unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+            list.texture_written(texture);
+            list.close();
+            let before = Readback::acquire(host, SIZE as u64).unwrap();
+            assert_ne!(before.resource, identity);
+
+            host.execute(&[&list]);
+            layout
+                .detile(&title, 0, 0, &mut linear, PITCH as usize, SIZE)
+                .unwrap();
+            assert!(linear.iter().all(|&byte| byte == value));
+            let landed = Readback::acquire(host, SIZE as u64).unwrap();
+            assert_ne!(landed.resource, identity);
+
+            list.reset();
+            let reset = Readback::acquire(host, SIZE as u64).unwrap();
+            assert_eq!(reset.resource, identity);
+            reset.recycle();
+        }
+        // Release the title resource before its backing memory goes away.
+        let release = crate::object::slot::<extern "system" fn(This) -> u32>(texture, 0x10);
+        release(texture);
     }
 }

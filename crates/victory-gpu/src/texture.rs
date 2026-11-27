@@ -1503,7 +1503,7 @@ impl Staging {
             u32::MAX
         };
         #[cfg(feature = "diagnostics")]
-        if tiled.iter().all(|&b| b == 0) {
+        if tracing::enabled!(tracing::Level::DEBUG) && tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
                 memory = ?self.memory,
                 desc = ?self.layout.desc,
@@ -1571,9 +1571,15 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
         let mut read = read.borrow_mut();
         read.resize(3 * WINDOW, 0);
         let mut take = |from: usize, bytes: usize| {
-            read[..bytes].fill(0);
+            let read = &mut read[..bytes];
+            // A host-side copy fills unreadable pages with zeros. The
+            // no-copy benchmark is the only mode that leaves `read` alone.
+            #[cfg(feature = "diagnostics")]
+            if crate::copystat::mode() == 2 {
+                read.fill(0);
+            }
             crate::host::copy_mapped(read.as_mut_ptr(), (at as usize + from) as *const u8, bytes, false);
-            print = print.rotate_left(37) ^ digest(&read[..bytes]).0;
+            print = print.rotate_left(37) ^ digest(read).0;
         };
         if len <= 3 * WINDOW {
             take(0, len);
@@ -2241,6 +2247,16 @@ mod allocation_costs {
         seen.dedup();
         assert_eq!(seen.len(), n);
         assert_eq!(digest(&text), digest(&text.clone()));
+    }
+
+    #[test]
+    fn a_fingerprint_of_unmapped_memory_overwrites_the_previous_sample() {
+        let zero = [0u8; 4096];
+        let filled = [0x5au8; 4096];
+        let empty = super::fingerprint(zero.as_ptr() as u64, zero.len() as u64);
+        let previous = super::fingerprint(filled.as_ptr() as u64, filled.len() as u64);
+        assert_ne!(empty, previous);
+        assert_eq!(super::fingerprint(0, filled.len() as u64), empty);
     }
 
     /// What a texture met for the first time costs, by step, in
