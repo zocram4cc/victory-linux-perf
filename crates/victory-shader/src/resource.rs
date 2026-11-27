@@ -1227,8 +1227,17 @@ impl<'a> Tracer<'a> {
                 todo.extend(self.p.blocks[b].phis[i].args.iter().map(|&a| self.origin(a)));
             } else if let Some(ops) = self.xor_operands(v) {
                 todo.extend(ops);
+            } else if let Some(t) = self.plus_scc(v) {
+                // `0 + carry` of the low half's add: a table address's high
+                // half, as `high_half` takes it (heap addresses fit in 32
+                // bits).
+                todo.push(t);
             } else {
                 if std::env::var_os("VICTORY_WHY_HIGH").is_some() {
+                    if let Some((b, i)) = self.defs[v.0 as usize] {
+                        let d = &self.p.blocks[b].insts[i];
+                        eprintln!("WHY-ZERO inst at {:#x}: {}", d.machine.offset, d.name());
+                    }
                     eprintln!("WHY-ZERO stops at {}", match (self.def(v), self.inputs[v.0 as usize]) {
                         (Some(i), _) => i.name().to_string(),
                         (_, Some(r)) => format!("in{r:?}"),
