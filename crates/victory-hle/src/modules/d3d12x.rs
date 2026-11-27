@@ -38,8 +38,8 @@ fn host_gpu_failed(what: &str) -> ! {
     unreachable!("the process has ended")
 }
 
-/// Makes the host GPU now, before any title code runs, unless
-/// `VICTORY_HOST_EARLY=0` (then it is made at the title's first command
+/// Makes the host GPU now, before any title code runs, only with
+/// `VICTORY_HOST_EARLY=1` (else it is made at the title's first command
 /// list): whether there is one and how long making it took. Made inside the
 /// title's start, a slow driver counts against the title's own watchdog
 /// (`victory_gpu::host_early`).

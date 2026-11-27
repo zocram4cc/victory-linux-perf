@@ -968,13 +968,15 @@ pub(crate) fn host() -> Option<&'static Host> {
 }
 
 /// Whether the runtime makes the host GPU before the title runs
-/// (`VICTORY_HOST_EARLY`, on unless `0`) instead of at the title's first
-/// command list. Made inside the title's start, the time the driver takes
-/// counts against the title's own watchdog, which ends the title (a write to
-/// address 0) when its start makes no progress for about 30 s; the driver
-/// alone can take that long (see `Making`).
+/// (`VICTORY_HOST_EARLY=1`; off by default here: upstream has it on, but its
+/// early device was never run through this tree's `create_preferred_device`)
+/// instead of at the title's first command list. Made inside the title's
+/// start, the time the driver takes counts against the title's own watchdog,
+/// which ends the title (a write to address 0) when its start makes no
+/// progress for about 30 s; the driver alone can take that long (see
+/// `Making`).
 pub fn early() -> bool {
-    std::env::var_os("VICTORY_HOST_EARLY").is_none_or(|v| v != "0")
+    std::env::var_os("VICTORY_HOST_EARLY").is_some_and(|v| v == "1")
 }
 
 /// Makes the host GPU now if it is not made yet; whether there is one.
