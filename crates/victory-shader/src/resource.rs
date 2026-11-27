@@ -418,6 +418,8 @@ struct Tracer<'a> {
     /// While set, [`Self::sum`] keeps the first-lane read of an index as
     /// the computed term instead of what the lanes hold.
     read_first_lane: std::cell::Cell<bool>,
+    /// Each block's immediate dominator, made when first asked for.
+    idom: std::cell::OnceCell<Vec<usize>>,
     /// What the conditions asked of `lanes` so far came down to: the proofs
     /// of one program ask about the same blocks and masks again and again.
     meets: std::cell::RefCell<Meets>,
@@ -489,6 +491,7 @@ impl<'a> Tracer<'a> {
             lane_copied: Default::default(),
             lanes,
             read_first_lane: Default::default(),
+            idom: Default::default(),
             meets: Default::default(),
             rpo,
             at: Default::default(),
@@ -1417,6 +1420,28 @@ impl<'a> Tracer<'a> {
         t
     }
 
+    /// Whether block `a` dominates block `b`.
+    fn dominates(&self, a: usize, b: usize) -> bool {
+        let idom = self.idom.get_or_init(|| {
+            let order = crate::ir::reverse_postorder(&self.p.blocks);
+            let mut index = vec![usize::MAX; self.p.blocks.len()];
+            for (i, &b) in order.iter().enumerate() {
+                index[b] = i;
+            }
+            crate::ir::idoms(&self.p.blocks, &order, &index)
+        });
+        let mut d = b;
+        loop {
+            if d == a {
+                return true;
+            }
+            match idom.get(d) {
+                Some(&n) if n != d && n != usize::MAX => d = n,
+                _ => return false,
+            }
+        }
+    }
+
     /// Words that phis of one block join, traced per predecessor (words
     /// defined before the join hold on every edge).
     fn phi(
@@ -1429,12 +1454,22 @@ impl<'a> Tracer<'a> {
             Term::Value(v) => self.phis[v.0 as usize],
             Term::Const(_) => None,
         };
-        let Some((block, _)) = words.iter().find_map(phi_of) else {
+        let Some((first, _)) = words.iter().find_map(phi_of) else {
             return Ok(None);
         };
-        if words.iter().filter_map(phi_of).any(|(b, _)| b != block) {
-            return Err("a descriptor joined in several blocks");
-        }
+        // Words joined in several blocks: the block every other one
+        // dominates goes first. The others' joins hold one value on each of
+        // its edges, and are traced on below it, on each edge.
+        let block = if words.iter().filter_map(phi_of).any(|(b, _)| b != first) {
+            let blocks: Vec<usize> = words.iter().filter_map(phi_of).map(|(b, _)| b).collect();
+            blocks
+                .iter()
+                .copied()
+                .find(|&b| blocks.iter().all(|&a| a == b || self.dominates(a, b)))
+                .ok_or("a descriptor joined in several blocks")?
+        } else {
+            first
+        };
         if joins.contains(&block) {
             return Err("a descriptor that changes in a loop");
         }
@@ -1448,8 +1483,8 @@ impl<'a> Tracer<'a> {
             words
                 .iter()
                 .map(|w| match phi_of(w) {
-                    Some((_, i)) => self.origin(phis[i].args[j]),
-                    None => *w,
+                    Some((b, i)) if b == block => self.origin(phis[i].args[j]),
+                    _ => *w,
                 })
                 .collect()
         };
