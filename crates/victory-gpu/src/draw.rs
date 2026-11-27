@@ -3226,6 +3226,10 @@ impl State {
         unsafe { list.list.Dispatch(x, y, z) };
         self.buffers_written();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        if p.stages.first().is_some_and(|s| !s.shader.clear_after.is_empty()) && self.clear_after(list, p) {
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
+        }
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
             && crate::ambient::on()
             && self.ambient(list, p, role)
@@ -3236,6 +3240,30 @@ impl State {
         if p.stages.first().is_some_and(|s| s.shader.probe.is_some()) {
             self.light_probe(list, p, true);
         }
+    }
+
+    /// `VICTORY_CLEAR_AFTER`: the named images of `p`'s tables set to zero.
+    /// Whether anything was recorded.
+    fn clear_after(&self, list: &HostList, p: &HostPipeline) -> bool {
+        let Some(stage) = p.stages.first() else {
+            return false;
+        };
+        let t = stage.translated();
+        let mut any = false;
+        for &at in &stage.shader.clear_after {
+            let Some((of, image)) = self.table_view(t, true, ResourceType::Uav, at) else {
+                once!(hash = stage.shader.hash, ?at, "VICTORY_CLEAR_AFTER: no image there");
+                continue;
+            };
+            if of.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+                once!(hash = stage.shader.hash, ?at, "VICTORY_CLEAR_AFTER: not a 2D image");
+                continue;
+            }
+            // (R32_UINT, R16_UINT, R8_UINT, R16G16_UINT, R32G32_UINT.)
+            let integer = matches!(of.Format.0, 42 | 57 | 62 | 36 | 17);
+            any |= crate::ambient::zero(list, image, [of.Width as u32, of.Height], integer);
+        }
+        any
     }
 
     /// The stand-in for the indirect light after a dispatch of `p`
@@ -4760,6 +4788,10 @@ impl State {
         // back (`crate::indirect`).
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            if p.stages.first().is_some_and(|s| !s.shader.clear_after.is_empty()) && self.clear_after(list, p) {
+                self.host_pipeline = 0;
+                self.host_roots[1] = 0;
+            }
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }

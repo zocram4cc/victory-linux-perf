@@ -370,6 +370,24 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
 }
 #endif
 
+#ifdef ZEROF
+RWTexture2D<float4> image_f : register(u0);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void zero_f(uint3 at : SV_DispatchThreadID) {
+    if (at.x < width && at.y < height) image_f[at.xy] = 0.0;
+}
+#endif
+
+#ifdef ZEROU
+RWTexture2D<uint4> image_u : register(u0);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void zero_u(uint3 at : SV_DispatchThreadID) {
+    if (at.x < width && at.y < height) image_u[at.xy] = 0;
+}
+#endif
+
 #ifdef RAISE
 RWTexture2D<uint> light : register(u0);
 float3 unpack(uint v) {
@@ -484,6 +502,8 @@ struct Pass {
     gather: ID3D12PipelineState,
     raise: ID3D12PipelineState,
     air: ID3D12PipelineState,
+    zero_f: ID3D12PipelineState,
+    zero_u: ID3D12PipelineState,
     cells: ID3D12Resource,
     points: ID3D12Resource,
     stats: ID3D12Resource,
@@ -523,6 +543,8 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     let gather = pipeline("GATHER", s!("gather"))?;
     let raise = pipeline("RAISE", s!("raise"))?;
     let air = pipeline("AIR", s!("clear_air"))?;
+    let zero_f = pipeline("ZEROF", s!("zero_f"))?;
+    let zero_u = pipeline("ZEROU", s!("zero_u"))?;
     let made = |bytes| buffer(bytes).ok_or_else(windows::core::Error::empty);
     Ok(Pass {
         root: root.ok_or_else(windows::core::Error::empty)?,
@@ -532,6 +554,8 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
         gather,
         raise,
         air,
+        zero_f,
+        zero_u,
         cells: made(CELL_BYTES)?,
         points: made(POINT_BYTES)?,
         stats: made(256)?,
@@ -577,6 +601,40 @@ pub(crate) struct Views {
     /// The size of the image, and how many slices it has.
     pub(crate) size: [u32; 2],
     pub(crate) slices: u32,
+}
+
+/// `VICTORY_CLEAR_AFTER`'s work: the 2D image at `image` (a view in the heap
+/// the list has set) is set to zero. Replaces the list's compute root
+/// signature and pipeline; false if it recorded nothing.
+pub(crate) fn zero(list: &HostList, image: D3D12_GPU_DESCRIPTOR_HANDLE, size: [u32; 2], integer: bool) -> bool {
+    let Some(pass) = pass() else {
+        return false;
+    };
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| tracing::info!(?size, integer, "an image is set to zero after a program (VICTORY_CLEAR_AFTER)"));
+    list.keep(&pass.cells);
+    list.keep(&pass.points);
+    list.keep(&pass.stats);
+    let mut words = [0u32; 15];
+    words[6] = size[0];
+    words[7] = size[1];
+    let l = &list.list;
+    // SAFETY: as in [`after`]: an open list with the heap of the view set,
+    // the image in the state the program just used it in.
+    unsafe {
+        uav_barrier(l);
+        l.SetComputeRootSignature(&pass.root);
+        l.SetComputeRoot32BitConstants(0, 15, words.as_ptr().cast(), 0);
+        l.SetComputeRootDescriptorTable(1, image);
+        l.SetComputeRootDescriptorTable(2, image);
+        l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
+        l.SetComputeRootUnorderedAccessView(4, pass.points.GetGPUVirtualAddress());
+        l.SetComputeRootUnorderedAccessView(5, pass.stats.GetGPUVirtualAddress());
+        l.SetPipelineState(if integer { &pass.zero_u } else { &pass.zero_f });
+        l.Dispatch(size[0].div_ceil(8), size[1].div_ceil(8), 1);
+        uav_barrier(l);
+    }
+    true
 }
 
 /// After the title's program of that role, in `list` with the program's view
