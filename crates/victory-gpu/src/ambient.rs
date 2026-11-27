@@ -106,7 +106,8 @@ pub(crate) fn on() -> bool {
 /// off by default; the shader's filter is `is_garbage`, the number its mode):
 /// `1` magenta (Belobug e9428969: "magenta garbage probes left by
 /// uninitialized/corrupted memory on AMD"), `2` magenta and green alone
-/// (breakwater 874af5e56).
+/// (breakwater 874af5e56), `3` magenta and the bluer kind (Fayberr's
+/// 01fe60053).
 fn magenta_filter() -> u8 {
     static ON: OnceLock<u8> = OnceLock::new();
     *ON.get_or_init(|| parse_magenta(&std::env::var("VICTORY_AMBIENT_MAGENTA").unwrap_or_default()))
@@ -116,6 +117,7 @@ fn parse_magenta(set: &str) -> u8 {
     match set.trim() {
         "1" => 1,
         "2" => 2,
+        "3" => 3,
         _ => 0,
     }
 }
@@ -258,6 +260,11 @@ bool is_garbage(float3 c) {
     // (taking every nearly pure colour made knuckles and elbows black: the
     // light in creases of skin is red).
     if (c.g > 4.0 * max(c.r, c.b) && c.g > 0.02) return true;
+#elif MAGENTA_FILTER == 3
+    // And the bluer kind of it (blue over 2.5x green and over red): left as
+    // a faint violet by the line above. The sky's light keeps green above
+    // 0.4x blue, sunsets keep blue low, so neither is touched.
+    if (c.b > 2.5 * c.g && c.b > c.r && c.b > 0.02) return true;
 #endif
     return false;
 }
@@ -682,16 +689,19 @@ mod tests {
         assert_eq!(parse_magenta("0"), 0);
         assert_eq!(parse_magenta("1"), 1);
         assert_eq!(parse_magenta(" 2 "), 2);
+        assert_eq!(parse_magenta("3"), 3);
         assert_eq!(parse_magenta("4"), 0);
     }
 
-    /// Modes 1 and 2 are different programs; a mode compiles the same way twice.
+    /// Modes 1 to 3 are different programs; a mode compiles the same way twice.
     #[test]
     fn magenta_modes_compile_apart() {
         let raise = |m| crate::host::compile(&source("RAISE", m), s!("raise"), s!("cs_5_1")).expect("raise");
         let one = raise(1);
         assert_eq!(raise(1), one);
         assert_ne!(raise(2), one);
+        assert_ne!(raise(3), one);
+        assert_ne!(raise(3), raise(2));
     }
 
     /// The passes compile with the system's compiler and the host takes them.
