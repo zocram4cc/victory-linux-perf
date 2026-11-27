@@ -47,7 +47,22 @@ const DISPATCH_UPSCALE: u64 = 0x1_0001;
 const CONSOLE_BACKEND: u64 = 0x100_0002;
 const HOST_BACKEND: u64 = 2;
 const GET_VERSIONS: u64 = 4;
+/// `ffxOverrideVersion` (ffx_api.h): a version id from `GET_VERSIONS`.
+const OVERRIDE_VERSION: u64 = 5;
 const GET_PROVIDER_VERSION: u64 = 6;
+
+/// `VICTORY_FFX_VERSION=<prefix>` (e.g. `3.1`): the host upscaler of the
+/// first version whose name starts with it, instead of the DLL's default.
+/// Under vkd3d-proton on an RX 7900 XTX the default (FSR 4.1.1) drew a grey
+/// or black picture (2026-11-27); 3.1 is the non-ML upscaler. Set by
+/// [`versions`] when the DLL offers such a version.
+static OVERRIDE: OnceLock<u64> = OnceLock::new();
+
+#[repr(C)]
+struct OverrideVersion {
+    header: Header,
+    id: u64,
+}
 const MEMORY_USAGE_WITH_DEVICE: u64 = 0x1_0009;
 
 #[repr(C)]
@@ -262,16 +277,29 @@ fn versions(host: &Host) -> Result<String, String> {
         ));
     }
     let mut names = vec![null::<c_char>(); count as usize];
+    let mut ids = vec![0u64; count as usize];
     query.names = names.as_mut_ptr();
-    // SAFETY: as above, with room for `count` names.
+    query.ids = ids.as_mut_ptr();
+    // SAFETY: as above, with room for `count` names and ids.
     unsafe { (host.query)(null_mut(), &mut query.header) };
-    Ok(names
+    let named: Vec<(u64, String)> = names
         .iter()
-        .filter(|n| !n.is_null())
+        .zip(&ids)
+        .filter(|(n, _)| !n.is_null())
         // SAFETY: NUL-terminated names the DLL keeps.
-        .map(|&n| unsafe { CStr::from_ptr(n) }.to_string_lossy().into_owned())
-        .collect::<Vec<_>>()
-        .join(", "))
+        .map(|(&n, &id)| (id, unsafe { CStr::from_ptr(n) }.to_string_lossy().into_owned()))
+        .collect();
+    if let Ok(want) = std::env::var("VICTORY_FFX_VERSION") {
+        let want = want.trim();
+        match named.iter().find(|(_, name)| name.starts_with(want)) {
+            Some(&(id, ref name)) => {
+                let _ = OVERRIDE.set(id);
+                tracing::info!(version = %name, id = format_args!("{id:#x}"), "FidelityFX: host upscaler version chosen (VICTORY_FFX_VERSION)");
+            }
+            None => tracing::warn!(want, "FidelityFX: no host upscaler version starts with VICTORY_FFX_VERSION: the default runs"),
+        }
+    }
+    Ok(named.into_iter().map(|(_, name)| name).collect::<Vec<_>>().join(", "))
 }
 
 /// Puts the host backend after the title's upscaler description, in place
@@ -338,6 +366,19 @@ extern "C" fn ffxCreateContext(
         device: host.device.as_raw(),
     };
     link(&mut upscale, &mut backend);
+    // `VICTORY_FFX_VERSION`: the chosen version, right after our backend.
+    let mut chosen = OverrideVersion {
+        header: Header {
+            kind: OVERRIDE_VERSION,
+            next: null_mut(),
+        },
+        id: 0,
+    };
+    if let Some(&id) = OVERRIDE.get() {
+        chosen.id = id;
+        chosen.header.next = backend.header.next;
+        backend.header.next = &raw mut chosen.header;
+    }
     // SAFETY: a PC chain; the title's later descriptions live for the call.
     let code = unsafe { (host.create)(context, &mut upscale.header, memory) };
     if code != OK {
