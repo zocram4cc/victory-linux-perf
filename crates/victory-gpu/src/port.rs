@@ -91,9 +91,11 @@ pub(crate) fn on() -> bool {
 /// `VICTORY_PORT_CONSTANTS_WINE` (`wine_setting`) and whether we run under
 /// Wine: `1` turns it on, but under Wine only with `VICTORY_PORT_CONSTANTS_WINE=1`
 /// as well. Under Wine 11.22, RADV and vkd3d-proton (RX 7900 XT) the port
-/// was reported to draw the HUD over a black world (PR #380); on Windows the
-/// world is drawn with it (RX 9070 XT, alone and with port #7). Until a
-/// Wine run shows otherwise it stays off there. Both halves read it here:
+/// draws the HUD over a black world (same-binary control on
+/// avatarmanz/VIctory-7900XTX#380): the GPU reads zeros from the opened
+/// heap whose bytes a second CPU mapping sees. On Windows the world is drawn
+/// with it (RX 9070 XT, alone and with port #7), and the same heap fixture
+/// passes. So it stays off under Wine. Both halves read it here:
 /// this crate's [`on`] and `victory_hle`'s xmem.
 pub fn constants_switch(setting: Option<&str>, wine_setting: Option<&str>, wine: bool) -> bool {
     let one = |v: Option<&str>| v.is_some_and(|v| v.trim() == "1");
@@ -104,7 +106,7 @@ pub fn constants_switch(setting: Option<&str>, wine_setting: Option<&str>, wine:
 pub fn constants_switch_here() -> bool {
     let setting = std::env::var("VICTORY_PORT_CONSTANTS").ok();
     let wine_setting = std::env::var("VICTORY_PORT_CONSTANTS_WINE").ok();
-    let wine = on_wine();
+    let wine = crate::wine::on_wine();
     let on = constants_switch(setting.as_deref(), wine_setting.as_deref(), wine);
     if wine && setting.as_deref().is_some_and(|v| v.trim() == "1") && !on {
         tracing::warn!(
@@ -113,19 +115,6 @@ pub fn constants_switch_here() -> bool {
         );
     }
     on
-}
-
-/// Whether we run under Wine (its ntdll exports `wine_get_version`).
-fn on_wine() -> bool {
-    static WINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *WINE.get_or_init(|| {
-        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
-        // SAFETY: plain lookups in ntdll, always loaded.
-        unsafe {
-            let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
-            !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
-        }
-    })
 }
 
 /// A stretch of title memory opened as a heap through a view of ours.
