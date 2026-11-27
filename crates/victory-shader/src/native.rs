@@ -536,7 +536,16 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
             root,
             table_offset_dwords: le32(e, 8),
             lower_bound: le32(e, 12),
-            stride: 0,
+            // For a buffer (a 4-dword descriptor read as SRV or UAV) the word
+            // after the register is its element size: a multiple of 4, or 1
+            // for a raw buffer (always so over 0x218's 2,680 programs, P.4);
+            // for a texture it is its view dimension.
+            stride: if e[20] == 4 && matches!(e[4], 0 | 3) {
+                let stride = le32(e, 16);
+                if stride == 1 || (stride >= 4 && stride.is_multiple_of(4)) { stride } else { 0 }
+            } else {
+                0
+            },
             dwords: e[20],
             user_data: e[21],
             slot: e[22],
