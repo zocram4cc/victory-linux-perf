@@ -962,6 +962,26 @@ pub(crate) fn dropped_now() -> u64 {
 pub(crate) fn take_dropped() -> u64 {
     DROPPED.swap(0, Ordering::Relaxed)
 }
+
+/// Dispatches of the ray-tracing structure builder left out because it is
+/// off (`VICTORY_BVH_BUILDER` unset), since the start: direct ones (also
+/// counted in [`DROPPED`]) and indirect ones (also in the list's indirect
+/// count). In the opening cutscene they were 2,000-3,000 a frame of the
+/// frame line's "dropped" and read as lost draws (runs 20261127-210643,
+/// -213538: no pipeline queued at the time).
+static BUILDER_OFF: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// [`BUILDER_OFF`] as of now, direct and indirect.
+pub(crate) fn builder_off() -> [u64; 2] {
+    BUILDER_OFF.each_ref().map(|a| a.load(Ordering::Relaxed))
+}
+
+/// [`BUILDER_OFF`] since the last call, for the frame line.
+pub(crate) fn take_builder_off() -> [u64; 2] {
+    static SAID: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+    let now = builder_off();
+    [0, 1].map(|i| now[i].saturating_sub(SAID[i].swap(now[i], Ordering::Relaxed)))
+}
 /// A root SRV's dynamic slot in a list, and the host copy it shows.
 type RootSlot = (u32, Option<std::sync::Arc<crate::shadow::Shadow>>);
 
@@ -4256,6 +4276,7 @@ impl State {
         // The ray-tracing structure builder's stages run all or none.
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            BUILDER_OFF[0].fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
@@ -5731,6 +5752,7 @@ impl State {
             return false;
         }
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+            BUILDER_OFF[1].fetch_add(1, Ordering::Relaxed);
             return false;
         }
         const DRAW: u32 = 0;

@@ -866,13 +866,14 @@ fn order_text(order: Option<&std::collections::HashMap<String, u32>>) -> String 
 /// what is kept. This run's time replaces an earlier run's (the opening
 /// scene moves when the save does); at most [`EARLY_MAX`] keys.
 fn note_order(order: &mut std::collections::HashMap<String, u32>, key: &str, at: u32) -> bool {
+    let full = order.len() >= EARLY_MAX;
     match order.get_mut(key) {
         Some(was) if *was == at => false,
         Some(was) => {
             *was = at;
             true
         }
-        None if order.len() >= EARLY_MAX => false,
+        None if full => false,
         None => {
             order.insert(key.to_owned(), at);
             true
