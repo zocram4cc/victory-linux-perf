@@ -139,6 +139,11 @@ The dump comes from one game run with `VICTORY_NATIVE_PSO_DUMP=Z:\…\pso-dump` 
   The table address's high dword is one of those spilled values. The swaps now resolve; what does not is **the spill slot**: lane 12 of v142 is written (`v_writelane_b32`) on several paths, so the value read back is a join that `ir::unspill` / `parked` does not turn into a phi.
 
   **Next:** in `unspill`, when a lane's writes on all paths into the read write the same origin (or 0 for a table's high half), take that origin. Otherwise make the read a phi of the written values at the join, so that `one_leaf` / `is_zero` can see through it. `VICTORY_WHY_UNSPILL=1` exists for this.
+- 25, **checked, and corrected**: `unspill` does succeed on the example (only v140, an ordinary VGPR, is not parked), so the spill lanes are already copies and phis. The zero proof stopped at two other things:
+  1. **`s_add_u32 sH, 0, src_scc`**: the high half as 0 plus the low add's carry, which `high_half` already accepts (offsets below 4 GB). Now `is_zero` accepts it too (`plus_scc`). Correct, kept.
+  2. **A lane mask in the same register on another path** (`218_0000000f002d6300` near 0x6580: `s_and_b32 s90, s90, exec_lo` … then the XOR swaps). The compiler reuses the register: on paths where the address is not used it holds a lane mask, and the join mixes that dead value in.
+
+  **Next:** prove the high half only over the paths that reach the access, as `classify` does for descriptors (`known`, `lanes.reach`, `only_edge`). A phi edge no lane that uses the address comes by does not count. `VICTORY_WHY_HIGH=1` prints the offset where the proof stops.
 
 ### Deferred on purpose: image stores of the alpha channel alone (69 programs)
 
