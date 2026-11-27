@@ -81,7 +81,15 @@ fn main() {
         let parsed = victory_shader::Container::parse(&c)
             .map_err(|e| e.to_string())
             .and_then(|c| victory_shader::native_programs(c.part(victory_shader::FourCC::ACCC).unwrap().data).map_err(|e| format!("fspx: {e}")));
-        let result = parsed.and_then(|_| victory_shader::emit::translate(&c).map(|_| ()).map_err(|e| format!("translate: {e}")));
+        let result = parsed.and_then(|_| {
+            match std::panic::catch_unwind(|| victory_shader::emit::translate(&c).map(|_| ())) {
+                Ok(r) => r.map_err(|e| format!("translate: {e}")),
+                Err(p) => Err(format!(
+                    "PANIC: {}",
+                    p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_default()
+                )),
+            }
+        });
         match result {
             Ok(()) => {
                 ok += 1;

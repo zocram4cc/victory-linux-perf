@@ -1224,7 +1224,7 @@ impl<'a> Tracer<'a> {
         // Words that went through XOR chains that cancel out (the console
         // compiler swaps registers with `s_xor_b32` three times): the word
         // they come back to.
-        let unxored: Vec<Term> = words.iter().map(|&w| self.xor_cancelled(w)).collect();
+        let unxored: Vec<Term> = words.iter().map(|&w| self.bfm_folded(self.xor_cancelled(w))).collect();
         let words = &unxored[..];
         if let Some(source) = self.phi(words, joins, known)? {
             return Ok(source);
@@ -2265,6 +2265,47 @@ impl<'a> Tracer<'a> {
             ([one], 0) => Term::Value(*one),
             _ => w,
         }
+    }
+
+    /// `w` as a constant when `s_bfm_b32` / `s_bfm_b64` made it from
+    /// constants (`((1 << width) - 1) << offset`; for the 64-bit form, the
+    /// half `w` is): the console compiler builds immediate samplers' words so
+    /// (`s_bfm_b64 s[88:89], 2, 54`). Otherwise `w`.
+    fn bfm_folded(&self, w: Term) -> Term {
+        let Term::Value(v) = w else {
+            return w;
+        };
+        let Some(inst) = self.def(v) else {
+            return w;
+        };
+        let wide = match inst.name() {
+            "s_bfm_b32" => false,
+            "s_bfm_b64" => true,
+            _ => return w,
+        };
+        let Some(half) = inst.writes.iter().position(|x| x.1 == v) else {
+            return w;
+        };
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return w;
+        };
+        let k = |o: Option<&Operand>| match o.and_then(|o| self.term(inst, o)) {
+            Some(Term::Const(c)) => Some(c),
+            _ => None,
+        };
+        let (Some(width), Some(offset)) = (k(src.first()), k(src.get(1))) else {
+            return w;
+        };
+        let value: u64 = if wide {
+            let (width, offset) = (width & 63, offset & 63);
+            let mask = if width == 0 { 0 } else { u64::MAX >> (64 - width) };
+            mask << offset
+        } else {
+            let (width, offset) = (width & 31, offset & 31);
+            let mask = if width == 0 { 0 } else { u32::MAX >> (32 - width) };
+            u64::from(mask << offset)
+        };
+        Term::Const(if half == 0 { value as u32 } else { (value >> 32) as u32 })
     }
 
     /// The operands of the XOR that made `v`: an `s_xor_b32`'s, or for each
