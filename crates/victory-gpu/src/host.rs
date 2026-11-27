@@ -323,7 +323,7 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
         let Some(a) = aside.as_mut() else { return Ok(()) };
         a.progress.run(
             || a.queue.ExecuteCommandLists(&[Some(a.list.clone())]),
-            |value, recovering| mapping_fence::confirm(device, &a.queue, &a.fence, a.event, value, recovering),
+            |value, attempt| mapping_fence::confirm(device, &a.queue, &a.fence, a.event, value, attempt),
         )?;
     }
     let us = started.elapsed().as_micros() as u64;
