@@ -10264,6 +10264,14 @@ impl Meter {
             let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;
             let picked_ms =
                 crate::draw::HEAP_BUFFER_MICROS.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
+            let [hp_slots, hp_spans, hp_textures, hp_mirrors, hp_readable] =
+                [0, 1, 2, 3, 4].map(|i| crate::draw::HEAP_SPLIT_US[i].swap(0, Ordering::Relaxed) as f64 / 1e3 / frames);
+            if picked_ms >= 1.0 {
+                tracing::info!(
+                    "heap passes per frame: {hp_slots:.1} ms looking at slots, {hp_spans:.1} ms on the spans of their copies, \
+                     {hp_textures:.1} ms on textures picked by index ({hp_mirrors:.1} ms making their host views, {hp_readable:.1} ms making them readable)"
+                );
+            }
             // Copies between depth textures and their colour twins, each way.
             let [twin_to_depth, twin_to_colour] =
                 [2, 3].map(|i| crate::resource::TWINS[i].swap(0, Ordering::Relaxed) as f64 / frames);

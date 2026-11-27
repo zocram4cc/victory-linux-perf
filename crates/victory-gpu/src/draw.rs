@@ -763,6 +763,11 @@ pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
 /// the spans and refreshes of their copies, the texture side.
 #[cfg(feature = "diagnostics")]
 pub(crate) static HEAP_SPLIT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Of the heap passes' microseconds, since the last frame line: the slots
+/// looked at, the spans of the copies they show, the textures picked by
+/// index; and of those, making the slots' host views (`mirror`: host
+/// textures made) and making them readable (uploads recorded).
+pub(crate) static HEAP_SPLIT_US: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
 /// Passes after which every buffer slot of the heap was looked at again.
 const HEAP_ROUND: u64 = 16;
@@ -1361,7 +1366,6 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     if crate::picked::on() {
         crate::picked::shown(unordered, all);
     }
-    #[cfg(feature = "diagnostics")]
     let looked = std::time::Instant::now();
     // Per host copy, the span its picked views cover.
     let mut spans: crate::host::ByCopy<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> = Default::default();
@@ -1402,13 +1406,14 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     }
     *unwatched = next_unwatched;
     drop(kept);
-    #[cfg(feature = "diagnostics")]
     let refreshed = std::time::Instant::now();
     crate::watch::look_at_holes();
     #[cfg(feature = "diagnostics")]
     for (sum, time) in HEAP_SPLIT.iter().zip([looked - started, refreshed - looked]) {
         sum.fetch_add(time.as_nanos() as u64, Ordering::Relaxed);
     }
+    HEAP_SPLIT_US[0].fetch_add((looked - started).as_micros() as u64, Ordering::Relaxed);
+    HEAP_SPLIT_US[1].fetch_add((refreshed - looked).as_micros() as u64, Ordering::Relaxed);
     static LOGGED: AtomicU64 = AtomicU64::new(0);
     // The first pass and every growth of the set by half.
     let seen = LOGGED.load(Ordering::Relaxed);
@@ -2565,11 +2570,11 @@ impl State {
                 shadow.refresh(list, from, to - from);
             }
         }
-        #[cfg(feature = "diagnostics")]
         let refreshed = std::time::Instant::now();
         stage.next("the heap pass: textures");
         self.heap_textures(list, heap, host);
         stage.end();
+        HEAP_SPLIT_US[2].fetch_add(refreshed.elapsed().as_micros() as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         HEAP_SPLIT[2].fetch_add(refreshed.elapsed().as_nanos() as u64, Ordering::Relaxed);
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
@@ -3089,9 +3094,11 @@ impl State {
                 && !baking
                 && crate::descriptor::host::show_after()
                 && heap.handle(index).is_some_and(|handle| !host.texture_slot_made_from(index, handle));
+            let mirroring = std::time::Instant::now();
             let view = heap.handle(index).and_then(|handle| {
                 if shows_other || late { crate::descriptor::view(handle) } else { host.mirror(index, handle, true) }
             });
+            HEAP_SPLIT_US[3].fetch_add(mirroring.elapsed().as_micros() as u64, Ordering::Relaxed);
             let at_once = || {
                 if late && let Some(handle) = heap.handle(index) {
                     let _ = host.mirror(index, handle, true);
@@ -3175,7 +3182,9 @@ impl State {
                 let _ = crate::residency::take_staging_deferred();
                 #[cfg(feature = "diagnostics")]
                 NOW_PIPELINE.with(|p| p.set(self.pipeline as usize));
+                let readable_since = std::time::Instant::now();
                 readable(list, sampled.kind, view);
+                HEAP_SPLIT_US[4].fetch_add(readable_since.elapsed().as_micros() as u64, Ordering::Relaxed);
                 crate::texture::PICKING.set(None);
             }
             // A staging buffer refused or put off (`crate::residency`) leaves
