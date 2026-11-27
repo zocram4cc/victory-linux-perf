@@ -1134,6 +1134,10 @@ void look() {
         rig.step = if format == DXGI_FORMAT_BC7_UNORM { "step 1, levels arrive (BC7)" } else { "step 1, levels arrive (BC3)" };
         let desc = Rig::desc(format, SIDE, LEVELS, true);
         let (texture, tiled) = rig.reserved(&desc);
+        let host = crate::resource::HostTexture::new_tiled(texture, 0, tiled);
+        let texture = &host.texture;
+        let tiled = host.tiled.as_ref().unwrap();
+        assert_eq!(host.backing_bytes(), 0);
         // (The card packs the levels smaller than a tile into shared
         // tiles; the software adapter may give each its own.)
         eprintln!(
@@ -1148,8 +1152,10 @@ void look() {
         let upload = rig.filled(&layout, |level| level as u8 + 1);
         for first in [3u32, 1, 0] {
             // Ahead of the list on the queue, as at a submission.
-            rig.give(&tiled, &texture, from_level(first));
-            let read = rig.round_trip(&texture, &layout, Some(&upload));
+            rig.give(tiled, texture, from_level(first));
+            let read = rig.round_trip(texture, &layout, Some(&upload));
+            let tiles = tiled.packed + tiled.standard.iter().skip(first as usize).sum::<u32>();
+            assert_eq!(host.backing_bytes(), u64::from(tiles) * TILE);
             for (level, bytes) in read.iter().enumerate() {
                 let want = if tiled.has_tiles(level as u32) { level as u8 + 1 } else { 0 };
                 assert!(all(bytes, want), "format {} from level {first}: level {level} reads {bytes:?}, wanted {want}", format.0);
