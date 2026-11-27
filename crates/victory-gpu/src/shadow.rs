@@ -3358,7 +3358,11 @@ impl Shadow {
         // shortcut: another host copy of the same bytes (a title buffer
         // inside this one with a copy of its own, a texture in it) is not
         // told: the card's writes are not seen by write watching.
-        if self.place.is_some() {
+        // Port 1's 32-bit constants heap (`< 4 GiB`): CPU constants live in the
+        // same 174 MB buffer as skinning writes, so no flight wait on its account.
+        // Above 4 GiB, in-place buffers still declare `Step::GpuWrite` so
+        // `line.written` tracks flight hazards (no snapshot or copy-back).
+        if self.place.is_some() && self.start < (1 << 32) {
             return;
         }
         self.written.store(true, Ordering::Relaxed);

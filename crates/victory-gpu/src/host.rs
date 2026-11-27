@@ -4267,7 +4267,7 @@ fn hand_back(back: &[Declared]) {
         // threads), then the merges, in order, as below.
         let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
         for (shadow, declared) in back {
-            if shadow.carded() {
+            if shadow.carded() || shadow.in_place() {
                 continue;
             }
             let mut sorted = declared.clone();
@@ -5286,7 +5286,7 @@ impl Host {
                 // (Each byte once: the ranges are joined.)
                 let mut back: Vec<Declared> = Vec::new();
                 for flight in &flights {
-                    for (shadow, ranges) in flight.back.iter().filter(|(shadow, _)| !shadow.carded()) {
+                    for (shadow, ranges) in flight.back.iter().filter(|(shadow, _)| !shadow.carded() && !shadow.in_place()) {
                         match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
                             Some((_, all)) => all.extend_from_slice(ranges),
                             None => back.push((shadow.clone(), ranges.clone())),

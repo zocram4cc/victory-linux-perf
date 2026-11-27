@@ -146,17 +146,34 @@ static BOUNDS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// touch it, their bytes.
 static STATS: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
 
-/// Whether `[at, at + len)` may be ported: in the title's 32-bit graphics
-/// memory.
-pub(crate) fn wanted(at: u64, len: u64) -> bool {
-    on() && at.checked_add(len).is_some_and(|end| end <= LOW && len > 0)
+/// `VICTORY_PORT_BUFFERS=1`: also place contiguous-section title buffers above
+/// 4 GiB in place (zero watch, zero protect, zero refresh, zero copy-back).
+pub(crate) fn buffers_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_PORT_BUFFERS").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Whether `[at, at + len)` may be ported: below 4 GiB with `VICTORY_PORT_CONSTANTS=1`,
+/// or contiguous-section title buffers above 4 GiB with `VICTORY_PORT_BUFFERS=1`.
+pub(crate) fn wanted(at: u64, len: u64, window: bool) -> bool {
+    let Some(end) = at.checked_add(len) else {
+        return false;
+    };
+    if len == 0 {
+        return false;
+    }
+    if end <= LOW {
+        on()
+    } else {
+        !window && buffers_on()
+    }
 }
 
 /// Title memory `[start, start + len)` in place, if [`wanted`] and the
 /// memory is one stretch of a section: a buffer placed in the region's
 /// heap. `None` leaves the caller to do what it did before.
 pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
-    if !wanted(start, len) {
+    if !wanted(start, len, window) {
         return None;
     }
     let host = crate::host::host()?;
@@ -242,16 +259,22 @@ fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usiz
     let Some((first, bytes, section, offset)) = stretch(at as usize, (end - at) as usize) else {
         return Err((3, format!("not one stretch of a section: {:?}", cover(at as usize, (end - at) as usize))));
     };
-    // The whole stretch, kept to what may be ported: the next buffer in it
-    // finds the region made.
+    // The whole stretch below 4 GiB (kept to what may be ported: the next buffer
+    // in it finds the region made). Above 4 GiB, open only the requested buffer's
+    // 64 KiB-aligned range so unused pages of a multi-GB section are not locked.
     let (mut first, mut bytes, mut offset) = (first as u64, bytes as u64, offset);
-    if first < LOW && first + bytes > LOW {
-        bytes = LOW.saturating_sub(first);
-    }
-    if bytes > MOST {
-        // Only what was asked for.
+    if at >= LOW {
         offset += at - first;
         (first, bytes) = (at, end - at);
+    } else {
+        if first < LOW && first + bytes > LOW {
+            bytes = LOW.saturating_sub(first);
+        }
+        if bytes > MOST {
+            // Only what was asked for.
+            offset += at - first;
+            (first, bytes) = (at, end - at);
+        }
     }
     if bytes > MOST {
         return Err((3, format!("{bytes:#x} bytes, over the most of a region")));
@@ -554,7 +577,7 @@ mod tests {
         // The switch is read once from the environment; tests do not set
         // it, so nothing is wanted.
         if !on() {
-            assert!(!wanted(0x3431_0000, 0x1000));
+            assert!(!wanted(0x3431_0000, 0x1000, false));
         }
         let low = |at: u64, len: u64| at.checked_add(len).is_some_and(|end| end <= LOW && len > 0);
         assert!(low(0x34e1_0000, 0xae0_0000));
