@@ -150,10 +150,16 @@ fn half_to_f32(h: u16) -> f32 {
 fn f32_to_half(v: f32) -> u16 {
     let bits = v.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
-    let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+    let raw_exp = (bits >> 23) & 0xff;
     let man = bits & 0x7f_ffff;
+    if raw_exp == 0xff && man != 0 {
+        // Quiet NaN, preserving sign and upper payload bits (set bit 9 so a
+        // signalling NaN with payload below bit 13 never turns into infinity).
+        return sign | 0x7e00 | (man >> 13) as u16;
+    }
+    let exp = raw_exp as i32 - 127 + 15;
     if exp >= 31 {
-        return sign | 0x7c00; // too large: infinity
+        return sign | 0x7c00; // infinity or overflow
     }
     if exp <= 0 {
         if exp < -10 {
@@ -170,10 +176,11 @@ fn f32_to_half(v: f32) -> u16 {
         let m = q + u32::from(r > halfway || (r == halfway && (q & 1) != 0));
         return sign | m as u16;
     }
-    // Rounded to nearest: a carry out of the mantissa is added into the
+    // Round to nearest even: a carry out of the mantissa is added into the
     // exponent (`2 - 2^-12` is 2.0); at most it reaches infinity, 0x7c00.
     let half = (exp as u32) << 10;
-    sign | (half + ((man + 0x1000) >> 13)) as u16
+    let lsb = (man >> 13) & 1;
+    sign | (half + ((man + 0x0fff + lsb) >> 13)) as u16
 }
 
 #[cfg(test)]
@@ -362,5 +369,53 @@ mod tests {
             &dst[11 * 16..12 * 16],
             &v([14.0, 20.0, 1.0], [0.75, 0.5])[..]
         );
+    }
+
+    #[test]
+    fn f32_to_half_preserves_nan_and_rounds_normals_to_nearest_even() {
+        // Quiet and signalling NaNs (both signs) must produce quiet f16 NaNs,
+        // never infinities (0x7c00 / 0xfc00).
+        for (bits, want) in [
+            (f32::NAN.to_bits(), 0x7e00u16),
+            ((-f32::NAN).to_bits(), 0xfe00),
+            (0x7fc0_4000, 0x7e02), // qNaN with payload bits
+            (0x7f80_0001, 0x7e00), // +sNaN with payload below bit 13
+            (0xff80_0001, 0xfe00), // -sNaN with payload below bit 13
+        ] {
+            let h = f32_to_half(f32::from_bits(bits));
+            assert_eq!(
+                h, want,
+                "f32_to_half({bits:#010x}) = {h:#06x}, want {want:#06x}"
+            );
+            assert!(half_to_f32(h).is_nan());
+        }
+        assert_eq!(f32_to_half(f32::INFINITY), 0x7c00);
+        assert_eq!(f32_to_half(f32::NEG_INFINITY), 0xfc00);
+
+        // Normal rounding must tie to even (matching subnormals):
+        // 1.0 + 2^-11 is midway between even 0x3c00 and odd 0x3c01 -> 0x3c00.
+        assert_eq!(f32_to_half(f32::from_bits(0x3f80_1000)), 0x3c00);
+        assert_eq!(f32_to_half(f32::from_bits(0xbf80_1000)), 0xbc00);
+        // 1.0 + 3*2^-11 is midway between odd 0x3c01 and even 0x3c02 -> 0x3c02.
+        assert_eq!(f32_to_half(f32::from_bits(0x3f80_3000)), 0x3c02);
+        // Strictly above the tie rounds up.
+        assert_eq!(f32_to_half(f32::from_bits(0x3f80_1001)), 0x3c01);
+        // Overflow boundary: just below 65520 stays finite (0x7bff); 65520 ties to even (+inf).
+        assert_eq!(f32_to_half(f32::from_bits(0x477f_efff)), 0x7bff);
+        assert_eq!(f32_to_half(f32::from_bits(0x477f_f000)), 0x7c00);
+
+        // Every finite/infinite f16 bit pattern round-trips identically; NaNs stay NaN.
+        for h in 0..=u16::MAX {
+            let f = half_to_f32(h);
+            let back = f32_to_half(f);
+            if f.is_nan() {
+                assert!(
+                    (back & 0x7fff) > 0x7c00 && (back & 0x8000) == (h & 0x8000),
+                    "NaN {h:#06x} became {back:#06x}"
+                );
+            } else {
+                assert_eq!(back, h, "f16 {h:#06x} failed round-trip");
+            }
+        }
     }
 }
