@@ -4028,6 +4028,7 @@ impl State {
             let same = !tabled && crate::texture::unchanged(resource, first);
             if same {
                 HEAP_TEXTURES_SAME.fetch_add(1, Ordering::Relaxed);
+                crate::descriptor::host::guard_due_same(index);
                 if n < sourced {
                     sourced_add(sourced::UNCHANGED, 1);
                 }
@@ -4146,6 +4147,7 @@ impl State {
                 return false;
             }
             let (bytes, whole) = crate::texture::staged(resource, there.is_none()).unwrap_or((0, true));
+            crate::descriptor::host::guard_due_uploaded(index, bytes);
             // Not all of it there: looked at again next frame, and from
             // then on as a slot with nothing new (a placed texture: until
             // more of it is mapped; a texture object at an address the

@@ -1689,6 +1689,13 @@ pub(crate) fn put_beside(block: usize, weight: u32, put: impl FnOnce(usize)) -> 
     for view in shown.iter().filter(|&&view| view != 0) {
         PUBLISHED.clear(view / BLOCK);
     }
+    // The texture pass: slots of textures uploaded before this write are
+    // brought up to date (`VICTORY_GUARD_WRITES`).
+    if crate::descriptor::host::guard_writes() {
+        for view in shown.iter().filter(|&&view| view != 0) {
+            crate::descriptor::host::guard_written(view / BLOCK * BLOCK, BLOCK);
+        }
+    }
     Beside::Done
 }
 
@@ -1704,8 +1711,30 @@ pub(crate) fn nothing_put(block: usize) -> bool {
 /// The title is about to write block by block around `at`: as by a fault.
 pub(crate) fn opened_for_writing(at: usize) {
     let mut g = guards();
-    if open(&mut g, at, at + 1) != 0 {
+    let opened = open(&mut g, at, at + 1) != 0;
+    if opened {
         g.opened(at / BLOCK);
+    }
+    drop(g);
+    if opened {
+        title_wrote(at / BLOCK);
+    }
+}
+
+/// The title wrote guarded `block` (a fault opened it, or it is about to
+/// write it block by block): the texture pass is told of it at every
+/// address its page is shown at (`crate::descriptor::host::guard_written`),
+/// as a landing tells of ours. Not for writes of our own: those are told
+/// where they are made ([`writing`], [`landed_beside`]).
+fn title_wrote(block: usize) {
+    if !crate::descriptor::host::guard_writes() {
+        return;
+    }
+    crate::descriptor::host::guard_written(block * BLOCK, BLOCK);
+    for other in crate::inplace::pages_of(block * BLOCK) {
+        if other / BLOCK != block {
+            crate::descriptor::host::guard_written(other / BLOCK * BLOCK, BLOCK);
+        }
     }
 }
 
@@ -4134,6 +4163,11 @@ pub(crate) fn install() {
                     }
                 }
                 drop(g);
+                // The texture pass: slots of textures uploaded before this
+                // write are brought up to date (`VICTORY_GUARD_WRITES`).
+                if ours.is_none() {
+                    title_wrote(block);
+                }
                 // Diagnostics: a write of the title's a flight watch may be
                 // looking for (`crate::flightwatch`); it has not happened yet.
                 #[cfg(feature = "diagnostics")]
