@@ -12240,6 +12240,14 @@ impl<'a> Lower<'a> {
                             *slot = self.s.m.extract(c, r, ch);
                             read = Some(r);
                         }
+                        // Experiment (P.4, the culling that hid the house):
+                        // `VICTORY_GATHER_LEVEL_CONST=<f32>` makes every
+                        // level gather read that value, so that an occlusion
+                        // test against the depth pyramid can be ruled in or out.
+                        if let Some(k) = std::env::var("VICTORY_GATHER_LEVEL_CONST").ok().and_then(|v| v.parse::<f32>().ok()) {
+                            let k = self.s.m.f32(k.to_bits());
+                            g = [k; 4];
+                        }
                         gathered = Some(g);
                         read.expect("four reads")
                     } else {

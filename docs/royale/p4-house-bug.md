@@ -106,3 +106,24 @@ Before step 17 that stopped translation ("a descriptor outside the heaps"). **St
 - **A hypothesis dropped:** at first I read `s8` as the group id. With TGID_X enabled in RSRC2 (0x90: 8 user SGPRs, then the group id), the group id *is* s8 at the start, and its bits 20+ would have collided with the layer's 2^20-group clamp on indirect dispatches. But the program overwrites s8 with the record word before that use: the group id only picks the record (`s8 * 24`). Not the cause.
 - **The trace** (`VICTORY_NATIVE_TRACE=60`) printed nothing for these 4 programs. Their dispatches do not go through `draw::dispatch`'s native trace, so they are most likely indirect (ExecuteIndirect). Next: trace there.
 - **One program at a time** (`bench/p4-cull/<program>.txt`, runs `bench/k-…-cull-one-*`): results below.
+- **cull-one-a2d400** (the first short variant alone): the user saw it look better, but the house black (not missing).
+- **cull-one-a2e600**: the user saw it look fine.
+- **cull-one-a2f800**: the house looks fine; some flicker in the intro before the loading screen (as in other runs), and on a shadow and a tree.
+- **cull-one-a33700**: no intro flicker this time. (The user: the intro flicker shows in some runs only, not tied to a known setting; it was seen in the a2f800 run.)
+- **cull-one-a33700**: the user felt fewer fps (it reached 25 before).
+- **Measured** (one run each): a2d400 24.6 fps, house dark (the user: 'black'); a2e600 20.2, fine; a2f800 18.1, fine; a33700 19.4, fine (camera elsewhere). **No program alone hides the house**: it takes a combination. Next: the three without a2d400.
+- **cull-no-a2d400** (a2e600 + a2f800 + a33700): **house whole** (23.8 fps). The user: no intro flicker; some flicker on a shadow and a background tree, as in the a2f800 run. **Conclusion: a2d400 is the culprit** (alone: house dark; with the others: house gone). Second, minor suspect for the shadow/tree flicker: a2f800.
+- **a2d400 and a2e600 are the same program**: identical code (`diff` of the disassembly: only the hash bytes before the code), identical packet (`w1`), metadata different only in the 0x43 hash record. Their translations are identical, so **the fault is in how this code is translated**, and it shows where the title uses a2d400 (most likely the main view's culling: the house), less where it uses a2e600 (another pass; possibly shadows, where the user saw flicker). Next: read the translation against the code.
+- **Decisive experiment** (`VICTORY_GATHER_LEVEL_CONST`, a switch in `emit/lower.rs` that makes every level gather read a constant; fresh caches `cache-exp-gather0/1` so the translation changes), the whole family on:
+  - **0: the house is whole and correct** (`bench/k-…-cull-gather0/run-1.png`);
+  - **1: everything is "occluded"**: half the house gone, Jason invisible, much flicker (the user's report, `…-cull-gather1`).
+
+  Depth is reversed (0 = far), so 0 lets nothing be occluded. **The fault is the occlusion test against the depth pyramid.** Either we read the pyramid wrongly (level, coordinates, texel order), or the pyramid itself is wrong: built by a pass we do not run yet, so it holds stale or foreign data. (Both runs started black then white: the empty caches made every pipeline compile at world entry.)
+- **How the culling reads the pyramid** (`218_0000000f00a2d400`, ~0x0a80-0x0bc0 in the code):
+  - level 0's size is `2^floor(log2(screen / 2))` per axis (1024×512 at 2560×1440, from root constants `s14`/`s15`);
+  - the box's screen bounds are scaled to it (floor of the low corner, ceil of the high one);
+  - the level is `max(ceil(log2(max extent)) - 1, 0)`, then one less while the box stays at least 5 texels wide;
+  - the coordinates are texel centres `(texel + 0.5) / floor(size × 2^-level)`;
+  - then one `image_gather4_l` plus three `image_gather4_l_o` at (2,0) (0,2) (2,2), a 4×4 block, minimum taken, and the edges masked to 1.0.
+
+  Our lowering reads those texels with `textureLoad` at the rounded level, and for integer levels and texel-centre coordinates it gives the same texels. **So reading is probably right, and the pyramid's contents are the suspect**: the pass that builds it may be one we do not run.
