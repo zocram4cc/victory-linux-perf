@@ -167,6 +167,16 @@ pub fn helper_own() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_HELPER_OWN").is_none_or(|v| v != "0"))
 }
 
+/// Whether `v_mad_legacy_f32` and `v_mac_legacy_f32` are one fused
+/// multiply-add of flushed sources, as the console's card runs them
+/// (`lower.rs` `legacy_fmad`); on unless `VICTORY_LEGACY_FMA=0` (the legacy
+/// product rounded, then the sum, as before). Part of the translation: the
+/// shader cache keys on it.
+pub fn legacy_fma() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LEGACY_FMA").is_none_or(|v| v != "0"))
+}
+
 /// Which of a translated program's group barriers wait for the whole
 /// group (`GroupMemoryBarrierWithGroupSync`); the others keep their memory
 /// fence and lose the wait. A wait that some thread of the group never
