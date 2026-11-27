@@ -1386,6 +1386,19 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    /// `VICTORY_LATE_WAIT=default` is the default (stage 3 with the relay), not
+    /// off: off, the submitting thread waited for the card at its submissions
+    /// (33.9 ms a frame, 50 submissions instead of 17, on an RX 9070 XT).
+    #[test]
+    fn late_wait_default_is_the_default() {
+        use super::late_stage_for;
+        assert_eq!(late_stage_for(Some("default"), true), late_stage_for(None, true), "=default with the relay");
+        assert_eq!(late_stage_for(Some(""), true), late_stage_for(None, true));
+        assert_eq!(late_stage_for(Some("default"), false), 0);
+        assert_eq!(late_stage_for(Some("0"), true), 0);
+        assert_eq!(late_stage_for(Some("2"), true), 2);
+    }
+
     /// A list of ours is found by its name, with the debug layer's note or not.
     #[cfg(feature = "diagnostics")]
     #[test]
@@ -2904,7 +2917,8 @@ pub(crate) fn late() -> bool {
     late_stage() > 0
 }
 
-/// `VICTORY_LATE_WAIT`: 0 (off), 1, or 2 ([`late_exact`]).
+/// `VICTORY_LATE_WAIT`: 0 (off), 1, or 2 ([`late_exact`]); unset, empty or
+/// `default`: 3 with the relay, off without it.
 fn late_stage() -> u8 {
     static STAGE: OnceLock<u8> = OnceLock::new();
     *STAGE.get_or_init(|| {
@@ -2913,15 +2927,19 @@ fn late_stage() -> u8 {
         if timing() {
             return 0;
         }
-        match std::env::var("VICTORY_LATE_WAIT").as_deref() {
-            Ok("1") => 1,
-            Ok("2") => 2,
-            Ok("3") => 3,
-            // The relay alone: on top of stage 3.
-            Err(_) if crate::shadow::relay() => 3,
-            _ => 0,
-        }
+        late_stage_for(std::env::var("VICTORY_LATE_WAIT").ok().as_deref(), crate::shadow::relay())
     })
+}
+
+fn late_stage_for(asked: Option<&str>, relay: bool) -> u8 {
+    match asked.filter(|v| !matches!(v.trim(), "" | "default")) {
+        Some("1") => 1,
+        Some("2") => 2,
+        Some("3") => 3,
+        // The relay alone: on top of stage 3.
+        None if relay => 3,
+        _ => 0,
+    }
 }
 
 /// Stage 2 of [`late`] (`VICTORY_LATE_WAIT=2`): point 3 of its list is no
