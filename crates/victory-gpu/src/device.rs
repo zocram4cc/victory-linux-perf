@@ -401,7 +401,7 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         dump_native(SLOT, desc as usize, std::path::Path::new(&dir));
     }
     #[cfg(windows)]
-    if SLOT == 0x218 && native_compute_on() {
+    if SLOT == 0x218 && native_compute_on() && calls <= native_compute_max() {
         if let Some(container) = native_compute(desc as usize) {
             let hr = crate::pipeline::create_compute_from(&container, _iid, out);
             NATIVE_COMPUTE[usize::from(hr < 0)].fetch_add(1, Ordering::Relaxed);
@@ -418,6 +418,13 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
 /// P.4 (`VICTORY_NATIVE_COMPUTE=1`): 0x218 pipelines made, refused by the
 /// host, and descriptions not understood.
 pub(crate) static NATIVE_COMPUTE: [std::sync::atomic::AtomicU32; 3] = [const { std::sync::atomic::AtomicU32::new(0) }; 3];
+
+/// `VICTORY_NATIVE_COMPUTE_MAX=N`: only the first N calls of 0x218 are made
+/// (to find, by halves, a program that breaks the picture).
+fn native_compute_max() -> u32 {
+    static MAX: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| std::env::var("VICTORY_NATIVE_COMPUTE_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(u32::MAX))
+}
 
 fn native_compute_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
