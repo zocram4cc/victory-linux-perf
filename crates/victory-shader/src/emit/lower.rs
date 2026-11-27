@@ -8368,8 +8368,10 @@ impl<'a> Lower<'a> {
             .scalar
             .get(&load)
             .ok_or("an untracked descriptor load")?;
+        let from_memory = a.param == crate::resource::MEMORY;
         match self.x.native.layout.get(a.param).map(|p| p.root) {
             Some(RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap) => {}
+            _ if from_memory => {}
             _ => return Err("a descriptor outside the heaps"),
         }
         let li: &Inst = &self.x.p.blocks[load.0].insts[load.1];
@@ -8397,6 +8399,9 @@ impl<'a> Lower<'a> {
             .m
             .i32((offset as i32 as u32).wrapping_add(4 * u32::from(first)));
         at = self.s.m.bin(c, Bin::Add, at, k);
+        if from_memory {
+            at = self.less_heap_start(at, sampler);
+        }
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
         Ok(self.s.m.bin(c, Bin::LShr, at, shift))
     }
@@ -8408,8 +8413,12 @@ impl<'a> Lower<'a> {
             .scalar
             .get(&load)
             .ok_or("an untracked descriptor load")?;
+        // From memory: an address the code read from data, a console
+        // address in the heap (`USER_VIEW_HEAP_START`).
+        let from_memory = a.param == crate::resource::MEMORY;
         match self.x.native.layout.get(a.param).map(|p| p.root) {
             Some(RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap) => {}
+            _ if from_memory => {}
             _ => return Err("a descriptor outside the heaps"),
         }
         let li: &Inst = &self.x.p.blocks[load.0].insts[load.1];
@@ -8437,8 +8446,20 @@ impl<'a> Lower<'a> {
             let so = self.operand(li, soffset)?;
             addr = self.s.m.bin(c, Bin::Add, addr, so);
         }
+        if from_memory {
+            addr = self.less_heap_start(addr, sampler);
+        }
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
         Ok(self.s.m.bin(c, Bin::LShr, addr, shift))
+    }
+
+    /// `addr` (a console address in a heap) less that heap's console start:
+    /// its byte offset in the heap.
+    fn less_heap_start(&mut self, addr: V, sampler: bool) -> V {
+        use super::shader::{USER_SAMPLER_HEAP_START, USER_VIEW_HEAP_START};
+        let kind = if sampler { USER_SAMPLER_HEAP_START } else { USER_VIEW_HEAP_START };
+        let start = self.host_word(RootType::Other(kind), 0, 0);
+        self.s.m.bin(self.cur, Bin::Sub, addr, start)
     }
 
     fn valu(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {

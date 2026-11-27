@@ -1322,6 +1322,16 @@ impl State {
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
         }
+        // The console address of the bound view (sampler) heap's first
+        // descriptor: descriptors a shader loads through an address it read
+        // from memory are at (address - this) / size there (P.4).
+        if kind == victory_shader::emit::USER_VIEW_HEAP_START || kind == victory_shader::emit::USER_SAMPLER_HEAP_START {
+            let which = usize::from(kind == victory_shader::emit::USER_SAMPLER_HEAP_START);
+            return match self.heaps[which] {
+                0 => 0,
+                h => crate::descriptor::heap(h as This).start as u32,
+            };
+        }
         // All of every group, unless the dispatch says otherwise.
         if kind == victory_shader::emit::USER_DISPATCH_THREADS_X {
             return 0;
