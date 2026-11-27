@@ -6847,8 +6847,8 @@ impl<'a> Lower<'a> {
                     "s_min_i32" => pred::SLT,
                     _ => pred::SGT,
                 };
-                let t = self.s.m.cmp(c, p, a, b);
-                (self.s.m.select(c, t, a, b), None)
+                let first_wins = self.s.m.cmp(c, p, a, b);
+                (self.s.m.select(c, first_wins, a, b), Some(first_wins))
             }
             "s_abs_i32" => {
                 let a = src32(self, 0)?;
