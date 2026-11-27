@@ -29,6 +29,9 @@ pub fn init(default_level: &str) {
         .with(
             tracing_subscriber::fmt::layer()
                 .with_target(true)
+                // `VICTORY_LOG_THREADS=1`: each line names its thread (which
+                // pipeline a worker that died was making, for one).
+                .with_thread_names(std::env::var_os("VICTORY_LOG_THREADS").is_some_and(|v| v == "1"))
                 .with_writer(std::io::stderr),
         )
         .try_init();

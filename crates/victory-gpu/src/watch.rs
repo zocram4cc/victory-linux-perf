@@ -2899,7 +2899,7 @@ pub(crate) fn asks() -> [u64; 13] {
 }
 
 /// The guards' lock, the wait for it counted.
-fn guards_timed() -> std::sync::RwLockWriteGuard<'static, Guards> {
+fn guards_timed() -> HeldGuards {
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     let g = guards();
@@ -3199,12 +3199,97 @@ static GUARDS: RwLock<Guards> = RwLock::new(Guards {
     known_runs: Mutex::new(KnownRuns::new()),
 });
 
-/// The guards, alone.
-fn guards() -> std::sync::RwLockWriteGuard<'static, Guards> {
-    if let Ok(g) = GUARDS.try_write() {
-        return g;
+thread_local! {
+    /// Whether this thread holds [`GUARDS`] ([`HeldGuards`]).
+    static GUARDS_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Blocks this thread's own writes faulted in while it held [`GUARDS`],
+    /// how many, and how often one of them faulted again: opened by the
+    /// handler without the lock ([`opened_held`]), noted when the lock is
+    /// given back.
+    static OPENED_HELD: std::cell::Cell<([usize; 32], usize, u32)> = const { std::cell::Cell::new(([0; 32], 0, 0)) };
+    /// Whether [`OPENED_HELD`] holds anything (asked each time the lock is
+    /// given back).
+    static OPENED_ANY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The guards, locked by this thread ([`GUARDS_HELD`]). A write of its own to
+/// a block they hold is let through without the lock while it holds it
+/// ([`opened_held`]): waiting for the lock would wait for itself, and every
+/// thread stood still (zeex64 502e905). The block is noted when it is given back.
+struct HeldGuards(std::sync::RwLockWriteGuard<'static, Guards>);
+
+impl std::ops::Deref for HeldGuards {
+    type Target = Guards;
+    fn deref(&self) -> &Guards {
+        &self.0
     }
-    waited(3, || GUARDS.write().unwrap_or_else(|e| e.into_inner()))
+}
+
+impl std::ops::DerefMut for HeldGuards {
+    fn deref_mut(&mut self) -> &mut Guards {
+        &mut self.0
+    }
+}
+
+impl Drop for HeldGuards {
+    fn drop(&mut self) {
+        // What the handler opened under the lock is memory of our own: noted
+        // so (never guarded again, `Guards::foreign`), and opened in the sets
+        // too (which may fault again and add to the list: until it stays empty).
+        while OPENED_ANY.try_with(|any| any.replace(false)).unwrap_or(false) {
+            let Ok((blocks, n, _)) = OPENED_HELD.try_with(|o| o.replace(([0; 32], 0, 0))) else {
+                break;
+            };
+            for &block in &blocks[..n] {
+                self.0.foreign.insert(block);
+                open(&self.0, block * BLOCK, block * BLOCK + 1);
+            }
+        }
+        let _ = GUARDS_HELD.try_with(|h| h.set(false));
+    }
+}
+
+/// For the fault handler, on a thread that holds [`GUARDS`] ([`HeldGuards`]):
+/// gives write access back to `block` if the guards hold it, without the
+/// lock, and notes it for the end of [`HeldGuards`]. False if the block is
+/// none of theirs, has faulted again and again, or the list of such blocks
+/// has no room: a write that nobody is told of does not go through.
+fn opened_held(block: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+    const AGAIN: u32 = 64;
+    if !PROTECTED.any(block, block + 1) {
+        return false;
+    }
+    let go_on = OPENED_HELD.try_with(|o| {
+        let (mut blocks, mut n, mut again) = o.get();
+        if blocks[..n].contains(&block) {
+            again += 1;
+        } else if n < blocks.len() {
+            blocks[n] = block;
+            n += 1;
+        } else {
+            return false;
+        }
+        o.set((blocks, n, again));
+        again <= AGAIN
+    });
+    let _ = OPENED_ANY.try_with(|any| any.set(true));
+    if !go_on.unwrap_or(false) {
+        return false;
+    }
+    let mut old = 0;
+    // SAFETY: only the protection of the faulting block changes.
+    unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) != 0 }
+}
+
+/// The guards, alone.
+fn guards() -> HeldGuards {
+    let g = match GUARDS.try_write() {
+        Ok(g) => g,
+        Err(_) => waited(3, || GUARDS.write().unwrap_or_else(|e| e.into_inner())),
+    };
+    let _ = GUARDS_HELD.try_with(|h| h.set(true));
+    HeldGuards(g)
 }
 
 /// The guards, shared (renderer port #6): what changes a block's state holds
@@ -3715,6 +3800,21 @@ pub(crate) fn in_view_space(at: usize) -> bool {
     n > 0 && at < spaces[n - 1].1
 }
 
+/// Whether the guards take only view memory (`VICTORY_GUARD_VIEWS_ONLY`; on
+/// by default, `0`: as before). Committed memory that is no view (a thread's
+/// stack, the layer's own heap, an image) is never made read-only by our hand
+/// ([`alike`]), and free memory is no hole of a view ([`is_view`]). Under
+/// Wine a range asked about as a view begins in one and can run on into such
+/// memory: the window of title memory cut on the 4 MiB grid over the end of a
+/// reservation. Belobug PR #478: a thread's stack made read-only ended the
+/// process at its next store inside a system call. zeex64 502e905: the
+/// layer's own heap, a fault in the handler until the stack was gone.
+fn views_only() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("VICTORY_GUARD_VIEWS_ONLY").is_none_or(|v| v != "0"));
+    *ON
+}
+
 /// Whether `[start, end)` is view memory. The title's views lie in
 /// placeholders, mapped and unmapped block by block as it streams, so a
 /// range can begin in a block that is not mapped right now: the first
@@ -3729,7 +3829,7 @@ pub(crate) fn in_view_space(at: usize) -> bool {
 /// `VICTORY_GUARD_HOLES=0` looks at the first address only, as before.
 fn is_view(start: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery,
+        MEM_COMMIT, MEM_FREE, MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
     static HOLES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let holes = *HOLES.get_or_init(|| std::env::var_os("VICTORY_GUARD_HOLES").is_none_or(|v| v != "0"));
@@ -3753,7 +3853,13 @@ fn is_view(start: usize, end: usize) -> bool {
         if info.State == MEM_COMMIT || !holes {
             return false;
         }
-        // A hole (a placeholder, or free): on to what follows it.
+        // Free memory is no hole of a view ([`views_only`]): the window a null
+        // address falls in is the process heap under Wine, whose writes then
+        // fault into the guards' handler (zeex64 502e905; Marvisak issue #1849).
+        if info.State == MEM_FREE && views_only() {
+            return false;
+        }
+        // A hole (a placeholder, or free with the switch off): on to what follows it.
         let next = (info.BaseAddress as usize).saturating_add(info.RegionSize);
         if next <= at || next >= end {
             return true;
@@ -3889,20 +3995,43 @@ fn view_pieces(first: usize, last: usize) -> Vec<(usize, usize)> {
     pieces
 }
 
+/// Says that the guards met committed memory that is no view where a view
+/// was asked for, the first few times ([`views_only`]).
+fn not_a_view(at: usize, bytes: usize, kind: u32, protection: u32) {
+    static TOLD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if TOLD.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
+        tracing::info!(
+            at = format_args!("{at:#x}"),
+            bytes,
+            kind = format_args!("{kind:#x}"),
+            protection = format_args!("{protection:#x}"),
+            "memory in a range asked about as a view is no view (private memory, an image, a thread's stack): the guards leave it as it is, and it is copied every time (VICTORY_GUARD_VIEWS_ONLY=0: guarded, as before)"
+        );
+    }
+}
+
 /// How many of the blocks `[first, last)`, from the first on, one change of
 /// protection can take with nothing to put back: committed memory of one
 /// region (one view, one allocation), read-only or read-write throughout.
 /// 0: what is at `first` is not for us to change without a look at what it
-/// was (code, memory the title protects itself, nothing).
+/// was (code, memory the title protects itself, nothing); with
+/// [`views_only`], nor is memory that is no view.
 fn alike(first: usize, last: usize) -> usize {
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READONLY, PAGE_READWRITE, VirtualQuery,
+        MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, PAGE_READONLY, PAGE_READWRITE, VirtualQuery,
     };
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery((first * BLOCK) as *const _, &mut info, size_of_val(&info)) };
     if n == 0 || info.State != MEM_COMMIT || !matches!(info.Protect, PAGE_READONLY | PAGE_READWRITE) {
+        return 0;
+    }
+    let at = first * BLOCK;
+    // (As [`is_view`] has a view: mapped, or committed in a reservation of the
+    // title's that is not the heap opened in place.)
+    if views_only() && info.Type != MEM_MAPPED && !(in_view_space(at) && !crate::inplace::at_home(at, 1)) {
+        not_a_view(at, info.RegionSize, info.Type, info.Protect);
         return 0;
     }
     ((info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK).min(last).saturating_sub(first)
@@ -5002,7 +5131,7 @@ fn forget_views(first: usize, last: usize) {
 
 /// Tells what keeps track of what title memory shows; the guards, with no
 /// block of the range known unmapped.
-fn title_memory_changed(at: usize, len: usize) -> std::sync::RwLockWriteGuard<'static, Guards> {
+fn title_memory_changed(at: usize, len: usize) -> HeldGuards {
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
@@ -5044,11 +5173,24 @@ pub(crate) fn install() {
         EXCEPTION_POINTERS,
     };
     unsafe extern "system" fn on_write(info: *mut EXCEPTION_POINTERS) -> i32 {
-        let _fault = crate::timeline::span("a fault looked at");
         // SAFETY: the system passes the exception being dispatched.
         let r = unsafe { &*(*info).ExceptionRecord };
         const READ: usize = 0;
         const WRITE: usize = 1;
+        // A write of this thread's own while it holds the guards' lock
+        // ([`HeldGuards`]), to a block they hold: opened here and now, without
+        // the lock (waiting for it would be waiting for ourselves), and before
+        // anything below writes memory of our own.
+        let held = GUARDS_HELD.try_with(|h| h.get()).unwrap_or(false);
+        if held
+            && r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
+            && r.NumberParameters >= 2
+            && r.ExceptionInformation[0] == WRITE
+            && opened_held(r.ExceptionInformation[1] / BLOCK)
+        {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        let _fault = crate::timeline::span("a fault looked at");
         // A fault of our own copies (`crate::safecopy`): whatever it is, if
         // it is not a block we guard, the copy fails and goes on from there.
         let ours = crate::safecopy::failing_exit(r.ExceptionAddress as usize);
@@ -5084,6 +5226,15 @@ pub(crate) fn install() {
         }
         let at = r.ExceptionInformation[1];
         let block = at / BLOCK;
+        // (Under the guards' lock, and not a block of theirs: nothing here
+        // may wait for the lock.)
+        if held {
+            return match ours {
+                _ if !PROTECTED.any(block, block + 1) && writable(at) => EXCEPTION_CONTINUE_EXECUTION,
+                Some(exit) => fail(exit),
+                None => EXCEPTION_CONTINUE_SEARCH,
+            };
+        }
         if ours.is_none()
             && PROTECTED.any(block, block + 1)
             // SAFETY: the context the system passes, to go on from.
@@ -5794,6 +5945,191 @@ mod tests {
             for block in 0..3 {
                 VirtualFree((p + block * BLOCK) as *mut _, 0, MEM_RELEASE);
             }
+        }
+    }
+
+    /// A view of a section of its own, one block, in place of the
+    /// placeholder of one block at `at`, of which nobody is told.
+    fn section_view_at(at: usize) -> windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, MEM_REPLACE_PLACEHOLDER, MapViewOfFile3};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        // SAFETY: a section's block in place of our placeholder; the view
+        // keeps the section, whose handle is closed.
+        unsafe {
+            let section = CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, BLOCK as u32, std::ptr::null());
+            assert!(!section.is_null());
+            let view = MapViewOfFile3(
+                section,
+                GetCurrentProcess(),
+                at as *const _,
+                0,
+                BLOCK,
+                MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            );
+            assert_eq!(view.Value as usize, at);
+            CloseHandle(section);
+            view
+        }
+    }
+
+    /// A range asked about as a view (it begins in one) that runs on into
+    /// memory that is no view, there before the first asking: the view is
+    /// guarded, the other memory keeps its protection and is copied every
+    /// time. (A window of title memory over the end of the title's
+    /// reservation ran on into a thread's stack under Wine: made read-only,
+    /// it ended the process. Belobug PR #478.)
+    #[test]
+    fn memory_past_a_view_that_is_no_view_is_not_guarded() {
+        use windows_sys::Win32::System::Memory::{MEM_PRESERVE_PLACEHOLDER, PAGE_READONLY, UnmapViewOfFile2};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        if !views_only() {
+            return;
+        }
+        let p = placeholder(4);
+        let view = section_view_at(p);
+        // Another's memory behind it, two blocks (a stack with its page that
+        // is not written at the bottom), and a hole.
+        private_at(p + BLOCK, PAGE_READONLY);
+        private_at(p + 2 * BLOCK, PAGE_READWRITE);
+        let block = |k: usize| p / BLOCK + k;
+        let as_made = || {
+            assert_eq!(protection(p + BLOCK), PAGE_READONLY);
+            assert_eq!(protection(p + 2 * BLOCK), PAGE_READWRITE);
+            assert!(!PROTECTED.any(block(1), block(3)));
+            let g = guards();
+            for k in 1..3 {
+                assert!(!g.protected.contains(block(k)) && !g.clean.contains(block(k)) && !g.absent.contains(block(k)));
+            }
+        };
+        // The first asking: all of it written, as far as anyone knows.
+        assert_eq!(guard(p, p + 4 * BLOCK).map(|w| w.len()), Some(4));
+        assert_eq!(protection(p), PAGE_READONLY, "the view is guarded");
+        as_made();
+        // A write there is nobody's fault.
+        // SAFETY: our allocation, read-write.
+        unsafe { ((p + 2 * BLOCK + 8) as *mut u8).write(1) };
+        for _ in 0..2 {
+            let written = guard(p, p + 4 * BLOCK).expect("as a view");
+            assert_eq!(written, vec![p / PAGE + 1, p / PAGE + 2], "copied every time, and nothing else");
+            as_made();
+        }
+        // The view is written and guarded again, as ever.
+        // SAFETY: the view, opened by the handler.
+        unsafe { ((p + 8) as *mut u8).write(1) };
+        assert_eq!(guard(p, p + 4 * BLOCK), Some(vec![p / PAGE, p / PAGE + 1, p / PAGE + 2]));
+        assert_eq!(protection(p), PAGE_READONLY);
+        as_made();
+        // Before the view goes, as the runtime does.
+        title_memory_unmapping(p, 4 * BLOCK);
+        // SAFETY: our view and our allocations.
+        unsafe {
+            assert_ne!(UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER), 0);
+            for k in 0..4 {
+                VirtualFree((p + k * BLOCK) as *mut _, 0, MEM_RELEASE);
+            }
+        }
+    }
+
+    /// What Windows said of a block once is not kept: a guarded view that
+    /// goes with nobody telling, and private memory in its place (a library's
+    /// mapping behind the title's reservation, and then a thread's stack), is
+    /// asked about again before it is guarded, and left as it is.
+    #[test]
+    fn what_comes_in_place_of_a_guarded_view_with_nobody_telling_is_not_guarded() {
+        use windows_sys::Win32::System::Memory::{MEM_PRESERVE_PLACEHOLDER, PAGE_READONLY, UnmapViewOfFile2};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        if !views_only() {
+            return;
+        }
+        let p = placeholder(2);
+        let (one, two) = (section_view_at(p), section_view_at(p + BLOCK));
+        let other = p / BLOCK + 1;
+        assert_eq!(guard(p, p + 2 * BLOCK).map(|w| w.len()), Some(2));
+        assert_eq!([protection(p), protection(p + BLOCK)], [PAGE_READONLY; 2]);
+        // The second view goes and private memory comes, untold.
+        // SAFETY: our view.
+        assert_ne!(unsafe { UnmapViewOfFile2(GetCurrentProcess(), two, MEM_PRESERVE_PLACEHOLDER) }, 0);
+        private_at(p + BLOCK, PAGE_READWRITE);
+        // What was noted guarded there is opened (our own write through the
+        // kernel, say), so the next asking would guard it again.
+        writing(p + BLOCK, BLOCK);
+        assert!(!guards().protected.contains(other));
+        for _ in 0..2 {
+            assert_eq!(guard(p, p + 2 * BLOCK), Some(vec![p / PAGE + 1]), "copied every time");
+            assert_eq!(protection(p + BLOCK), PAGE_READWRITE, "asked about again: no view, and left as it is");
+            assert!(!PROTECTED.any(other, other + 1));
+        }
+        assert_eq!(protection(p), PAGE_READONLY, "the view that stayed is guarded still");
+        title_memory_unmapping(p, 2 * BLOCK);
+        // SAFETY: our view and our allocations.
+        unsafe {
+            assert_ne!(UnmapViewOfFile2(GetCurrentProcess(), one, MEM_PRESERVE_PLACEHOLDER), 0);
+            for k in 0..2 {
+                VirtualFree((p + k * BLOCK) as *mut _, 0, MEM_RELEASE);
+            }
+        }
+    }
+
+    /// Free memory is no hole of a view: a range in it is not one (the
+    /// window a null address falls in is the process heap under Wine); a
+    /// reserved placeholder still is.
+    #[test]
+    fn free_memory_is_no_hole_of_a_view() {
+        let p = placeholder(2);
+        assert!(is_view(p, p + 2 * BLOCK), "a placeholder: a view's hole");
+        // SAFETY: our placeholders, given up: free memory now.
+        unsafe {
+            for k in 0..2 {
+                VirtualFree((p + k * BLOCK) as *mut _, 0, MEM_RELEASE);
+            }
+        }
+        assert_eq!(is_view(p, p + 2 * BLOCK), !views_only());
+    }
+
+    /// A write of the thread that holds the guards' lock to a block they
+    /// hold is opened by the handler without the lock (it waited for the
+    /// lock its own thread held, and every thread stood still), and the
+    /// block is never guarded again: memory of our own.
+    #[test]
+    fn a_write_under_the_guards_lock_does_not_wait_for_it() {
+        use windows_sys::Win32::System::Memory::{MEM_PRESERVE_PLACEHOLDER, PAGE_READONLY, UnmapViewOfFile2};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let p = placeholder(1);
+        let view = section_view_at(p);
+        let block = p / BLOCK;
+        assert_eq!(guard(p, p + BLOCK), Some(vec![block]));
+        assert_eq!(protection(p), PAGE_READONLY);
+        let (tell, told) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let g = guards();
+            // SAFETY: our view; the fault is taken by the handler.
+            unsafe { ((p + 16) as *mut u8).write(7) };
+            assert!(g.protected.contains(block), "noted when the lock is given back, not before");
+            drop(g);
+            let _ = tell.send(());
+        });
+        assert!(told.recv_timeout(std::time::Duration::from_secs(10)).is_ok(), "the handler waited for its own thread's lock");
+        writer.join().unwrap();
+        // SAFETY: our view.
+        assert_eq!(unsafe { ((p + 16) as *const u8).read() }, 7);
+        assert_eq!(protection(p), PAGE_READWRITE);
+        {
+            let g = guards();
+            assert!(g.foreign.contains(&block) && !g.protected.contains(block));
+        }
+        assert!(!PROTECTED.any(block, block + 1));
+        // Asked about again: told as written, left as it is.
+        assert_eq!(guard(p, p + BLOCK), Some(vec![block]));
+        assert_eq!(protection(p), PAGE_READWRITE);
+        title_memory_unmapping(p, BLOCK);
+        // SAFETY: our view and our allocation.
+        unsafe {
+            assert_ne!(UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER), 0);
+            VirtualFree(p as *mut _, 0, MEM_RELEASE);
         }
     }
 
