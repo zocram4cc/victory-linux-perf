@@ -2004,12 +2004,15 @@ impl State {
             }
             Some(s)
         };
+        // (Copied out: the memo below borrows `self` mutably beside this closure.)
+        #[cfg(feature = "diagnostics")]
+        let pipeline = self.pipeline;
         let ready = |a: u64, s: &std::sync::Arc<crate::shadow::Shadow>| {
             let len = s.left(a).min(limit);
             s.refresh(list, a, len);
             if writes {
                 #[cfg(feature = "diagnostics")]
-                crate::host::wide_write(a, len, self.pipeline);
+                crate::host::wide_write(a, len, pipeline);
                 s.gpu_writes(list, a, len);
             }
         };
