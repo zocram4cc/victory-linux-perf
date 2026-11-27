@@ -6105,6 +6105,71 @@ impl<'a> Lower<'a> {
         self.s.op(qb, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &[faults, place, iu, mark, iu, iu, iu, mask, align]);
     }
 
+    /// Whether `v` is only ever used as a descriptor: followed through
+    /// copies (`s_mov_b32`/`s_mov_b64`, among them the moves `ir::unspill`
+    /// makes of spill saves and restores) and joins, every use is an SGPR
+    /// operand of a memory instruction (its resource or sampler words).
+    /// Then no number depends on its value: descriptors are traced to their
+    /// loads, not read. P.4 (27 Nov): the runtime marker's two hits were
+    /// image descriptor dwords (`s[80:87]`) saved to spill lanes and back
+    /// around a loop.
+    fn descriptor_only(&self, v: Value) -> bool {
+        let p = self.x.p;
+        let mut todo = vec![v];
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(x) = todo.pop() {
+            if !seen.insert(x) {
+                continue;
+            }
+            if seen.len() > 512 {
+                return false;
+            }
+            for block in &p.blocks {
+                for ph in &block.phis {
+                    if ph.args.contains(&x) {
+                        todo.push(ph.value);
+                    }
+                }
+                for i in &block.insts {
+                    let Some(&(reg, _)) = i.reads.iter().find(|r| r.1 == x) else { continue };
+                    let name = i.name();
+                    if matches!(name, "s_mov_b32" | "s_mov_b64") {
+                        // The copy's dword that reads `x`.
+                        let k = match (&i.fields, reg) {
+                            (Fields::Sop { src, .. }, Reg::S(c)) => match src.first() {
+                                Some(Operand::Scalar { code, .. }) if c >= *code => usize::from(c - code),
+                                _ => return false,
+                            },
+                            _ => return false,
+                        };
+                        match i.writes.get(k) {
+                            Some(&(_, w)) => todo.push(w),
+                            None => return false,
+                        }
+                        continue;
+                    }
+                    // Only the resource and sampler operands (not `soffset`, a
+                    // number).
+                    let within = |op: &Operand| match (*op, reg) {
+                        (Operand::Scalar { code, dwords }, Reg::S(c)) => c >= code && c < code + dwords,
+                        _ => false,
+                    };
+                    let descriptor = match &i.fields {
+                        Fields::Smem { base, .. } if name.starts_with("s_buffer_") => within(base),
+                        Fields::Buffer { rsrc, .. } => within(rsrc),
+                        Fields::Image { rsrc, sampler, .. } => within(rsrc) || sampler.as_ref().is_some_and(within),
+                        _ => false,
+                    };
+                    if descriptor {
+                        continue;
+                    }
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// Whether no lane that reads `v` (a join in block `b`) can have come into
     /// `b` from its predecessor `q`: what that edge brings is never read, so
     /// any value is right there. False where that is not proven (a read
@@ -13664,12 +13729,18 @@ impl<'a> Lower<'a> {
                     (Some(Val::Missing(why)), false)
                         if self.read_phis.contains(&phi.value)
                             && DEAD_DESCRIPTOR_WORDS.contains(&why)
-                            && (assume_dead_joins() || self.edge_unread(phi.value, b, q))
+                            && (assume_dead_joins() || self.edge_unread(phi.value, b, q) || self.descriptor_only(phi.value))
                             && !std::env::var_os("VICTORY_DEAD_DESCRIPTOR_JOINS").is_some_and(|v| v == "0") =>
                     {
                         // Assumed, not proven: the runtime marker, where asked.
-                        if !self.edge_unread(phi.value, b, q) {
+                        if !self.edge_unread(phi.value, b, q) && !self.descriptor_only(phi.value) {
                             let at = p.blocks[b].insts.first().map_or(b as u32, |i| i.machine.offset as u32);
+                            if std::env::var_os("VICTORY_WHY_DEAD").is_some() {
+                                let readers: Vec<String> = p.blocks.iter().flat_map(|bl| bl.insts.iter())
+                                    .filter(|i| i.reads.iter().any(|r| r.1 == phi.value))
+                                    .map(|i| format!("{:#x} {}", i.machine.offset, i.name())).collect();
+                                eprintln!("WHY-DEAD reg {:?} into {at:#x} from IR pred {q}: {why}; read by {readers:?}", phi.reg);
+                            }
                             self.dead_marker(qb, b, at);
                         }
                         self.s.m.i32(0)
