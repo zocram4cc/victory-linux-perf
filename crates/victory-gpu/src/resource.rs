@@ -1265,6 +1265,10 @@ struct Hosted {
     gone: std::sync::atomic::AtomicBool,
     /// A texture of [`PLACED_TEXTURES`].
     placed: std::sync::atomic::AtomicBool,
+    /// Such a texture's first page was shown by a view of the title's
+    /// physical pages when its host copy was last made: its memory is of
+    /// that kind, a view or nothing ([`memory_gone`]).
+    viewed: std::sync::atomic::AtomicBool,
     /// The lowest level a view asked for since it had no host copy
     /// ([`want_level`]; `u32::MAX`: none said).
     wanted: std::sync::atomic::AtomicU32,
@@ -1772,6 +1776,11 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             KINDS[5].fetch_add(host.bytes, Relaxed);
         }
         KINDS[6].fetch_add(1, Relaxed);
+        // For the sweep's order ([`memory_gone`]): whether it lies in a view
+        // of the title's physical pages now.
+        if r.host.placed.load(Relaxed) && gone_first() {
+            r.host.viewed.store(crate::inplace::shown_bytes(r.data() as usize, 1).is_some(), Relaxed);
+        }
         *made = Some((std::sync::Arc::new(host), twin));
         // Slots the title wrote with views of it while it had no host copy
         // are made before the next submission runs.
@@ -2226,7 +2235,7 @@ pub(crate) fn let_go_idle() {
             let used = used.saturating_sub(crate::pool::texture_room())
                 + crate::shadow::card_room_kept()
                 + targets_room_kept();
-            crate::host::vram_keep(budget, used)
+            crate::host::vram_keep(budget, sweep_used(budget, used))
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
     };
@@ -2261,15 +2270,19 @@ pub(crate) fn let_go_idle() {
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
     let mut dxgi_bytes = 0;
-    // With a limit, the longest idle first.
-    let mut by_age: Vec<(u64, usize)> = Vec::new();
+    // With a limit (the card's line, or a full texture budget: both are
+    // served by the one walk below), the longest idle first; before all of
+    // them the copies whose title memory is gone ([`gone_first`]), the
+    // longest idle first too.
+    let mut by_age: Vec<(bool, u64, usize)> = Vec::new();
     if most != u64::MAX {
+        let gone_first = gone_first();
         for &at in all.iter() {
             // SAFETY: as below.
             let r = unsafe { &*(at as *const Resource) };
             let used = r.host.used.load(Relaxed);
             if used != 0 && fills(&r.desc) && crate::host::long_ago(used, idle_ms, IDLE_FRAMES) {
-                by_age.push((used & 0xffff_ffff, at));
+                by_age.push((!(gone_first && memory_gone(r)), used & 0xffff_ffff, at));
             }
         }
         by_age.sort_unstable();
@@ -2290,7 +2303,9 @@ pub(crate) fn let_go_idle() {
     };
     let from = if part == PART { FROM.load(Relaxed) } else { 0 };
     let mut looked = 0;
-    for at in all.range(from..).take(part).copied().chain(by_age.iter().map(|&(_, at)| at)) {
+    // (With the limit: whether the copy's title memory is still there.)
+    let limited = by_age.iter().map(|&(there, _, at)| (at, Some(there)));
+    for (at, there) in all.range(from..).take(part).map(|&at| (at, None)).chain(limited) {
         if dxgi_bytes >= most && bytes >= texture_most {
             break;
         }
@@ -2329,6 +2344,10 @@ pub(crate) fn let_go_idle() {
             let backing = host.backing_bytes();
             KINDS[2].fetch_add(1, Relaxed);
             KINDS[3].fetch_add(backing, Relaxed);
+            if let Some(there) = there {
+                LIMITED[2 * usize::from(there)].fetch_add(1, Relaxed);
+                LIMITED[2 * usize::from(there) + 1].fetch_add(backing, Relaxed);
+            }
             went += 1;
             bytes += backing;
             dxgi_bytes += host.bytes;
@@ -2350,13 +2369,88 @@ pub(crate) fn let_go_idle() {
     if went > 0 {
         crate::host::trail(|| {
             format!(
-                "sweep: {went} host copies of textures the title fills let go ({} KiB), each held by its title texture alone (no list, no slot); the first: title texture {:#x}",
+                "sweep: {went} host copies of textures the title fills let go ({} KiB), each held by its title texture alone (no list, no slot); the first: title texture {:#x}; under a limit since the start: {} whose title memory was gone ({} MiB), {} others ({} MiB)",
                 bytes >> 10,
-                first.unwrap_or(0)
+                first.unwrap_or(0),
+                LIMITED[0].load(Relaxed),
+                LIMITED[1].load(Relaxed) >> 20,
+                LIMITED[2].load(Relaxed),
+                LIMITED[3].load(Relaxed) >> 20
             )
         });
     }
 }
+
+/// What [`let_go_idle`] counts as in use of the card where the line up to
+/// which host copies are made is not the default one ([`room_percent`], 90):
+/// as much less (or more) as that line is higher (or lower), so that the
+/// sweep's own lines (88 % and 85 % of the budget, `crate::host::vram_keep`)
+/// stand as far under it as they do by default. At 90 nothing changes.
+/// `VICTORY_SWEEP_FOLLOWS_ROOM=0`: the sweep's lines where they were.
+/// (zeex64 502e905: with the lines fixed, `VICTORY_TEXTURE_ROOM_PERCENT`
+/// above 88 said nothing, the sweep let go at 88 % whatever it was.)
+#[cfg(windows)]
+fn sweep_used(budget: u64, used: u64) -> u64 {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_SWEEP_FOLLOWS_ROOM").is_none_or(|v| v != "0")) {
+        return used;
+    }
+    sweep_used_at(budget, used, room_percent())
+}
+
+/// [`sweep_used`] for a line at `percent` of the budget.
+#[cfg(any(windows, test))]
+fn sweep_used_at(budget: u64, used: u64, percent: u64) -> u64 {
+    let shift = budget / 100 * percent.abs_diff(90);
+    if percent >= 90 { used.saturating_sub(shift) } else { used.saturating_add(shift) }
+}
+
+/// Whether, of the host copies [`let_go_idle`] may let go under a limit of
+/// bytes, those whose title memory is gone go before the others
+/// (`VICTORY_SWEEP_GONE_FIRST=0`: the longest idle first whatever their
+/// memory, as before).
+///
+/// zeex64 502e905: in a 56-minute play the card stood at the sweep's line
+/// throughout; 483,000 copies went (29.7 GB) and 139,000 of them were made
+/// and uploaded again (9.7 GB), each shown late and as the neutral texture
+/// meanwhile, while some 700 MB of such copies were of placed textures
+/// whose memory the title had unmapped. Nothing shows those again before
+/// the title has streamed them in again, while a copy whose memory is
+/// still there is wanted again as soon as a view of it is written. By age
+/// alone a copy of either kind went.
+#[cfg(windows)]
+fn gone_first() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SWEEP_GONE_FIRST").is_none_or(|v| v != "0"))
+}
+
+/// Whether `r` is a texture placed in the views of the title's physical
+/// pages whose first page no view shows now (its smallest levels lie there,
+/// mapped first and unmapped last). By the runtime's word of what it mapped
+/// (`crate::inplace::shown_bytes`): no question to the host, which the sweep
+/// would ask for thousands of textures on the thread that submits. That the
+/// memory is of that kind is known from the making of its host copy, when a
+/// view showed it ([`Hosted::viewed`]; zeex64 asks its record of the
+/// runtime's placeholders, which ours does not keep).
+#[cfg(windows)]
+fn memory_gone(r: &Resource) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    // (Most of the idle ones have no host copy: nothing to ask about.)
+    if !r.host.placed.load(Relaxed)
+        || !r.host.viewed.load(Relaxed)
+        || r.host.made.lock().unwrap_or_else(|e| e.into_inner()).is_none()
+    {
+        return false;
+    }
+    let at = r.data() as usize;
+    at != 0 && crate::inplace::shown_bytes(at, 1).is_none()
+}
+
+/// Since the start, of the host copies [`let_go_idle`] let go under a limit
+/// of bytes: those whose title memory was gone and their bytes, the others
+/// and their bytes ([`gone_first`]).
+#[cfg(windows)]
+pub(crate) static LIMITED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// Since the start: looks of [`let_go_idle`], their microseconds, and the
 /// longest one's.
@@ -2917,6 +3011,7 @@ fn hand_out_resource(
             refused: std::sync::atomic::AtomicBool::new(false),
             gone: std::sync::atomic::AtomicBool::new(false),
             placed: std::sync::atomic::AtomicBool::new(false),
+            viewed: std::sync::atomic::AtomicBool::new(false),
             wanted: std::sync::atomic::AtomicU32::new(u32::MAX),
             grown: std::sync::atomic::AtomicBool::new(false),
         },
@@ -5303,5 +5398,49 @@ float4 lit() : SV_Target { return 1.0; }
         assert!(!textures().contains(&(source as usize)), "the last reference frees it");
         assert!(!is_aliased(view) && alias_of(view).is_none());
         resource_release(view);
+    }
+
+    /// The sweep's lines follow the line up to which host copies are made:
+    /// at the default 90 % nothing changes, at 94 % what counts as in use is
+    /// 4 % of the budget less, at 80 % a tenth more. (zeex64 502e905.)
+    #[test]
+    fn the_sweeps_lines_follow_the_room_line() {
+        const GIB: u64 = 1 << 30;
+        let budget = 10 * GIB;
+        assert_eq!(sweep_used_at(budget, 9 * GIB, 90), 9 * GIB);
+        assert_eq!(sweep_used_at(budget, 9 * GIB, 94), 9 * GIB - budget / 100 * 4);
+        assert_eq!(sweep_used_at(budget, 9 * GIB, 80), 9 * GIB + budget / 100 * 10);
+        assert_eq!(sweep_used_at(budget, GIB / 100, 97), 0);
+    }
+
+    /// Under a limit the host copies of placed textures whose title memory
+    /// is gone go before the others, the longest idle first among each; one
+    /// counts as gone only if a view of the title's pages showed its first
+    /// page when the copy was made and none does now. (zeex64 502e905.)
+    #[cfg(windows)]
+    #[test]
+    fn copies_whose_title_memory_is_gone_go_first() {
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        // (still there, when last used, which): as the sweep sorts them.
+        let mut by_age = vec![(true, 5u64, 1usize), (false, 9, 2), (true, 2, 3), (false, 4, 4)];
+        by_age.sort_unstable();
+        assert_eq!(by_age.iter().map(|&(_, _, at)| at).collect::<Vec<_>>(), [4, 2, 3, 1]);
+
+        if crate::host::host().is_none() {
+            return;
+        }
+        let desc = [3u32, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0];
+        let whole = placed_bytes(&desc).unwrap() as usize;
+        // SAFETY: memory of our own that stays.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), whole.max(65536), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        let texture = texture_at(at as u64, &desc).unwrap();
+        let r = resource(texture);
+        assert!(!memory_gone(r), "no host copy");
+        assert!(host_copy(texture).is_some());
+        assert!(!r.host.viewed.load(Relaxed) && !memory_gone(r), "memory of another kind: never gone");
+        // As if a view had shown it when the copy was made, and none now.
+        r.host.viewed.store(true, Relaxed);
+        assert!(memory_gone(r));
     }
 }
