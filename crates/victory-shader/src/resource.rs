@@ -21,8 +21,9 @@ use crate::structure::{Bool, LaneExit, Meets, Structured};
 /// An instruction: block and index in [`crate::ir::Block::insts`].
 pub type Site = (usize, usize);
 
-/// A byte address: a root parameter's, plus a constant and at most one
-/// value the program computes (an index times a stride, say).
+/// A byte address: a root parameter's, plus a constant and at most two
+/// values the program computes (an index times a stride, say; a second in
+/// the instruction's offset register, P.4's programs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Address {
     /// Index into the layout, or [`CODE`].
@@ -31,6 +32,10 @@ pub struct Address {
     /// descriptor's address).
     pub offset: u32,
     pub dynamic: Option<Value>,
+    /// A second computed term, added to [`Address::dynamic`]'s (only with
+    /// it set): the code added an offset register to an address that had
+    /// one already.
+    pub dynamic2: Option<Value>,
 }
 
 /// [`Address::param`] of the program's own code: a constant table the
@@ -617,6 +622,9 @@ impl<'a> Tracer<'a> {
         if base.root != RootType::Table {
             return None;
         }
+        if address.dynamic2.is_some() {
+            return None;
+        }
         let dynamic = address.dynamic?;
         let (input, shift) = match self.sop2(dynamic, &["s_lshl_b32"]) {
             Some((_, [Term::Value(input), Term::Const(shift)])) => (input, (shift & 31) as u8),
@@ -881,6 +889,7 @@ impl<'a> Tracer<'a> {
                 param: MEMORY,
                 offset: 0,
                 dynamic: None,
+                dynamic2: None,
             })
         } else {
             Err(why)
@@ -945,9 +954,9 @@ impl<'a> Tracer<'a> {
             _ => hi,
         };
         let s = self.sum(lo);
-        if s.dynamic.is_some() && extra.dynamic.is_some() {
-            return Err("an address with two computed terms");
-        }
+        // Two computed terms (one in the address registers, one in the
+        // offset register): both kept, added where the address is used.
+        let second = if s.dynamic.is_some() { extra.dynamic } else { None };
         let base = s.base.ok_or_else(|| self.why_no_base(s.dynamic))?;
         if let Some(pc) = self.getpc(base) {
             // A table in the code: the base is the next instruction's offset.
@@ -963,6 +972,7 @@ impl<'a> Tracer<'a> {
                 param: CODE,
                 offset: first.wrapping_add(s.offset).wrapping_add(extra.offset),
                 dynamic: s.dynamic.or(extra.dynamic),
+                dynamic2: second,
             });
         }
         let reg = self.inputs[base.0 as usize].ok_or("an address not from a root parameter")?;
@@ -990,6 +1000,7 @@ impl<'a> Tracer<'a> {
             param,
             offset: s.offset.wrapping_add(extra.offset),
             dynamic: s.dynamic.or(extra.dynamic),
+            dynamic2: second,
         })
     }
 
@@ -1542,7 +1553,11 @@ impl<'a> Tracer<'a> {
         self.read_first_lane.set(true);
         let address = self.smem_address(inst, base, *offset, soffset);
         self.read_first_lane.set(false);
-        match self.origin(address.ok()?.dynamic?) {
+        let address = address.ok()?;
+        if address.dynamic2.is_some() {
+            return None;
+        }
+        match self.origin(address.dynamic?) {
             Term::Value(v) if self.first_lane_source(v).is_some() => Some(v),
             _ => None,
         }
@@ -1752,7 +1767,7 @@ impl<'a> Tracer<'a> {
             self.runs(site, known)?;
             let a = address(site)?;
             let want = a0.offset.wrapping_add(4 * (first + k) as u32);
-            if (a.param, a.dynamic) != (a0.param, a0.dynamic)
+            if (a.param, a.dynamic, a.dynamic2) != (a0.param, a0.dynamic, a0.dynamic2)
                 || a.offset.wrapping_add(4 * dword as u32) != want
             {
                 return Err("a descriptor read from the first lane of loads that do not line up");
@@ -2467,6 +2482,7 @@ pub(crate) mod tests {
             param,
             offset,
             dynamic: None,
+            dynamic2: None,
         }
     }
 

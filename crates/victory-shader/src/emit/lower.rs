@@ -2244,7 +2244,7 @@ impl<'a> Lower<'a> {
         };
         let c = self.cur;
         let mut off = self.s.m.i32(a.offset);
-        if let Some(d) = a.dynamic {
+        for d in [a.dynamic, a.dynamic2].into_iter().flatten() {
             let d = self.i32_of(d)?;
             off = self.s.m.bin(c, Bin::Add, off, d);
         }
@@ -7345,6 +7345,9 @@ impl<'a> Lower<'a> {
             Some("x16") => 16,
             _ => return Err("a scalar load from the code"),
         };
+        if a.dynamic2.is_some() {
+            return Err("a scalar load from the code with two computed terms");
+        }
         let c = self.cur;
         let mut addr = self.s.m.i32(a.offset);
         if let Some(value) = a.dynamic {
@@ -7790,6 +7793,10 @@ impl<'a> Lower<'a> {
                     Some(v) => Some(self.i32_of(v)?),
                     None => None,
                 };
+                if let (Some(v), Some(d)) = (address.dynamic2, x) {
+                    let v = self.i32_of(v)?;
+                    x = Some(self.s.m.bin(self.cur, Bin::Add, d, v));
+                }
                 if let Some(bias) = self.root_bias(address.param) {
                     x = Some(match x {
                         Some(d) => self.s.m.bin(self.cur, Bin::Add, d, bias),
