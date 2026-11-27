@@ -104,6 +104,13 @@ of 1 MiB and more, title memory in place, texture steps of 80 ms at scene cuts,
 the list threads joined, among others. All measurements and what was tried and not
 kept: CHANGELOG.md on the `xtx-2026-11-27` branch.
 
+## Changing it, or forking it
+
+Read [AGENTS.md](AGENTS.md) first (people and coding agents alike), and add an entry to
+[CHANGELOG.md](CHANGELOG.md) for every change: what, why, measured how, with what result, and
+where it came from. Forks: please keep both files and keep adding to them; that is how fixes
+travel between forks.
+
 ## Credits
 
 This is a tree of other people's work with more on top. The history is kept, and
