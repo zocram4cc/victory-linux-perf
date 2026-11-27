@@ -1,3 +1,23 @@
+> [!CAUTION]
+> # ⛔ DO NOT USE THIS REPOSITORY. DO NOT OPEN PULL REQUESTS OR ISSUES HERE. ⛔
+>
+> **This is a personal scratch fork for one machine's performance experiments.** It is merged by
+> machine from other people's forks, rebased and rewritten without notice, and switches here are
+> left half-tested on purpose. Nothing here is supported, nothing here is released, and pull
+> requests and issues **will be closed without reading**.
+>
+> **Want to help, or want a build that works? Contribute to the upstreams instead** — every useful
+> change here came from them and goes back to them:
+>
+> - [Marvisak/VIctory](https://github.com/Marvisak/VIctory) — the original project
+> - [avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX) — the AMD / Linux line this follows
+> - [PastiiJay/klbf-lab](https://github.com/PastiiJay/klbf-lab) — the AMD tuning lab
+> - [fxceless/victory-fork](https://github.com/fxceless/victory-fork) — faces, FSR and much of the GPU side
+>
+> Credit for the code below belongs to their authors (kept on every commit), not to this fork.
+
+---
+
 # VIctory on an RX 7900 XTX
 
 A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
