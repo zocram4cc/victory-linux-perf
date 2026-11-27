@@ -2185,8 +2185,10 @@ impl Player {
             .filter(|p| {
                 let hashes = self.hashes(p);
                 o.skip_shaders.iter().any(|s| {
+                    // `#<id>`: the pipeline of that id (ours have no name).
                     !s.is_empty()
                         && (p.name.contains(s.as_str())
+                            || s.strip_prefix('#') == Some(p.id.to_string().as_str())
                             || hashes.iter().any(|h| h.contains(s.as_str())))
                 })
             })
