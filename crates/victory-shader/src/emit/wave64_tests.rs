@@ -1752,3 +1752,137 @@ fn independent_hlsl_group_any_scc_oracle() {
         assert_eq!(data, &expected, "below {below}, selected {selected}");
     }
 }
+
+/// A scalar a lane branch's region writes: s20 is 5, and 7 behind `s_and_saveexec` and
+/// `s_cbranch_execz` for the threads below s0; every thread stores s20 after EXEC is
+/// restored. On the console the wave runs the region once when some lane is in it, so every
+/// lane stores 7 then (5 when none is). (avatarmanz PR #405.)
+fn scalar_in_a_lane_branch(wave64: bool) -> NativeProgram {
+    let (saveexec, restore) = if wave64 {
+        (0xBE8C_246A, 0xBEFE_040C) // s_and_saveexec_b64 s[12:13], vcc; s_mov_b64 exec, s[12:13]
+    } else {
+        (0xBE8C_3C6A, 0xBEFE_030C) // s_and_saveexec_b32 s12, vcc_lo; s_mov_b32 exec_lo, s12
+    };
+    native_of(
+        &[
+            0xBF8C_0000, // s_waitcnt 0: the descriptor
+            0xBE94_0385, // s_mov_b32 s20, 5
+            0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+            saveexec,
+            0xBF88_0001, // s_cbranch_execz to the restore
+            0xBE94_0387, // s_mov_b32 s20, 7
+            restore,
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0x7E06_0214, // v_mov_b32 v3, s20
+            0xE070_1000,
+            0x8002_0301, // buffer_store_dword v3, v1, s[8:11], 0 offen
+        ],
+        wave64,
+        if wave64 { 64 } else { 32 },
+    )
+}
+
+/// The branch around a scalar that the code after the join reads is found; a branch around
+/// a scalar nothing reads after it is not.
+#[test]
+fn a_scalar_written_in_a_lane_branch_names_its_branch() {
+    for wave64 in [false, true] {
+        let native = scalar_in_a_lane_branch(wave64);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("IR");
+        let st = structure::structure(&p).expect("structure");
+        let branch = (0..p.blocks.len())
+            .find(|&b| p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz"))
+            .expect("the branch");
+        assert_eq!(lower::scalar_splits(&p, &st), Some(vec![branch]), "wave64 {wave64}");
+        // taken wave-wide, it is no lane branch any more
+        let wide = structure::structure_wide(&p, &HashSet::from([branch])).expect("structure");
+        assert_eq!(lower::scalar_splits(&p, &wide), Some(Vec::new()), "wave64 {wave64}");
+    }
+    // (s7, written inside the branch, is read inside it only)
+    let native = program(0xBF88_0000);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("IR");
+    let st = structure::structure(&p).expect("structure");
+    assert_eq!(lower::scalar_splits(&p, &st), Some(Vec::new()));
+}
+
+/// On the card: every thread stores the region's value once some lane ran the region, for a
+/// console wave of 32 (one host wave) and of 64 (two host waves of 32, which needs
+/// `VICTORY_WAVE_WIDE=1`: on this thread only here). The per-lane form's result is printed,
+/// not checked.
+#[test]
+fn a_scalar_written_in_a_lane_branch_reaches_every_lane() {
+    if !super::scalar_splits() {
+        eprintln!("VICTORY_SCALAR_SPLITS=0; skipped");
+        return;
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let host = Host::new(false).ok();
+    for wave64 in [false, true] {
+        let native = scalar_in_a_lane_branch(wave64);
+        let threads: u32 = if wave64 { 64 } else { 32 };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("IR");
+        let st = structure::structure(&p).expect("structure");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resources");
+        let io = io::raise(&p, &native).expect("io");
+        let c = crate::Container { digest: [0; 16], version: (1, 0), parts: Vec::new() };
+        let was = lower::TEST_HOST_WAVE.replace(Some(32));
+        let per_lane = super::emit(&c, &native, &p, &st, &io, &res);
+        lower::THREAD_WAVE_WIDE.set(true);
+        let shader = super::emit(&c, &native, &p, &st, &io, &res);
+        lower::THREAD_WAVE_WIDE.set(false);
+        lower::TEST_HOST_WAVE.set(was);
+        let shader = shader.expect("the branch taken wave-wide");
+        let per_lane = per_lane.expect("per lane");
+        if wave64 {
+            // (two host waves: wave-wide only when asked for)
+            assert_ne!(shader.dxil, per_lane.dxil, "wave64: the branch is taken wave-wide when asked");
+        } else {
+            assert_eq!(shader.dxil, per_lane.dxil, "wave32: the host wave is the console's, no switch needed");
+        }
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            v.validate(&mut shader.dxil.clone()).expect("DXIL validation");
+        }
+        let Some(host) = &host else {
+            eprintln!("no SM 6.6 hardware device; not run");
+            continue;
+        };
+        let run = |shader: &HostShader, s0: u32| -> Option<Vec<u32>> {
+            let (root, pso) = match host.compute_pipeline(shader) {
+                Ok(x) => x,
+                Err(e) => {
+                    eprintln!("the hardware device does not take this program: {e}; not run");
+                    return None;
+                }
+            };
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                if let (RootType::Constants, 0, 0) = (u.root, u.slot, u.dword) {
+                    ud[u.index as usize] = s0;
+                }
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(64)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+            Some(out[0][..threads as usize].to_vec())
+        };
+        for s0 in [0, 1, 9, 32, 40, 64] {
+            let Some(got) = run(&shader, s0) else { break };
+            let expected = vec![if s0 > 0 { 7 } else { 5 }; threads as usize];
+            assert_eq!(got, expected, "wave64 {wave64}, s0 {s0}");
+            if wave64 && let Some(before) = run(&per_lane, s0) {
+                let old = before.iter().zip(&expected).filter(|(a, b)| a != b).count();
+                eprintln!("wave64, s0 {s0}: per lane, {old} of {threads} threads keep the value from before the branch");
+            }
+        }
+        eprintln!("ran on the hardware device (wave64 {wave64}): the region's scalar in every lane");
+    }
+}

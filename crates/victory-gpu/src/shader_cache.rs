@@ -130,6 +130,7 @@ fn build() -> [u8; 32] {
             "VICTORY_LEGACY_FMA",
             "VICTORY_WAVE_SCC",
             "VICTORY_LANE_SPLIT",
+            "VICTORY_SCALAR_SPLITS",
             // Whether the ray-tracing node test always misses.
             "VICTORY_RT_MISS",
         ] {

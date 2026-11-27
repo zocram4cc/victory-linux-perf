@@ -543,6 +543,88 @@ pub(super) fn branches_around(st: &Structured, needs: &[usize]) -> Option<Vec<us
     Some(out)
 }
 
+/// The per-lane branches (by block) around a scalar the console's wave writes once for every
+/// lane: a scalar instruction (or `v_readfirstlane`, `v_readlane`, an SCC) in the region of a
+/// per-lane branch whose result a join after the region mixes with another value that is
+/// read. The console runs such a region when any lane needs it (scalar instructions ignore
+/// EXEC), so after the join every lane has the region's value; lowered per lane, only the
+/// lanes that ran the region would. Taking those branches wave-wide
+/// ([`crate::structure::structure_wide`]) is what the console does. A copy (`s_mov`) of a
+/// value from before the region counts as that value. Branches whose wave-wide meaning is
+/// not known ([`Structured::wave_any`]) are left out, and the ones the wave takes together
+/// already ([`Structured::wave_scc`]). None with an indirect exit. (avatarmanz PR #405.)
+pub(super) fn scalar_splits(p: &Program, st: &Structured) -> Option<Vec<usize>> {
+    let scalar = |reg: Reg, v: Value| match reg {
+        Reg::Scc => true,
+        Reg::S(code) => {
+            code != EXEC && code != EXEC + 1 && !st.masks.contains_key(&v) && !st.highs.contains_key(&v)
+        }
+        Reg::V(_) => false,
+    };
+    let mut copy: HashMap<Value, Value> = HashMap::new();
+    let mut read: HashSet<Value> = HashSet::new();
+    for block in &p.blocks {
+        for phi in &block.phis {
+            read.extend(phi.args.iter().copied());
+        }
+        for inst in &block.insts {
+            read.extend(inst.reads.iter().map(|r| r.1));
+            if matches!(inst.name(), "s_mov_b32" | "s_mov_b64") {
+                let from: Vec<Value> = inst.reads.iter().filter(|r| matches!(r.0, Reg::S(_))).map(|r| r.1).collect();
+                let to: Vec<Value> = inst.writes.iter().filter(|w| matches!(w.0, Reg::S(_))).map(|w| w.1).collect();
+                if from.len() == to.len() {
+                    for (t, f) in to.into_iter().zip(from) {
+                        copy.insert(t, f);
+                    }
+                }
+            }
+        }
+    }
+    let origin = |mut v: Value| {
+        for _ in 0..64 {
+            match copy.get(&v) {
+                Some(&u) => v = u,
+                None => break,
+            }
+        }
+        v
+    };
+    let mut out = Vec::new();
+    for (d, region) in lane_regions(st)? {
+        if st.wave_scc.contains(&d) || st.wave_any.get(d).copied().flatten().is_none() {
+            continue;
+        }
+        let mixes = p.blocks.iter().enumerate().filter(|&(j, _)| !region[j]).any(|(_, block)| {
+            block.phis.iter().any(|phi| {
+                if !scalar(phi.reg, phi.value) || !read.contains(&phi.value) {
+                    return false;
+                }
+                // Which value a lane gets depends on its way through the region: the join is
+                // reached through it, and its values (copies seen through) are not one.
+                let first = phi.args.first().map(|&a| origin(a));
+                let differ = phi.args.iter().any(|&a| Some(origin(a)) != first);
+                let through = block.preds.iter().any(|&q| q == d || region.get(q).copied().unwrap_or(false));
+                differ && through
+            })
+        });
+        if mixes {
+            out.push(d);
+        }
+    }
+    Some(out)
+}
+
+/// `VICTORY_WAVE_WIDE=1`: a console wave run as two host waves may take branches wave-wide,
+/// with group barriers inside them. [`THREAD_WAVE_WIDE`] turns it on for one thread: tests,
+/// which must not change the environment that other tests read while they translate.
+pub(super) fn wave_wide_on() -> bool {
+    THREAD_WAVE_WIDE.get() || std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1")
+}
+
+thread_local! {
+    pub(super) static THREAD_WAVE_WIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Whether a refusal is of code that needs every lane of the wave where it stands (two host
 /// waves meeting there), which the other forms of the program may give it.
 pub(super) fn needs_every_lane(what: &str) -> bool {
