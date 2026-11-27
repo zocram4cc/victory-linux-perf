@@ -2971,7 +2971,7 @@ impl<'a> Lower<'a> {
             Input::FrontFace => (13, 0),
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
             Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
-            Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
+            Input::GroupInfo => return self.group_info(),
             Input::MeshGroup => {
                 let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
                     unreachable!()
@@ -5122,6 +5122,31 @@ impl<'a> Lower<'a> {
     /// flat id is the wave's first lane's, rounded down to the wave size,
     /// plus the lane index. (A bijection while each host wave holds a
     /// wave-aligned run of flat ids, as the console's waves do.)
+    /// The thread-group info SGPR (`TG_SIZE_EN`): bits 0-5 the number of
+    /// console waves in the group, bits 6-11 this wave's index in it (as
+    /// AMD's ACO reads it: `& 0x3f`, `s_bfe_u32 x, 6 | 6 << 16`). Made from
+    /// the console's flat thread index and wave size.
+    fn group_info(&mut self) -> Val {
+        let Some([x, y, z]) = self.s.threads else {
+            return Val::Missing("the thread-group info SGPR");
+        };
+        let lanes = if self.x.native.wave64 { 64 } else { 32 };
+        let waves = (x * y * z).div_ceil(lanes);
+        let (e, i32t) = (self.s.entry, self.s.t.i32);
+        // The console's flat thread index: with a console wave run as two
+        // host halves, as `thread_id` takes it there; otherwise the host's.
+        let flat = if self.console_lanes && self.halves.is_some() {
+            self.s.flags |= flags::WAVE_OPS;
+            self.console_thread()
+        } else {
+            self.s.op(e, "flattenedThreadIdInGroup.i32", Attr::ReadNone, i32t, 96, &[])
+        };
+        let (lk, k6, wk) = (self.s.m.i32(lanes), self.s.m.i32(6), self.s.m.i32(waves & 0x3f));
+        let wave = self.s.m.bin(e, Bin::UDiv, flat, lk);
+        let wave = self.s.m.bin(e, Bin::Shl, wave, k6);
+        Val::I32(self.s.m.bin(e, Bin::Or, wave, wk))
+    }
+
     fn thread_id(&mut self, c: u8) -> Val {
         if !self.console_lanes {
             return self.compute_id("threadIdInGroup.i32", 95, c);
