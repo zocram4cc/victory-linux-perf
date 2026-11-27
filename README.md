@@ -163,6 +163,11 @@ The dump comes from one game run with `VICTORY_NATIVE_PSO_DUMP=Z:\…\pso-dump` 
   The wall is gone from the top; **1,304 → 1,324**, none lost.
 - 30, **cube images sized from their descriptor** (kind 5, DEPTH 0 cubes less one as RADV computes it, type 11), as the image lowering already takes cubes. Then the dead-dword rule extended to sampler and constant-buffer dwords: **1,324 → 1,340**.
 - 31, **the dead-dword rule tightened from an assumption to a proof** (default): **1,265** proven; the assumption (1,340) behind `VICTORY_DEAD_DESCRIPTOR_JOINS=assume`, its 75 extra programs to be checked with real values. Details: [p4-shortcuts.md](docs/royale/p4-shortcuts.md).
+- 32, **the runtime marker tested in game** (`VICTORY_DEAD_MARKERS=1`): of ~1,744 assumed-dead edges watched, 2 ran, and **both are real counterexamples**:
+  - a descriptor's address compared as a number, to see whether a texture changed. Fix: give dwords 0-1 the view's identity;
+  - EXEC restored from a register our analysis wrongly takes for a descriptor dword. Fix: the analysis.
+
+  The proven default stays; `=assume` must not be used in play. Details: [p4-shortcuts.md](docs/royale/p4-shortcuts.md), "The runtime marker in game".
 - (Before step 31:) **The dead-dword rule is being tightened from an assumption to a proof.** Why, the risk, the plan and how to test it with real values: [p4-shortcuts.md, "Shortcut #2 in depth"](docs/royale/p4-shortcuts.md).
 - Next walls (before step 30):
   - "an image dimension (cube or MSAA)" (261, first);

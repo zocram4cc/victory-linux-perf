@@ -62,3 +62,28 @@ Some of the ~100 programs may stop translating; those that stay are right by con
 **The 75 programs that need the assumption** are behind `VICTORY_DEAD_DESCRIPTOR_JOINS=assume`. Before they are accepted, check them with real values:
 1. An A/B in game of any family that becomes whole with `=assume` (screenshots against plain play and against the default).
 2. A runtime marker: a debug translation that writes to a debug buffer whenever an assumed-dead value is actually used by an active lane. Any hit means the assumption was wrong there. To be built: emit `atomicrmw or` into a host debug UAV at each substituted edge, guarded by "this lane came by that edge".
+
+### The runtime marker in game (27 Nov, ~22:40): the assumption is wrong in places
+
+**Run** (`bench/k-…-dead-markers`, cache `cache-marker`): all 1,340 programs that translate with the assumption (`bench/p4-assume/all-assume.txt`), with `VICTORY_DEAD_DESCRIPTOR_JOINS=assume VICTORY_DEAD_MARKERS=1`. The picture was broken (black, grey, the HUD, ~1 fps at first), as expected with partial chains. It did not matter: the run only asked whether the assumed-dead edges execute.
+
+**Result:**
+- ~1,744 assumed-dead join edges were watched; 69 could not be (their block branches elsewhere too).
+- **Only 2 marker hits**: code `0x2014` and `0x2214`.
+- Found with `VICTORY_WHY_DEAD=1` in the harness, which prints each assumed edge with its program.
+
+**Both hits are real counterexamples:**
+
+1. **`218_0000000f05456500`, the join near 0x2200: a descriptor's address compared as a number.** A loop loads an image descriptor (`s[100:107]`, from spill lanes of v71) and reads a 3D texture with it (`image_load … dim:SQ_RSRC_IMG_3D` at 0x224c). On the next pass it moves the joined `s[100:101]` (the descriptor's dwords 0-1, its address) into `s[26:27]` and compares (`s_cmp_eq_i32 s27, s67`, `s_bfe_u32 s26, …`) to tell whether the texture changed. **The address is used as a number.** With 0 every comparison says "same texture", and needed reloads would be skipped.
+
+   **A correct fix exists:** an equality test does not need the console address, only a value that *identifies the view*. Giving dwords 0-1 the view's identity (its heap slot or the layer's view entry number, unique per view) makes "same descriptor?" answer as on the console.
+
+2. **`218_0000000f05499700`, the join at 0x2014: EXEC restored from the joined register** (`s_mov_b32 exec_lo, s100`). A correct program never loads EXEC from a descriptor dword, so on that edge s100 (`= s53`) must really be a saved lane mask, and our analysis marks it as a descriptor dword. 0 there would switch every lane off for the rest of the program. Besides refuting the assumption here, **this points at a wrong tracking in our analysis** (likely the spill-lane lives of v79 in `ir::unspill`, or the register's origin across the join). To investigate.
+
+**Conclusions:**
+- The default (proven) rule stays. **`=assume` is unsafe and must not be used in play.**
+- The marker method works: it singled out the two places out of ~1,744 where the assumption is tested in practice.
+- The 75 programs that need the assumption need, instead:
+  - the view-identity values for dwords 0-1 (case 1);
+  - a fix of the analysis (case 2);
+  - then this test again.
