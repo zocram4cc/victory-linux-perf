@@ -50,6 +50,17 @@ right). The rest are within noise, and all of them at once gain nothing over r3.
 VICTORY_DYNAMIC_BITS=1 VICTORY_TABLE_MEMO=1 VICTORY_COMPUTE_WAIT_MS=500` on top of the play-fast
 settings: **48.2 ms** against 77.7 with every new switch off (−38 %).
 
+### Series X reference (same combined set, `CONSOLE` unset: Series X mode, the title's own upscaler)
+
+| Run | Frame (median) | p90 | Prep | GPU busy |
+|---|---|---|---|---|
+| sx-comb-1 | 61.7 ms | 86.9 | 44.8 | 84 % |
+| sx-comb-2 | 63.2 ms | 83.4 | 46.1 | 83 % |
+| **mean** | **62.5 ms** | | | |
+
+Earlier Series X runs here, before these switches: 85–88 ms. Series X is close to card-bound
+(83–84 % busy) where Series S is not (78 %).
+
 ## Earlier measurements on this machine (300 world seconds, 1 run each, `perf/v7900-final`)
 
 All with Series S, `VICTORY_PORT_CBV=1`, `VICTORY_MAP_LOCK_FINE=1`, `VICTORY_SKIP_MOVIES=end`:
@@ -111,7 +122,8 @@ not from the merge); sparkle on glass and speckle on floors; `VICTORY_PORT_CONST
 
 ## Next
 
-1. Late captures (world frame 3000+) of r0 and the combined set: the pink blinds and trees may
-   only be a baseline problem (they look gone on screen with the combined set).
+1. Pink/magenta blinds and island trees: late captures (world frames 2500/3000) show them with the
+   combined set too, so not a baseline-only problem. Lead: the light-probe fallback with ray tracing
+   off (another fork's "probe rays" change removes violet vegetation with RT off).
 2. More runs of the combined set (4) to firm up the number; `VICTORY_FRAME_INTERVAL_MS=16.667`
    once frames get near the title's 33 ms.
