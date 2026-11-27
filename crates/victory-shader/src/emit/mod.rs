@@ -1086,6 +1086,12 @@ fn widen(
         // (a program whose waves are the host's meets no one: no barrier, any group)
         crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
         crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
+        // A group of fewer threads is one console wave too, part of whose lanes are absent
+        // (the shadow tiles' classifiers, `CS_ShadowTileClassify` and `_BalanceRTCost`, are
+        // 8 x 6): every thread of it reaches the barriers. Only where the wave-wide form was
+        // asked for (`VICTORY_WAVE_WIDE=1`, `VICTORY_WAVE_WIDE_ONLY`), so that the programs the
+        // other ways into this function take stay as they were.
+        crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() < 64 && lower::wave_wide_on() => {}
         crate::native::StageIo::Cs(cs) => {
             if why {
                 eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);

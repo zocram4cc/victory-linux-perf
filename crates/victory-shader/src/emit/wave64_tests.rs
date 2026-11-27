@@ -1635,7 +1635,13 @@ fn the_wave_wide_list_is_read_as_documented() {
 /// what it read to dword t; after the region every thread stores s20 to dword 64 + t. The
 /// console code has no barrier: one wave runs its LDS instructions in order.
 fn lds_seed_fold_read() -> NativeProgram {
-    let mut native = native(&[
+    lds_seed_fold_read_of(64)
+}
+
+/// [`lds_seed_fold_read`] in a group of `threads` threads (one console wave, part of whose
+/// lanes are absent when fewer than 64).
+fn lds_seed_fold_read_of(threads: u32) -> NativeProgram {
+    let mut native = native_of(&[
         0xBF8C_0000, // s_waitcnt 0: the descriptor
         0xBE94_0380, // s_mov_b32 s20, 0
         0x3402_0082, // v_lshlrev_b32 v1, 2, v0
@@ -1663,7 +1669,7 @@ fn lds_seed_fold_read() -> NativeProgram {
         0x7E06_0214, // v_mov_b32 v3, s20
         0xE070_1100,
         0x8002_0301, // buffer_store_dword v3, v1, s[8:11], 256 offen
-    ]);
+    ], true, threads);
     // one 512-byte block of LDS
     if let StageIo::Cs(cs) = &mut native.io {
         cs.rsrc2 |= 1 << 15;
@@ -1689,12 +1695,19 @@ fn emit_seed_fold_read(native: &NativeProgram, p: &ir::Program, on: bool) -> Res
 /// t < s0 the maximum of the seed 7 and every `u ^ s1` for u < s0; dwords 64.. s20, 7 once
 /// some thread went on; the rest 0.
 fn seed_fold_read_expected(below: u32, xor: u32) -> Vec<u32> {
-    let folded = (0..below).map(|u| u ^ xor).fold(7, u32::max);
+    seed_fold_read_expected_of(below, xor, 64)
+}
+
+/// [`seed_fold_read_expected`] for a group of `threads` threads: the absent lanes store nothing.
+fn seed_fold_read_expected_of(below: u32, xor: u32, threads: u32) -> Vec<u32> {
+    let on = below.min(threads);
+    let folded = (0..on).map(|u| u ^ xor).fold(7, u32::max);
     (0..128u32)
         .map(|i| match i {
-            0..64 if i < below => folded,
+            0..64 if i < on => folded,
             0..64 => 0,
-            _ => 7 * u32::from(below > 0),
+            _ if i - 64 < threads => 7 * u32::from(on > 0),
+            _ => 0,
         })
         .collect()
 }
@@ -1768,4 +1781,56 @@ fn a_named_program_is_taken_wave_wide_and_its_lds_seed_folds_and_read_stay_in_or
         }
     }
     eprintln!("ran on the hardware device: the console's words in every case; not named, {old_wrong} words differ");
+}
+
+/// A group of 48 threads (8 x 6, as the shadow tiles' classifiers have) is one console wave
+/// with its upper 16 lanes absent: named, it is taken wave-wide (refused before: "a thread
+/// group of several console waves"), and on a card of 32-lane waves (a host wave of 32 and
+/// one of 16) gives the words the instructions' definitions give.
+#[test]
+fn a_named_program_of_48_threads_is_one_console_wave_taken_wave_wide() {
+    if std::env::var_os("VICTORY_WAVE_WIDE").is_some() {
+        eprintln!("VICTORY_WAVE_WIDE set; skipped");
+        return;
+    }
+    let native = lds_seed_fold_read_of(48);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("IR");
+    let wide = emit_seed_fold_read(&native, &p, true).expect("wave-wide in a group of 48");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut wide.dxil.clone()).expect("DXIL validation");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let (root, pso) = match host.compute_pipeline(&wide) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("the hardware device does not take this program: {e}; not run");
+            return;
+        }
+    };
+    for (below, xor) in [(64, 0), (48, 0), (40, 0), (33, 0), (32, 0), (5, 0), (1, 0), (0, 0), (40, 0x20), (47, 0x2f)] {
+        let mut ud = vec![0u32; wide.user_data_dwords().max(1) as usize];
+        for u in &wide.user_data {
+            if let (RootType::Constants, 0, d @ 0..=1) = (u.root, u.slot, u.dword) {
+                ud[u.index as usize] = [below, xor][d as usize];
+            }
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(128)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        assert_eq!(out[0][..128].to_vec(), seed_fold_read_expected_of(below, xor, 48), "{below} threads on, xor {xor:#x}");
+    }
+    eprintln!("ran on the hardware device: the console's words in every case");
 }
