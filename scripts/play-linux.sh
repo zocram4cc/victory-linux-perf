@@ -378,6 +378,12 @@ stop() {
   # Ctrl-C again while the title ends changes nothing: this script waits
   # for it and writes the run's end.
   trap '' INT
+  # The title can take a while to end: tens of GB to give back, some of it
+  # in swap. Say so, so that it does not look like a hang.
+  ( n=0; while kill -0 "$title" 2>/dev/null; do
+      sleep 5; n=$((n + 5))
+      kill -0 "$title" 2>/dev/null && echo "still waiting for the title to end (${n} s)..." >&2 || true
+    done ) &
   echo "stopping the title (SIGTERM)..." >&2 || true
   # The title's Wine process first (found below umu-run, never by a name
   # match across the system), then umu's own group; never SIGKILL.
@@ -399,7 +405,10 @@ code=0
 while kill -0 "$title" 2>/dev/null; do
   wait "$title" && code=0 || code=$?
 done
-trap - INT TERM HUP
+# Ctrl-C stays ignored from here on (a second one used to land right
+# after the title ended and kill this script before it wrote the run's end).
+trap '' INT
+trap - TERM HUP
 [[ -n "${timer:-}" ]] && kill "$timer" 2>/dev/null || true
 kill "$sampler" 2>/dev/null || true
 wait "$sampler" ${timer:+"$timer"} 2>/dev/null || true
