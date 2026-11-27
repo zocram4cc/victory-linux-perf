@@ -18,6 +18,9 @@ Tested on: AMD RX 6800 XT (RDNA2), Mesa RADV, CachyOS, our Proton build (see
 | Loader: opt-in title hooks (`VICTORY_NO_WATCHDOG`, `VICTORY_NO_POOL_TRAP`, `VICTORY_RT_FALLBACK`, `VICTORY_RT_FALLBACK_NO_BVH`) | byte-checked, build 1.0.2.1 only, each off unless set. The title's watchdog ends the process when its main thread has not advanced for about 30 s, which a long load on a slow host exceeds; the instance-list pool stop of upstream issue #698 (returns NULL instead: things go missing from then on); the title's own non-ray-traced fallback lighting (its "is the top-level structure there?" check says no), optionally with the acceleration-structure builds skipped too. The RT fallback hooks are not yet measured in game |
 | Input: live keys from a file (`VICTORY_KEYS_FILE`, diagnostics builds) | lines appended to a file while the game runs are pressed (`<key>[+<key>...][:<ms>]`), on top of `VICTORY_KEYS` and a connected controller: for hands-free and scripted test runs |
 | Linux: our Proton build as a submodule, `proton-ge`; this file | see below |
+| GPU: the ray-tracing builder is its 52 programs, not any program that spills its user data | with ray tracing off, every compute program whose user data spills was dropped as a builder stage; now the builder is the 52 programs of `XboxBvhBuilder.dll` (by hash, build 1.0.2.1), and other spilled programs run (logged once each) |
+| Linux: Proton fork at 5fc510e2 | its Wine imports section memory as dma-bufs (udmabuf): `VICTORY_PORT_CONSTANTS` needs it (see below) |
+| FidelityFX: under Wine FSR 4.1.2 only when its code loads | Proton's builtin `amdxc64` makes AMD's SDK offer FSR 4.1.2 although its code (`amdxcffx64.dll`) is missing; the context made on it upscaled wrongly (doubled, smeared outlines). Without the DLL the newest FSR 3.1 is used |
 
 What earlier Wine fixes of the fork's `linux` branch became here:
 
@@ -34,22 +37,47 @@ What earlier Wine fixes of the fork's `linux` branch became here:
 
 ## Belobug's switches under Proton
 
-Measured in the jail scene with our Proton build, one run each (2026-11-26):
+Measured in the jail scene with our Proton build, one run each (2026-11-26/27):
 
-- **Belobug's defaults** (no launcher settings, no renderer patches) render
-  correctly: 116-127 ms a frame, where the fork's `linux` branch took about
-  384 ms in the same scene. Frame pacing in the intro, the loading cards and
-  the world is uneven, and characters' mouths do not move in dialogue.
-- **`scripts\play.ps1`'s settings together with the five renderer patches
-  (`VICTORY_PORT_CONSTANTS`, `_DESCRIPTORS`, `_CBV`, `_GUARD`, `_JOURNAL`)
-  turn every frame black** under Proton (the card does next to no work; port 1
-  falls back to copies, "title memory not in place"). Under investigation:
-  which setting or patch does it is not known yet. Until then run with the
-  defaults.
+| Settings | Frame | Notes |
+|---|---|---|
+| the fork's old `linux` branch | about 384 ms | |
+| Belobug's defaults | 116-127 ms | renders correctly |
+| `scripts\play.ps1`'s settings + the five renderer patches (`VICTORY_PORT_CONSTANTS`, `_DESCRIPTORS`, `_CBV`, `_GUARD`, `_JOURNAL`) | 78-98 ms | needs our Proton build at 5fc510e2 or later |
+| the same + PC FSR 3.1 (`VICTORY_FSR_4K=performance`, below) | 72-102 ms | 0.4 GB less video memory |
+
+- **`VICTORY_PORT_CONSTANTS` with any other Proton build turns every frame
+  black.** It opens the title's 185 MB graphics region as a GPU heap over a
+  second view of its section (`OpenExistingHeapFromAddress1`). Stock Wine
+  cannot import that memory, and stock vkd3d-proton then silently gives the
+  heap other memory: the card reads constants the title never wrote. Our
+  Proton build imports section memory as dma-bufs (and fails a heap whose
+  import fails, so the tree keeps copies instead of drawing black). The other
+  four patches and all of `play.ps1`'s settings render with any Proton build.
+- `VICTORY_THIN` (eight threads of ours translating the title's lists) is
+  most of the gain: without it 133-152 ms.
+- Known issues: audio crackles in the world with the full set (clean in the
+  menus; under investigation); frame pacing is uneven; video memory peaks
+  near 15 GB (Belobug's texture budget fills up to nine tenths of what the
+  system grants, plus up to 4 GiB of card copies, `VICTORY_MEMORY_CARD_MB`).
 - The pipeline-library fix above is needed for pipelines to be kept between
   runs under Proton at all.
 - Ray tracing is off by Belobug's default (`VICTORY_BVH_BUILDER` turns the
-  title's builder on, as `play.ps1 -RayTracing` does); not yet tried here.
+  title's builder on, as `play.ps1 -RayTracing` does); `VICTORY_AMBIENT=0.8`
+  (in `play.ps1`'s set) paints an estimate of the missing indirect light.
+
+### PC FSR
+
+Belobug's bridge (from DexNom) serves the title's FidelityFX calls with AMD's
+PC upscaler: put `amd_fidelityfx_upscaler_dx12.dll` and
+`amd_fidelityfx_loader_dx12.dll` from the
+[FidelityFX SDK 2.4.0 `signedbin`](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/tree/v2.4.0/Kits/FidelityFX/signedbin)
+in a folder, then `VICTORY_FIDELITYFX_DIR='Z:\that\folder'` and
+`VICTORY_FSR_4K=quality|balanced|performance` (2560x1440, 2258x1270 or
+1920x1080 drawn, 3840x2160 out). On RDNA2 and older AMD cards, and on other
+vendors, that is FSR 3.1. FSR 4 needs an RDNA3 or RDNA4 card and AMD's FSR 4
+code in the prefix: `PROTON_FSR4_UPGRADE=1` makes our Proton build download
+it (GE-Proton's option); without it FSR 3.1 is used.
 
 ## Building
 
@@ -75,9 +103,15 @@ every map or unmap walked them all. Its vkd3d-proton fails a heap opened
 over existing memory (`OpenExistingHeapFromAddress`, which this tree's
 in-place paths use) when the host-memory import fails, where stock
 vkd3d-proton gives the heap fresh memory that the title never sees
-(`VKD3D_HOST_IMPORT_STRICT=0` restores that). More fixes for VIctory under
-Wine go there as they come. It is not supported by
-GloriousEggroll: report problems with it here, not to GE-Proton.
+(`VKD3D_HOST_IMPORT_STRICT=0` restores that). Its Wine imports section memory
+(file mappings) as dma-bufs through `/dev/udmabuf`, which the renderer port's
+in-place heap needs, and refuses host-pointer imports of other memory (amdgpu
+re-checks those at every submission and rejected them; VIctory keeps copies
+there): a deliberate, VIctory-specific choice, so other programs that import
+private memory fall back or fail under this build. `/dev/udmabuf` must be
+readable and writable for the user (on most distributions the `kvm` group).
+More fixes for VIctory under Wine go there as they come. It is not supported
+by GloriousEggroll: report problems with it here, not to GE-Proton.
 
 Building it takes Docker (or Podman), about 40 GB of disk and, the first
 time, about 40 minutes on 16 threads:
@@ -87,9 +121,9 @@ git submodule update --init --recursive proton-ge   # about 8 GB of sources
 cd proton-ge
 ./patches/protonprep-valve-staging.sh &> patchlog.txt   # grep -i fail patchlog.txt
 cd .. && mkdir proton-build && cd proton-build
-../proton-ge/configure.sh --build-name=GE-Proton11-14-victory3
+../proton-ge/configure.sh --build-name=GE-Proton11-14-victory5
 make ENABLE_CCACHE=1 redist   # ccache (in ~/.ccache) speeds up later full builds
-tar -xf GE-Proton11-14-victory3.tar.gz -C ~/.steam/steam/compatibilitytools.d/
+tar -xf GE-Proton11-14-victory5.tar.gz -C ~/.steam/steam/compatibilitytools.d/
 ```
 
 After pulling a newer `proton-ge`, `make ENABLE_CCACHE=1 redist` again in the
@@ -106,7 +140,7 @@ Use a Proton prefix of its own and Proton's vkd3d-proton (`d3d12` native).
 yourself:
 
 ```sh
-PROTON=~/.steam/steam/compatibilitytools.d/GE-Proton11-14-victory3/proton
+PROTON=~/.steam/steam/compatibilitytools.d/GE-Proton11-14-victory5/proton
 export STEAM_COMPAT_DATA_PATH=~/victory-prefix STEAM_COMPAT_CLIENT_INSTALL_PATH=~/.steam/steam
 export WINEDLLOVERRIDES="d3d12=n;d3d12core=n;dxgi=n;d3d11=n;d3d10core=n;d3d9=n"
 export VICTORY_GAME_DIR='Z:\path\to\GTA6.Xbox.v1.0.2.1'
@@ -114,6 +148,18 @@ export VICTORY_NO_WATCHDOG=1
 # Optional: go on past the instance-list pool stop in the intro (things go
 # missing from then on).
 # export VICTORY_NO_POOL_TRAP=1
+
+# The fast set (scripts\play.ps1's settings and the five renderer patches;
+# VICTORY_PORT_CONSTANTS needs our Proton build, see above). Leave it out for
+# Belobug's defaults.
+export VICTORY_TEXTURE_NO_WAIT=1 VICTORY_RELAY=2 VICTORY_WIDE_BACK=1 VICTORY_CARD_REHASH_RUNS=1 \
+  VICTORY_JOIN_COPIES=1 VICTORY_INDIRECT_WINDOW=1 VICTORY_RELAY_COPY=1 VICTORY_CARD_STEPS=2 \
+  VICTORY_INDIRECT_BATCH=2 VICTORY_MAP_THREADS=1 VICTORY_CARD_AWAKE=1 VICTORY_SHOW_AFTER=1 \
+  VICTORY_AMBIENT=0.8 VICTORY_THIN=1 VICTORY_JOIN_PARTS=8 VICTORY_UPLOAD_AHEAD=1 \
+  VICTORY_PORT_CONSTANTS=1 VICTORY_PORT_DESCRIPTORS=1 VICTORY_PORT_CBV=1 VICTORY_PORT_GUARD=1 \
+  VICTORY_PORT_JOURNAL=1
+# Optional, PC FSR (see "PC FSR" above):
+# export VICTORY_FIDELITYFX_DIR='Z:\path\to\fidelityfx' VICTORY_FSR_4K=performance
 
 # Once, and again after updating this branch: translate every shader into the
 # shader store (minutes; it goes on where it was stopped).
