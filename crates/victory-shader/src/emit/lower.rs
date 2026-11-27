@@ -4612,6 +4612,16 @@ impl<'a> Lower<'a> {
             // lanes it adds only feed derivatives, and exports keep their own
             // masks. Wrong if such a section had a side effect.
             Atom::Quad(_) => Ok(self.s.m.bool(true)),
+            // A dead descriptor dword (no host value) read as a lane mask:
+            // the compiler's lane-mask merge (`s_and_b32 sX, sX, exec_lo`)
+            // reads a register its variable never set on this path (P.4).
+            // No lanes. `p4-shortcuts.md` #2, `VICTORY_DEAD_DESCRIPTOR_JOINS=0`.
+            Atom::Opaque(v)
+                if matches!(self.vals.get(&v), Some(Val::Missing("a descriptor's address or format read as data")))
+                    && !std::env::var_os("VICTORY_DEAD_DESCRIPTOR_JOINS").is_some_and(|x| x == "0") =>
+            {
+                Ok(self.s.m.bool(false))
+            }
             // With console lanes, a mask held as a number is the console's:
             // the lane tests its own bit.
             Atom::Opaque(v) if self.console_lanes => {
