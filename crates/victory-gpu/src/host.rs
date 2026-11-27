@@ -6099,6 +6099,9 @@ impl Host {
                 crate::flightwatch::arm(copy, &ranges, this_submission);
             }
         }
+        // The title's bytes held back for the shaders of this submission
+        // (and those held too long), ahead of its lists.
+        crate::shadow::release_held_back(&declared);
         let card = self.card_before(&declared, &picked, flown);
         // The sends are taken: from here on the references hold what the
         // copies in the lists put.

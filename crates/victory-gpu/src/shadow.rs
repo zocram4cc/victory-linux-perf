@@ -102,6 +102,145 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// [`hold_back`]: the 64 KiB pieces of title memory (title address / 64
+    /// KiB) a landing put shaders' bytes into, and the frame it did; and the
+    /// title's changed bytes held back (offsets).
+    landed_pieces: Mutex<std::collections::HashMap<usize, u64>>,
+    held_back: Mutex<HeldBack>,
+}
+
+/// Whether the title's bytes that a refresh finds changed in a 64 KiB piece
+/// a landing put shaders' bytes into this frame or the one before are held
+/// back, and go up at the next submission that declares shader writes to
+/// them, ahead of its lists (`VICTORY_FLIGHT_HOLD_BACK=1`; off unless asked
+/// for). Bytes of other pieces go up as before.
+///
+/// The console's order: what the CPU writes before a list is submitted lies
+/// under what that list's shaders write, as the card runs the list later. In
+/// the prison corridor the title writes a 12-byte record into the pre-skinned
+/// vertex buffer every frame after the skinning was submitted; the refresh
+/// of the next submission sent it up over the skinned vertices, after the
+/// skinning had run on the card and before the draws read them (captures:
+/// skinning in lists 9 and 36, the copies in list 45, the draws in 58 to 60):
+/// the stray sheets. Held back, it goes up ahead of the next frame's
+/// skinning, which stores over it as the console's would.
+///
+/// Bounded: a byte held for [`HOLD_FRAMES`] frames with no submission
+/// declaring writes to it goes up as before (a character that leaves the
+/// view is skinned no more, and the title may give its range to something
+/// the CPU fills). What it can hide: a title write in such a piece that a
+/// shader reads before the next submission that declares writes there.
+fn hold_back() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FLIGHT_HOLD_BACK").is_some_and(|v| v == "1"))
+}
+
+/// The copies (by title start) that hold title bytes back ([`hold_back`]).
+static HOLDERS: Mutex<std::collections::BTreeSet<u64>> = Mutex::new(std::collections::BTreeSet::new());
+
+/// [`hold_back`], before a submission's copies go up (after its refreshes,
+/// ahead of the plan of what goes to the card): the held bytes `declared`
+/// (this submission's declared shader writes, by copy) overlaps go up ahead
+/// of its lists, and every copy's bytes held [`HOLD_FRAMES`] frames go up.
+pub(crate) fn release_held_back(declared: &[(Arc<Shadow>, Vec<(usize, usize)>)]) {
+    if !hold_back() {
+        return;
+    }
+    for (shadow, ranges) in declared {
+        shadow.release_held(ranges);
+    }
+    let holders: Vec<u64> = HOLDERS.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().collect();
+    for start in holders {
+        let shadow = find(start, 1).filter(|s| s.start == start);
+        if let Some(s) = &shadow {
+            s.release_held(&[]);
+        }
+        if shadow.is_none_or(|s| !s.holds_back()) {
+            HOLDERS.lock().unwrap_or_else(|e| e.into_inner()).remove(&start);
+        }
+    }
+}
+
+/// Frames a held byte waits for a submission that declares writes to it. The
+/// skinning runs every frame for the characters in view: a range two frames
+/// without one is no character's being drawn.
+const HOLD_FRAMES: u64 = 2;
+
+/// Whether a landing put shaders' bytes into a piece at `landed` that counts
+/// at frame `now` ([`hold_back`]): this frame or the one before.
+fn landed_lately(landed: Option<u64>, now: u64) -> bool {
+    landed.is_some_and(|f| now.saturating_sub(f) <= 1)
+}
+
+/// The title's changed bytes held back by [`hold_back`]: offsets `[from,
+/// to)` of a copy and the frame they were first held in, apart and in order.
+#[derive(Default, Debug)]
+pub(crate) struct HeldBack {
+    ranges: Vec<(usize, usize, u64)>,
+}
+
+impl HeldBack {
+    /// `[from, to)` is held from frame `frame` on (joined with what touches
+    /// it; a joined range keeps the earliest frame).
+    pub(crate) fn add(&mut self, from: usize, to: usize, frame: u64) {
+        if from >= to {
+            return;
+        }
+        let (mut from, mut to, mut frame) = (from, to, frame);
+        self.ranges.retain(|&(a, b, f)| {
+            if b < from || a > to {
+                return true;
+            }
+            from = from.min(a);
+            to = to.max(b);
+            frame = frame.min(f);
+            false
+        });
+        let at = self.ranges.partition_point(|r| r.0 < from);
+        self.ranges.insert(at, (from, to, frame));
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
+    /// What is to go up now: the parts of held ranges that `declared` (offsets,
+    /// a submission's declared shader writes) overlaps, to go ahead of its
+    /// lists; and whole ranges held since `frame - HOLD_FRAMES` or earlier,
+    /// released by the bound. Both leave the held.
+    pub(crate) fn due(&mut self, declared: &[(usize, usize)], frame: u64) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+        let (mut ahead, mut released) = (Vec::new(), Vec::new());
+        let mut keep = Vec::with_capacity(self.ranges.len());
+        for (a, b, f) in std::mem::take(&mut self.ranges) {
+            if frame.saturating_sub(f) >= HOLD_FRAMES {
+                released.push((a, b));
+                continue;
+            }
+            let mut rest = vec![(a, b)];
+            for &(d, e) in declared {
+                let mut next = Vec::new();
+                for (x, y) in rest {
+                    if e <= x || d >= y {
+                        next.push((x, y));
+                        continue;
+                    }
+                    ahead.push((x.max(d), y.min(e)));
+                    if x < d {
+                        next.push((x, d));
+                    }
+                    if e < y {
+                        next.push((e, y));
+                    }
+                }
+                rest = next;
+            }
+            keep.extend(rest.into_iter().map(|(x, y)| (x, y, f)));
+        }
+        keep.sort_unstable();
+        self.ranges = keep;
+        ahead.sort_unstable();
+        (ahead, released)
+    }
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -2104,6 +2243,11 @@ pub(crate) mod resent {
         /// Bytes of the title's that took the card's value at a landing
         /// ([`super::card_wins`]).
         pub(crate) won: u64,
+        /// [`super::hold_back`]: title bytes held back, sent ahead of a
+        /// submission that declared writes to them, released by the bound.
+        pub(crate) held: u64,
+        pub(crate) ahead: u64,
+        pub(crate) released: u64,
     }
 
     impl Resent {
@@ -2116,6 +2260,9 @@ pub(crate) mod resent {
             self.runs += o.runs;
             self.missed += o.missed;
             self.won += o.won;
+            self.held += o.held;
+            self.ahead += o.ahead;
+            self.released += o.released;
         }
 
         pub(crate) fn is_empty(&self) -> bool {
@@ -2128,7 +2275,8 @@ pub(crate) mod resent {
             format!(
                 "pages sent up {:.1} (title-written {:.1}, landing noted and differing {:.1}; whole {:.1}, as runs {:.1}), \
                  {:.1} KB differing from the card, echo pages left {:.1}, landing pages title memory missed {:.1}, \
-                 card won over title bytes {:.1} KB",
+                 card won over title bytes {:.1} KB, held back {:.1} KB, sent ahead of a declaring submission {:.1} KB, \
+                 released by the bound {:.1} KB",
                 f(self.title + self.landed),
                 f(self.title),
                 f(self.landed),
@@ -2137,7 +2285,10 @@ pub(crate) mod resent {
                 f(self.bytes) / 1024.0,
                 f(self.echo),
                 f(self.missed),
-                f(self.won) / 1024.0
+                f(self.won) / 1024.0,
+                f(self.held) / 1024.0,
+                f(self.ahead) / 1024.0,
+                f(self.released) / 1024.0
             )
         }
     }
@@ -2176,7 +2327,7 @@ pub(crate) mod resent {
             return Vec::new();
         };
         let mut v: Vec<(u64, u64, Resent)> = all.by_copy.drain().map(|(s, (l, r))| (s, l, r)).collect();
-        v.sort_by_key(|(s, _, r)| (std::cmp::Reverse(r.bytes + r.won), std::cmp::Reverse(r.title + r.landed), *s));
+        v.sort_by_key(|(s, _, r)| (std::cmp::Reverse(r.bytes + r.won + r.held), std::cmp::Reverse(r.title + r.landed), *s));
         v.truncate(most);
         v
     }
@@ -3055,6 +3206,74 @@ mod landing_tests {
         drop(room);
     }
 
+    /// [`super::hold_back`] on a copy a landing put shaders' bytes into: the
+    /// title's bytes found changed in a piece landed this frame wait, and go
+    /// up when a submission declares writes to them, ahead of its lists;
+    /// those of a piece no landing touched go up at once; with the switch off
+    /// they go up at once whatever the piece, as before.
+    #[test]
+    fn title_bytes_over_lately_landed_pieces_wait_for_the_next_declaring_submission() {
+        use super::PAGE as PIECE;
+        let room = vec![5u8; 3 * PIECE];
+        let title = (room.as_ptr() as usize).next_multiple_of(PIECE);
+        let mut side = vec![5u8; PIECE + KERNEL_PAGE];
+        let copy = Shadow::unbacked(title as u64, side.as_mut_ptr(), side.len() as u64, true);
+        copy.note_landing(0, KERNEL_PAGE);
+        // A landing put shaders' bytes into the first piece this frame.
+        copy.landed_pieces.lock().unwrap().insert(title / PIECE, crate::frame::current());
+        let write = |at: usize| {
+            // SAFETY: in `room`.
+            unsafe { ((title + at) as *mut u32).write_volatile(0x0ffff800) }
+        };
+        write(64);
+        write(PIECE + 8);
+        let all = (title, title + PIECE + KERNEL_PAGE);
+        // Off: both go up at once, as before.
+        copy.take_with(all.0, all.1, true, false);
+        let mut dirty = copy.take_dirty();
+        dirty.sort_unstable();
+        assert_eq!(dirty, [(64, 68), (PIECE + 8, PIECE + 12)]);
+        // On: the landed piece's byte waits; the other piece's goes up.
+        write(128);
+        write(PIECE + 16);
+        copy.take_with(all.0, all.1, true, true);
+        assert_eq!(copy.take_dirty(), [(PIECE + 16, PIECE + 20)]);
+        assert_eq!(&side[128..132], &[5; 4], "the CPU's side does not take it yet");
+        assert!(copy.holds_back());
+        // A submission declaring writes elsewhere leaves it held.
+        copy.release_held(&[(title + PIECE, title + PIECE + 4)]);
+        assert_eq!(copy.take_dirty(), []);
+        // One declaring writes over it sends it, ahead of its lists.
+        copy.release_held(&[(title, title + PIECE)]);
+        assert_eq!(copy.take_dirty(), [(128, 132)]);
+        assert_eq!(&side[128..132], &0x0ffff800u32.to_le_bytes());
+        assert!(!copy.holds_back());
+        drop(room);
+    }
+
+    /// The bound: what no declaring submission took goes up after
+    /// [`super::HOLD_FRAMES`] frames; declared parts go ahead, the rest waits.
+    #[test]
+    fn held_bytes_are_released_by_the_bound_and_declared_parts_go_ahead() {
+        let mut back = super::HeldBack::default();
+        back.add(100, 200, 10);
+        back.add(150, 260, 11);
+        back.add(1000, 1010, 11);
+        assert_eq!(back.ranges, [(100, 260, 10), (1000, 1010, 11)], "joined, with the earliest frame");
+        // Frame 11: a submission declares [180, 220): that part goes ahead.
+        let (ahead, released) = back.due(&[(180, 220)], 11);
+        assert_eq!((ahead, released), (vec![(180, 220)], vec![]));
+        assert_eq!(back.ranges, [(100, 180, 10), (220, 260, 10), (1000, 1010, 11)]);
+        // Frame 12: what was held since frame 10 goes up by the bound.
+        let (ahead, released) = back.due(&[], 12);
+        assert_eq!((ahead, released), (vec![], vec![(100, 180), (220, 260)]));
+        assert_eq!(back.ranges, [(1000, 1010, 11)]);
+        let (_, released) = back.due(&[], 13);
+        assert_eq!(released, [(1000, 1010)]);
+        assert!(back.is_empty());
+        assert!(super::landed_lately(Some(5), 6) && !super::landed_lately(Some(5), 7) && !super::landed_lately(None, 5));
+    }
+
     /// Which copies a refresh sends changed dwords of.
     #[test]
     fn changed_dwords_go_up_for_copies_shaders_write() {
@@ -3441,6 +3660,8 @@ impl Shadow {
             changes_only: Default::default(),
             mapped: false,
             place: None,
+            landed_pieces: Mutex::default(),
+            held_back: Mutex::default(),
         }
     }
 
@@ -4537,6 +4758,82 @@ impl Shadow {
         won
     }
 
+    /// [`hold_back`]: a landing looks at offsets `[from, to)`, in pieces the
+    /// compare found the card changed.
+    fn note_landed_pieces(&self, from: usize, to: usize) {
+        if !hold_back() || from >= to {
+            return;
+        }
+        let start = self.start as usize;
+        let frame = crate::frame::current();
+        let mut pieces = self.landed_pieces.lock().unwrap_or_else(|e| e.into_inner());
+        for piece in (start + from) / PAGE..=(start + to - 1) / PAGE {
+            pieces.insert(piece, frame);
+        }
+        // (Old ones go: a copy lands every frame at most what it has.)
+        if pieces.len() > 4096 {
+            pieces.retain(|_, f| frame.saturating_sub(*f) <= 1);
+        }
+    }
+
+    /// [`hold_back`], before a submission's copies go up: of the title's bytes
+    /// held back, those `declared` (title addresses, this submission's
+    /// declared shader writes to the copy) overlaps go up now, ahead of its
+    /// lists, and so do those held [`HOLD_FRAMES`] frames. Title memory as it
+    /// is now is taken there (the title may have written again since).
+    pub(crate) fn release_held(&self, declared: &[(usize, usize)]) {
+        if self.card.is_none() {
+            return;
+        }
+        let start = self.start as usize;
+        let declared: Vec<(usize, usize)> = declared
+            .iter()
+            .filter_map(|&(a, e)| {
+                let (from, to) = self.inside(a, e.saturating_sub(a));
+                (from < to).then_some((from, to))
+            })
+            .collect();
+        let (ahead, released) = {
+            let mut back = self.held_back.lock().unwrap_or_else(|e| e.into_inner());
+            if back.is_empty() {
+                return;
+            }
+            back.due(&declared, crate::frame::current())
+        };
+        if ahead.is_empty() && released.is_empty() {
+            return;
+        }
+        // The landings are kept out while the CPU's side takes them.
+        let _merging = self.merging.write().unwrap_or_else(|e| e.into_inner());
+        let mut title = Vec::new();
+        let mut sent = [0u64; 2];
+        for (k, list) in [ahead, released].into_iter().enumerate() {
+            for (from, to) in list {
+                title.clear();
+                title.resize(to - from, 0);
+                if !crate::host::read_into((start + from) as *const u8, &mut title) {
+                    continue;
+                }
+                // SAFETY: inside the mapping of the CPU's side; the landings
+                // are kept out, and the refreshes of this submission are done.
+                let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(from), to - from) };
+                let runs = dword_runs(start + from, held, &title, 0);
+                for &(a, len) in &runs {
+                    held[a..a + len].copy_from_slice(&title[a..a + len]);
+                    self.changed(from + a, from + a + len);
+                }
+                self.card_changed_runs(runs.iter().map(|&(a, len)| (from + a, from + a + len)));
+                sent[k] += runs.iter().map(|r| r.1 as u64).sum::<u64>();
+            }
+        }
+        resent::note(self.start, self.len, resent::Resent { ahead: sent[0], released: sent[1], ..Default::default() });
+    }
+
+    /// Whether title bytes are held back ([`hold_back`]).
+    pub(crate) fn holds_back(&self) -> bool {
+        !self.held_back.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+    }
+
     /// For [`resent`]: `pages` of a landing were not put into title memory,
     /// and the CPU's side took the card's bytes there.
     pub(crate) fn resent_missed(&self, pages: u64) {
@@ -4604,6 +4901,11 @@ impl Shadow {
     /// Copies title memory `[from, to)` (inside the buffer) into the copy;
     /// `known`: the copy held it before ([`send_changed`]).
     fn take(&self, from: usize, to: usize, known: bool) -> usize {
+        self.take_with(from, to, known, hold_back())
+    }
+
+    /// [`Shadow::take`], with [`hold_back`] as `hold` says.
+    fn take_with(&self, from: usize, to: usize, known: bool, hold: bool) -> usize {
         thread_local! {
             /// A page of title memory, as read.
             static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -4641,6 +4943,33 @@ impl Shadow {
                 let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at - start), n) };
                 let was = crate::host::upcheck::on().then(|| held.to_vec());
                 let runs = if whole { vec![(0, n)] } else { dword_runs(at, held, title, 0) };
+                // (A piece a landing put shaders' bytes into lately: the
+                // title's bytes wait for the next submission that declares
+                // writes there, [`hold_back`]. `at` lies in one piece.)
+                let held_now = hold
+                    && !whole
+                    && !runs.is_empty()
+                    && landed_lately(
+                        self.landed_pieces.lock().unwrap_or_else(|e| e.into_inner()).get(&(at / PAGE)).copied(),
+                        crate::frame::current(),
+                    );
+                if held_now {
+                    HOLDERS.lock().unwrap_or_else(|e| e.into_inner()).insert(self.start);
+                    let frame = crate::frame::current();
+                    let mut back = self.held_back.lock().unwrap_or_else(|e| e.into_inner());
+                    for &(a, len) in &runs {
+                        back.add(at - start + a, at - start + a + len, frame);
+                    }
+                    drop(back);
+                    resent::note(
+                        self.start,
+                        self.len,
+                        resent::Resent { held: runs.iter().map(|r| r.1 as u64).sum(), ..Default::default() },
+                    );
+                    SEND[0].fetch_add(n as u64, Ordering::Relaxed);
+                    at += n;
+                    continue;
+                }
                 for &(a, len) in &runs {
                     held[a..a + len].copy_from_slice(&title[a..a + len]);
                     self.changed(at - start + a, at - start + a + len);
@@ -4927,6 +5256,7 @@ impl Shadow {
         if self.card.is_none() || at + gpu.len() > self.len as usize {
             return 0;
         }
+        self.note_landed_pieces(at, at + gpu.len());
         // SAFETY: inside the mapping (checked above); only the submitting
         // thread writes it.
         let old = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
@@ -5001,6 +5331,7 @@ impl Shadow {
         if at + gpu.len() > self.len as usize {
             return 0;
         }
+        self.note_landed_pieces(at, at + gpu.len());
         let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: inside the mapping (checked above). The offsets are in a
         // range declared and not done with, which no refresh writes; what
@@ -5158,6 +5489,7 @@ impl Shadow {
             if merged > 0 {
                 self.note_landing(lo, hi);
             }
+            self.note_landed_pieces(lo, hi);
             put += merged;
         }
         put
