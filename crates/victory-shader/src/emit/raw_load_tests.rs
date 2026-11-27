@@ -1,4 +1,4 @@
-//! Byte and half loads through a root SRV, including a half at byte 3.
+//! Byte and half loads through a root SRV or code table, including byte 3.
 
 use super::host::{Dispatch, Host, Root, View};
 use super::{HostShader, lower, validator};
@@ -8,12 +8,28 @@ use crate::native::{
 use crate::{io, ir, resource, structure};
 
 /// Each lane reads at its lane number. The result is written to its own
-/// dword in a raw UAV. The root SRV supplies bytes with both signs.
-fn shader(op: u32, wave64: bool) -> HostShader {
-    let words = [
+/// dword in a raw UAV. Input bytes come from a root SRV or are appended
+/// to the code and addressed through `s_getpc_b64`.
+fn shader(op: u32, wave64: bool, table: Option<&[u8]>) -> HostShader {
+    let mut words = vec![
         0xBE85_0380, // s_mov_b32 s5, 0: the output table at s4
         0xF408_0202,
         0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+    ];
+    let relocation = table.map(|_| {
+        let pc = (words.len() as u32 + 1) * 4;
+        words.extend([
+            0xBE86_1F00, // s_getpc_b64 s[6:7]
+            0x8006_FF06, // s_add_u32 s6, s6, literal
+        ]);
+        let literal = words.len();
+        words.extend([
+            0,           // replaced with the offset from the PC to the table
+            0x8207_8007, // s_addc_u32 s7, s7, 0
+        ]);
+        (literal, pc)
+    });
+    words.extend([
         0x3404_0082, // v_lshlrev_b32 v2, 2, v0: output byte
         0xDC00_8000 | op << 18,
         0x0106_0000, // global_load_* v1, v0, s[6:7]
@@ -21,7 +37,14 @@ fn shader(op: u32, wave64: bool) -> HostShader {
         0xE070_1000,
         0x8002_0102, // buffer_store_dword v1, v2, s[8:11], 0 offen
         0xBF81_0000, // s_endpgm
-    ];
+    ]);
+    if let Some((literal, pc)) = relocation {
+        words[literal] = words.len() as u32 * 4 - pc;
+    }
+    let mut code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    if let Some(table) = table {
+        code.extend_from_slice(table);
+    }
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64,
@@ -70,11 +93,19 @@ fn shader(op: u32, wave64: bool) -> HostShader {
             rsrc2: 8 << 1,
             threads: [if wave64 { 64 } else { 32 }, 1, 1],
         }),
-        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        code,
     };
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("IR");
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resources");
+    if table.is_some() {
+        assert!(
+            res.scalar
+                .iter()
+                .any(|(_, address)| address.param == resource::CODE),
+            "exercise the code-constant-table route"
+        );
+    }
     let io = io::raise(&p, &native).expect("IO");
     let l = lower::lower(&lower::Parts {
         native: &native,
@@ -99,11 +130,18 @@ fn shader(op: u32, wave64: bool) -> HostShader {
         root_uavs: l.root_uavs,
         root_indexed_views: res.root_indexed_views,
     };
-    assert_eq!(
-        shader.root_srvs,
-        [2],
-        "exercise the root SRV, not a title-memory lookup"
-    );
+    if table.is_some() {
+        assert!(
+            shader.root_srvs.is_empty(),
+            "the code table needs no root SRV"
+        );
+    } else {
+        assert_eq!(
+            shader.root_srvs,
+            [2],
+            "exercise the root SRV, not a title-memory lookup"
+        );
+    }
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())
             .expect("DXIL validation");
@@ -113,6 +151,15 @@ fn shader(op: u32, wave64: bool) -> HostShader {
 
 #[test]
 fn global_subdword_loads_read_all_bytes_and_extend_the_sign() {
+    exercise(false);
+}
+
+#[test]
+fn code_table_subdword_loads_read_all_bytes_and_extend_the_sign() {
+    exercise(true);
+}
+
+fn exercise(code_table: bool) {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -134,24 +181,25 @@ fn global_subdword_loads_read_all_bytes_and_extend_the_sign() {
             for (op, width, signed) in
                 [(8, 8, false), (9, 8, true), (10, 16, false), (11, 16, true)]
             {
-                let shader = shader(op, wave64);
+                let shader = shader(op, wave64, code_table.then_some(bytes.as_slice()));
                 let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
                 let ud = vec![0u32; shader.user_data_dwords() as usize];
+                let mut roots = vec![(0, Root::Constants(ud))];
+                if !code_table {
+                    roots.push((
+                        1,
+                        Root::View {
+                            srv: true,
+                            data: data.clone(),
+                        },
+                    ));
+                }
                 let out = host
                     .dispatch(
                         &root,
                         &pso,
                         &Dispatch {
-                            roots: vec![
-                                (0, Root::Constants(ud)),
-                                (
-                                    1,
-                                    Root::View {
-                                        srv: true,
-                                        data: data.clone(),
-                                    },
-                                ),
-                            ],
+                            roots,
                             views: &[View::RawUav(lanes)],
                             samplers: &[],
                             groups: [1, 1, 1],
@@ -171,10 +219,10 @@ fn global_subdword_loads_read_all_bytes_and_extend_the_sign() {
                     .collect();
                 assert_eq!(
                     out[0], want,
-                    "{label}, wave64={wave64}, width={width}, signed={signed}"
+                    "{label}, code_table={code_table}, wave64={wave64}, width={width}, signed={signed}"
                 );
                 println!(
-                    "{label}: wave64={wave64}, width={width}, signed={signed}: {lanes} lanes passed"
+                    "{label}: code_table={code_table}, wave64={wave64}, width={width}, signed={signed}: {lanes} lanes passed"
                 );
                 ran += 1;
             }
