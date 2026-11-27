@@ -64,6 +64,9 @@ pub(crate) struct Pending {
     /// A first use that went without it was written down (diagnostics).
     #[cfg(feature = "diagnostics")]
     noted: AtomicBool,
+    /// The worker that was making it ended in the middle ([`watch`]): it
+    /// will never be made, and nothing waits for it.
+    lost: AtomicBool,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -95,6 +98,7 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            lost: AtomicBool::new(false),
         }
     }
 
@@ -130,6 +134,7 @@ impl Pending {
 pub(crate) fn missing(p: &Pending) -> Option<String> {
     match p.made.get() {
         Some(Some(_)) => None,
+        None if p.lost.load(Ordering::Relaxed) => Some(format!("lost, its making ended the worker {:?}", p.shaders)),
         None => Some("being made".into()),
         Some(None) => {
             let failed: Vec<String> = p
@@ -201,11 +206,14 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         super::library::note_used(&p.key);
     }
     if p.made.get().is_none() {
+        if p.lost.load(Ordering::Relaxed) {
+            return None;
+        }
         start(p, REQUESTED);
         wait(p, crate::frame::current());
         // (Which first uses go without: once a pipeline.)
         #[cfg(feature = "diagnostics")]
-        if p.made.get().is_none() && !p.noted.swap(true, Ordering::Relaxed) {
+        if p.made.get().is_none() && !p.lost.load(Ordering::Relaxed) && !p.noted.swap(true, Ordering::Relaxed) {
             tracing::info!(
                 shaders = ?p.shaders,
                 frame = crate::frame::current(),
@@ -219,6 +227,9 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
 /// that is making it); whether it has a host pipeline.
 pub(crate) fn now(p: &Arc<Pending>) -> bool {
+    if p.lost.load(Ordering::Relaxed) {
+        return false;
+    }
     p.make();
     p.made.get().is_some_and(|made| made.is_some())
 }
@@ -331,7 +342,7 @@ fn wait_compute(p: &Pending, frame: u64, budget: Duration) {
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
-    while p.made.get().is_none() {
+    while p.made.get().is_none() && !p.lost.load(Ordering::Relaxed) {
         let rest = until.saturating_duration_since(Instant::now());
         if rest.is_zero() {
             break;
@@ -418,7 +429,7 @@ fn wait(p: &Pending, frame: u64) {
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
-    while p.made.get().is_none() {
+    while p.made.get().is_none() && !p.lost.load(Ordering::Relaxed) {
         let rest = left.saturating_sub(started.elapsed());
         if rest.is_zero() {
             break;
@@ -627,6 +638,131 @@ fn worker_count(asked: Option<usize>, processors: usize) -> usize {
     }
 }
 
+/// The stack of a worker: `VICTORY_PIPELINE_STACK_MB` (1 to 1024), else
+/// `victory_shader::emit::PIPELINE_STACK`. Reserved; used as far as it is
+/// needed.
+///
+/// Upstream's default is the standard library's 2 MiB; here every worker has
+/// had 256 MiB since 64373d81. Its runs found the six programs of the first
+/// scene that end their worker under Wine do so with 64 MiB and with 1 GiB as
+/// with 2 MiB (runs 16 and 18, `docs/linux-wine.md`), so the size is not the
+/// cure, and [`watch`] is for what is left.
+fn worker_stack() -> usize {
+    match std::env::var("VICTORY_PIPELINE_STACK_MB").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
+        Some(megabytes) => {
+            tracing::info!(megabytes, "pipeline workers' stacks (VICTORY_PIPELINE_STACK_MB)");
+            megabytes.clamp(1, 1024) << 20
+        }
+        None => victory_shader::emit::PIPELINE_STACK,
+    }
+}
+
+/// What each worker is making now, by its number.
+static NOW: Mutex<Vec<Option<Arc<Pending>>>> = Mutex::new(Vec::new());
+
+/// Worker `i`: takes pipelines from the queue and makes them, for as long as
+/// the process runs.
+fn spawn_worker(i: usize, screens_only: bool, stack: usize) -> std::io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new().name(format!("victory-pipelines-{i}")).stack_size(stack).spawn(move || {
+        // Below the title's own threads (loading, recording),
+        // and the streaming one, which is below normal itself
+        // (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before).
+        let lowest = !screens_only && std::env::var_os("VICTORY_PIPELINE_LOWEST").is_none_or(|v| v != "0");
+        // SAFETY: a plain call on our own thread.
+        unsafe {
+            use windows::Win32::System::Threading::*;
+            let priority = if lowest { THREAD_PRIORITY_LOWEST } else { THREAD_PRIORITY_BELOW_NORMAL };
+            let _ = SetThreadPriority(GetCurrentThread(), priority);
+        }
+        let making = |p: Option<Arc<Pending>>| {
+            let mut now = NOW.lock().unwrap_or_else(|e| e.into_inner());
+            if now.len() <= i {
+                now.resize(i + 1, None);
+            }
+            now[i] = p;
+        };
+        loop {
+            let p = next(screens_only);
+            making(Some(p.clone()));
+            p.make();
+            making(None);
+            if p.was_slow.load(Ordering::Relaxed) {
+                let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+                queue.slow_now -= 1;
+                AVAILABLE.notify_all();
+            }
+            if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
+                drained();
+            } else {
+                super::library::save(false);
+            }
+        }
+    })
+}
+
+/// Under Wine: watches the workers, and when one ends, which only the host
+/// can have done, gives up the pipeline it was making and starts another
+/// worker in its place (`VICTORY_PIPELINE_WATCH=0`: not watched, as before).
+///
+/// Wine ends a thread whose stack has run out with no word (unless its `err`
+/// channel is on: "virtual_setup_exception stack overflow"), where Windows
+/// ends the process. The host's `CreatePipelineState` is vkd3d-proton's
+/// there, which turns the shader into the host's form on the calling thread,
+/// and for six compute programs of the first scene that runs out of any
+/// stack. The pipeline then stayed "being made" for good: every frame that
+/// used it waited its whole budget for it ([`wait`]), half a second, 250 of
+/// 271 ms a frame (run 13), and the six workers were gone. Given up, its
+/// draws and dispatches are dropped at once, as those of a pipeline the host
+/// refuses are.
+///
+/// This covers the pipeline workers alone. A thread of the title's or ours
+/// that runs out of stack is not watched.
+fn watch(mut workers: Vec<(usize, bool, std::thread::JoinHandle<()>)>, stack: usize) {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::{INFINITE, WaitForMultipleObjects};
+    let watching = std::thread::Builder::new().name("victory-pipelines-watch".into()).spawn(move || {
+        while !workers.is_empty() {
+            let handles: Vec<HANDLE> = workers.iter().map(|w| HANDLE(w.2.as_raw_handle())).collect();
+            // SAFETY: the handles of threads we hold, which stay open while we do.
+            let ended = unsafe { WaitForMultipleObjects(&handles, false, INFINITE) };
+            let k = ended.0.wrapping_sub(WAIT_OBJECT_0.0) as usize;
+            if k >= workers.len() {
+                tracing::warn!(?ended, "the pipeline workers are watched no more");
+                return;
+            }
+            let (i, screens_only, _gone) = workers.swap_remove(k);
+            let was = NOW.lock().unwrap_or_else(|e| e.into_inner()).get_mut(i).and_then(Option::take);
+            if let Some(p) = was {
+                p.lost.store(true, Ordering::Relaxed);
+                if p.was_slow.load(Ordering::Relaxed) {
+                    let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+                    queue.slow_now -= 1;
+                    AVAILABLE.notify_all();
+                }
+                WAITING.fetch_sub(1, Ordering::Relaxed);
+                tracing::warn!(
+                    worker = i,
+                    shaders = ?p.shaders,
+                    "a host pipeline's making ended its worker (under Wine: the host ran out of stack?): the title goes without this pipeline"
+                );
+                let (lock, done) = &DONE;
+                let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+                done.notify_all();
+            } else {
+                tracing::warn!(worker = i, "a pipeline worker ended with no pipeline in the making");
+            }
+            match spawn_worker(i, screens_only, stack) {
+                Ok(worker) => workers.push((i, screens_only, worker)),
+                Err(e) => tracing::warn!(error = %e, worker = i, "no pipeline worker in its place"),
+            }
+        }
+    });
+    if let Err(e) = watching {
+        tracing::warn!(error = %e, "the pipeline workers are not watched");
+    }
+}
+
 /// Starts the workers ([`worker_count`]) on first use.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
@@ -640,42 +776,20 @@ fn workers() -> bool {
         );
         tracing::info!(workers, "pipeline workers");
         let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
+        let stack = worker_stack();
+        let mut started = Vec::new();
         for i in 0..workers + screens {
             let screens_only = i >= workers;
-            let spawned = std::thread::Builder::new()
-                .name(format!("victory-pipelines-{i}"))
-                .stack_size(victory_shader::emit::PIPELINE_STACK)
-                .spawn(move || {
-                    // Below the title's own threads (loading, recording),
-                    // and the streaming one, which is below normal itself
-                    // (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before).
-                    let lowest = !screens_only && std::env::var_os("VICTORY_PIPELINE_LOWEST").is_none_or(|v| v != "0");
-                    // SAFETY: a plain call on our own thread.
-                    unsafe {
-                        use windows::Win32::System::Threading::*;
-                        let priority = if lowest { THREAD_PRIORITY_LOWEST } else { THREAD_PRIORITY_BELOW_NORMAL };
-                        let _ = SetThreadPriority(GetCurrentThread(), priority);
-                    }
-                    loop {
-                        let p = next(screens_only);
-                        p.make();
-                        if p.was_slow.load(Ordering::Relaxed) {
-                            let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-                            queue.slow_now -= 1;
-                            AVAILABLE.notify_all();
-                        }
-                        if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
-                            drained();
-                        } else {
-                            super::library::save(false);
-                        }
-                    }
-                });
-            if let Err(e) = spawned {
-                tracing::warn!(error = %e, "no pipeline worker");
-            } else {
-                running = true;
+            match spawn_worker(i, screens_only, stack) {
+                Ok(worker) => {
+                    started.push((i, screens_only, worker));
+                    running = true;
+                }
+                Err(e) => tracing::warn!(error = %e, "no pipeline worker"),
             }
+        }
+        if crate::wine::on_wine() && std::env::var_os("VICTORY_PIPELINE_WATCH").is_none_or(|v| v != "0") {
+            watch(started, stack);
         }
         running
     })
