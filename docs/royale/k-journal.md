@@ -126,3 +126,4 @@ Seen: the intro flickers before the loading screen (the author lists it as known
 - Ported: `VICTORY_COMPUTE_WAIT_MS` (avatarmanz d9ee5f2f via zocram ccec681, with `wine.rs`); `VICTORY_DYNAMIC_BITS` (zocram 5defcd6, on by default: to measure). `TABLE_MEMO` (92852c4) conflicts in draw.rs/host.rs: later. `WINE_MAP`/`PORT_HOME`: to compare with kroeeee's port 1.
 - PR #2 to the author (kroeeee #2): CARD_BUFFERS_MIN_KB=64 and COMPUTE_WAIT_MS=500 defaults, the ANSI fix of the huge-page watcher, the null-blob pipeline library; commits rewritten to the noreply identity.
 - **Translator 1,164 → 1,202 (27 Nov afternoon):** typed buffer stores of 1-3 channels; the TG_SIZE SGPR. Families: 9 whole (40 programs); 43/1023, 413/525, 282/330, 165/246.
+- **Translator 1,202 → 1,248:** XOR chains 32 deep; descriptor tables addressed from constant data (heap start as a host word). Families: 12 whole (77 programs); 43/1023, 413/525, 282/330, 165/246.
