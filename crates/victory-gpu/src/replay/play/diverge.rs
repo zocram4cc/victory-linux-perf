@@ -1145,8 +1145,14 @@ impl Player {
                         .filter(|v| *v > 64)
                         .collect();
                     bases.dedup();
+                    // VICTORY_SLOTS_SPAN: slots shown from each place (tables
+                    // reach further than the first 12).
+                    let span = std::env::var("VICTORY_SLOTS_SPAN")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(12u32);
                     for base in bases {
-                        for k in 0..12 {
+                        for k in 0..span {
                             let s = self.slot_at(heap, base + k, i);
                             if s.kind != slot::EMPTY {
                                 say(format!("  slot {base}+{k}: {}", self.slot_text(&s)));
