@@ -14231,6 +14231,39 @@ mod tests {
         assert!(!uniform.contains(&new_v1));
     }
 
+    /// In a lane branch of a console wave64 program, an LDS atomic minimum and then an add
+    /// on one word: split in two host waves, the halves need ordering inside the branch
+    /// (`super::lds_meetings` refuses the region), where two adds alone commute and do not
+    /// (avatarmanz/VIctory-7900XTX #204).
+    #[test]
+    fn lds_atomics_of_two_kinds_in_a_lane_branch_need_ordering() {
+        let meets = |first: u32, second: u32| {
+            let words: [u32; 13] = [
+                0x7E12_0280, // v_mov_b32 v9, 0 (address and minimum)
+                0x7E04_0281, // v_mov_b32 v2, 1 (increment)
+                0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+                0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+                0xBF88_0004, // s_cbranch_execz past both atomics
+                0x36 << 26 | first << 18,
+                9 << 8 | 9, // ds_<first> v9, v9
+                0x36 << 26 | second << 18,
+                2 << 8 | 9,  // ds_<second> v9, v2
+                0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+                0x36 << 26 | 0x36 << 18,
+                5 << 24 | 9, // ds_read_b32 v5, v9
+                S_ENDPGM,
+            ];
+            let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+            let p = ir::build(&code, true, 16).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let all = super::all_lane_blocks(&st).unwrap();
+            super::lds_meetings(&p, &st, &all).is_some()
+        };
+        assert!(!meets(0x07, 0x00), "ds_min_u32 then ds_add_u32");
+        assert!(!meets(0x07, 0x20), "ds_min_u32 then ds_add_rtn_u32");
+        assert!(meets(0x00, 0x00), "two ds_add_u32");
+    }
+
     #[test]
     fn packed_pixel_inputs_find_their_second_row() {
         use super::super::container::SigElement;
