@@ -1,0 +1,32 @@
+From 292630c2de48c92cd703f85bec5b250f7437fe37 Mon Sep 17 00:00:00 2001
+From: skornuta <126527569+skornuta@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 09:51:12 -0800
+Subject: [PATCH 25/27] play.ps1: upload pool at 256 MB, budgets packed,
+ compare in pieces
+
+Run of the first area (3 minutes in the world, heap profile off) with
+VICTORY_CARD_WINDOW_UPLOAD_MB=256, VICTORY_BUDGET_PACK=1 and
+VICTORY_COMPARE_PIECES=1: 8.55 GB on the card, private 20.26-20.61 GB,
+rust_heap 1,102 MB (-254 MB), d3d12_ours_unranged 982 MB (-190 MB);
+16.5 fps median, 17.8 p90; no pop-in seen, no device loss.
+---
+ play.ps1 | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/play.ps1 b/play.ps1
+index 1451174..ca78568 100644
+--- a/play.ps1
++++ b/play.ps1
+@@ -94,6 +94,9 @@ $set = [ordered]@{
+   VICTORY_ALLOCATOR_TRIM      = '1'         # command allocators taken anew every 30 s (they keep their largest recording)
+   VICTORY_PRELUDE_POOL        = '1'         # host lists' preludes from one shared pool (each kept one of its own: ~0.85 MB each)
+   VICTORY_STAGE_POOL_MB       = '64'        # spare texture staging buffers kept (256 by default; the world uses about 25 MB)
++  VICTORY_CARD_WINDOW_UPLOAD_MB = '256'     # pool of the card windows' upload buffers (512 MB by default)
++  VICTORY_BUDGET_PACK         = '1'         # host lists' indirect budgets are 256-byte slots of shared 64 KiB buffers
++  VICTORY_COMPARE_PIECES      = '1'         # refreshes compare 1 MiB at a time (each thread kept a buffer as large as its largest range)
+ }
+ if (-not $NoAutoA) { $set['VICTORY_AUTO_A'] = '150' }   # taps A through the start screens for 150 s
+ if ($FrametimeDump) { $set['VICTORY_FRAMETIME_DUMP'] = '1' }
+-- 
+2.55.0.windows.3
+

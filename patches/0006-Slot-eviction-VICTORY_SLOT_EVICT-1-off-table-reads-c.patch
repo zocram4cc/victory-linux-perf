@@ -1,0 +1,358 @@
+From eb798751a062ba9550363269906f92ddfa6893a2 Mon Sep 17 00:00:00 2001
+From: skornuta <126527569+skornuta@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 13:10:14 -0800
+Subject: [PATCH 06/27] Slot eviction (VICTORY_SLOT_EVICT=1, off): table reads
+ count as use, two lines
+
+A texture a draw reads through a table every frame never asks for its
+host copy again (`HostHeap::mirror` finds the slot showing it already),
+so its last use stayed old although it was on screen: the eviction took
+it as idle and the next draw made it again. Now a texture any of whose
+slots a draw's table showed after "idle time ago" is kept. That frame is
+read from a ring of (frame, time) points the sweep keeps, once a second;
+each slot's table stamp says the frame it was last shown (`seen_since`,
+31-bit, erring toward "used"). Nothing is added to the draw path.
+
+Eviction now starts above VICTORY_SLOT_EVICT_PERCENT (85) and goes on
+until the card is under VICTORY_SLOT_EVICT_LOW_PERCENT (high - 10), at
+most VICTORY_SLOT_EVICT_MB (256) a sweep (`slot_plan`), instead of
+freeing the excess over one line every second. As before: only textures
+whose every slot a table showed lately (which its draw makes again), and
+none a list holds; slots nulled first, the copy retired behind running
+submissions, by the sweep, which runs with nothing in the air; a texture
+that came back is not taken again for 60 s.
+
+The memory CSV gets the eviction's counts (evicted, MB, slots reset, came
+back, within 2 s, given up) and its state (evicting, candidates, kept as
+seen by a table, blocked by slots picked by index).
+
+(cherry picked from commit 6497c6e37e8377b60054ff507fb430a1ac1863a9)
+---
+ crates/victory-gpu/src/descriptor.rs      |  18 +++-
+ crates/victory-gpu/src/descriptor/host.rs |  29 +++++-
+ crates/victory-gpu/src/ramline.rs         |  13 ++-
+ crates/victory-gpu/src/resource.rs        | 121 +++++++++++++++++++---
+ 4 files changed, 158 insertions(+), 23 deletions(-)
+
+diff --git a/crates/victory-gpu/src/descriptor.rs b/crates/victory-gpu/src/descriptor.rs
+index 9bee861..c190759 100644
+--- a/crates/victory-gpu/src/descriptor.rs
++++ b/crates/victory-gpu/src/descriptor.rs
+@@ -813,11 +813,16 @@ fn wait_for(resource: usize, handle: u64) {
+ /// pointer to title texture), those shown only by title slots a draw makes
+ /// again by itself (`HostHeap::slots_showing`), with those slots as (heap,
+ /// index). A texture any other slot shows is left out.
++///
++/// (Neptune) A texture one of whose slots a draw's table showed after frame `cutoff` is left
++/// out too, and counted (the second result): a texture drawn through a table every frame
++/// never asks for its host copy again, so its last use is old although it is on screen.
+ #[cfg(windows)]
+ pub(crate) fn evictable_slots(
+     raws: &std::collections::HashMap<usize, usize>,
+     frame: u64,
+-) -> std::collections::HashMap<usize, Vec<(usize, u32)>> {
++    cutoff: u64,
++) -> (std::collections::HashMap<usize, Vec<(usize, u32)>>, u64, u64) {
+     let set: std::collections::HashSet<usize> = raws.keys().copied().collect();
+     let heaps: Vec<usize> = SHADER_HEAPS
+         .lock()
+@@ -827,12 +832,16 @@ pub(crate) fn evictable_slots(
+         .collect();
+     let mut by_texture: std::collections::HashMap<usize, Vec<(usize, u32)>> = std::collections::HashMap::new();
+     let mut blocked = std::collections::HashSet::new();
++    let mut seen = std::collections::HashSet::new();
+     for at in heaps {
+         // SAFETY: registered heaps are live (removed when dropped).
+         let Some(Some(host)) = unsafe { &*(at as *const Heap) }.host.get() else {
+             continue;
+         };
+-        for (index, raw, ok) in host.slots_showing(&set, frame) {
++        for (index, raw, ok, lately) in host.slots_showing(&set, frame, cutoff) {
++            if lately {
++                seen.insert(raw);
++            }
+             if ok {
+                 by_texture.entry(raw).or_default().push((at, index));
+             } else {
+@@ -840,8 +849,9 @@ pub(crate) fn evictable_slots(
+             }
+         }
+     }
+-    by_texture.retain(|raw, _| !blocked.contains(raw));
+-    by_texture.into_iter().filter_map(|(raw, slots)| Some((*raws.get(&raw)?, slots))).collect()
++    let kept = seen.iter().filter(|raw| !blocked.contains(raw)).count() as u64;
++    by_texture.retain(|raw, _| !blocked.contains(raw) && !seen.contains(raw));
++    (by_texture.into_iter().filter_map(|(raw, slots)| Some((*raws.get(&raw)?, slots))).collect(), kept, blocked.len() as u64)
+ }
+ 
+ /// Puts the slots of title texture `resource` back to waiting for its host
+diff --git a/crates/victory-gpu/src/descriptor/host.rs b/crates/victory-gpu/src/descriptor/host.rs
+index f7d98ac..c9e0f52 100644
+--- a/crates/victory-gpu/src/descriptor/host.rs
++++ b/crates/victory-gpu/src/descriptor/host.rs
+@@ -491,6 +491,24 @@ const TABLED_GRACE: u64 = 8;
+ 
+ /// In [`HostHeap::tabled`]: a draw read the slot in that frame.
+ const TABLED_READ: u32 = 1 << 31;
++
++/// (Neptune) Whether a slot's table stamp ([`HostHeap::tabled`]: the frame a draw's table last
++/// showed it, plus one, in 31 bits; 0 never) is later than frame `cutoff`, seen from frame
++/// `frame`. A stamp without [`TABLED_READ`] counts too (a table showed the slot; whether the
++/// shader read it then is not known): the answer errs toward "used".
++pub(crate) fn seen_since(stamp: u32, cutoff: u64, frame: u64) -> bool {
++    let stamp = stamp & !TABLED_READ;
++    if stamp == 0 {
++        return false;
++    }
++    let mask = !TABLED_READ;
++    let now = (frame as u32).wrapping_add(1) & mask;
++    let cut = (cutoff as u32).wrapping_add(1) & mask;
++    // Ages back from now, in the stamps' 31 bits.
++    let age = now.wrapping_sub(stamp) & mask;
++    let limit = now.wrapping_sub(cut) & mask;
++    age < limit
++}
+ /// (Neptune) The slots of a block of [`HostHeap::tabled_blocks`].
+ const TABLED_BLOCK: u32 = 64;
+ 
+@@ -1715,11 +1733,17 @@ impl HostHeap {
+     /// ([`HostHeap::mirror`]). Slots only shaders pick by index (nothing
+     /// would make them again) and dynamic ones (a list not yet reset) are
+     /// not.
++    ///
++    /// (Neptune) And, per slot, whether a draw's table showed it after frame `cutoff`
++    /// ([`seen_since`]): a texture a draw reads through a table every frame never asks for its
++    /// host copy again (the slot shows it already, `HostHeap::mirror`), so its last use says
++    /// nothing of that, and only the slot's table stamp does.
+     pub(crate) fn slots_showing(
+         &self,
+         raws: &std::collections::HashSet<usize>,
+         frame: u64,
+-    ) -> Vec<(u32, usize, bool)> {
++        cutoff: u64,
++    ) -> Vec<(u32, usize, bool, bool)> {
+         self.kept
+             .iter()
+             .enumerate()
+@@ -1731,7 +1755,8 @@ impl HostHeap {
+                 };
+                 raws.contains(&raw).then(|| {
+                     let i = i as u32;
+-                    (i, raw, i < self.count && !self.sampler && self.tabled_lately(i, frame))
++                    let ok = i < self.count && !self.sampler && self.tabled_lately(i, frame);
++                    (i, raw, ok, seen_since(self.tabled_stamp(i), cutoff, frame))
+                 })
+             })
+             .collect()
+diff --git a/crates/victory-gpu/src/ramline.rs b/crates/victory-gpu/src/ramline.rs
+index edc1e63..2fb03be 100644
+--- a/crates/victory-gpu/src/ramline.rs
++++ b/crates/victory-gpu/src/ramline.rs
+@@ -301,7 +301,7 @@ rust_heap,d3d12_upload,d3d12_shared,d3d12_gpu_upload,d3d12_ours_unranged,sysmem_
+ other_private,other_private_res,other_mapped,unattributed_private,\
+ host_lists,preludes_made,idle_lists,list_scratch,\
+ card_copies,tex_filled,tex_filled_placed,tex_targets,tex_depth,tex_uav,tex_twins,tex_idle_held,\
+-detile_raw_used,detile_card_used,detile_raw_size,detile_card_size,detile_to_cpu,vram_commit_backing,residual_private";
++detile_raw_used,detile_card_used,detile_raw_size,detile_card_size,detile_to_cpu,vram_commit_backing,residual_private,slot_evicted,slot_evicted_mb,slot_slots_reset,slot_came_back,slot_came_back_2s,slot_given_up,slot_evicting,slot_candidates,slot_kept_seen,slot_blocked";
+ 
+ /// (Neptune) Once a minute, from the resident sampler's thread: one row of the memory
+ /// breakdown into the memory CSV, and the same derived in one log line. What we track (title
+@@ -328,6 +328,7 @@ fn minute(r: &Resident) {
+     let alive: Vec<u64> = crate::host::ALIVE.iter().map(|a| a.load(Relaxed)).collect();
+     let vk: Vec<u64> = crate::resource::VRAM_KINDS.iter().map(|k| k.load(Relaxed)).collect();
+     let det = crate::detile::memory();
++    let sev: Vec<u64> = crate::resource::SLOT_EVICT.iter().map(|k| k.load(Relaxed)).collect();
+     // Our buffers in the PC's memory that no range above names: their CPU sides are the host
+     // copies and the staging buffers, which the sampler took first.
+     let ranged = r.buffers.0 + r.windows.0 + r.staging.0;
+@@ -392,6 +393,16 @@ fn minute(r: &Resident) {
+         det[4],
+         mb(card[1]),
+         mb(residual),
++        sev[0],
++        mb(sev[1]),
++        sev[2],
++        sev[3],
++        sev[4],
++        sev[6],
++        crate::resource::SLOT_STATE[0].load(Relaxed),
++        crate::resource::SLOT_STATE[3].load(Relaxed),
++        crate::resource::SLOT_STATE[1].load(Relaxed),
++        crate::resource::SLOT_STATE[2].load(Relaxed),
+     ];
+     tracing::info!(
+         "memory minute: private {} MB (peak {} MB), working set {} MB, PC free {} MB, system commit {} of {} MB; \
+diff --git a/crates/victory-gpu/src/resource.rs b/crates/victory-gpu/src/resource.rs
+index 2459654..3e75f54 100644
+--- a/crates/victory-gpu/src/resource.rs
++++ b/crates/victory-gpu/src/resource.rs
+@@ -2082,6 +2082,14 @@ pub(crate) fn let_go_idle() {
+ pub(crate) static SLOT_EVICT: [std::sync::atomic::AtomicU64; 8] =
+     [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+ 
++/// (Neptune) [`slot_evict`] as of its last pass that looked at textures: whether it is evicting
++/// (between its two lines, on the way down); of the idle-looking textures (the last, their
++/// count), those it kept because a draw's table showed one of their slots within the idle
++/// time, and those it may not take because a slot shaders pick by index (or a dynamic one, or
++/// one no table showed lately) shows them.
++#[cfg(windows)]
++pub(crate) static SLOT_STATE: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
++
+ /// A texture back within this time was a bad victim; one that came back
+ /// is not a victim again for [`PROTECT_MS`].
+ #[cfg(windows)]
+@@ -2095,20 +2103,39 @@ const PROTECT_MS: u64 = 60_000;
+ /// draw reads through a table show them, at most `VICTORY_SLOT_EVICT_MB`
+ /// (default 512) a sweep. Off by default.
+ #[cfg(windows)]
+-fn slot_evict_settings() -> Option<(u64, u64)> {
+-    static S: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
++fn slot_evict_settings() -> Option<(u64, u64, u64)> {
++    static S: std::sync::OnceLock<Option<(u64, u64, u64)>> = std::sync::OnceLock::new();
+     *S.get_or_init(|| {
+         let num = |k: &str| std::env::var(k).ok().and_then(|v| v.trim().parse::<u64>().ok());
+-        (std::env::var("VICTORY_SLOT_EVICT").is_ok_and(|v| v == "1"))
+-            .then(|| (num("VICTORY_SLOT_EVICT_PERCENT").unwrap_or(80).clamp(50, 97), num("VICTORY_SLOT_EVICT_MB").unwrap_or(512) << 20))
++        (std::env::var("VICTORY_SLOT_EVICT").is_ok_and(|v| v == "1")).then(|| {
++            // (Neptune) Two lines: eviction starts above the high one and goes on, a capped
++            // step a sweep, until the card is under the low one (`slot_plan`).
++            let high = num("VICTORY_SLOT_EVICT_PERCENT").unwrap_or(85).clamp(50, 97);
++            let low = num("VICTORY_SLOT_EVICT_LOW_PERCENT").unwrap_or(high.saturating_sub(10)).clamp(40, high - 1);
++            (high, low, num("VICTORY_SLOT_EVICT_MB").unwrap_or(256).clamp(16, 2048) << 20)
++        })
+     })
+ }
+ 
+-/// How many bytes a [`slot_evict`] pass lets go: the excess over `percent`
+-/// of the budget, at most `cap`.
+-#[cfg_attr(not(windows), allow(dead_code))]
+-fn slot_need(budget: u64, used: u64, percent: u64, cap: u64) -> u64 {
+-    excess(budget, used, percent).min(cap)
++/// (Neptune) What a [`slot_evict`] pass does, with the card's `used` bytes of `budget`:
++/// whether eviction is on from here (`evicting`: it was on after the last pass) and how many
++/// bytes to let go now. It starts once the card is over `high` percent, then lets go of the
++/// excess over `low` percent, at most `cap` a pass, until it is under `low`, and stops: the
++/// card does not sit on one line, freeing and making copies again every second.
++fn slot_plan(evicting: bool, budget: u64, used: u64, high: u64, low: u64, cap: u64) -> (bool, u64) {
++    if !evicting && used <= budget / 100 * high {
++        return (false, 0);
++    }
++    match excess(budget, used, low) {
++        0 => (false, 0),
++        need => (true, need.min(cap)),
++    }
++}
++
++/// (Neptune) The latest frame of `ring` (frame, milliseconds, oldest first) at or before
++/// `at_ms`; `None` if the ring does not reach back that far.
++fn frame_at(ring: &std::collections::VecDeque<(u64, u64)>, at_ms: u64) -> Option<u64> {
++    ring.iter().rev().find(|&&(_, ms)| ms <= at_ms).map(|&(frame, _)| frame)
+ }
+ 
+ /// Lets go of idle host copies of textures the title fills that only title
+@@ -2125,13 +2152,33 @@ fn slot_need(budget: u64, used: u64, percent: u64, cap: u64) -> u64 {
+ #[cfg(windows)]
+ fn slot_evict(video: Option<[u64; 4]>, idle_ms: u64, frames: u64) {
+     use std::sync::atomic::Ordering::Relaxed;
+-    let (Some((percent, cap)), Some([budget, used, ..])) = (slot_evict_settings(), video) else {
++    let (Some((high, low, cap)), Some([budget, used, ..])) = (slot_evict_settings(), video) else {
+         return;
+     };
+-    let need = slot_need(budget, used, percent, cap);
++    // (Neptune) Frames by time, a point a sweep (once a second), two minutes of them: what
++    // frame "`idle_ms` ago" was, for the slots' table stamps, which count frames.
++    static RING: std::sync::Mutex<std::collections::VecDeque<(u64, u64)>> = std::sync::Mutex::new(std::collections::VecDeque::new());
++    let now_ms = crate::host::now_ms();
++    let frame = crate::frame::current();
++    let cutoff = {
++        let mut ring = RING.lock().unwrap_or_else(|e| e.into_inner());
++        ring.push_back((frame, now_ms));
++        while ring.len() > 120 {
++            ring.pop_front();
++        }
++        frame_at(&ring, now_ms.saturating_sub(idle_ms))
++    };
++    static EVICTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
++    let (on, need) = slot_plan(EVICTING.load(Relaxed), budget, used, high, low, cap);
++    EVICTING.store(on, Relaxed);
++    SLOT_STATE[0].store(u64::from(on), Relaxed);
+     if need == 0 {
+         return;
+     }
++    // Not yet a frame `idle_ms` back: nothing is known idle by its slots.
++    let Some(cutoff) = cutoff else {
++        return;
++    };
+     let mut copies = Vec::new();
+     let mut raws = std::collections::HashMap::new();
+     for &at in textures().iter() {
+@@ -2156,7 +2203,10 @@ fn slot_evict(video: Option<[u64; 4]>, idle_ms: u64, frames: u64) {
+     if copies.is_empty() {
+         return;
+     }
+-    let slots = crate::descriptor::evictable_slots(&raws, crate::frame::current());
++    let (slots, kept, blocked) = crate::descriptor::evictable_slots(&raws, frame, cutoff);
++    SLOT_STATE[3].store(raws.len() as u64, Relaxed);
++    SLOT_STATE[2].store(blocked, Relaxed);
++    SLOT_STATE[1].store(kept, Relaxed);
+     copies.retain(|&(at, ..)| slots.contains_key(&at));
+     let (mut n, mut bytes) = (0u64, 0u64);
+     for at in oldest_covering(copies, need) {
+@@ -3270,11 +3320,50 @@ static RESOURCE_FUNCTIONS: Table<32> = {
+ 
+ #[cfg(test)]
+ mod tests {
++    /// Between the lines nothing starts; over the high one eviction starts and takes the
++    /// excess over the low one, a capped step at a time, until the card is under the low one.
++    #[test]
++    fn slot_eviction_starts_high_and_stops_low() {
++        use super::slot_plan;
++        let (budget, high, low, cap) = (1000, 85, 75, 50);
++        // Idle between the lines: nothing.
++        assert_eq!(slot_plan(false, budget, 800, high, low, cap), (false, 0));
++        assert_eq!(slot_plan(false, budget, 850, high, low, cap), (false, 0));
++        // Over the high line: on, down toward the low one, capped.
++        assert_eq!(slot_plan(false, budget, 900, high, low, cap), (true, 50));
++        assert_eq!(slot_plan(false, budget, 860, high, low, cap), (true, 50));
++        // On, between the lines: it goes on (the line it stops at is the low one).
++        assert_eq!(slot_plan(true, budget, 800, high, low, cap), (true, 50));
++        assert_eq!(slot_plan(true, budget, 770, high, low, cap), (true, 20));
++        // Under the low line: off, and it stays off until the high one again.
++        assert_eq!(slot_plan(true, budget, 750, high, low, cap), (false, 0));
++        assert_eq!(slot_plan(false, budget, 840, high, low, cap), (false, 0));
++    }
++
++    #[test]
++    fn the_frame_ring_says_the_frame_at_a_time_back() {
++        let ring: std::collections::VecDeque<(u64, u64)> = [(100, 1_000), (114, 2_000), (130, 3_000)].into();
++        assert_eq!(super::frame_at(&ring, 2_500), Some(114));
++        assert_eq!(super::frame_at(&ring, 3_000), Some(130));
++        assert_eq!(super::frame_at(&ring, 999), None, "the ring does not reach back that far");
++    }
++
++    /// A slot's table stamp is the frame plus one in 31 bits: "seen since the cutoff" holds
++    /// for a frame after it, also across the wrap, and never for a slot never seen.
+     #[test]
+-    fn slot_eviction_need_is_the_excess_capped_by_the_rate() {
+-        assert_eq!(super::slot_need(1000, 900, 80, 50), 50);
+-        assert_eq!(super::slot_need(1000, 820, 80, 50), 20);
+-        assert_eq!(super::slot_need(1000, 800, 80, 50), 0);
++    fn a_slot_seen_by_a_table_after_the_cutoff_is_seen_since() {
++        use crate::descriptor::host::seen_since;
++        let stamp = |frame: u64| (frame as u32).wrapping_add(1) & 0x7fff_ffff;
++        assert!(seen_since(stamp(1_000), 900, 1_010));
++        assert!(!seen_since(stamp(900), 900, 1_010), "at the cutoff is not after it");
++        assert!(!seen_since(stamp(800), 900, 1_010));
++        assert!(!seen_since(0, 900, 1_010), "never seen");
++        // The read bit set: the same.
++        assert!(seen_since(stamp(1_000) | 1 << 31, 900, 1_010));
++        // Across the 31-bit wrap.
++        let top = (1u64 << 31) - 3;
++        assert!(seen_since(stamp(top + 5), top, top + 10));
++        assert!(!seen_since(stamp(top - 1), top, top + 10));
+     }
+ 
+     #[test]
+-- 
+2.55.0.windows.3
+

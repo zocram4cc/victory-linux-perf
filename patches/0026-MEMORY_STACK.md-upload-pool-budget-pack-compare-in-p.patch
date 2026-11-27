@@ -1,0 +1,75 @@
+From 7d00aee313beeda4e67f0cb46bf37a9d3e7a2ad2 Mon Sep 17 00:00:00 2001
+From: skornuta <126527569+skornuta@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 09:51:38 -0800
+Subject: [PATCH 26/27] MEMORY_STACK.md: upload pool, budget pack, compare in
+ pieces; 8.55 GB on the card
+
+---
+ MEMORY_STACK.md | 23 +++++++++++++++++------
+ 1 file changed, 17 insertions(+), 6 deletions(-)
+
+diff --git a/MEMORY_STACK.md b/MEMORY_STACK.md
+index 1626625..b0dcf62 100644
+--- a/MEMORY_STACK.md
++++ b/MEMORY_STACK.md
+@@ -9,10 +9,12 @@ RTX 5080 16 GB, Ryzen 7 9800X3D, 32 GB RAM. First area, 3 minutes in the world.
+ 
+ | | Before | After |
+ |---|---:|---:|
+-| VRAM used | ~12.6 GB | **8.63 GB** |
+-| Private commit | ~26.0 GB | **20.59 GB** |
+-| Working set | 15.1 GB | **12.85 GB** |
+-| Frame rate | ~17 fps | ~17 fps |
++| VRAM used | ~12.6 GB | **8.55 GB** |
++| Private commit | ~26.0 GB | **~20.3–20.6 GB** (20.26–20.61) |
++| Rust heap (`rust_heap`) | | **1,102 MB** (−254 MB from the last three switches) |
++| Our D3D12 buffers (`d3d12_ours_unranged`) | | **982 MB** (−190 MB from the last three switches) |
++| Working set | 15.1 GB | 12.85 GB (measured before the last three switches) |
++| Frame rate | ~17 fps | 16.5 fps median, 17.8 p90 |
+ 
+ Textures keep their native quality. In these runs no pop-in, flicker or black surfaces were
+ seen, and the device was never lost.
+@@ -31,14 +33,20 @@ seen, and the device was never lost.
+ | `VICTORY_ALLOCATOR_TRIM=1` | Replaces each command allocator every 30 s (an allocator keeps its largest recording), and frees spare list scratch. |
+ | `VICTORY_PRELUDE_POOL=1` | Host lists share one pool of preludes instead of keeping one each (~0.85 MB per list on NVIDIA). |
+ | `VICTORY_STAGE_POOL_MB=64` | Keeps at most 64 MB of spare texture staging buffers (an existing switch; the default is 256). |
++| `VICTORY_CARD_WINDOW_UPLOAD_MB=256` | Caps the pool of the card windows' upload buffers at 256 MB (an existing switch; the default is 512). |
++| `VICTORY_BUDGET_PACK=1` | A host list's 256-byte indirect-work budget is a slot of a shared 64 KiB buffer, not a 64 KiB committed buffer of its own (602 of them held 37 MB). |
++| `VICTORY_COMPARE_PIECES=1` | Refreshes compare the title's range 1 MiB at a time through one 1 MiB buffer per thread, instead of a buffer as large as the largest range (~270 MB across 12 threads). Same bytes copied, same runs sent. |
+ 
+ ## Cherry-pick order (onto `e94251a`)
+ 
+ ```
+ d8a3df8 49dd4c7 0ab9ab8 f879d92 df8839d 6497c6e 406ff5f 3599b52 7c274de 9c0c61b
+ 876456c 79dc3be cd5ae44 390d949 2f94a58 be0f84c 1626109 66cee8f 98a4e60 4b8ff9e 0c78932
++8172480 75d1f4f efe723a
+ ```
+ 
++(Hashes are those on `gpu-detile`.)
++
+ | Group | Commits | Hook points |
+ |---|---|---|
+ | GPU detile + ring trim | `d8a3df8` `0ab9ab8` `390d949` `2f94a58` | `formats/texture.rs` (`copy_table`); new `gpu/detile.rs`; `texture.rs` (upload route); `host.rs` (`Step::GpuTexture`, a pre-list at `lists[0]` in `submit`, `detile::sent`) |
+@@ -46,14 +54,17 @@ d8a3df8 49dd4c7 0ab9ab8 f879d92 df8839d 6497c6e 406ff5f 3599b52 7c274de 9c0c61b
+ | Slot eviction | `6497c6e` `406ff5f` | `resource.rs`, `descriptor.rs`, `descriptor/host.rs`. `406ff5f` fixes a deadlock: never take one without the other. |
+ | Bindless feedback | `7c274de` `9c0c61b` `876456c` `79dc3be` | new `gpu/feedback.rs`; the shader emitter (`emit/shader.rs`); `descriptor/host.rs` (parking); `draw.rs::heap_textures`; `pipeline/library.rs` (a separate library file); a pre-list in `host.rs` |
+ | Allocator, scratch and prelude trims | `cd5ae44` `1626109` `4b8ff9e` | `host.rs`: allocator swap at list and prelude resets, `Spare::trim`, the prelude pool tagged at both send sites; `list.rs` |
+-| Launcher | `be0f84c` `66cee8f` `98a4e60` `0c78932` | `play.ps1` only |
++| Budget pack | `8172480` | `host.rs`: budget slots taken at list creation, given back at retire |
++| Compare in pieces | `75d1f4f` | `shadow.rs` (`Shadow::copy_now`), with a unit test against the whole compare |
++| Launcher | `be0f84c` `66cee8f` `98a4e60` `0c78932` `efe723a` | `play.ps1` only |
+ | Optional | `49dd4c7` `3599b52` | test target compile fix; hang watch (`VICTORY_HANG_WATCH_S`, a diagnostic) |
+ 
+-The patches also apply with `git am` (series `0001` to `0021`).
++The patches also apply with `git am` (series `0001` to `0026`; `0022` and `0026` only touch this file).
+ 
+ ## Left out on purpose
+ 
+ - `5bc8998`, `3469541`: the copy profile, a diagnostic.
++- `bd8a047`: the heap profile (`VICTORY_HEAP_PROFILE`), a diagnostic.
+ - `9e6e2db`, `857a1ac`: `VICTORY_VIEW_NO_ASK`, worth about 1 ms a frame.
+ - `0e7e3e3`, `a44a9c3`: a change and its revert.
+ - `VICTORY_GUARD_HOT` and `VICTORY_INPLACE` (both existing switches) made things worse in testing: keep them off.
+-- 
+2.55.0.windows.3
+

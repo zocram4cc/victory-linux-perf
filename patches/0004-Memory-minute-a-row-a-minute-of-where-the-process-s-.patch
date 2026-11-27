@@ -1,0 +1,635 @@
+From df80b7dc842c9219f7b9340a70c9b07471de1e9f Mon Sep 17 00:00:00 2001
+From: skornuta <126527569+skornuta@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 12:26:23 -0800
+Subject: [PATCH 04/27] Memory minute: a row a minute of where the process's
+ memory is
+
+The resident sampler (every 30 s, on its own thread) now hands every other
+pass to `ramline::minute`, which logs a "memory minute" line and appends a
+row to `<cache>\memory.csv` (`VICTORY_MEMORY_CSV=<path>`, `=0`: none),
+headed with the run's VICTORY_ switches. Beside the process and system
+counts (private, peak, working set, free, system commit and limit) and
+the card's (budget and use, both segments) it names what we track - title
+memory by kind, host copies' CPU sides, staging, the snapshot pool, the
+Rust heap, our CPU-visible D3D12 buffers - and what is left:
+`unattributed_private`, the private memory no category names (the
+driver's own command memory among it), and `sysmem_gpu_untracked`, what
+the system counts as shared with the card beyond our buffers.
+
+- Rust heap: `heapcount` is striped, a counter on a cache line per thread
+  (64), summed by the sampler; on unless `VICTORY_HEAP_COUNT=0`. The old
+  shared counter slowed loading and was off, so release builds said 0.
+- Our D3D12 buffers: `memtel::track` counts what `upload_buffer`,
+  `shared_buffer` and `gpu_upload_buffer` make, and D3D12's destruction
+  callback (`ID3DDestructionNotifier`) takes it off, whoever let it go.
+
+Nothing else changes. Tests: stripes sum exactly with blocks freed on
+other threads; a tracked buffer counts until D3D12 destroys it (WARP).
+
+(cherry picked from commit f879d92f556b6ac01237390d026a74479fce7cf3)
+---
+ apps/victory/src/main.rs             |   6 +-
+ apps/victory/src/run.rs              |   3 +
+ crates/victory-core/src/heapcount.rs | 106 ++++++++++++--
+ crates/victory-gpu/src/detile.rs     |  12 ++
+ crates/victory-gpu/src/host.rs       |  18 ++-
+ crates/victory-gpu/src/lib.rs        |   4 +
+ crates/victory-gpu/src/memtel.rs     | 106 ++++++++++++++
+ crates/victory-gpu/src/ramline.rs    | 203 ++++++++++++++++++++++++++-
+ 8 files changed, 443 insertions(+), 15 deletions(-)
+ create mode 100644 crates/victory-gpu/src/memtel.rs
+
+diff --git a/apps/victory/src/main.rs b/apps/victory/src/main.rs
+index 7e73c7b..d59db3b 100644
+--- a/apps/victory/src/main.rs
++++ b/apps/victory/src/main.rs
+@@ -211,8 +211,10 @@ unsafe impl Sync for SdkPath {}
+ pub static D3D12SDKPath: SdkPath = SdkPath(b".\\D3D12\\\0".as_ptr());
+ 
+ fn main() -> Result<()> {
+-    // `VICTORY_HEAP_COUNT=1`: the Rust heap's live bytes for the resident line (off: it slowed loading).
+-    victory_core::heapcount::enable(std::env::var_os("VICTORY_HEAP_COUNT").is_some_and(|v| v == "1"));
++    // The Rust heap's live bytes for the resident line and the memory minute (`heapcount`:
++    // striped, a cache line per thread; the old shared counter slowed loading and was off).
++    // `VICTORY_HEAP_COUNT=0`: not counted.
++    victory_core::heapcount::enable(std::env::var_os("VICTORY_HEAP_COUNT").is_none_or(|v| v != "0"));
+     // (Neptune) Discord Rich Presence while a title runs (`discord.rs`).
+     if std::env::args().nth(1).as_deref() == Some("run") {
+         discord::start();
+diff --git a/apps/victory/src/run.rs b/apps/victory/src/run.rs
+index 9b1032c..0fb1b6a 100644
+--- a/apps/victory/src/run.rs
++++ b/apps/victory/src/run.rs
+@@ -23,6 +23,9 @@ pub fn run(
+     if std::env::var_os("VICTORY_FRAMETIME_DUMP").is_some_and(|v| v.to_str() == Some("1")) {
+         victory_gpu::frametime::use_dump_path(cfg.cache_dir.join("frametime.csv"));
+     }
++    // (Neptune) The memory minute's rows, beside the rest of Victory's cache.
++    #[cfg(windows)]
++    victory_gpu::use_memory_path(cfg.cache_dir.join("memory.csv"));
+     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
+     let prepared = victory_loader::prepare(&original)?;
+     let hash = prepared.original_hash.to_hex();
+diff --git a/crates/victory-core/src/heapcount.rs b/crates/victory-core/src/heapcount.rs
+index 2fd8a71..a6c6956 100644
+--- a/crates/victory-core/src/heapcount.rs
++++ b/crates/victory-core/src/heapcount.rs
+@@ -1,28 +1,69 @@
+ //! Live bytes of the Rust heap, kept by the binary's global allocator for the resident line
+ //! (`victory-gpu`'s `ramline`). Here because `apps/victory` and `victory-gpu` both depend on this crate.
++//!
++//! (Neptune) Striped: each thread adds to a counter on a cache line of its own (64 of them,
++//! a thread's chosen once), and [`sample`] sums them. The first form kept two atomics on one
++//! shared line, and that slowed loading with many threads allocating; with a line per thread
++//! an allocation costs one uncontended atomic add. A block freed on another thread than the
++//! one that made it moves bytes between stripes; the sum is still exact.
+ 
+-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
++use std::cell::Cell;
++use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering::Relaxed};
+ 
+-/// Live bytes, and the peak of live bytes.
++/// Live bytes, and the peak of live bytes, as the last [`sample`] found them.
+ pub static RUST_HEAP: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+ 
+-/// Whether the counting is on (`VICTORY_HEAP_COUNT=1`, set once by `main`). Off by default:
+-/// two atomics on one shared line per allocation slowed loading, with many threads allocating.
++/// Whether the counting is on (set once by `main`: on unless `VICTORY_HEAP_COUNT=0`).
+ static ON: AtomicBool = AtomicBool::new(false);
+ 
++const STRIPES: usize = 64;
++
++/// One counter on a cache line (and its neighbour, which the prefetcher pairs) of its own.
++#[repr(align(128))]
++struct Stripe(AtomicI64);
++
++static LIVE: [Stripe; STRIPES] = [const { Stripe(AtomicI64::new(0)) }; STRIPES];
++
++/// The next stripe handed to a thread.
++static NEXT: AtomicUsize = AtomicUsize::new(0);
++
++thread_local! {
++    /// This thread's stripe (`usize::MAX`: none chosen yet). Constant-initialised and without
++    /// a destructor: reading it never allocates, also while a thread ends.
++    static SLOT: Cell<usize> = const { Cell::new(usize::MAX) };
++}
++
++fn stripe() -> &'static AtomicI64 {
++    let at = SLOT
++        .try_with(|slot| {
++            let mut at = slot.get();
++            if at == usize::MAX {
++                at = NEXT.fetch_add(1, Relaxed) % STRIPES;
++                slot.set(at);
++            }
++            at
++        })
++        .unwrap_or(0);
++    &LIVE[at].0
++}
++
+ /// Turns the counting on or off; called by `main` before the runtime starts (the allocator
+ /// itself must not read the environment: that allocates).
+ pub fn enable(on: bool) {
+     ON.store(on, Relaxed);
+ }
+ 
++/// Whether the counting is on.
++pub fn enabled() -> bool {
++    ON.load(Relaxed)
++}
++
+ /// `bytes` more are live.
+ pub fn grow(bytes: usize) {
+     if !ON.load(Relaxed) {
+         return;
+     }
+-    let live = RUST_HEAP[0].fetch_add(bytes as u64, Relaxed) + bytes as u64;
+-    RUST_HEAP[1].fetch_max(live, Relaxed);
++    stripe().fetch_add(bytes as i64, Relaxed);
+ }
+ 
+ /// `bytes` are released.
+@@ -30,6 +71,55 @@ pub fn shrink(bytes: usize) {
+     if !ON.load(Relaxed) {
+         return;
+     }
+-    // Saturating: blocks made before `main` turned the counting on were never added.
+-    let _ = RUST_HEAP[0].fetch_update(Relaxed, Relaxed, |v| Some(v.saturating_sub(bytes as u64)));
++    stripe().fetch_sub(bytes as i64, Relaxed);
++}
++
++/// The live bytes now (the stripes summed; blocks made before the counting was turned on and
++/// freed since count below zero, so the sum is floored at zero), noted in [`RUST_HEAP`] with
++/// the peak of the samples so far.
++pub fn sample() -> u64 {
++    let live = LIVE.iter().map(|s| s.0.load(Relaxed)).sum::<i64>().max(0) as u64;
++    RUST_HEAP[0].store(live, Relaxed);
++    RUST_HEAP[1].fetch_max(live, Relaxed);
++    live
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// Bytes made on one thread and freed on others sum to what is live; nothing is lost.
++    /// (The counters are the process's: other tests' allocations are not counted, as
++    /// counting is on only through `grow` and `shrink` called here.)
++    #[test]
++    fn stripes_sum_to_the_live_bytes() {
++        enable(true);
++        let before = LIVE.iter().map(|s| s.0.load(Relaxed)).sum::<i64>();
++        let threads: Vec<_> = (0..8)
++            .map(|i| {
++                std::thread::spawn(move || {
++                    for _ in 0..1000 {
++                        grow(100 + i);
++                    }
++                })
++            })
++            .collect();
++        threads.into_iter().for_each(|t| t.join().unwrap());
++        let freed: Vec<_> = (0..4)
++            .map(|i| {
++                std::thread::spawn(move || {
++                    for _ in 0..1000 {
++                        shrink(100 + 2 * i);
++                        shrink(101 + 2 * i);
++                    }
++                })
++            })
++            .collect();
++        freed.into_iter().for_each(|t| t.join().unwrap());
++        let after = LIVE.iter().map(|s| s.0.load(Relaxed)).sum::<i64>();
++        assert_eq!(after - before, 0, "made on eight threads, freed on four others");
++        grow(4096);
++        assert!(sample() >= 4096 || before < 0);
++        shrink(4096);
++    }
+ }
+diff --git a/crates/victory-gpu/src/detile.rs b/crates/victory-gpu/src/detile.rs
+index 8689fb5..f25fc1f 100644
+--- a/crates/victory-gpu/src/detile.rs
++++ b/crates/victory-gpu/src/detile.rs
+@@ -928,6 +928,18 @@ fn land_checks(state: &mut State, completed: u64) {
+     }
+ }
+ 
++/// For the memory minute: bytes of the raw and the card's ring reserved or waiting for the
++/// card, the rings' sizes, and uploads sent the CPU's way since the start (zeros without the
++/// switch, or before the rings are made).
++pub(crate) fn memory() -> [u64; 5] {
++    let refused = (0..8).map(|i| STATS[WHY_AT + i].load(Relaxed)).sum();
++    let guard = STATE.lock().unwrap_or_else(|e| e.into_inner());
++    match guard.as_ref() {
++        Some(s) => [s.raw_arena.used(), s.out_arena.used(), s.raw_arena.size(), s.out_arena.size(), refused],
++        None => [0, 0, 0, 0, refused],
++    }
++}
++
+ /// Every ten seconds, with the switch on: what went to the card and what did not.
+ fn status() {
+     static LAST: AtomicU64 = AtomicU64::new(0);
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index 5b6a28a..b7e045a 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -7999,7 +7999,11 @@ impl Host {
+                 })
+         };
+         match made {
+-            Ok(()) => Some((buffer?, data.cast())),
++            Ok(()) => {
++                let buffer = buffer?;
++                crate::memtel::track(&buffer, crate::memtel::UPLOAD, size);
++                Some((buffer, data.cast()))
++            }
+             Err(e) => {
+                 tracing::warn!(error = %e, size, "no upload buffer");
+                 None
+@@ -9003,7 +9007,11 @@ impl Host {
+                 })
+         };
+         match made {
+-            Ok(()) => Some((buffer?, data.cast())),
++            Ok(()) => {
++                let buffer = buffer?;
++                crate::memtel::track(&buffer, crate::memtel::SHARED, size);
++                Some((buffer, data.cast()))
++            }
+             Err(e) => {
+                 tracing::warn!(error = %e, size, "no shared buffer");
+                 None
+@@ -9063,7 +9071,11 @@ impl Host {
+                 })
+         };
+         match made {
+-            Ok(()) if !data.is_null() => Some((buffer?, data.cast())),
++            Ok(()) if !data.is_null() => {
++                let buffer = buffer?;
++                crate::memtel::track(&buffer, crate::memtel::GPU_UPLOAD, size);
++                Some((buffer, data.cast()))
++            }
+             Ok(()) => None,
+             Err(e) => {
+                 tracing::warn!(error = %e, size, "no GPU upload buffer");
+diff --git a/crates/victory-gpu/src/lib.rs b/crates/victory-gpu/src/lib.rs
+index 293f7e1..dd72151 100644
+--- a/crates/victory-gpu/src/lib.rs
++++ b/crates/victory-gpu/src/lib.rs
+@@ -62,8 +62,12 @@ pub mod shader_cache;
+ #[cfg(windows)]
+ mod memory;
+ #[cfg(windows)]
++mod memtel;
++#[cfg(windows)]
+ mod ramline;
+ #[cfg(windows)]
++pub use ramline::use_memory_path;
++#[cfg(windows)]
+ mod shadow;
+ #[cfg(windows)]
+ mod windowup;
+diff --git a/crates/victory-gpu/src/memtel.rs b/crates/victory-gpu/src/memtel.rs
+new file mode 100644
+index 0000000..dba7914
+--- /dev/null
++++ b/crates/victory-gpu/src/memtel.rs
+@@ -0,0 +1,106 @@
++//! (Neptune) Our CPU-visible D3D12 memory, alive: the buffers the host's factories make
++//! (`Host::upload_buffer`, `Host::shared_buffer`, `Host::gpu_upload_buffer`), counted when made
++//! and taken off when D3D12 destroys them (`ID3DDestructionNotifier`), whoever held them last.
++//! Beside the system's count of the process's memory shared with the card (`Host::video_memory`)
++//! this tells our buffers from what the driver allocates for itself (command memory and the
++//! like) and from the few buffers made elsewhere.
++
++use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
++
++use windows::Win32::Graphics::Direct3D::ID3DDestructionNotifier;
++use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
++use windows::core::Interface;
++
++/// Upload heaps (write-combined, the PC's memory).
++pub(crate) const UPLOAD: usize = 0;
++/// Custom write-back heaps in the PC's memory (`Host::shared_buffer`: host copies' CPU sides,
++/// fetches, results).
++pub(crate) const SHARED: usize = 1;
++/// GPU upload heaps (the card's memory, CPU-visible through Resizable BAR).
++pub(crate) const GPU_UPLOAD: usize = 2;
++
++/// Bytes alive by kind (rounded up to the 64 KiB a committed buffer takes), and buffers.
++pub(crate) static ALIVE: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
++pub(crate) static BUFFERS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
++
++/// Counts `resource`, a buffer of `bytes` of `kind`, until D3D12 destroys it. A resource that
++/// cannot tell of its destruction is not counted at all (so nothing is counted that never
++/// goes).
++pub(crate) fn track(resource: &ID3D12Resource, kind: usize, bytes: u64) {
++    let Ok(notifier) = resource.cast::<ID3DDestructionNotifier>() else {
++        return;
++    };
++    let bytes = bytes.max(1).next_multiple_of(64 << 10);
++    // The kind in the low two bits, the bytes above: no allocation for the callback's data.
++    let data = (bytes << 2) | kind as u64;
++    ALIVE[kind].fetch_add(bytes, Relaxed);
++    BUFFERS[kind].fetch_add(1, Relaxed);
++    // SAFETY: a live resource; the callback takes a plain number, not a pointer to anything.
++    if unsafe { notifier.RegisterDestructionCallback(Some(destroyed), data as usize as *const _) }.is_err() {
++        ALIVE[kind].fetch_sub(bytes, Relaxed);
++        BUFFERS[kind].fetch_sub(1, Relaxed);
++    }
++}
++
++/// D3D12's call as a counted buffer is destroyed (on whatever thread let it go last).
++unsafe extern "system" fn destroyed(data: *mut core::ffi::c_void) {
++    let data = data as usize as u64;
++    let kind = (data & 3) as usize;
++    if kind < ALIVE.len() {
++        ALIVE[kind].fetch_sub(data >> 2, Relaxed);
++        BUFFERS[kind].fetch_sub(1, Relaxed);
++    }
++}
++
++/// Bytes alive by kind.
++pub(crate) fn alive() -> [u64; 3] {
++    [0, 1, 2].map(|k| ALIVE[k].load(Relaxed))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
++    use windows::Win32::Graphics::Direct3D12::*;
++    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
++    use windows::Win32::Graphics::Dxgi::*;
++
++    /// A tracked buffer counts while it lives, whoever lets it go, and not after.
++    #[test]
++    fn warp_a_tracked_buffer_counts_until_it_is_destroyed() {
++        // SAFETY: plain object creation on the software adapter.
++        let device = unsafe {
++            let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) else { return };
++            let Ok(adapter) = factory.EnumWarpAdapter::<IDXGIAdapter>() else { return };
++            let mut device: Option<ID3D12Device> = None;
++            if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_err() {
++                return;
++            }
++            device.unwrap()
++        };
++        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() };
++        let desc = D3D12_RESOURCE_DESC {
++            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
++            Width: 100_000,
++            Height: 1,
++            DepthOrArraySize: 1,
++            MipLevels: 1,
++            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
++            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
++            ..Default::default()
++        };
++        let mut buffer: Option<ID3D12Resource> = None;
++        // SAFETY: plain creation.
++        unsafe { device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut buffer).unwrap() };
++        let buffer = buffer.unwrap();
++        // The kind no factory uses in tests running beside this one: GPU upload heaps.
++        let before = ALIVE[GPU_UPLOAD].load(Relaxed);
++        track(&buffer, GPU_UPLOAD, 100_000);
++        assert_eq!(ALIVE[GPU_UPLOAD].load(Relaxed), before + (128 << 10), "rounded up to whole 64 KiB");
++        let held = buffer.clone();
++        drop(buffer);
++        assert_eq!(ALIVE[GPU_UPLOAD].load(Relaxed), before + (128 << 10), "another reference holds it");
++        drop(held);
++        assert_eq!(ALIVE[GPU_UPLOAD].load(Relaxed), before, "taken off as D3D12 destroys it");
++    }
++}
+diff --git a/crates/victory-gpu/src/ramline.rs b/crates/victory-gpu/src/ramline.rs
+index 2aac8d3..e96d44e 100644
+--- a/crates/victory-gpu/src/ramline.rs
++++ b/crates/victory-gpu/src/ramline.rs
+@@ -249,13 +249,212 @@ fn sampler() {
+                 mb(s.1),
+                 mb(c.WorkingSetSize as u64),
+                 started.elapsed().as_millis(),
+-                mb(victory_core::heapcount::RUST_HEAP[0].load(Relaxed)),
++                mb(victory_core::heapcount::sample()),
+                 mb(victory_core::heapcount::RUST_HEAP[1].load(Relaxed)),
+             );
++            // (Neptune) Every other pass (once a minute): the memory minute, from this pass.
++            static PASSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++            if PASSES.fetch_add(1, Relaxed) % 2 == 1 {
++                let k = |i: usize| (by_kind[i].0, by_kind[i].1);
++                minute(&Resident {
++                    title: [k(0), k(1), k(2), k(3)],
++                    other_private: (private.1, private.0),
++                    other_mapped: (mapped.1, mapped.0),
++                    buffers: (total(&buffers), b.0),
++                    windows: (total(&windows), w.0),
++                    staging: (total(&staging), s.0),
++                });
++            }
+         });
+     });
+ }
+ 
++/// (Neptune) What one pass of the resident sampler found, each as (committed, resident) bytes:
++/// the title's images, page views, virtual allocations and heap blocks, what is left of the
++/// private and the mapped regions, and the host copies' CPU sides and the staging buffers.
++struct Resident {
++    title: [(u64, u64); 4],
++    other_private: (u64, u64),
++    other_mapped: (u64, u64),
++    buffers: (u64, u64),
++    windows: (u64, u64),
++    staging: (u64, u64),
++}
++
++/// Where the memory minute's rows go (`apps/victory` passes `<cache>\memory.csv`;
++/// `%TEMP%\victory-memory.csv` without). `VICTORY_MEMORY_CSV=<path>` names another,
++/// `VICTORY_MEMORY_CSV=0` writes none (the log line stays).
++static MEMORY_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
++
++/// Points the memory minute's rows at `path`. Call before the title starts.
++pub fn use_memory_path(path: std::path::PathBuf) {
++    let _ = MEMORY_PATH.set(path);
++}
++
++/// The memory minute's columns, in megabytes unless named otherwise.
++const COLUMNS: &str = "unix_s,frame,\
++proc_private,proc_peak_private,proc_working_set,sys_avail_phys,sys_commit,sys_commit_limit,\
++vram_budget,vram_used,sysmem_gpu_budget,sysmem_gpu_used,\
++title_images,title_page_views,title_virtual,title_heap,title_page_views_res,title_virtual_res,\
++host_buffer_cpu,host_window_cpu,texture_staging,snapshot_pool,\
++rust_heap,d3d12_upload,d3d12_shared,d3d12_gpu_upload,d3d12_ours_unranged,sysmem_gpu_untracked,\
++other_private,other_private_res,other_mapped,unattributed_private,\
++host_lists,preludes_made,idle_lists,list_scratch,\
++card_copies,tex_filled,tex_filled_placed,tex_targets,tex_depth,tex_uav,tex_twins,tex_idle_held,\
++detile_raw_used,detile_card_used,detile_raw_size,detile_card_size,detile_to_cpu";
++
++/// (Neptune) Once a minute, from the resident sampler's thread: one row of the memory
++/// breakdown into the memory CSV, and the same derived in one log line. What we track (title
++/// memory, host copies, staging, the Rust heap, our CPU-visible D3D12 buffers) is told from
++/// what is left: `unattributed_private` is the private memory no category names, the driver's
++/// own (command memory, the system's backing for it) among it.
++fn minute(r: &Resident) {
++    use windows_sys::Win32::System::ProcessStatus::{
++        K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
++    };
++    use windows_sys::Win32::System::Threading::GetCurrentProcess;
++    let mb = |v: u64| v >> 20;
++    let mut c = PROCESS_MEMORY_COUNTERS_EX { cb: size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32, ..Default::default() };
++    // SAFETY: our own process and a sized structure (the extended form, as `cb` says).
++    unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), (&raw mut c).cast::<PROCESS_MEMORY_COUNTERS>(), c.cb) };
++    let mut p = PERFORMANCE_INFORMATION { cb: size_of::<PERFORMANCE_INFORMATION>() as u32, ..Default::default() };
++    // SAFETY: a sized structure.
++    unsafe { K32GetPerformanceInfo(&mut p, p.cb) };
++    let page = p.PageSize as u64;
++    let card = crate::host::host().and_then(|h| h.video_memory()).unwrap_or_default();
++    let heap = victory_core::heapcount::sample();
++    let d3d = crate::memtel::alive();
++    let copies = crate::shadow::memory();
++    let alive: Vec<u64> = crate::host::ALIVE.iter().map(|a| a.load(Relaxed)).collect();
++    let vk: Vec<u64> = crate::resource::VRAM_KINDS.iter().map(|k| k.load(Relaxed)).collect();
++    let det = crate::detile::memory();
++    // Our buffers in the PC's memory that no range above names: their CPU sides are the host
++    // copies and the staging buffers, which the sampler took first.
++    let ranged = r.buffers.0 + r.windows.0 + r.staging.0;
++    let ours_unranged = (d3d[0] + d3d[1]).saturating_sub(ranged);
++    // What the system counts of the process's memory shared with the card beyond our buffers.
++    let untracked = card[3].saturating_sub(d3d[0] + d3d[1]);
++    let unattributed = r.other_private.0.saturating_sub(heap + ours_unranged);
++    let row: Vec<u64> = vec![
++        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()),
++        crate::frame::current(),
++        mb(c.PrivateUsage as u64),
++        mb(c.PeakPagefileUsage as u64),
++        mb(c.WorkingSetSize as u64),
++        mb(p.PhysicalAvailable as u64 * page),
++        mb(p.CommitTotal as u64 * page),
++        mb(p.CommitLimit as u64 * page),
++        mb(card[0]),
++        mb(card[1]),
++        mb(card[2]),
++        mb(card[3]),
++        mb(r.title[0].0),
++        mb(r.title[1].0),
++        mb(r.title[2].0),
++        mb(r.title[3].0),
++        mb(r.title[1].1),
++        mb(r.title[2].1),
++        mb(r.buffers.0),
++        mb(r.windows.0),
++        mb(r.staging.0),
++        mb(copies[5]),
++        mb(heap),
++        mb(d3d[0]),
++        mb(d3d[1]),
++        mb(d3d[2]),
++        mb(ours_unranged),
++        mb(untracked),
++        mb(r.other_private.0),
++        mb(r.other_private.1),
++        mb(r.other_mapped.0),
++        mb(unattributed),
++        alive[0],
++        crate::host::LISTS[1].load(Relaxed),
++        crate::list::idle_pool().0,
++        mb(alive[2]),
++        mb(crate::shadow::card_copy_bytes()[0]),
++        mb(vk[0]),
++        mb(vk[1]),
++        mb(vk[2]),
++        mb(vk[3]),
++        mb(vk[4]),
++        mb(vk[5]),
++        mb(vk[6]),
++        mb(det[0]),
++        mb(det[1]),
++        mb(det[2]),
++        mb(det[3]),
++        det[4],
++    ];
++    tracing::info!(
++        "memory minute: private {} MB (peak {} MB), working set {} MB, PC free {} MB, system commit {} of {} MB; \
++         card {} of {} MB, shared with the card {} MB; tracked: title {} MB (page views {} MB mapped, not private), \
++         host copies {} MB, staging {} MB, rust heap {} MB, our D3D12 buffers {} MB upload + {} MB shared + {} MB GPU upload \
++         ({} MB of them not in a range above); not ours in the shared count {} MB; left: private {} MB, mapped {} MB, \
++         unattributed private {} MB; host lists {}, preludes {}",
++        row[2],
++        row[3],
++        row[4],
++        row[5],
++        row[6],
++        row[7],
++        row[9],
++        row[8],
++        row[11],
++        row[12] + row[14] + row[15],
++        row[13],
++        row[18] + row[19],
++        row[20],
++        row[22],
++        row[23],
++        row[24],
++        row[25],
++        row[26],
++        row[27],
++        row[28],
++        row[30],
++        row[31],
++        row[32],
++        row[33],
++    );
++    write_row(&row);
++}
++
++/// Appends `row` to the memory CSV, made with a header (the switches the run was started with,
++/// then [`COLUMNS`]) on the first row.
++fn write_row(row: &[u64]) {
++    use std::io::Write;
++    static FILE: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
++    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    if *OFF.get_or_init(|| std::env::var_os("VICTORY_MEMORY_CSV").is_some_and(|v| v == "0")) {
++        return;
++    }
++    let mut file = FILE.lock().unwrap_or_else(|e| e.into_inner());
++    if file.is_none() {
++        let path = std::env::var_os("VICTORY_MEMORY_CSV")
++            .map(std::path::PathBuf::from)
++            .or_else(|| MEMORY_PATH.get().cloned())
++            .unwrap_or_else(|| std::env::temp_dir().join("victory-memory.csv"));
++        let Ok(mut made) = std::fs::File::create(&path) else {
++            tracing::warn!(path = %path.display(), "memory minute: the CSV could not be made");
++            let _ = OFF.set(true);
++            return;
++        };
++        let mut switches: Vec<String> =
++            std::env::vars().filter(|(k, _)| k.starts_with("VICTORY_")).map(|(k, v)| format!("{k}={v}")).collect();
++        switches.sort();
++        let _ = writeln!(made, "# switches: {}", switches.join(" "));
++        let _ = writeln!(made, "{COLUMNS}");
++        tracing::info!(path = %path.display(), "memory minute: a row a minute");
++        *file = Some(made);
++    }
++    if let Some(f) = file.as_mut() {
++        let text: Vec<String> = row.iter().map(u64::to_string).collect();
++        let _ = writeln!(f, "{}", text.join(","));
++        let _ = f.flush();
++    }
++}
++
+ /// Logs one line, called every five seconds from the host's frame stats.
+ pub(crate) fn log() {
+     sampler();
+@@ -300,7 +499,7 @@ pub(crate) fn log() {
+         idle,
+         mb(idle_bytes),
+         crate::list::TRIMMED_LISTS.load(Relaxed),
+-        mb(victory_core::heapcount::RUST_HEAP[0].load(Relaxed)),
++        mb(victory_core::heapcount::sample()),
+         mb(crate::watch::NOTIFIED.swap(0, Relaxed)),
+     );
+     tracing::info!(
+-- 
+2.55.0.windows.3
+

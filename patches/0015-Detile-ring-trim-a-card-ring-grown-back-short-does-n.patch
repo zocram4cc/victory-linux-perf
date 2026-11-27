@@ -1,0 +1,37 @@
+From bb86c62f4994078fe8f5ed7df5ba757bf68817a2 Mon Sep 17 00:00:00 2001
+From: skornuta <126527569+skornuta@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 22:48:57 -0800
+Subject: [PATCH 15/27] Detile ring trim: a card ring grown back short does not
+ lower the full size
+
+Run of 06:44: the card had no room for the whole ring when it grew back
+(256 of 512 MB), and that became the full size for the rest of the run.
+Now the full size stays what was asked, and growing is tried again ten
+seconds later.
+
+(cherry picked from commit 2f94a58939135d6e18170933ce8f9b7e28d31cb9)
+---
+ crates/victory-gpu/src/detile.rs | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/crates/victory-gpu/src/detile.rs b/crates/victory-gpu/src/detile.rs
+index 8ffe4f6..3ba1e6e 100644
+--- a/crates/victory-gpu/src/detile.rs
++++ b/crates/victory-gpu/src/detile.rs
+@@ -626,9 +626,10 @@ fn fit(state: &mut State, completed: u64) {
+             let old_out = std::mem::replace(&mut state.out, (out, out_gpu));
+             state.raw_arena = Arena::new(want.0);
+             state.out_arena = Arena::new(out_size);
+-            if grow {
+-                // The card's ring may come back smaller than asked (no room): that is full now.
+-                state.full.1 = out_size;
++            if grow && out_size < want.1 {
++                // The card had no room for the whole ring: tried again in ten seconds; the full
++                // size stays what was asked.
++                state.tried_ms = now + 9_000;
+             }
+             crate::host::retire((old_raw.0, old_out.0));
+             RESIZES[usize::from(grow)].fetch_add(1, Relaxed);
+-- 
+2.55.0.windows.3
+

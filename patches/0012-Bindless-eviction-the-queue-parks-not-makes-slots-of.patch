@@ -1,0 +1,248 @@
+From 0f906a452700b21d3e52a9d094e52c7cb9a19a1a Mon Sep 17 00:00:00 2001
+From: skornuta <126527569+skornuta@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 17:04:28 -0800
+Subject: [PATCH 12/27] Bindless eviction: the queue parks, not makes, slots of
+ textures let go unread
+
+Every evicted copy made again now notes its call path (`REMADE`, the
+memory minute lists the most common). A 3-minute run named one: of
+~14,500 copies made again, all of the top paths went through
+`State::heap_textures` -> `HostHeap::mirror` -> `make`: the texture queue
+serving title slots that show the texture but had no host slot when it
+was let go (so were not parked), due again when the title wrote them or
+the texture's memory changed - no shader asking.
+
+A texture let go while no shader read any of its slots is marked (the
+frame it went; cleared when it is made again). When the queue comes to a
+slot of such a texture it parks that slot too (with its view's key) and
+takes it out of the due slots, unless the feedback saw a shader read that
+very slot since; a draw through a table, a shader read, or another view
+written into the slot make it as before.
+
+The memory CSV gets `fb_queue_parked`.
+
+(cherry picked from commit 79dc3be705370e4d6769042e66f65f7447c3e3bd)
+---
+ crates/victory-gpu/src/descriptor/host.rs | 13 +++++
+ crates/victory-gpu/src/draw.rs            | 19 +++++++
+ crates/victory-gpu/src/feedback.rs        |  5 +-
+ crates/victory-gpu/src/ramline.rs         |  6 +-
+ crates/victory-gpu/src/resource.rs        | 67 +++++++++++++++++++++++
+ 5 files changed, 107 insertions(+), 3 deletions(-)
+
+diff --git a/crates/victory-gpu/src/descriptor/host.rs b/crates/victory-gpu/src/descriptor/host.rs
+index 8d2194e..c0bd10e 100644
+--- a/crates/victory-gpu/src/descriptor/host.rs
++++ b/crates/victory-gpu/src/descriptor/host.rs
+@@ -1767,6 +1767,19 @@ impl HostHeap {
+         self.textures.lock().unwrap_or_else(|e| e.into_inner()).park(index, key);
+     }
+ 
++    /// (Neptune) Parks title slot `index` with the view the title's record at `handle` holds (the
++    /// key [`HostHeap::mirror`] makes of it), and takes it out of the queue's due slots: the queue
++    /// came to a slot of a texture the eviction let go unread. Whether it was a view.
++    pub(crate) fn park_at(&self, index: u32, handle: u64) -> bool {
++        // SAFETY: the handle is a descriptor slot in title memory.
++        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
++        if tag != VIEW_TAG || generation == 0 {
++            return false;
++        }
++        self.park(index, u64::from(generation) << 32 | u64::from(i));
++        true
++    }
++
+     /// (Neptune) The key of the view host slot `index` shows now (0: none).
+     pub(crate) fn made_key(&self, index: u32) -> u64 {
+         self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).copied().unwrap_or(0)
+diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
+index 0fc5cb6..788373a 100644
+--- a/crates/victory-gpu/src/draw.rs
++++ b/crates/victory-gpu/src/draw.rs
+@@ -2030,6 +2030,25 @@ impl State {
+                     );
+                 }
+             }
++            // (Neptune) Bindless usage feedback: a slot of a texture the eviction let go while no
++            // shader read it is parked too, not made, unless a shader read this very slot since
++            // (the queue comes to such slots when the title writes them again or the texture's
++            // memory changes, with no shader asking: that was nearly every texture made again).
++            if crate::feedback::on()
++                && let Some(handle) = heap.handle(index)
++                && let Some(seen) = crate::descriptor::view(handle)
++            {
++                let placed = crate::descriptor::host::placed_texture(&seen);
++                if let Some(&View::Shader(texture, _)) = placed.as_ref().or(Some(&seen))
++                    && let Some(went) = crate::resource::unread_evicted(texture as This)
++                    && !crate::feedback::seen_since(index, went)
++                    && host.park_at(index, handle)
++                {
++                    host.texture_slot_done(index, write, None);
++                    crate::feedback::STATS[3].fetch_add(1, Ordering::Relaxed);
++                    continue;
++                }
++            }
+             let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
+             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
+             let resource = match placed.as_ref().or(view.as_ref()) {
+diff --git a/crates/victory-gpu/src/feedback.rs b/crates/victory-gpu/src/feedback.rs
+index 9a51a0e..2add923 100644
+--- a/crates/victory-gpu/src/feedback.rs
++++ b/crates/victory-gpu/src/feedback.rs
+@@ -48,8 +48,9 @@ pub(crate) fn idle_ms() -> u64 {
+         * 1000
+ }
+ 
+-/// Since the start: copies landed, slots found read in them (summed), slots unparked.
+-pub(crate) static STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
++/// Since the start: copies landed, slots found read in them (summed), slots unparked, and slots
++/// of textures let go unread that the queue came to and parked instead of making them.
++pub(crate) static STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+ 
+ /// Per view heap slot: the frame (plus one) of the copy that last found it read; 0 never.
+ static LAST_SEEN: OnceLock<Vec<AtomicU32>> = OnceLock::new();
+diff --git a/crates/victory-gpu/src/ramline.rs b/crates/victory-gpu/src/ramline.rs
+index 113c703..bb285a3 100644
+--- a/crates/victory-gpu/src/ramline.rs
++++ b/crates/victory-gpu/src/ramline.rs
+@@ -301,7 +301,7 @@ rust_heap,d3d12_upload,d3d12_shared,d3d12_gpu_upload,d3d12_ours_unranged,sysmem_
+ other_private,other_private_res,other_mapped,unattributed_private,\
+ host_lists,preludes_made,idle_lists,list_scratch,\
+ card_copies,tex_filled,tex_filled_placed,tex_targets,tex_depth,tex_uav,tex_twins,tex_idle_held,\
+-detile_raw_used,detile_card_used,detile_raw_size,detile_card_size,detile_to_cpu,vram_commit_backing,residual_private,slot_evicted,slot_evicted_mb,slot_slots_reset,slot_came_back,slot_came_back_2s,slot_given_up,slot_evicting,slot_candidates,slot_kept_seen,slot_blocked,fb_copies,fb_parked,fb_unparked";
++detile_raw_used,detile_card_used,detile_raw_size,detile_card_size,detile_to_cpu,vram_commit_backing,residual_private,slot_evicted,slot_evicted_mb,slot_slots_reset,slot_came_back,slot_came_back_2s,slot_given_up,slot_evicting,slot_candidates,slot_kept_seen,slot_blocked,fb_copies,fb_parked,fb_unparked,fb_queue_parked";
+ 
+ /// (Neptune) Once a minute, from the resident sampler's thread: one row of the memory
+ /// breakdown into the memory CSV, and the same derived in one log line. What we track (title
+@@ -406,6 +406,7 @@ fn minute(r: &Resident) {
+         crate::feedback::STATS[0].load(Relaxed),
+         crate::descriptor::parked(),
+         crate::feedback::STATS[2].load(Relaxed),
++        crate::feedback::STATS[3].load(Relaxed),
+     ];
+     tracing::info!(
+         "memory minute: private {} MB (peak {} MB), working set {} MB, PC free {} MB, system commit {} of {} MB; \
+@@ -440,6 +441,9 @@ fn minute(r: &Resident) {
+         row[32],
+         row[33],
+     );
++    for (i, path) in crate::resource::remakes(8).iter().enumerate() {
++        tracing::info!("memory minute: evicted copies made again, path {i}: {path}");
++    }
+     write_row(&row);
+ }
+ 
+diff --git a/crates/victory-gpu/src/resource.rs b/crates/victory-gpu/src/resource.rs
+index 863635d..810e6b7 100644
+--- a/crates/victory-gpu/src/resource.rs
++++ b/crates/victory-gpu/src/resource.rs
+@@ -1210,6 +1210,9 @@ struct Hosted {
+     /// that (0: never).
+     slot_evicted: std::sync::atomic::AtomicU64,
+     slot_returned: std::sync::atomic::AtomicU64,
++    /// (Neptune) The frame (plus one) the eviction let it go while no shader read any of its
++    /// slots (`crate::feedback`); 0: not, or made again since.
++    fb_evicted: std::sync::atomic::AtomicU64,
+ }
+ 
+ /// Counts for the memory line: host copies of textures the title fills
+@@ -1441,6 +1444,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
+         // Slots the title wrote with views of it while it had no host copy
+         // are made before the next submission runs.
+         crate::descriptor::texture_made(this as usize);
++        r.host.fb_evicted.store(0, Relaxed);
+         let evicted = r.host.slot_evicted.swap(0, Relaxed);
+         if evicted != 0 {
+             let now = crate::host::moment();
+@@ -1448,12 +1452,69 @@ fn hosted(this: This, make: bool) -> Option<Made> {
+             SLOT_EVICT[4].fetch_add(u64::from(!crate::host::long_ago(evicted, FAST_BACK_MS, 0)), Relaxed);
+             SLOT_EVICT[5].fetch_add(now.wrapping_sub(evicted) & 0xffff_ffff, Relaxed);
+             r.host.slot_returned.store(now.max(1), Relaxed);
++            note_remake();
+         }
+     }
+     r.host.used.store(crate::host::moment(), Relaxed);
+     made.clone()
+ }
+ 
++/// (Neptune) If title texture `this` was let go by the slot eviction while no shader read any of
++/// its slots (`crate::feedback`) and has not been made since: the frame it went.
++#[cfg(windows)]
++pub(crate) fn unread_evicted(this: This) -> Option<u64> {
++    let r = resource(this);
++    if r.desc.dimension == BUFFER {
++        return None;
++    }
++    match r.host.fb_evicted.load(std::sync::atomic::Ordering::Relaxed) {
++        0 => None,
++        f => Some(f - 1),
++    }
++}
++
++/// (Neptune) Copies the slot eviction let go that were made again, by the call path that made
++/// them: the return addresses above `hosted`, as offsets in this executable (0: another
++/// module), with how many. For finding what brings evicted textures back (the memory minute
++/// lists the most common).
++static REMADE: std::sync::Mutex<Option<std::collections::HashMap<[u32; 8], u64>>> = std::sync::Mutex::new(None);
++
++/// Notes the call path of a copy made again after the eviction let it go ([`REMADE`]).
++#[cfg(windows)]
++fn note_remake() {
++    use windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace;
++    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
++    let mut frames = [std::ptr::null_mut::<core::ffi::c_void>(); 10];
++    // SAFETY: room for 10 return addresses; this thread's own stack.
++    let n = unsafe { RtlCaptureStackBackTrace(2, frames.len() as u32, frames.as_mut_ptr(), std::ptr::null_mut()) } as usize;
++    // SAFETY: the executable's own module handle, never freed.
++    let base = unsafe { GetModuleHandleW(std::ptr::null()) } as usize;
++    let mut key = [0u32; 8];
++    for (k, &f) in key.iter_mut().zip(&frames[..n.min(8)]) {
++        let at = f as usize;
++        *k = if at >= base && at - base < 1 << 30 { (at - base) as u32 } else { 0 };
++    }
++    let mut map = REMADE.lock().unwrap_or_else(|e| e.into_inner());
++    *map.get_or_insert_with(Default::default).entry(key).or_insert(0) += 1;
++}
++
++/// For the memory minute: the `most` call paths that made evicted copies again most often, as
++/// "count: victory.exe+rva <- ..." each.
++#[cfg(windows)]
++pub(crate) fn remakes(most: usize) -> Vec<String> {
++    let map = REMADE.lock().unwrap_or_else(|e| e.into_inner());
++    let Some(map) = map.as_ref() else { return Vec::new() };
++    let mut all: Vec<(&[u32; 8], &u64)> = map.iter().collect();
++    all.sort_unstable_by(|a, b| b.1.cmp(a.1));
++    all.into_iter()
++        .take(most)
++        .map(|(key, n)| {
++            let path: Vec<String> = key.iter().map(|&rva| if rva == 0 { "-".into() } else { format!("{rva:#x}") }).collect();
++            format!("{n}: {}", path.join(" <- "))
++        })
++        .collect()
++}
++
+ /// The host copy of title texture `this` if it is made, without making it
+ /// (for diagnostics, which must not count as a use).
+ #[cfg(all(windows, feature = "diagnostics"))]
+@@ -2247,6 +2308,11 @@ fn slot_evict(video: Option<[u64; 4]>, idle_ms: u64, frames: u64) {
+             if idle {
+                 crate::texture::unstage(at as This);
+                 r.host.slot_evicted.store(crate::host::moment().max(1), Relaxed);
++                // (Neptune) Let go while no shader read it: its other slots, when the queue
++                // comes to them, are parked too (`unread_evicted`).
++                if slots[&at].iter().any(|s| s.2) {
++                    r.host.fb_evicted.store(frame + 1, Relaxed);
++                }
+                 made.take()
+             } else {
+                 None
+@@ -2758,6 +2824,7 @@ fn hand_out_resource(
+             placed: std::sync::atomic::AtomicBool::new(false),
+             slot_evicted: std::sync::atomic::AtomicU64::new(0),
+             slot_returned: std::sync::atomic::AtomicU64::new(0),
++            fb_evicted: std::sync::atomic::AtomicU64::new(0),
+         },
+     });
+     // The host copy waits for the texture's first use ([`Hosted`]).
+-- 
+2.55.0.windows.3
+

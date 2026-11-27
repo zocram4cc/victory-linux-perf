@@ -1,0 +1,337 @@
+From ed45dbc15bdb3122db866362eefd0906610c2291 Mon Sep 17 00:00:00 2001
+From: skornuta <126527569+skornuta@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 00:03:45 -0800
+Subject: [PATCH 20/27] Prelude pool (VICTORY_PRELUDE_POOL=1, off): host lists
+ share their preludes
+
+Measured on the RTX 5080 (new ignored memtel card test): a command
+allocator alone costs 3 KB of private memory, a closed list 228 KB, an
+allocator with a list that recorded anything ~0.85 MB however little it
+holds, and resetting gives none of it back. Each host list kept a prelude
+of its own (some 870 in the first area): most of the ~1.95 GB the memory
+minute leaves unattributed.
+
+A prelude runs in one submission only. With the switch a submission's
+preludes come from one shared pool: taken when recorded (one whose last
+submission passed its fence, or a new one), tagged with the submission's
+fence value when it is sent (both send paths), and idle ones past 64 are
+let go. A list's own prelude is not made. Title lists keep their own
+allocators: a closed list may be executed again without a reset, so its
+commands must stay.
+
+The memory CSV gets the pool's preludes alive and made.
+
+(cherry picked from commit 4b8ff9e98b5940d8fa81e0b3a3b95c8bae1d90c0)
+---
+ crates/victory-gpu/src/host.rs    | 114 +++++++++++++++++++++++++----
+ crates/victory-gpu/src/memtel.rs  | 118 ++++++++++++++++++++++++++++++
+ crates/victory-gpu/src/ramline.rs |   4 +-
+ 3 files changed, 221 insertions(+), 15 deletions(-)
+
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index 1ed4cd4..9248067 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -938,6 +938,79 @@ pub(crate) fn allocator_trim() -> Option<u64> {
+     })
+ }
+ 
++/// (Neptune) Whether host lists' preludes come from one shared pool (`VICTORY_PRELUDE_POOL=1`;
++/// off by default). A prelude runs in one submission only: the transitions and twin copies its
++/// list needs before it, recorded again at each submission of the list. Each host list kept a
++/// prelude of its own (an allocator and a list) for as long as it lived: some 870 in the first
++/// area, and on the RTX 5080 an allocator with a list that recorded anything costs ~0.85 MB of
++/// private memory however little it holds (`memtel` tests). With the switch a prelude is taken
++/// from the pool when a submission records one, and goes back to it once that submission has
++/// passed its fence ([`prelude_pool_sent`]); idle ones past [`PRELUDE_POOL_IDLE`] are let go.
++pub(crate) fn prelude_pool() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_PRELUDE_POOL").is_some_and(|v| v == "1"))
++}
++
++/// The most idle preludes the pool keeps.
++const PRELUDE_POOL_IDLE: usize = 64;
++
++/// Preludes of the pool: allocator, list, and the fence value of the submission that last ran
++/// it (0: never sent; `u64::MAX`: recorded for the submission being made, not sent yet).
++static PRELUDE_POOL: Mutex<Vec<(ID3D12CommandAllocator, ID3D12GraphicsCommandList, u64)>> = Mutex::new(Vec::new());
++
++/// (Neptune) Preludes of the pool alive, and made so far.
++pub(crate) static PRELUDE_POOL_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
++
++/// A prelude of the pool whose last submission has run, or a new one: taken out of the pool
++/// until recorded. Whether it is new.
++fn take_prelude() -> (ID3D12CommandAllocator, ID3D12GraphicsCommandList, bool) {
++    let completed = host().map_or(0, |h| h.completed());
++    {
++        let mut pool = PRELUDE_POOL.lock().unwrap_or_else(|e| e.into_inner());
++        if let Some(at) = pool.iter().position(|p| p.2 != u64::MAX && p.2 <= completed) {
++            let (allocator, list, _) = pool.swap_remove(at);
++            return (allocator, list, false);
++        }
++    }
++    let Some((allocator, list)) = host().and_then(|h| h.make_prelude()) else {
++        fail(format_args!("no host list for a state prelude (VICTORY_PRELUDE_POOL=1)"));
++    };
++    PRELUDE_POOL_STATS[0].fetch_add(1, Ordering::Relaxed);
++    PRELUDE_POOL_STATS[1].fetch_add(1, Ordering::Relaxed);
++    (allocator, list, true)
++}
++
++/// After a submission is sent with fence value `fence`: the preludes recorded for it run under
++/// that value; idle ones past [`PRELUDE_POOL_IDLE`] are let go (their submissions have run).
++pub(crate) fn prelude_pool_sent(fence: u64) {
++    if !prelude_pool() {
++        return;
++    }
++    let completed = host().map_or(0, |h| h.completed());
++    let gone = {
++        let mut pool = PRELUDE_POOL.lock().unwrap_or_else(|e| e.into_inner());
++        for p in pool.iter_mut().filter(|p| p.2 == u64::MAX) {
++            p.2 = fence;
++        }
++        let idle = pool.iter().filter(|p| p.2 <= completed).count();
++        let mut extra = idle.saturating_sub(PRELUDE_POOL_IDLE);
++        let mut gone = Vec::new();
++        let mut i = 0;
++        while extra > 0 && i < pool.len() {
++            if pool[i].2 <= completed {
++                gone.push(pool.swap_remove(i));
++                extra -= 1;
++            } else {
++                i += 1;
++            }
++        }
++        gone
++    };
++    PRELUDE_POOL_STATS[0].fetch_sub(gone.len() as u64, Ordering::Relaxed);
++    // Let go outside the lock; their submissions have run.
++    drop(gone);
++}
++
+ /// (Neptune) Since the start: host list allocators and prelude allocators taken anew
+ /// ([`allocator_trim`]).
+ pub(crate) static ALLOCATOR_TRIMS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+@@ -6193,6 +6266,7 @@ impl Host {
+             if crate::detile::on() {
+                 crate::detile::sent(*submitted);
+             }
++            crate::host::prelude_pool_sent(*submitted);
+             self.card_sent();
+             if let Err(e) = signalled {
+                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
+@@ -6280,6 +6354,7 @@ impl Host {
+         if crate::detile::on() {
+             crate::detile::sent(*submitted);
+         }
++        crate::host::prelude_pool_sent(*submitted);
+         let _ = &firsts;
+         FINISHED.store(this_submission, Ordering::Release);
+         bury(this_submission);
+@@ -7004,19 +7079,10 @@ impl HostList {
+         if barriers.is_empty() && syncs.is_empty() && ahead.is_empty() {
+             return None;
+         }
+-        let Some((allocator, list)) = self
+-            .prelude
+-            .get_or_init(|| host().and_then(|h| h.make_prelude()).map(|(a, l)| (Mutex::new((a, now_ms())), l)))
+-            .as_ref()
+-        else {
+-            fail(format_args!("no host list for a state prelude"));
+-        };
+-        let mut allocator = allocator.lock().unwrap_or_else(|e| e.into_inner());
+-        let fresh = allocator_refresh(&mut allocator, &ALLOCATOR_TRIMS[1]);
+-        let allocator = &allocator.0;
+-        // SAFETY: the prelude is not executing (every submission is waited
+-        // for); the textures are live.
+-        let recorded = unsafe {
++        // SAFETY (for both kinds of prelude below): the allocator's last list has run (a pooled
++        // one's submission passed its fence; a list's own one ran before the list's reset, and
++        // every submission is waited for); the textures are live.
++        let record = |allocator: &ID3D12CommandAllocator, list: &ID3D12GraphicsCommandList, fresh: bool| unsafe {
+             (if fresh { Ok(()) } else { allocator.Reset() }).and_then(|()| {
+                 list.Reset(allocator, None)?;
+                 if !to_copy.is_empty() {
+@@ -7035,7 +7101,27 @@ impl HostList {
+                 list.Close()
+             })
+         };
+-        if let Err(e) = recorded {
++        // (Neptune) With `VICTORY_PRELUDE_POOL=1`: a prelude of the shared pool, given back when
++        // this submission has run ([`prelude_pool`]).
++        if prelude_pool() {
++            let (allocator, list, made) = take_prelude();
++            if let Err(e) = record(&allocator, &list, made) {
++                fail(format_args!("a host state prelude did not record ({e})"));
++            }
++            let out = list.cast().ok();
++            PRELUDE_POOL.lock().unwrap_or_else(|e| e.into_inner()).push((allocator, list, u64::MAX));
++            return out;
++        }
++        let Some((allocator, list)) = self
++            .prelude
++            .get_or_init(|| host().and_then(|h| h.make_prelude()).map(|(a, l)| (Mutex::new((a, now_ms())), l)))
++            .as_ref()
++        else {
++            fail(format_args!("no host list for a state prelude"));
++        };
++        let mut allocator = allocator.lock().unwrap_or_else(|e| e.into_inner());
++        let fresh = allocator_refresh(&mut allocator, &ALLOCATOR_TRIMS[1]);
++        if let Err(e) = record(&allocator.0, list, fresh) {
+             fail(format_args!("a host state prelude did not record ({e})"));
+         }
+         list.cast().ok()
+diff --git a/crates/victory-gpu/src/memtel.rs b/crates/victory-gpu/src/memtel.rs
+index 2ca9f0c..40ce477 100644
+--- a/crates/victory-gpu/src/memtel.rs
++++ b/crates/victory-gpu/src/memtel.rs
+@@ -185,6 +185,124 @@ mod tests {
+         drop((card, upload, lists));
+     }
+ 
++    /// (Neptune) What small command lists cost in private bytes, on the card itself
++    /// (`VICTORY_MEMTEL_CARD=1 cargo test -p victory-gpu memtel -- --ignored --nocapture`):
++    /// 1,000 allocators with a list each, open and empty (as a host list waits after its
++    /// reset); 1,000 with a few barriers recorded and closed (as a prelude stands); and the
++    /// same allocators reset with their lists recording again.
++    #[test]
++    #[ignore]
++    fn card_what_small_command_lists_cost_in_private_bytes() {
++        if std::env::var_os("VICTORY_MEMTEL_CARD").is_none_or(|v| v != "1") {
++            return;
++        }
++        // SAFETY: plain object creation on the default adapter.
++        let device = unsafe {
++            let mut device: Option<ID3D12Device> = None;
++            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).unwrap();
++            device.unwrap()
++        };
++        let kb = |a: u64, b: u64| (b as i64 - a as i64) / 1024 / 1000;
++        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
++        let desc = D3D12_RESOURCE_DESC {
++            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
++            Width: 1 << 20,
++            Height: 1,
++            DepthOrArraySize: 1,
++            MipLevels: 1,
++            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
++            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
++            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
++            ..Default::default()
++        };
++        let mut b: Option<ID3D12Resource> = None;
++        // SAFETY: plain creation.
++        unsafe { device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut b).unwrap() };
++        let buffer = b.unwrap();
++        let make = || -> (ID3D12CommandAllocator, ID3D12GraphicsCommandList) {
++            // SAFETY: plain creation.
++            unsafe {
++                let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
++                let list = device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).unwrap();
++                (allocator, list)
++            }
++        };
++        let barriers = |list: &ID3D12GraphicsCommandList| {
++            let uav = D3D12_RESOURCE_BARRIER {
++                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
++                Anonymous: D3D12_RESOURCE_BARRIER_0 {
++                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
++                        // SAFETY: a borrowed pointer the barrier never releases.
++                        pResource: unsafe { std::mem::transmute_copy(&buffer) },
++                    }),
++                },
++                ..Default::default()
++            };
++            // SAFETY: an open list; a live buffer.
++            unsafe {
++                for _ in 0..8 {
++                    list.ResourceBarrier(&[uav.clone()]);
++                }
++                list.Close().unwrap();
++            }
++        };
++        // The driver's first lists set up what every later one shares: not counted.
++        let warm: Vec<_> = (0..200).map(|_| make()).collect();
++        // SAFETY: an open list of ours: closed so its allocator can make others.
++        unsafe { warm[0].1.Close().unwrap() };
++        // Allocators alone, and lists alone (closed, all made on one allocator).
++        let before = private();
++        // SAFETY: plain creation.
++        let allocators: Vec<ID3D12CommandAllocator> =
++            (0..1000).map(|_| unsafe { device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap() }).collect();
++        let after_allocators = private();
++        let lists: Vec<ID3D12GraphicsCommandList> = (0..1000)
++            .map(|_| {
++                // SAFETY: plain creation; each list is closed before the allocator makes the next.
++                unsafe {
++                    let list: ID3D12GraphicsCommandList =
++                        device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &warm[0].0, None).unwrap();
++                    list.Close().unwrap();
++                    list
++                }
++            })
++            .collect();
++        let after_lists = private();
++        println!(
++            "private bytes: an allocator alone {} KB, a closed list alone {} KB",
++            kb(before, after_allocators),
++            kb(after_allocators, after_lists)
++        );
++        drop((allocators, lists));
++        let start = private();
++        let open: Vec<_> = (0..1000).map(|_| make()).collect();
++        let after_open = private();
++        let closed: Vec<_> = (0..1000)
++            .map(|_| {
++                let pair = make();
++                barriers(&pair.1);
++                pair
++            })
++            .collect();
++        let after_closed = private();
++        for (allocator, list) in &closed {
++            // SAFETY: never executed: nothing runs from the allocator.
++            unsafe {
++                allocator.Reset().unwrap();
++                list.Reset(allocator, None).unwrap();
++            }
++        }
++        let after_reset = private();
++        println!(
++            "private bytes per allocator with its list: open and empty {} KB; 8 barriers recorded and closed {} KB; \
++             those reset and recording again: {} KB less each",
++            kb(start, after_open),
++            kb(after_open, after_closed),
++            kb(after_reset, after_closed)
++        );
++        drop((open, closed, buffer));
++    }
++
+     /// A tracked buffer counts while it lives, whoever lets it go, and not after.
+     #[test]
+     fn warp_a_tracked_buffer_counts_until_it_is_destroyed() {
+diff --git a/crates/victory-gpu/src/ramline.rs b/crates/victory-gpu/src/ramline.rs
+index afd0bc8..44cd342 100644
+--- a/crates/victory-gpu/src/ramline.rs
++++ b/crates/victory-gpu/src/ramline.rs
+@@ -301,7 +301,7 @@ rust_heap,d3d12_upload,d3d12_shared,d3d12_gpu_upload,d3d12_ours_unranged,sysmem_
+ other_private,other_private_res,other_mapped,unattributed_private,\
+ host_lists,preludes_made,idle_lists,list_scratch,\
+ card_copies,tex_filled,tex_filled_placed,tex_targets,tex_depth,tex_uav,tex_twins,tex_idle_held,\
+-detile_raw_used,detile_card_used,detile_raw_size,detile_card_size,detile_to_cpu,vram_commit_backing,residual_private,slot_evicted,slot_evicted_mb,slot_slots_reset,slot_came_back,slot_came_back_2s,slot_given_up,slot_evicting,slot_candidates,slot_kept_seen,slot_blocked,fb_copies,fb_parked,fb_unparked,fb_queue_parked,alloc_renewed,prelude_alloc_renewed,idle_lists_trimmed,detile_shrunk,detile_grown";
++detile_raw_used,detile_card_used,detile_raw_size,detile_card_size,detile_to_cpu,vram_commit_backing,residual_private,slot_evicted,slot_evicted_mb,slot_slots_reset,slot_came_back,slot_came_back_2s,slot_given_up,slot_evicting,slot_candidates,slot_kept_seen,slot_blocked,fb_copies,fb_parked,fb_unparked,fb_queue_parked,alloc_renewed,prelude_alloc_renewed,idle_lists_trimmed,detile_shrunk,detile_grown,prelude_pool_alive,prelude_pool_made";
+ 
+ /// (Neptune) Once a minute, from the resident sampler's thread: one row of the memory
+ /// breakdown into the memory CSV, and the same derived in one log line. What we track (title
+@@ -415,6 +415,8 @@ fn minute(r: &Resident) {
+         crate::list::TRIMMED_LISTS.load(Relaxed),
+         crate::detile::RESIZES[0].load(Relaxed),
+         crate::detile::RESIZES[1].load(Relaxed),
++        crate::host::PRELUDE_POOL_STATS[0].load(Relaxed),
++        crate::host::PRELUDE_POOL_STATS[1].load(Relaxed),
+     ];
+     tracing::info!(
+         "memory minute: private {} MB (peak {} MB), working set {} MB, PC free {} MB, system commit {} of {} MB; \
+-- 
+2.55.0.windows.3
+

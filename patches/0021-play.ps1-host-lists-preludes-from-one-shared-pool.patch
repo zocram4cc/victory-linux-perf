@@ -1,0 +1,29 @@
+From 82804882936e2081d1a8285b1d3c5a33e976d92a Mon Sep 17 00:00:00 2001
+From: skornuta <126527569+skornuta@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 00:10:11 -0800
+Subject: [PATCH 21/27] play.ps1: host lists' preludes from one shared pool
+
+Run of 00:04 (first area, 3 minutes in the world): private 21.5 -> 20.6
+GB, working set 15.1 -> 12.8 GB; no flicker or black surfaces seen, no
+device loss.
+
+(cherry picked from commit 0c789328b3b3f55bf5525829c24bb9b2fac9bd2f)
+---
+ play.ps1 | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/play.ps1 b/play.ps1
+index 9eef19f..1451174 100644
+--- a/play.ps1
++++ b/play.ps1
+@@ -92,6 +92,7 @@ $set = [ordered]@{
+   VICTORY_SLOT_EVICT_LOW_PERCENT = '50'
+   VICTORY_BINDLESS_FEEDBACK   = '1'         # shaders note the textures they take from the heap, so unseen ones can go too
+   VICTORY_ALLOCATOR_TRIM      = '1'         # command allocators taken anew every 30 s (they keep their largest recording)
++  VICTORY_PRELUDE_POOL        = '1'         # host lists' preludes from one shared pool (each kept one of its own: ~0.85 MB each)
+   VICTORY_STAGE_POOL_MB       = '64'        # spare texture staging buffers kept (256 by default; the world uses about 25 MB)
+ }
+ if (-not $NoAutoA) { $set['VICTORY_AUTO_A'] = '150' }   # taps A through the start screens for 150 s
+-- 
+2.55.0.windows.3
+

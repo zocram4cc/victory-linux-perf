@@ -1,0 +1,163 @@
+From 6c7ad0ac0daef01489320953484d957193542760 Mon Sep 17 00:00:00 2001
+From: skornuta <126527569+skornuta@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 12:37:00 -0800
+Subject: [PATCH 05/27] Memory minute: name the commit held for the card's
+ memory
+
+Measured on the RTX 5080 (the new ignored card test in `memtel`, run with
+VICTORY_MEMTEL_CARD=1): 2,048 MB of buffers in the card's memory added
+2,053 MB to the process's private bytes, a 512 MB upload buffer 513 MB,
+and 300 command allocators with a 4,000-command list each 459 MB. The
+system charges commit for every byte of the card's memory a process
+holds, so the "unattributed" private memory of a run is mostly that.
+
+Two more columns at the end of the CSV: `vram_commit_backing` (the card's
+memory in use) and `residual_private` (what is left of the unattributed:
+command memory and the driver's own); the log line says both.
+
+(cherry picked from commit df8839d4961562416534d58e3389060b3b2aedfe)
+---
+ crates/victory-gpu/src/memtel.rs  | 75 +++++++++++++++++++++++++++++++
+ crates/victory-gpu/src/ramline.rs | 13 +++++-
+ 2 files changed, 86 insertions(+), 2 deletions(-)
+
+diff --git a/crates/victory-gpu/src/memtel.rs b/crates/victory-gpu/src/memtel.rs
+index dba7914..a3d8178 100644
+--- a/crates/victory-gpu/src/memtel.rs
++++ b/crates/victory-gpu/src/memtel.rs
+@@ -65,6 +65,81 @@ mod tests {
+     use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+     use windows::Win32::Graphics::Dxgi::*;
+ 
++    /// The process's private bytes.
++    fn private() -> u64 {
++        use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX};
++        use windows_sys::Win32::System::Threading::GetCurrentProcess;
++        let mut c = PROCESS_MEMORY_COUNTERS_EX { cb: size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32, ..Default::default() };
++        // SAFETY: our own process and a sized structure.
++        unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), (&raw mut c).cast::<PROCESS_MEMORY_COUNTERS>(), c.cb) };
++        c.PrivateUsage as u64
++    }
++
++    /// What the card's memory and command memory cost in the process's private bytes, on the
++    /// card itself (`VICTORY_MEMTEL_CARD=1 cargo test -p victory-gpu memtel -- --ignored
++    /// --nocapture`): 2 GB of buffers in the card's memory, then 300 command allocators with a
++    /// list each that recorded a few thousand commands. Prints what each step added.
++    #[test]
++    #[ignore]
++    fn card_what_card_memory_and_command_memory_cost_in_private_bytes() {
++        if std::env::var_os("VICTORY_MEMTEL_CARD").is_none_or(|v| v != "1") {
++            return;
++        }
++        // SAFETY: plain object creation on the default adapter.
++        let device = unsafe {
++            let mut device: Option<ID3D12Device> = None;
++            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).unwrap();
++            device.unwrap()
++        };
++        let mb = |v: u64| v as i64 >> 20;
++        let start = private();
++        let buffer = |heap: D3D12_HEAP_TYPE, bytes: u64| {
++            let heap = D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() };
++            let desc = D3D12_RESOURCE_DESC {
++                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
++                Width: bytes,
++                Height: 1,
++                DepthOrArraySize: 1,
++                MipLevels: 1,
++                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
++                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
++                ..Default::default()
++            };
++            let mut b: Option<ID3D12Resource> = None;
++            let state = if heap.Type == D3D12_HEAP_TYPE_UPLOAD { D3D12_RESOURCE_STATE_GENERIC_READ } else { D3D12_RESOURCE_STATE_COMMON };
++            // SAFETY: plain creation.
++            unsafe { device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut b).unwrap() };
++            b.unwrap()
++        };
++        let card: Vec<_> = (0..4).map(|_| buffer(D3D12_HEAP_TYPE_DEFAULT, 512 << 20)).collect();
++        let after_card = private();
++        let upload = buffer(D3D12_HEAP_TYPE_UPLOAD, 512 << 20);
++        let after_upload = private();
++        let mut lists = Vec::new();
++        for _ in 0..300 {
++            // SAFETY: plain creation and recording of a list that is never executed.
++            unsafe {
++                let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
++                let list: ID3D12GraphicsCommandList = device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).unwrap();
++                for _ in 0..4000 {
++                    list.CopyBufferRegion(&card[0], 0, &card[1], 0, 256);
++                }
++                list.Close().unwrap();
++                lists.push((allocator, list));
++            }
++        }
++        let after_lists = private();
++        println!(
++            "private bytes: start {} MB; +2048 MB of card buffers: +{} MB; +512 MB upload buffer: +{} MB; \
++             +300 allocators with a 4,000-command list each: +{} MB",
++            mb(start),
++            mb(after_card) - mb(start),
++            mb(after_upload) - mb(after_card),
++            mb(after_lists) - mb(after_upload)
++        );
++        drop((card, upload, lists));
++    }
++
+     /// A tracked buffer counts while it lives, whoever lets it go, and not after.
+     #[test]
+     fn warp_a_tracked_buffer_counts_until_it_is_destroyed() {
+diff --git a/crates/victory-gpu/src/ramline.rs b/crates/victory-gpu/src/ramline.rs
+index e96d44e..edc1e63 100644
+--- a/crates/victory-gpu/src/ramline.rs
++++ b/crates/victory-gpu/src/ramline.rs
+@@ -301,7 +301,7 @@ rust_heap,d3d12_upload,d3d12_shared,d3d12_gpu_upload,d3d12_ours_unranged,sysmem_
+ other_private,other_private_res,other_mapped,unattributed_private,\
+ host_lists,preludes_made,idle_lists,list_scratch,\
+ card_copies,tex_filled,tex_filled_placed,tex_targets,tex_depth,tex_uav,tex_twins,tex_idle_held,\
+-detile_raw_used,detile_card_used,detile_raw_size,detile_card_size,detile_to_cpu";
++detile_raw_used,detile_card_used,detile_raw_size,detile_card_size,detile_to_cpu,vram_commit_backing,residual_private";
+ 
+ /// (Neptune) Once a minute, from the resident sampler's thread: one row of the memory
+ /// breakdown into the memory CSV, and the same derived in one log line. What we track (title
+@@ -335,6 +335,11 @@ fn minute(r: &Resident) {
+     // What the system counts of the process's memory shared with the card beyond our buffers.
+     let untracked = card[3].saturating_sub(d3d[0] + d3d[1]);
+     let unattributed = r.other_private.0.saturating_sub(heap + ours_unranged);
++    // The system charges the process commit for every byte of the card's memory it holds (2,048 MB
++    // of buffers there added 2,053 MB of private bytes on the RTX 5080: `memtel`'s card test): of
++    // what no category names, that much is the card's own, and the rest the driver's (command
++    // memory, about 1.5 MB an allocator in that test) and whatever else is left.
++    let residual = unattributed.saturating_sub(card[1]);
+     let row: Vec<u64> = vec![
+         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()),
+         crate::frame::current(),
+@@ -385,13 +390,15 @@ fn minute(r: &Resident) {
+         mb(det[2]),
+         mb(det[3]),
+         det[4],
++        mb(card[1]),
++        mb(residual),
+     ];
+     tracing::info!(
+         "memory minute: private {} MB (peak {} MB), working set {} MB, PC free {} MB, system commit {} of {} MB; \
+          card {} of {} MB, shared with the card {} MB; tracked: title {} MB (page views {} MB mapped, not private), \
+          host copies {} MB, staging {} MB, rust heap {} MB, our D3D12 buffers {} MB upload + {} MB shared + {} MB GPU upload \
+          ({} MB of them not in a range above); not ours in the shared count {} MB; left: private {} MB, mapped {} MB, \
+-         unattributed private {} MB; host lists {}, preludes {}",
++         unattributed private {} MB (of it the commit the system holds for our {} MB of the card's memory, the rest {} MB: \n         command memory and the driver's own); host lists {}, preludes {}",
+         row[2],
+         row[3],
+         row[4],
+@@ -414,6 +421,8 @@ fn minute(r: &Resident) {
+         row[28],
+         row[30],
+         row[31],
++        row[49],
++        row[50],
+         row[32],
+         row[33],
+     );
+-- 
+2.55.0.windows.3
+

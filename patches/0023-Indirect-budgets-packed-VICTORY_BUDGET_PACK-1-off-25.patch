@@ -1,0 +1,160 @@
+From 901d18d1f5e8ce588ecd50c1f2d7958abde57a5a Mon Sep 17 00:00:00 2001
+From: skornuta <126527569+skornuta@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 00:27:33 -0800
+Subject: [PATCH 23/27] Indirect budgets packed (VICTORY_BUDGET_PACK=1, off):
+ 256-byte slots of shared buffers
+
+A host list's indirect-work budget is 256 bytes that shaders write
+through its address (a root view: no barrier names its buffer), and each
+list made a shared buffer of its own for it: a committed buffer takes 64
+KiB, and 602 of them held 37 MB in the first area. With the switch a
+budget is a 256-byte slot of a 64 KiB buffer, zeroed when taken; its slot
+goes back behind the submissions running when its list goes (retire).
+---
+ crates/victory-gpu/src/host.rs | 106 +++++++++++++++++++++++++++++----
+ 1 file changed, 95 insertions(+), 11 deletions(-)
+
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index 9248067..659e70b 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -897,7 +897,7 @@ pub(crate) struct HostList {
+     pipelines: Mutex<std::collections::BTreeSet<String>>,
+     /// The work its indirect executions may still do (`indirect`): a
+     /// shader-writable word, zeroed when the list is submitted.
+-    budget: OnceLock<Option<(ID3D12Resource, usize)>>,
++    budget: OnceLock<Option<Budget>>,
+     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
+     /// grown to the largest indirect execution recorded on the list.
+     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+@@ -1011,6 +1011,96 @@ pub(crate) fn prelude_pool_sent(fence: u64) {
+     drop(gone);
+ }
+ 
++/// (Neptune) Whether host lists' indirect-work budgets share buffers (`VICTORY_BUDGET_PACK=1`;
++/// off by default). A budget is 256 bytes that shaders write through its address (a root
++/// view; no barrier names its buffer); each list made a shared buffer of its own for it, and a
++/// buffer takes 64 KiB: 602 of them held 37 MB in the first area. With the switch a budget is
++/// a 256-byte slot of a 64 KiB buffer of [`BUDGET_SLABS`], given back behind the submissions
++/// running when its list goes (`retire`).
++fn budget_pack() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_BUDGET_PACK").is_some_and(|v| v == "1"))
++}
++
++const BUDGET_SLOT: u64 = 256;
++const BUDGET_SLAB: u64 = 64 << 10;
++
++/// The budgets' buffers (buffer, mapping, GPU address) and the free slots (buffer, offset).
++static BUDGET_SLABS: Mutex<(Vec<(ID3D12Resource, usize, u64)>, Vec<(usize, u64)>)> = Mutex::new((Vec::new(), Vec::new()));
++
++/// A host list's indirect-work budget: a buffer of its own, or a slot of a shared one.
++enum Budget {
++    Own(ID3D12Resource, usize, u64),
++    Packed(BudgetSlot),
++}
++
++/// A slot of [`BUDGET_SLABS`]: given back when dropped, behind the submissions running then.
++struct BudgetSlot {
++    slab: usize,
++    offset: u64,
++    data: usize,
++    gpu: u64,
++}
++
++/// Gives a slot back when dropped ([`retire`] drops it once the submissions running at the
++/// list's end have finished).
++struct BudgetFree(usize, u64);
++
++impl Drop for BudgetFree {
++    fn drop(&mut self) {
++        BUDGET_SLABS.lock().unwrap_or_else(|e| e.into_inner()).1.push((self.0, self.1));
++    }
++}
++
++impl Drop for BudgetSlot {
++    fn drop(&mut self) {
++        retire(BudgetFree(self.slab, self.offset));
++    }
++}
++
++impl Budget {
++    fn new() -> Option<Budget> {
++        if !budget_pack() {
++            let (buffer, data) = host()?.shared_buffer(BUDGET_SLOT)?;
++            // SAFETY: a live buffer.
++            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
++            return Some(Budget::Own(buffer, data as usize, gpu));
++        }
++        let mut slabs = BUDGET_SLABS.lock().unwrap_or_else(|e| e.into_inner());
++        if slabs.1.is_empty() {
++            let (buffer, data) = host()?.shared_buffer(BUDGET_SLAB)?;
++            name(&buffer, || "indirect budgets".into());
++            // SAFETY: a live buffer.
++            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
++            let at = slabs.0.len();
++            slabs.0.push((buffer, data as usize, gpu));
++            // Taken from the front: the slab's first slot first.
++            slabs.1.extend((0..BUDGET_SLAB / BUDGET_SLOT).rev().map(|k| (at, k * BUDGET_SLOT)));
++        }
++        let (slab, offset) = slabs.1.pop()?;
++        let (_, data, gpu) = &slabs.0[slab];
++        let (data, gpu) = (data + offset as usize, gpu + offset);
++        // A slot given back holds its last list's words: zeroed, as a new buffer is.
++        // SAFETY: the slot's 256 mapped bytes, ours alone now (its last list's submissions ran).
++        unsafe { std::ptr::write_bytes(data as *mut u8, 0, BUDGET_SLOT as usize) };
++        Some(Budget::Packed(BudgetSlot { slab, offset, data, gpu }))
++    }
++
++    fn data(&self) -> usize {
++        match self {
++            Budget::Own(_, data, _) => *data,
++            Budget::Packed(slot) => slot.data,
++        }
++    }
++
++    fn gpu(&self) -> u64 {
++        match self {
++            Budget::Own(_, _, gpu) => *gpu,
++            Budget::Packed(slot) => slot.gpu,
++        }
++    }
++}
++
+ /// (Neptune) Since the start: host list allocators and prelude allocators taken anew
+ /// ([`allocator_trim`]).
+ pub(crate) static ALLOCATOR_TRIMS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+@@ -7422,17 +7512,12 @@ impl HostList {
+     /// The host address of the list's indirect-work budget, zeroed at each
+     /// submission of the list from the first use after a reset on.
+     pub(crate) fn budget(&self) -> Option<u64> {
+-        let (buffer, data) = self
+-            .budget
+-            .get_or_init(|| {
+-                let (b, d) = host()?.shared_buffer(256)?;
+-                Some((b, d as usize))
+-            })
+-            .as_ref()?;
++        let budget = self.budget.get_or_init(Budget::new).as_ref()?;
++        let (data, gpu) = (budget.data(), budget.gpu());
+         let mut deferred = self.deferred();
+         if !deferred.budget_zeroed {
+             deferred.budget_zeroed = true;
+-            let at = *data;
++            let at = data;
+             // SAFETY: the list's own mapped words, written before it runs.
+             // The words after the budget hold what the clamp noted about the
+             // list's last run (mesh dispatches: the largest group count
+@@ -7452,8 +7537,7 @@ impl HostList {
+                 }
+             })));
+         }
+-        // SAFETY: a live buffer.
+-        Some(unsafe { buffer.GetGPUVirtualAddress() })
++        Some(gpu)
+     }
+ 
+     /// A device-local unordered-access buffer of at least `size` bytes for
+-- 
+2.55.0.windows.3
+

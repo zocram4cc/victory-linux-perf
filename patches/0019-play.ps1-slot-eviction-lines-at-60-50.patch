@@ -1,0 +1,35 @@
+From 4c0dc4d5bc1badf1bcbfda270e52ac21e8eeb29d Mon Sep 17 00:00:00 2001
+From: skornuta <126527569+skornuta@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 00:00:46 -0800
+Subject: [PATCH 19/27] play.ps1: slot eviction lines at 60/50 %
+
+Run of 23:55 (first area, 3 minutes in the world): VRAM 9.85 -> 8.71 GB,
+private 22.6 -> 21.6 GB, idle textures held 1,811 -> 469 MB; 2 textures
+back within 2 s of being let go (first minute), no pop-in seen, no device
+loss.
+
+(cherry picked from commit 98a4e602aaa9b1e3069370406345cd34d9e27ee2)
+---
+ play.ps1 | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/play.ps1 b/play.ps1
+index 455a0ed..9eef19f 100644
+--- a/play.ps1
++++ b/play.ps1
+@@ -87,9 +87,9 @@ $set = [ordered]@{
+   VICTORY_GPU_DETILE_OUT_MB   = '512'       # detile rings for loading bursts...
+   VICTORY_GPU_DETILE_RAW_MB   = '512'
+   VICTORY_GPU_DETILE_TRIM     = '1'         # ...shrunk to 64 + 64 MB once loading is over, grown back for a burst
+-  VICTORY_SLOT_EVICT          = '1'         # idle textures' card copies let go above 75 % of the card's budget, down to 65 %
+-  VICTORY_SLOT_EVICT_PERCENT  = '75'
+-  VICTORY_SLOT_EVICT_LOW_PERCENT = '65'
++  VICTORY_SLOT_EVICT          = '1'         # idle textures' card copies let go above 60 % of the card's budget, down to 50 %
++  VICTORY_SLOT_EVICT_PERCENT  = '60'
++  VICTORY_SLOT_EVICT_LOW_PERCENT = '50'
+   VICTORY_BINDLESS_FEEDBACK   = '1'         # shaders note the textures they take from the heap, so unseen ones can go too
+   VICTORY_ALLOCATOR_TRIM      = '1'         # command allocators taken anew every 30 s (they keep their largest recording)
+   VICTORY_STAGE_POOL_MB       = '64'        # spare texture staging buffers kept (256 by default; the world uses about 25 MB)
+-- 
+2.55.0.windows.3
+

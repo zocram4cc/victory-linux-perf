@@ -1,0 +1,117 @@
+From c27705b8a9adc8a89a087bf9e5831ec6041d33e3 Mon Sep 17 00:00:00 2001
+From: skornuta <126527569+skornuta@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 15:05:19 -0800
+Subject: [PATCH 08/27] Hang watch: VICTORY_HANG_WATCH_S=<s> dumps every thread
+ when frames stop
+
+Three runs in a row lost the title in the world's first load to its own
+watchdog: our host stopped logging mid-burst, no frame began for 20-30 s,
+and the title wrote to address 0 (+0x23cf683, five times in crashes.log
+today, also before this branch's changes). The stack dump of every
+thread (`victory_loader::dump_stacks`, diagnostics-only until now) is
+built into release builds too, and with the switch a thread of its own
+prints it when no frame has begun for that many seconds, and again at
+twice that; nothing then until frames begin again. Off by default.
+
+(cherry picked from commit 3599b52899abc3cdc948ef14271dbbdb8fefe37e)
+---
+ apps/victory/src/run.rs          | 35 ++++++++++++++++++++++++++++++++
+ crates/victory-gpu/src/frame.rs  |  6 ++++++
+ crates/victory-loader/src/lib.rs |  4 ++--
+ 3 files changed, 43 insertions(+), 2 deletions(-)
+
+diff --git a/apps/victory/src/run.rs b/apps/victory/src/run.rs
+index 0fb1b6a..0f421d8 100644
+--- a/apps/victory/src/run.rs
++++ b/apps/victory/src/run.rs
+@@ -119,6 +119,8 @@ pub fn run(
+     }
+     victory_loader::report_crashes();
+     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
++    #[cfg(windows)]
++    hang_watch();
+     victory_hle::runtime::use_console_timers();
+     #[cfg(feature = "diagnostics")]
+     diagnostics(&image, &cfg);
+@@ -142,6 +144,39 @@ pub fn run(
+     Ok(())
+ }
+ 
++/// (Neptune) `VICTORY_HANG_WATCH_S=<seconds>` (off by default): when the title has begun no
++/// frame for that long, every thread's stack goes to the log (`victory_loader::dump_stacks`),
++/// and once more at twice that; then nothing until frames begin again. A title whose frame
++/// stands for half a minute ends itself (its watchdog writes to address 0): the dump names
++/// what stood. Counted from the first frame on; a thread of its own, a look a second.
++#[cfg(windows)]
++fn hang_watch() {
++    let Some(after) = std::env::var("VICTORY_HANG_WATCH_S").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&s| s > 0)
++    else {
++        return;
++    };
++    let _ = std::thread::Builder::new().name("victory-hang-watch".into()).spawn(move || {
++        let (mut last, mut since, mut dumps) = (0u64, std::time::Instant::now(), 0u32);
++        loop {
++            std::thread::sleep(std::time::Duration::from_secs(1));
++            let frame = victory_gpu::frame::begun();
++            if frame != last {
++                (last, since, dumps) = (frame, std::time::Instant::now(), 0);
++                continue;
++            }
++            if frame == 0 {
++                continue;
++            }
++            let stood = since.elapsed().as_secs();
++            if (dumps == 0 && stood >= after) || (dumps == 1 && stood >= 2 * after) {
++                dumps += 1;
++                eprintln!("VIctory: hang watch: no frame begun for {stood} s (frame {frame}); every thread's stack:");
++                victory_loader::dump_stacks();
++            }
++        }
++    });
++}
++
+ /// The debugging aids (README): scheduled stack dumps, watched values and
+ /// memory saved on a crash.
+ #[cfg(all(windows, feature = "diagnostics"))]
+diff --git a/crates/victory-gpu/src/frame.rs b/crates/victory-gpu/src/frame.rs
+index 6a75cc3..557feb4 100644
+--- a/crates/victory-gpu/src/frame.rs
++++ b/crates/victory-gpu/src/frame.rs
+@@ -94,6 +94,12 @@ pub(crate) fn current() -> u64 {
+     FRAME.load(Ordering::Relaxed)
+ }
+ 
++/// (Neptune) [`current`], for the app's hang watch: a title that stops beginning frames is
++/// stuck somewhere.
++pub fn begun() -> u64 {
++    current()
++}
++
+ /// Per event kind (origin, vblank, flip and later kinds): the last tick a
+ /// wait for it ended on.
+ static LAST: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+diff --git a/crates/victory-loader/src/lib.rs b/crates/victory-loader/src/lib.rs
+index 28cabd6..442cf9f 100644
+--- a/crates/victory-loader/src/lib.rs
++++ b/crates/victory-loader/src/lib.rs
+@@ -26,7 +26,7 @@ mod console_insn;
+ mod crash;
+ pub mod prepare;
+ pub mod resolve;
+-#[cfg(all(windows, feature = "diagnostics"))]
++#[cfg(windows)]
+ mod stacks;
+ #[cfg(windows)]
+ mod threads;
+@@ -45,7 +45,7 @@ pub use crash::{
+ pub use crash::save_on_crash;
+ pub use prepare::{PrepareError, PreparedImage, prepare};
+ pub use resolve::{ImportResolver, Provenance, Resolution};
+-#[cfg(all(windows, feature = "diagnostics"))]
++#[cfg(windows)]
+ pub use stacks::{dump_stacks, dump_stacks_on_schedule};
+ #[cfg(windows)]
+ pub use threads::disable_thread_calls;
+-- 
+2.55.0.windows.3
+

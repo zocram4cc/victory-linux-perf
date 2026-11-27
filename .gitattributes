@@ -1,0 +1,2 @@
+# Patches are applied with git am: never convert their line endings.
+*.patch -text

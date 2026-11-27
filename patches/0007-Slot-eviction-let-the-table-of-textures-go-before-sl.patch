@@ -1,0 +1,43 @@
+From 1c7c002f0eab5eb18853666442f2a4c308ac74e1 Mon Sep 17 00:00:00 2001
+From: skornuta <126527569+skornuta@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 15:10:29 -0800
+Subject: [PATCH 07/27] Slot eviction: let the table of textures go before
+ slot_evict takes it
+
+`let_go_idle` held `textures()` (a plain mutex) to the end and called
+`slot_evict` with it held, which locks it again: the submitting thread
+waited on itself in `Host::submit`'s sweep as soon as eviction had
+anything to do (the card past its line), no frame began, and the title's
+watchdog ended the run with a write to address 0 (+0x23cf683), thirty
+seconds later. Three runs in a row with VICTORY_SLOT_EVICT=1 died so in
+the world's first load; the control run without it lived. The hang
+watch's dump named the frame (resource.rs: slot_evict -> textures ->
+Mutex::lock_contended under Host::submit). It was there before the
+eviction's changes too: the switch, off by default, never ran under
+pressure.
+
+(cherry picked from commit 406ff5fb6324a8128a0dca1ca748d190f0cbf13f)
+---
+ crates/victory-gpu/src/resource.rs | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/crates/victory-gpu/src/resource.rs b/crates/victory-gpu/src/resource.rs
+index 3e75f54..23f45eb 100644
+--- a/crates/victory-gpu/src/resource.rs
++++ b/crates/victory-gpu/src/resource.rs
+@@ -2061,6 +2061,12 @@ pub(crate) fn let_go_idle() {
+             crate::host::retire(host);
+         }
+     }
++    // (Neptune) The table of textures is let go first: `slot_evict` takes it itself, and
++    // a lock taken twice by one thread waits for ever. That was the hang of every run with
++    // `VICTORY_SLOT_EVICT=1` as soon as the card passed its line (the submitting thread stood
++    // in `textures()` under `Host::submit`'s sweep, no frame began, and the title's watchdog
++    // wrote to address 0 thirty seconds later; `VICTORY_HANG_WATCH_S` showed it).
++    drop(all);
+     slot_evict(video, idle_ms, IDLE_FRAMES);
+     if went > 0 {
+         crate::host::trail(|| {
+-- 
+2.55.0.windows.3
+

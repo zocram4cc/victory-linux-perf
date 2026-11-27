@@ -1,0 +1,40 @@
+From af6903827a23e9158d27a22d12b1010504365076 Mon Sep 17 00:00:00 2001
+From: skornuta <126527569+skornuta@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 23:05:54 -0800
+Subject: [PATCH 16/27] play.ps1: the memory switches verified on the RTX 5080
+
+GPU detile with ring trim, slot eviction at 75/65 % with bindless
+feedback, allocator trim: VRAM 12.6 -> 9.5 GB and private memory 26.0 ->
+22.6 GB in the first area (3 minutes in the world, no device loss, no
+texture back within 2 s of being let go, no pop-in seen).
+
+(cherry picked from commit be0f84c8194d3eb1dbb7200609d05c94980c26cd)
+---
+ play.ps1 | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/play.ps1 b/play.ps1
+index abc03f6..cf700f3 100644
+--- a/play.ps1
++++ b/play.ps1
+@@ -81,6 +81,17 @@ $set = [ordered]@{
+   VICTORY_DESC_DATA           = '1'         # shaders that read a descriptor as data translate (5 more in the first scenes)
+   VICTORY_VRAM_IDLE_MS        = '15000,2500,1000'   # an unused texture is kept 15 s while the card has room (less black-then-back)
+   VICTORY_PIPELINE_WAIT_MS    = '2500'      # a frame waits at most 2.5 s for a shader being compiled (12 s by default: freezes, and the game's own watchdog ends a 30 s frame)
++  # Memory (RTX 5080 runs of 2026-11-26: VRAM 12.6 -> 9.5 GB, private 26.0 -> 22.6 GB in the first area, no pop-in seen)
++  VICTORY_GPU_DETILE          = '1'         # textures are detiled on the card
++  VICTORY_GPU_DETILE_VERIFY   = '0'
++  VICTORY_GPU_DETILE_OUT_MB   = '512'       # detile rings for loading bursts...
++  VICTORY_GPU_DETILE_RAW_MB   = '512'
++  VICTORY_GPU_DETILE_TRIM     = '1'         # ...shrunk to 64 + 64 MB once loading is over, grown back for a burst
++  VICTORY_SLOT_EVICT          = '1'         # idle textures' card copies let go above 75 % of the card's budget, down to 65 %
++  VICTORY_SLOT_EVICT_PERCENT  = '75'
++  VICTORY_SLOT_EVICT_LOW_PERCENT = '65'
++  VICTORY_BINDLESS_FEEDBACK   = '1'         # shaders note the textures they take from the heap, so unseen ones can go too
++  VICTORY_ALLOCATOR_TRIM      = '1'         # command allocators taken anew every 30 s (they keep their largest recording)
+ }
+ if (-not $NoAutoA) { $set['VICTORY_AUTO_A'] = '150' }   # taps A through the start screens for 150 s
+ if ($FrametimeDump) { $set['VICTORY_FRAMETIME_DUMP'] = '1' }
+-- 
+2.55.0.windows.3
+

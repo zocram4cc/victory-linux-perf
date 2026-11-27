@@ -1,0 +1,299 @@
+From 5ba4f42ebe99608a683baa645ceae4da6aac8657 Mon Sep 17 00:00:00 2001
+From: skornuta <126527569+skornuta@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 23:08:24 -0800
+Subject: [PATCH 17/27] Memory minute: our buffers by call site; spare scratch
+ trimmed (VICTORY_ALLOCATOR_TRIM=1)
+
+- memtel: the host's buffer factories (upload, shared, GPU upload) take
+  their caller's location (#[track_caller]) and count bytes and buffers
+  alive by it, carried in the destruction callback's data (8 bits of
+  site, 256 sites). The memory minute logs the 14 largest: what holds the
+  ~1.1 GB of our CPU-visible buffers outside the host copies' CPU sides
+  and the detile rings.
+- With VICTORY_ALLOCATOR_TRIM=1, every ten seconds the spare scratch
+  chunks that stayed kept the whole while (the fewest bytes kept since
+  the last trim) are freed, oldest first. Chunks lists take and give back
+  every frame stay; only the never-used surplus of the 128 MB cap goes
+  (about 70 MB in the first area).
+
+(cherry picked from commit 1626109e425195a17a5a89d98a926c0b1315b9b2)
+---
+ crates/victory-gpu/src/host.rs    | 74 +++++++++++++++++++++++++++++--
+ crates/victory-gpu/src/memtel.rs  | 55 ++++++++++++++++++++---
+ crates/victory-gpu/src/ramline.rs |  3 ++
+ 3 files changed, 123 insertions(+), 9 deletions(-)
+
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index 53ae09d..1ed4cd4 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -1701,17 +1701,21 @@ fn scratch_pool() -> bool {
+ struct Spare<T> {
+     kept: Vec<(T, u64)>,
+     bytes: u64,
++    /// (Neptune) The fewest bytes kept since the last [`Spare::trim`]: kept all that while
++    /// and never asked for.
++    low: u64,
+ }
+ 
+ impl<T> Spare<T> {
+     const fn new() -> Self {
+-        Spare { kept: Vec::new(), bytes: 0 }
++        Spare { kept: Vec::new(), bytes: 0, low: 0 }
+     }
+ 
+     /// A kept thing of `size` bytes, the one given last.
+     fn take(&mut self, size: u64) -> Option<T> {
+         let at = self.kept.iter().rposition(|(_, s)| *s == size)?;
+         self.bytes -= size;
++        self.low = self.low.min(self.bytes);
+         Some(self.kept.remove(at).0)
+     }
+ 
+@@ -1725,6 +1729,21 @@ impl<T> Spare<T> {
+         self.kept.push((thing, size));
+         None
+     }
++
++    /// (Neptune) Takes out the oldest things kept, up to the fewest bytes kept since the last
++    /// trim (none of those was asked for in all that time), to be freed.
++    fn trim(&mut self) -> Vec<(T, u64)> {
++        let mut out = Vec::new();
++        let mut left = self.low;
++        while let Some(at) = self.kept.iter().position(|(_, s)| *s <= left) {
++            let (thing, size) = self.kept.remove(at);
++            left -= size;
++            self.bytes -= size;
++            out.push((thing, size));
++        }
++        self.low = self.bytes;
++        out
++    }
+ }
+ 
+ /// Scratch chunks no list holds.
+@@ -1782,10 +1801,31 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
+             }
+         }
+     }
++    // (Neptune) With `VICTORY_ALLOCATOR_TRIM=1`, every ten seconds: the chunks kept all that
++    // while and never taken go too.
++    if crate::host::allocator_trim().is_some() {
++        static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++        let now = now_ms();
++        let last = LAST.load(Ordering::Relaxed);
++        if now >= last + 10_000 && LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
++            let trimmed = SPARE.lock().unwrap_or_else(|e| e.into_inner()).trim();
++            for (chunk, size) in trimmed {
++                ALIVE[3].fetch_sub(1, Ordering::Relaxed);
++                ALIVE[4].fetch_sub(size, Ordering::Relaxed);
++                ALIVE[1].fetch_sub(1, Ordering::Relaxed);
++                ALIVE[2].fetch_sub(size, Ordering::Relaxed);
++                SPARE_TRIMMED.fetch_add(size, Ordering::Relaxed);
++                freed.push(chunk);
++            }
++        }
++    }
+     // Freed outside the lock.
+     drop(freed);
+ }
+ 
++/// (Neptune) Bytes of spare scratch chunks freed by the trim since the start.
++pub(crate) static SPARE_TRIMMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++
+ /// What the host keeps for copies in the card's own memory
+ /// ([`crate::shadow::cards`]): three lists of ours and the compare.
+ struct CardWork {
+@@ -8036,7 +8076,9 @@ impl Host {
+         }
+     }
+ 
++    #[track_caller]
+     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
++        let site = std::panic::Location::caller();
+         MADE[0].fetch_add(1, Ordering::Relaxed);
+         MADE[1].fetch_add(size, Ordering::Relaxed);
+         let heap = D3D12_HEAP_PROPERTIES {
+@@ -8077,7 +8119,7 @@ impl Host {
+         match made {
+             Ok(()) => {
+                 let buffer = buffer?;
+-                crate::memtel::track(&buffer, crate::memtel::UPLOAD, size);
++                crate::memtel::track(&buffer, crate::memtel::UPLOAD, size, site);
+                 Some((buffer, data.cast()))
+             }
+             Err(e) => {
+@@ -9041,7 +9083,9 @@ impl Host {
+     /// it is fast too) and shaders read and write: for host copies of title
+     /// memory that shaders write, which upload memory cannot be. Starts in
+     /// the common state (buffers move out of it implicitly).
++    #[track_caller]
+     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
++        let site = std::panic::Location::caller();
+         MADE[2].fetch_add(1, Ordering::Relaxed);
+         MADE[3].fetch_add(size, Ordering::Relaxed);
+         let heap = D3D12_HEAP_PROPERTIES {
+@@ -9085,7 +9129,7 @@ impl Host {
+         match made {
+             Ok(()) => {
+                 let buffer = buffer?;
+-                crate::memtel::track(&buffer, crate::memtel::SHARED, size);
++                crate::memtel::track(&buffer, crate::memtel::SHARED, size, site);
+                 Some((buffer, data.cast()))
+             }
+             Err(e) => {
+@@ -9116,7 +9160,9 @@ impl Host {
+     /// memory is write-combined: a read is very slow); shaders and copies only read it, so it has
+     /// no unordered access. Starts in the common state, from which reads promote it as they do
+     /// for [`Host::shared_buffer`].
++    #[track_caller]
+     pub(crate) fn gpu_upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
++        let site = std::panic::Location::caller();
+         if !self.gpu_upload_supported() {
+             return None;
+         }
+@@ -9149,7 +9195,7 @@ impl Host {
+         match made {
+             Ok(()) if !data.is_null() => {
+                 let buffer = buffer?;
+-                crate::memtel::track(&buffer, crate::memtel::GPU_UPLOAD, size);
++                crate::memtel::track(&buffer, crate::memtel::GPU_UPLOAD, size, site);
+                 Some((buffer, data.cast()))
+             }
+             Ok(()) => None,
+@@ -9395,6 +9441,26 @@ mod trail {
+ mod spare {
+     use super::Spare;
+ 
++    /// A trim frees only what stayed kept through the whole window since the last one.
++    #[test]
++    fn a_trim_frees_only_what_was_never_asked_for_since_the_last() {
++        let mut spare: Spare<u32> = Spare::new();
++        for (thing, size) in [(1, 4), (2, 4), (3, 4)] {
++            assert_eq!(spare.give(thing, size, 100), None);
++        }
++        // The first trim knows no window yet: nothing goes.
++        assert!(spare.trim().is_empty());
++        assert_eq!(spare.bytes, 12);
++        // One taken and given back: 8 bytes stayed kept all the while.
++        assert_eq!(spare.take(4), Some(3));
++        assert_eq!(spare.give(3, 4, 100), None);
++        let gone = spare.trim();
++        assert_eq!(gone.iter().map(|g| g.1).sum::<u64>(), 8);
++        assert_eq!(gone.iter().map(|g| g.0).collect::<Vec<_>>(), vec![1, 2], "the oldest go");
++        assert_eq!(spare.bytes, 4);
++        assert_eq!(spare.take(4), Some(3));
++    }
++
+     /// Kept things come back by size, the last given first, and nothing is
+     /// kept past the limit.
+     #[test]
+diff --git a/crates/victory-gpu/src/memtel.rs b/crates/victory-gpu/src/memtel.rs
+index a3d8178..2ca9f0c 100644
+--- a/crates/victory-gpu/src/memtel.rs
++++ b/crates/victory-gpu/src/memtel.rs
+@@ -26,29 +26,74 @@ pub(crate) static BUFFERS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+ /// Counts `resource`, a buffer of `bytes` of `kind`, until D3D12 destroys it. A resource that
+ /// cannot tell of its destruction is not counted at all (so nothing is counted that never
+ /// goes).
+-pub(crate) fn track(resource: &ID3D12Resource, kind: usize, bytes: u64) {
++pub(crate) fn track(resource: &ID3D12Resource, kind: usize, bytes: u64, site: &'static std::panic::Location<'static>) {
+     let Ok(notifier) = resource.cast::<ID3DDestructionNotifier>() else {
+         return;
+     };
+     let bytes = bytes.max(1).next_multiple_of(64 << 10);
+-    // The kind in the low two bits, the bytes above: no allocation for the callback's data.
+-    let data = (bytes << 2) | kind as u64;
++    let at = site_index(site);
++    // The kind in the low two bits, the site in the next eight, the bytes above: no
++    // allocation for the callback's data.
++    let data = (bytes << 10) | ((at as u64) << 2) | kind as u64;
+     ALIVE[kind].fetch_add(bytes, Relaxed);
+     BUFFERS[kind].fetch_add(1, Relaxed);
++    SITE_ALIVE[at].fetch_add(bytes, Relaxed);
++    SITE_BUFFERS[at].fetch_add(1, Relaxed);
+     // SAFETY: a live resource; the callback takes a plain number, not a pointer to anything.
+     if unsafe { notifier.RegisterDestructionCallback(Some(destroyed), data as usize as *const _) }.is_err() {
+         ALIVE[kind].fetch_sub(bytes, Relaxed);
+         BUFFERS[kind].fetch_sub(1, Relaxed);
++        SITE_ALIVE[at].fetch_sub(bytes, Relaxed);
++        SITE_BUFFERS[at].fetch_sub(1, Relaxed);
+     }
+ }
+ 
++/// (Neptune) The most call sites told apart; later ones share the last.
++const SITES: usize = 256;
++/// Bytes and buffers alive by the call site that asked a factory for them ([`by_site`]).
++static SITE_ALIVE: [AtomicU64; SITES] = [const { AtomicU64::new(0) }; SITES];
++static SITE_BUFFERS: [AtomicU64; SITES] = [const { AtomicU64::new(0) }; SITES];
++/// The call sites, in the order first seen.
++static SITE_NAMES: std::sync::Mutex<Vec<&'static std::panic::Location<'static>>> = std::sync::Mutex::new(Vec::new());
++
++fn site_index(site: &'static std::panic::Location<'static>) -> usize {
++    let mut names = SITE_NAMES.lock().unwrap_or_else(|e| e.into_inner());
++    if let Some(at) = names.iter().position(|s| s.file() == site.file() && s.line() == site.line()) {
++        return at;
++    }
++    if names.len() < SITES {
++        names.push(site);
++    }
++    names.len() - 1
++}
++
++/// (Neptune) For the memory minute: bytes and buffers alive by the call site that made them
++/// (`file:line`), largest first.
++pub(crate) fn by_site() -> Vec<(String, u64, u64)> {
++    let names = SITE_NAMES.lock().unwrap_or_else(|e| e.into_inner()).clone();
++    let mut out: Vec<_> = names
++        .iter()
++        .enumerate()
++        .map(|(at, s)| {
++            let file = s.file().rsplit(['/', '\\']).next().unwrap_or(s.file());
++            (format!("{file}:{}", s.line()), SITE_ALIVE[at].load(Relaxed), SITE_BUFFERS[at].load(Relaxed))
++        })
++        .filter(|s| s.1 > 0)
++        .collect();
++    out.sort_unstable_by_key(|s| std::cmp::Reverse(s.1));
++    out
++}
++
+ /// D3D12's call as a counted buffer is destroyed (on whatever thread let it go last).
+ unsafe extern "system" fn destroyed(data: *mut core::ffi::c_void) {
+     let data = data as usize as u64;
+     let kind = (data & 3) as usize;
++    let at = ((data >> 2) & 0xff) as usize;
+     if kind < ALIVE.len() {
+-        ALIVE[kind].fetch_sub(data >> 2, Relaxed);
++        ALIVE[kind].fetch_sub(data >> 10, Relaxed);
+         BUFFERS[kind].fetch_sub(1, Relaxed);
++        SITE_ALIVE[at].fetch_sub(data >> 10, Relaxed);
++        SITE_BUFFERS[at].fetch_sub(1, Relaxed);
+     }
+ }
+ 
+@@ -170,7 +215,7 @@ mod tests {
+         let buffer = buffer.unwrap();
+         // The kind no factory uses in tests running beside this one: GPU upload heaps.
+         let before = ALIVE[GPU_UPLOAD].load(Relaxed);
+-        track(&buffer, GPU_UPLOAD, 100_000);
++        track(&buffer, GPU_UPLOAD, 100_000, std::panic::Location::caller());
+         assert_eq!(ALIVE[GPU_UPLOAD].load(Relaxed), before + (128 << 10), "rounded up to whole 64 KiB");
+         let held = buffer.clone();
+         drop(buffer);
+diff --git a/crates/victory-gpu/src/ramline.rs b/crates/victory-gpu/src/ramline.rs
+index 70c848a..afd0bc8 100644
+--- a/crates/victory-gpu/src/ramline.rs
++++ b/crates/victory-gpu/src/ramline.rs
+@@ -314,6 +314,9 @@ fn minute(r: &Resident) {
+     };
+     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+     let mb = |v: u64| v >> 20;
++    // (Neptune) Our CPU-visible D3D12 buffers alive, by the code that asked for them.
++    let sites: Vec<String> = crate::memtel::by_site().iter().take(14).map(|(s, b, n)| format!("{s} {} MB/{n}", b >> 20)).collect();
++    tracing::info!("memory minute: our buffers by site: {}", sites.join(", "));
+     let mut c = PROCESS_MEMORY_COUNTERS_EX { cb: size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32, ..Default::default() };
+     // SAFETY: our own process and a sized structure (the extended form, as `cb` says).
+     unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), (&raw mut c).cast::<PROCESS_MEMORY_COUNTERS>(), c.cb) };
+-- 
+2.55.0.windows.3
+

@@ -1,0 +1,30 @@
+From 50309911316efc8b7caa7369ea96d37bd96ff205 Mon Sep 17 00:00:00 2001
+From: skornuta <126527569+skornuta@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 23:20:19 -0800
+Subject: [PATCH 18/27] play.ps1: keep at most 64 MB of spare texture staging
+ buffers
+
+The pool kept up to 256 MB of staging buffers (295 MB alive with the
+ones textures hold, run of 23:10); in the world about 25 MB is in use,
+most uploads being detiled on the card.
+
+(cherry picked from commit 66cee8f96b4eab2f3f071d292d9af5e090adf3cc)
+---
+ play.ps1 | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/play.ps1 b/play.ps1
+index cf700f3..455a0ed 100644
+--- a/play.ps1
++++ b/play.ps1
+@@ -92,6 +92,7 @@ $set = [ordered]@{
+   VICTORY_SLOT_EVICT_LOW_PERCENT = '65'
+   VICTORY_BINDLESS_FEEDBACK   = '1'         # shaders note the textures they take from the heap, so unseen ones can go too
+   VICTORY_ALLOCATOR_TRIM      = '1'         # command allocators taken anew every 30 s (they keep their largest recording)
++  VICTORY_STAGE_POOL_MB       = '64'        # spare texture staging buffers kept (256 by default; the world uses about 25 MB)
+ }
+ if (-not $NoAutoA) { $set['VICTORY_AUTO_A'] = '150' }   # taps A through the start screens for 150 s
+ if ($FrametimeDump) { $set['VICTORY_FRAMETIME_DUMP'] = '1' }
+-- 
+2.55.0.windows.3
+

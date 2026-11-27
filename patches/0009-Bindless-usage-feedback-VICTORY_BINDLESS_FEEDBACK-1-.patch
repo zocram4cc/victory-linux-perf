@@ -1,0 +1,1117 @@
+From 4f76b002fc29b8d52025c81c03d7e4ac36803c27 Mon Sep 17 00:00:00 2001
+From: skornuta <126527569+skornuta@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 16:30:41 -0800
+Subject: [PATCH 09/27] Bindless usage feedback (VICTORY_BINDLESS_FEEDBACK=1,
+ off): evict what no shader reads
+
+The slot eviction could take none of the 3.3-3.5 GB of textures held
+"idle" on the card: every one was shown by slots shaders pick by index,
+and nothing on the CPU said whether a frame read them.
+
+Translator: with the switch every texture a shader takes from the view
+heap stores 1 into dword `index` of a raw buffer at the slot below the
+null slot (`feedback_slot`). A plain store (every lane stores the same
+value: no read-modify-write, no contention, no branch, which the handle
+helpers cannot emit). Stages other than pixel and compute declare UAVs
+at every stage. The setting is in the translation fingerprint.
+
+Host (`crate::feedback`): the buffer (a dword per view heap slot, 4 MB
+on a heap of 1,000,000) has its raw UAV in that slot of every view
+heap, written after the heap is made null and taken out of the dynamic
+slots. Every VICTORY_BINDLESS_FEEDBACK_EVERY frames (4) a list first in
+a submission copies it down and clears it (COMMON -> COPY_SOURCE ->
+COPY_DEST -> COMMON; the title's shaders take it from COMMON as a UAV),
+into one of three read-back buffers; when the card has run it, each
+slot found read gets that copy's frame.
+
+Eviction: a texture whose slots no table shows may go once none of them
+was read for VICTORY_BINDLESS_IDLE_S (45) seconds and the feedback has
+watched that whole time; the 85/75 % lines and the 256 MB cap as before.
+Its slots are nulled (with nothing in the air, the copy retired behind
+running submissions, as before) and parked: the texture queue does not
+serve them, whatever puts them in it. A slot a shader is seen reading
+again is unparked and due at once, and so is one the title writes
+another view into; its texture is made and uploaded again by the queue.
+
+The pipeline library of such runs is a file of its own
+(host-pipelines-feedback.bin, .next, early-pipelines-feedback.txt): the
+usual library is never read, replaced or trimmed by them.
+
+The memory CSV gets the copies landed, slots parked and slots unparked.
+
+Tests: the store validated by dxil.dll and run on the card and on WARP
+(the texture's slot reads 1, a buffer's 0, the sample unchanged); the
+queue never serves a parked slot and serves it after a read or a write;
+the last-seen frames and the coverage.
+
+(cherry picked from commit 7c274de42a010033baf31ca242975c702441b7ea)
+---
+ crates/victory-gpu/src/descriptor.rs          |  45 ++-
+ crates/victory-gpu/src/descriptor/host.rs     | 107 ++++++-
+ crates/victory-gpu/src/feedback.rs            | 295 ++++++++++++++++++
+ crates/victory-gpu/src/host.rs                |  15 +
+ crates/victory-gpu/src/lib.rs                 |   2 +
+ crates/victory-gpu/src/pipeline/library.rs    |  38 ++-
+ crates/victory-gpu/src/ramline.rs             |   5 +-
+ crates/victory-gpu/src/resource.rs            |  17 +-
+ .../src/emit/descriptor_tests.rs              |  44 ++-
+ crates/victory-shader/src/emit/mod.rs         |   4 +-
+ crates/victory-shader/src/emit/shader.rs      |  90 ++++++
+ 11 files changed, 633 insertions(+), 29 deletions(-)
+ create mode 100644 crates/victory-gpu/src/feedback.rs
+
+diff --git a/crates/victory-gpu/src/descriptor.rs b/crates/victory-gpu/src/descriptor.rs
+index c190759..2058b71 100644
+--- a/crates/victory-gpu/src/descriptor.rs
++++ b/crates/victory-gpu/src/descriptor.rs
+@@ -822,7 +822,8 @@ pub(crate) fn evictable_slots(
+     raws: &std::collections::HashMap<usize, usize>,
+     frame: u64,
+     cutoff: u64,
+-) -> (std::collections::HashMap<usize, Vec<(usize, u32)>>, u64, u64) {
++    fb_cutoff: Option<u64>,
++) -> (std::collections::HashMap<usize, Vec<(usize, u32, bool)>>, u64, u64) {
+     let set: std::collections::HashSet<usize> = raws.keys().copied().collect();
+     let heaps: Vec<usize> = SHADER_HEAPS
+         .lock()
+@@ -830,7 +831,7 @@ pub(crate) fn evictable_slots(
+         .iter()
+         .map(|&(_, _, h)| h)
+         .collect();
+-    let mut by_texture: std::collections::HashMap<usize, Vec<(usize, u32)>> = std::collections::HashMap::new();
++    let mut by_texture: std::collections::HashMap<usize, Vec<(usize, u32, bool)>> = std::collections::HashMap::new();
+     let mut blocked = std::collections::HashSet::new();
+     let mut seen = std::collections::HashSet::new();
+     for at in heaps {
+@@ -838,12 +839,12 @@ pub(crate) fn evictable_slots(
+         let Some(Some(host)) = unsafe { &*(at as *const Heap) }.host.get() else {
+             continue;
+         };
+-        for (index, raw, ok, lately) in host.slots_showing(&set, frame, cutoff) {
++        for (index, raw, ok, lately, bindless) in host.slots_showing(&set, frame, cutoff, fb_cutoff) {
+             if lately {
+                 seen.insert(raw);
+             }
+             if ok {
+-                by_texture.entry(raw).or_default().push((at, index));
++                by_texture.entry(raw).or_default().push((at, index, bindless));
+             } else {
+                 blocked.insert(raw);
+             }
+@@ -859,9 +860,9 @@ pub(crate) fn evictable_slots(
+ /// (`make_waiting`) or by the draw that reads them. Returns how many were
+ /// made. Called before the host copy is let go.
+ #[cfg(windows)]
+-pub(crate) fn evict_slots(resource: usize, slots: &[(usize, u32)]) -> u64 {
++pub(crate) fn evict_slots(resource: usize, slots: &[(usize, u32, bool)]) -> u64 {
+     let mut n = 0;
+-    for &(at, index) in slots {
++    for &(at, index, bindless) in slots {
+         let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+         if !heaps.iter().any(|&(_, _, h)| h == at) {
+             continue;
+@@ -880,10 +881,42 @@ pub(crate) fn evict_slots(resource: usize, slots: &[(usize, u32)]) -> u64 {
+             }
+             n += 1;
+         }
++        // (Neptune) A slot shaders pick by index (`crate::feedback`): parked, so the queue
++        // does not make it again until a shader reads it.
++        if bindless {
++            host.park(index);
++        }
++    }
++    n
++}
++
++/// (Neptune) Of `seen` (view heap slots a shader read, `crate::feedback`), the parked ones of
++/// every shader-visible view heap are due again. Returns how many.
++#[cfg(windows)]
++pub(crate) fn unpark_seen(seen: &[u32]) -> u64 {
++    let frame = crate::frame::current();
++    let heaps: Vec<usize> = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|&(_, _, h)| h).collect();
++    let mut n = 0;
++    for at in heaps {
++        // SAFETY: registered heaps are live (removed when dropped).
++        if let Some(Some(host)) = unsafe { &*(at as *const Heap) }.host.get() {
++            n += host.unpark_seen(seen, frame);
++        }
+     }
+     n
+ }
+ 
++/// (Neptune) Slots parked now, over every shader-visible view heap.
++#[cfg(windows)]
++pub(crate) fn parked() -> u64 {
++    let heaps: Vec<usize> = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|&(_, _, h)| h).collect();
++    heaps
++        .into_iter()
++        // SAFETY: registered heaps are live (removed when dropped).
++        .filter_map(|at| unsafe { &*(at as *const Heap) }.host.get().and_then(Option::as_ref).map(|h| h.parked()))
++        .sum()
++}
++
+ /// Makes the host slots that waited for a texture's host copy, for the
+ /// textures made since the last call. Called before a submission runs, by
+ /// the thread that submits: a slot is read when a list runs.
+diff --git a/crates/victory-gpu/src/descriptor/host.rs b/crates/victory-gpu/src/descriptor/host.rs
+index c9e0f52..556f646 100644
+--- a/crates/victory-gpu/src/descriptor/host.rs
++++ b/crates/victory-gpu/src/descriptor/host.rs
+@@ -579,6 +579,10 @@ pub(crate) struct TextureQueue {
+     /// they need ([`TextureQueue::hold`]), each with the write it was
+     /// held as.
+     held: std::collections::BTreeMap<u32, u64>,
++    /// (Neptune) Slots whose texture the slot eviction let go while no shader read them
++    /// (`crate::feedback`): never due by themselves, made again only when a shader is seen
++    /// reading one ([`TextureQueue::unpark`]) or the title writes another view into it.
++    parked: std::collections::BTreeSet<u32>,
+ }
+ 
+ impl TextureQueue {
+@@ -587,6 +591,10 @@ impl TextureQueue {
+     /// the host slot from a view the queue may hold already, which then
+     /// stays as it is.
+     fn written(&mut self, index: u32, frame: u64, due: u64, seen: bool) {
++        // (Neptune) The title wrote a view into a parked slot: its own, wanted now.
++        if !seen {
++            self.parked.remove(&index);
++        }
+         if seen && self.slots.contains_key(&index) {
+             return;
+         }
+@@ -601,6 +609,22 @@ impl TextureQueue {
+         self.rechecks.remove(&index);
+     }
+ 
++    /// (Neptune) Slot `index` lost its texture to the slot eviction: parked.
++    fn park(&mut self, index: u32) {
++        self.parked.insert(index);
++        self.rechecks.remove(&index);
++    }
++
++    /// (Neptune) A shader read parked slot `index` (seen in `frame`): no longer parked, and due
++    /// now as one written now, so the queue makes its texture again. Whether it was parked.
++    fn unpark(&mut self, index: u32, frame: u64) -> bool {
++        if !self.parked.remove(&index) {
++            return false;
++        }
++        self.changed(index, frame, frame);
++        true
++    }
++
+     /// Slot `index` was uploaded whole in `frame` from memory `at`, whose
+     /// fingerprint is `print`: looked at again ([`RECHECK_FRAMES`]), unless
+     /// it was written again meanwhile and waits in the queue.
+@@ -661,7 +685,7 @@ impl TextureQueue {
+     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
+         let mut again: Vec<(u64, u32, u64)> = Vec::new();
+         let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
+-        for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
++        for (&index, w) in self.slots.iter().filter(|(i, w)| w.due <= frame && !self.parked.contains(i)) {
+             let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
+             class.push((w.written, index, w.write));
+         }
+@@ -916,6 +940,9 @@ pub(crate) fn probe_view_limit() {
+             views,
+             "host view heaps hold {views} views; view indices are clamped to the null slot at the end from the first shader on"
+         );
++        // (Neptune) Bindless usage feedback (`crate::feedback`): told the translator with the
++        // limit, before the first shader, as every translation keeps it.
++        victory_shader::emit::set_bindless_feedback(crate::feedback::on());
+         victory_shader::emit::set_view_heap_limit(views - 1);
+     });
+ }
+@@ -1091,6 +1118,24 @@ impl HostHeap {
+             tracing::warn!(error = %e, "host descriptor heap not made null");
+         }
+         tracing::debug!(ms = started.elapsed().as_millis(), "host descriptor heap made null");
++        // (Neptune) Bindless usage feedback: the slot below the null slot holds the feedback
++        // buffer (`crate::feedback`), out of the dynamic slots if it is one of them, written
++        // after the heap was made null.
++        if !sampler
++            && let Some(slot) = victory_shader::emit::feedback_slot()
++            && slot < size
++        {
++            if let Some(d) = slot.checked_sub(h.count).filter(|&d| d < h.dynamic) {
++                let mut next = h.next.lock().unwrap_or_else(|e| e.into_inner());
++                if !next.1[d as usize] {
++                    next.1[d as usize] = true;
++                    h.free.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
++                }
++            }
++            if !crate::feedback::install(h.cpu(slot), slot) {
++                tracing::warn!(slot, "VICTORY_BINDLESS_FEEDBACK=1: no feedback buffer in this view heap");
++            }
++        }
+         Some(h)
+     }
+ 
+@@ -1715,6 +1760,27 @@ impl HostHeap {
+     /// (any more): a host slot made from it becomes null again, so that
+     /// the host copy can be let go (`crate::resource::let_go_idle`; a slot
+     /// keeps what it views). True if the slot was made.
++    /// (Neptune) Parks title slot `index` ([`TextureQueue::park`]): its texture was let go
++    /// while no shader read it.
++    pub(crate) fn park(&self, index: u32) {
++        self.textures.lock().unwrap_or_else(|e| e.into_inner()).park(index);
++    }
++
++    /// (Neptune) Of `seen` (slots a shader read, `crate::feedback`), the parked ones are due
++    /// again ([`TextureQueue::unpark`]). Returns how many.
++    pub(crate) fn unpark_seen(&self, seen: &[u32], frame: u64) -> u64 {
++        let mut queue = self.textures.lock().unwrap_or_else(|e| e.into_inner());
++        if queue.parked.is_empty() {
++            return 0;
++        }
++        seen.iter().filter(|&&i| queue.unpark(i, frame)).count() as u64
++    }
++
++    /// (Neptune) Slots parked now.
++    pub(crate) fn parked(&self) -> u64 {
++        self.textures.lock().unwrap_or_else(|e| e.into_inner()).parked.len() as u64
++    }
++
+     pub(crate) fn texture_slot_gone(&self, index: u32) -> bool {
+         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+         if made.get(index as usize).is_none_or(|&key| key == 0) {
+@@ -1738,12 +1804,18 @@ impl HostHeap {
+     /// ([`seen_since`]): a texture a draw reads through a table every frame never asks for its
+     /// host copy again (the slot shows it already, `HostHeap::mirror`), so its last use says
+     /// nothing of that, and only the slot's table stamp does.
++    ///
++    /// (Neptune) With bindless usage feedback (`fb_cutoff`: the frame its idle time back, when
++    /// the feedback has watched every frame since, `crate::feedback::covers`), a title slot no
++    /// table showed lately is safe too when no shader read it after that frame: it is parked
++    /// when its texture goes (the last field says which), and made again when a shader reads it.
+     pub(crate) fn slots_showing(
+         &self,
+         raws: &std::collections::HashSet<usize>,
+         frame: u64,
+         cutoff: u64,
+-    ) -> Vec<(u32, usize, bool, bool)> {
++        fb_cutoff: Option<u64>,
++    ) -> Vec<(u32, usize, bool, bool, bool)> {
+         self.kept
+             .iter()
+             .enumerate()
+@@ -1755,8 +1827,14 @@ impl HostHeap {
+                 };
+                 raws.contains(&raw).then(|| {
+                     let i = i as u32;
+-                    let ok = i < self.count && !self.sampler && self.tabled_lately(i, frame);
+-                    (i, raw, ok, seen_since(self.tabled_stamp(i), cutoff, frame))
++                    let title = i < self.count && !self.sampler;
++                    let tabled = self.tabled_lately(i, frame);
++                    let lately = seen_since(self.tabled_stamp(i), cutoff, frame);
++                    let bindless = title
++                        && !tabled
++                        && !lately
++                        && fb_cutoff.is_some_and(|c| !crate::feedback::seen_since(i, c));
++                    (i, raw, (title && tabled) || bindless, lately, bindless)
+                 })
+             })
+             .collect()
+@@ -3799,6 +3877,27 @@ mod tests {
+         assert_eq!(elements_inside(0, 7, 4, 1 << 40), 7);
+     }
+ 
++    /// (Neptune) A parked slot is never served, whatever puts it in the queue (the sweep, a
++    /// change of its memory); a shader seen reading it makes it due at once; the title writing
++    /// another view into it unparks it too; a slot not parked is not touched by an unpark.
++    #[test]
++    fn a_parked_slot_waits_until_a_shader_reads_it() {
++        let mut q = TextureQueue::default();
++        q.park(9);
++        q.written(9, 10, 10, true); // the sweep puts it back in the queue
++        q.changed(9, 11, 11); // its memory changed
++        assert!(q.due(1_000, 99).is_empty(), "parked: not served");
++        assert!(!q.unpark(5, 12), "not parked");
++        assert!(q.unpark(9, 20), "a shader read it");
++        let due = q.due(20, 99);
++        assert_eq!(due.len(), 1);
++        assert_eq!(due[0].0, 9);
++        assert!(!q.unpark(9, 21), "once");
++        q.park(4);
++        q.written(4, 30, 30, false); // the title wrote a view into it
++        assert!(q.due(30, 99).iter().any(|&(i, _)| i == 4), "unparked by the write");
++    }
++
+     /// A slot uploaded whole is looked at a few times, further and further
+     /// apart; one found changed is due at once; one written again, taken
+     /// out or waiting in the queue is not looked at.
+diff --git a/crates/victory-gpu/src/feedback.rs b/crates/victory-gpu/src/feedback.rs
+new file mode 100644
+index 0000000..ac9d56e
+--- /dev/null
++++ b/crates/victory-gpu/src/feedback.rs
+@@ -0,0 +1,295 @@
++//! (Neptune) Bindless usage feedback (`VICTORY_BINDLESS_FEEDBACK=1`; off by default).
++//!
++//! Shaders pick most of the title's textures by index from the view heap: nothing on the CPU
++//! says whether a frame read one, so a texture only such slots show was never let go (3.3-3.5
++//! GB of the card held "idle" in the open world, every one of them blocked from the slot
++//! eviction). With the switch the translator (`victory_shader::emit::feedback_slot`) has every
++//! texture a shader takes from the view heap store 1 into dword `index` of a raw buffer at the
++//! slot below the null slot. Every `VICTORY_BINDLESS_FEEDBACK_EVERY` frames (4) a list ahead of
++//! a submission copies the buffer down and clears it; when the card has run it, each slot found
++//! read gets the frame of that copy as the last frame a shader read it ([`seen_since`]).
++//!
++//! The slot eviction (`crate::resource::slot_evict`) may then take a texture that only such
++//! slots show, once none of them was read for `VICTORY_BINDLESS_IDLE_S` seconds (45) and the
++//! feedback has watched that whole time ([`covers`]). Its slots are parked
++//! (`crate::descriptor::host::HostHeap::park`): the texture queue does not make them again by
++//! itself; a slot found read here again is unparked and due at once ([`land`]).
++//!
++//! The buffer rests in the common state between submissions, as the detile ring does: the
++//! copy list goes COMMON -> COPY_SOURCE (copied down) -> COPY_DEST (zeros copied in) -> COMMON,
++//! and the title's shaders after it in the same call take it from COMMON as a UAV.
++
++use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
++use std::sync::{Mutex, OnceLock};
++
++use windows::Win32::Graphics::Direct3D12::*;
++use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_TYPELESS;
++use windows::core::Interface;
++
++/// Whether shaders note the textures they take from the view heap.
++pub(crate) fn on() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_BINDLESS_FEEDBACK").is_some_and(|v| v == "1"))
++}
++
++/// Frames between copies of the buffer (`VICTORY_BINDLESS_FEEDBACK_EVERY`, 4; 1 to 64).
++fn every() -> u64 {
++    static N: OnceLock<u64> = OnceLock::new();
++    *N.get_or_init(|| {
++        std::env::var("VICTORY_BINDLESS_FEEDBACK_EVERY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4).clamp(1, 64)
++    })
++}
++
++/// How long none of a texture's slots may have been read before the eviction may take it
++/// (`VICTORY_BINDLESS_IDLE_S`, 45 s; 5 to 600), in milliseconds.
++pub(crate) fn idle_ms() -> u64 {
++    static S: OnceLock<u64> = OnceLock::new();
++    *S.get_or_init(|| std::env::var("VICTORY_BINDLESS_IDLE_S").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(45).clamp(5, 600))
++        * 1000
++}
++
++/// Since the start: copies landed, slots found read in them (summed), slots unparked.
++pub(crate) static STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
++
++/// Per view heap slot: the frame (plus one) of the copy that last found it read; 0 never.
++static LAST_SEEN: OnceLock<Vec<AtomicU32>> = OnceLock::new();
++
++/// The frame of the first copy that landed: what the feedback has watched since (0: none).
++static COVERED_FROM: AtomicU64 = AtomicU64::new(0);
++
++/// Whether a shader read view heap slot `slot` after frame `cutoff`, as far as the copies
++/// landed so far say.
++pub(crate) fn seen_since(slot: u32, cutoff: u64) -> bool {
++    LAST_SEEN
++        .get()
++        .and_then(|s| s.get(slot as usize))
++        .is_some_and(|f| u64::from(f.load(Relaxed)) > cutoff + 1)
++}
++
++/// Whether the feedback has watched every frame since `cutoff`: a slot it never found read
++/// since then was not read.
++pub(crate) fn covers(cutoff: u64) -> bool {
++    let from = COVERED_FROM.load(Relaxed);
++    from != 0 && from <= cutoff
++}
++
++struct Back {
++    buffer: ID3D12Resource,
++    data: usize,
++    /// The fence value of the submission that copied into it: 0 free, `u64::MAX` recorded
++    /// and not sent yet.
++    fence: u64,
++    /// The frame the copy was recorded in.
++    frame: u64,
++}
++
++struct State {
++    buffer: ID3D12Resource,
++    zeros: ID3D12Resource,
++    slots: u32,
++    backs: Vec<Back>,
++    lists: Vec<(ID3D12CommandAllocator, ID3D12GraphicsCommandList, u64)>,
++    last: u64,
++}
++
++// SAFETY: D3D12 objects (free-threaded) and persistent mappings, used under the lock.
++unsafe impl Send for State {}
++
++static STATE: Mutex<Option<State>> = Mutex::new(None);
++
++/// The feedback buffer, made on the first ask (with `slots` dwords: the view heap's slots);
++/// `None` without the switch or if it could not be made.
++fn buffer(slots: u32) -> Option<ID3D12Resource> {
++    if !on() {
++        return None;
++    }
++    let mut guard = STATE.lock().unwrap_or_else(|e| e.into_inner());
++    if let Some(s) = guard.as_ref() {
++        return Some(s.buffer.clone());
++    }
++    let host = crate::host::host()?;
++    let bytes = u64::from(slots) * 4;
++    let buffer = host.uav_buffer(bytes)?;
++    crate::host::name(&buffer, || "bindless feedback".into());
++    let (zeros, data) = host.upload_buffer(bytes)?;
++    // SAFETY: the upload buffer's mapping, `bytes` long.
++    unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
++    crate::host::name(&zeros, || "bindless feedback zeros".into());
++    let mut backs = Vec::new();
++    for _ in 0..3 {
++        let (b, d) = host.shared_buffer(bytes)?;
++        crate::host::name(&b, || "bindless feedback read-back".into());
++        backs.push(Back { buffer: b, data: d as usize, fence: 0, frame: 0 });
++    }
++    let _ = LAST_SEEN.set((0..slots).map(|_| AtomicU32::new(0)).collect());
++    tracing::info!(slots, every = every(), idle_s = idle_ms() / 1000, "VICTORY_BINDLESS_FEEDBACK=1: shaders note the textures they take from the view heap");
++    *guard = Some(State { buffer: buffer.clone(), zeros, slots, backs, lists: Vec::new(), last: 0 });
++    Some(buffer)
++}
++
++/// For a view heap just made null (`HostHeap::new`): writes the feedback buffer's view into
++/// slot `slot` at `at` (a raw UAV over all of it). Whether it did.
++pub(crate) fn install(at: D3D12_CPU_DESCRIPTOR_HANDLE, slot: u32) -> bool {
++    let Some(host) = crate::host::host() else {
++        return false;
++    };
++    // One dword per slot up to and with the null slot.
++    let slots = slot + 2;
++    let Some(buffer) = buffer(slots) else {
++        return false;
++    };
++    let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
++        Format: DXGI_FORMAT_R32_TYPELESS,
++        ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
++        Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
++            Buffer: D3D12_BUFFER_UAV { NumElements: slots, Flags: D3D12_BUFFER_UAV_FLAG_RAW, ..Default::default() },
++        },
++    };
++    // SAFETY: a slot of a live view heap; a live buffer of `slots` dwords.
++    unsafe { host.device.CreateUnorderedAccessView(&buffer, None, Some(&desc), at) };
++    true
++}
++
++/// At submission, after the steps: lands the copies the card has run, and every
++/// [`every`] frames the list that copies the buffer down and clears it, to go first in the
++/// submission's call.
++pub(crate) fn pre_list() -> Option<ID3D12CommandList> {
++    let host = crate::host::host()?;
++    let completed = host.completed();
++    let frame = crate::frame::current();
++    let mut seen_now: Vec<u32> = Vec::new();
++    let list = {
++        let mut guard = STATE.lock().unwrap_or_else(|e| e.into_inner());
++        let state = guard.as_mut()?;
++        land(state, completed, &mut seen_now);
++        record(host, state, frame, completed)
++    };
++    if !seen_now.is_empty() {
++        let n = crate::descriptor::unpark_seen(&seen_now);
++        STATS[2].fetch_add(n, Relaxed);
++    }
++    list
++}
++
++/// The copies the card has run: each slot found read gets the copy's frame; the slots found
++/// read that are parked go into `parked`.
++fn land(state: &mut State, completed: u64, seen: &mut Vec<u32>) {
++    let Some(last) = LAST_SEEN.get() else { return };
++    for back in state.backs.iter_mut().filter(|b| b.fence != 0 && b.fence != u64::MAX && b.fence <= completed) {
++        // SAFETY: the read-back buffer's mapping, `slots` dwords, written by a list that has run.
++        let words = unsafe { std::slice::from_raw_parts(back.data as *const u32, state.slots as usize) };
++        let stamp = (back.frame + 1).min(u64::from(u32::MAX)) as u32;
++        let mut found = 0u64;
++        for (slot, &word) in words.iter().enumerate() {
++            if word != 0 {
++                found += 1;
++                if let Some(f) = last.get(slot) {
++                    f.store(stamp, Relaxed);
++                }
++                seen.push(slot as u32);
++            }
++        }
++        STATS[0].fetch_add(1, Relaxed);
++        STATS[1].fetch_add(found, Relaxed);
++        if COVERED_FROM.load(Relaxed) == 0 {
++            COVERED_FROM.store(back.frame.max(1), Relaxed);
++        }
++        back.fence = 0;
++    }
++}
++
++/// The copy list, if one is due and a read-back buffer is free.
++fn record(host: &crate::host::Host, state: &mut State, frame: u64, completed: u64) -> Option<ID3D12CommandList> {
++    if state.last != 0 && frame < state.last + every() {
++        return None;
++    }
++    let back = state.backs.iter().position(|b| b.fence == 0)?;
++    let at = match state.lists.iter().position(|l| l.2 <= completed) {
++        Some(at) => at,
++        None => {
++            // SAFETY: plain object creation.
++            let made: windows::core::Result<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)> = unsafe {
++                (|| {
++                    let allocator: ID3D12CommandAllocator = host.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
++                    let list: ID3D12GraphicsCommandList = host.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)?;
++                    list.Close()?;
++                    Ok((allocator, list))
++                })()
++            };
++            match made {
++                Ok((a, l)) => {
++                    state.lists.push((a, l, 0));
++                    state.lists.len() - 1
++                }
++                Err(e) => {
++                    tracing::warn!(error = %e, "bindless feedback: no list for the copy");
++                    return None;
++                }
++            }
++        }
++    };
++    let bytes = u64::from(state.slots) * 4;
++    let (allocator, list, _) = &state.lists[at];
++    let (b, rb, z) = (&state.buffer, &state.backs[back].buffer, &state.zeros);
++    let t = crate::host::transition;
++    let (common, source, dest) = (D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
++    // SAFETY: the allocator's last list has run; live buffers of `bytes` bytes.
++    let recorded = unsafe {
++        (|| -> windows::core::Result<()> {
++            allocator.Reset()?;
++            list.Reset(allocator, None)?;
++            list.ResourceBarrier(&[t(b, common, source)]);
++            list.CopyBufferRegion(rb, 0, b, 0, bytes);
++            list.ResourceBarrier(&[t(b, source, dest)]);
++            list.CopyBufferRegion(b, 0, z, 0, bytes);
++            list.ResourceBarrier(&[t(b, dest, common)]);
++            list.Close()
++        })()
++    };
++    if let Err(e) = recorded {
++        tracing::warn!(error = %e, "bindless feedback: the copy could not be recorded");
++        return None;
++    }
++    let out = list.cast().ok();
++    state.backs[back].fence = u64::MAX;
++    state.backs[back].frame = frame;
++    state.lists[at].2 = u64::MAX;
++    state.last = frame;
++    out
++}
++
++/// After the submission is sent with fence value `fence`.
++pub(crate) fn sent(fence: u64) {
++    let mut guard = STATE.lock().unwrap_or_else(|e| e.into_inner());
++    if let Some(state) = guard.as_mut() {
++        for b in state.backs.iter_mut().filter(|b| b.fence == u64::MAX) {
++            b.fence = fence;
++        }
++        for l in state.lists.iter_mut().filter(|l| l.2 == u64::MAX) {
++            l.2 = fence;
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// A slot read at frame 100 is seen since frame 99, not since frame 100; coverage starts at
++    /// the first landed copy.
++    #[test]
++    fn seen_since_and_covers_go_by_the_copies_frames() {
++        let _ = LAST_SEEN.set((0..8).map(|_| AtomicU32::new(0)).collect());
++        let last = LAST_SEEN.get().unwrap();
++        last[3].store(101, Relaxed);
++        assert!(seen_since(3, 99));
++        assert!(!seen_since(3, 100));
++        assert!(!seen_since(4, 0), "never read");
++        assert!(!seen_since(1_000_000, 0), "past the heap");
++        assert!(!covers(500), "nothing landed yet");
++        COVERED_FROM.store(200, Relaxed);
++        assert!(covers(200) && covers(900));
++        assert!(!covers(150), "not watched since 150");
++        COVERED_FROM.store(0, Relaxed);
++    }
++}
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index b7e045a..924c2c9 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -6049,6 +6049,15 @@ impl Host {
+                 *first += 1;
+             }
+         }
++        // (Neptune) Bindless usage feedback (`crate::feedback`): its copy and clear, first.
++        if crate::feedback::on()
++            && let Some(pre) = crate::feedback::pre_list()
++        {
++            lists.insert(0, Some(pre));
++            for first in firsts.iter_mut().skip(1) {
++                *first += 1;
++            }
++        }
+         crate::watch::ask_once_end();
+         // The snapshots of the ranges shaders may write, if they were left
+         // for now (`crate::shadow::wide_back`): the refreshes are done, the
+@@ -6081,6 +6090,9 @@ impl Host {
+                 self.queue.ExecuteCommandLists(&lists);
+                 self.queue.Signal(&self.fence, *submitted)
+             };
++            if crate::feedback::on() {
++                crate::feedback::sent(*submitted);
++            }
+             if crate::detile::on() {
+                 crate::detile::sent(*submitted);
+             }
+@@ -6165,6 +6177,9 @@ impl Host {
+             let _ = (i, started);
+         }
+         // (Neptune) The last group's value: every group of this submission is behind it.
++        if crate::feedback::on() {
++            crate::feedback::sent(*submitted);
++        }
+         if crate::detile::on() {
+             crate::detile::sent(*submitted);
+         }
+diff --git a/crates/victory-gpu/src/lib.rs b/crates/victory-gpu/src/lib.rs
+index dd72151..3898518 100644
+--- a/crates/victory-gpu/src/lib.rs
++++ b/crates/victory-gpu/src/lib.rs
+@@ -23,6 +23,8 @@ mod copystat;
+ pub mod descriptor;
+ #[cfg(windows)]
+ mod detile;
++#[cfg(windows)]
++mod feedback;
+ pub mod device;
+ #[cfg(windows)]
+ mod ambient;
+diff --git a/crates/victory-gpu/src/pipeline/library.rs b/crates/victory-gpu/src/pipeline/library.rs
+index a903934..d7228e2 100644
+--- a/crates/victory-gpu/src/pipeline/library.rs
++++ b/crates/victory-gpu/src/pipeline/library.rs
+@@ -204,8 +204,8 @@ impl Blob {
+     /// The library file in `dir`: a library a save left beside it
+     /// ([`NEXT_FILE`]) takes its place first.
+     fn of(dir: &std::path::Path) -> Blob {
+-        let path = dir.join(LIBRARY_FILE);
+-        let next = dir.join(NEXT_FILE);
++        let path = dir.join(library_file());
++        let next = dir.join(next_file());
+         if next.exists() && std::fs::rename(&next, &path).is_err() {
+             tracing::warn!("the host pipeline library saved last could not take the old one's place");
+         }
+@@ -434,6 +434,24 @@ const LIBRARY_FILE: &str = "host-pipelines.bin";
+ /// start renames it over the library first ([`Blob::of`]).
+ const NEXT_FILE: &str = "host-pipelines.next";
+ const EARLY_FILE: &str = "early-pipelines.txt";
++
++/// (Neptune) The library's files: with bindless usage feedback (`crate::feedback`) every
++/// shader that takes a texture from the heap is another, so those runs keep a library of
++/// their own (`host-pipelines-feedback.bin`, `.next`, `early-pipelines-feedback.txt`) and
++/// never read, replace or trim the usual one.
++fn library_file() -> &'static str {
++    if crate::feedback::on() { "host-pipelines-feedback.bin" } else { LIBRARY_FILE }
++}
++
++/// See [`library_file`] and [`NEXT_FILE`].
++fn next_file() -> &'static str {
++    if crate::feedback::on() { "host-pipelines-feedback.next" } else { NEXT_FILE }
++}
++
++/// See [`library_file`] and [`EARLY_FILE`].
++fn early_file() -> &'static str {
++    if crate::feedback::on() { "early-pipelines-feedback.txt" } else { EARLY_FILE }
++}
+ /// Title pipelines listed for an early start, at most.
+ const EARLY_MAX: usize = 8192;
+ 
+@@ -581,7 +599,7 @@ pub(crate) fn save(now: bool) {
+         tracing::warn!(error = %e, "host pipeline library not saved");
+         return;
+     }
+-    let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
++    let tmp = dir.join(library_file()).with_extension("tmp");
+     // The bytes of the library written to `tmp`; 0 when no pipeline was
+     // added: the library on disk is then what it was, and only the early
+     // list is written (a title pipeline first drawn with wrote all 1,352 MB
+@@ -617,7 +635,7 @@ pub(crate) fn save(now: bool) {
+     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
+     if bytes > 0 && library_written.is_ok() {
+         // In place unless the system refused and the new one waits beside it.
+-        let in_place = !dir.join(NEXT_FILE).exists();
++        let in_place = !dir.join(next_file()).exists();
+         if in_place && VIEW[0].load(Ordering::Relaxed) != 0 {
+             REPLACED[1].store(crate::host::now_ms(), Ordering::Relaxed);
+             REPLACED[0].fetch_add(1, Ordering::Relaxed);
+@@ -630,7 +648,7 @@ pub(crate) fn save(now: bool) {
+         });
+     }
+     let written = library_written
+-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
++        .and_then(|()| write_atomically(&dir.join(early_file()), used.join("\n").as_bytes()));
+     match written {
+         Ok(()) => tracing::info!(
+             bytes,
+@@ -670,7 +688,7 @@ fn serialise(library: &ID3D12PipelineLibrary1, tmp: &std::path::Path, size: usiz
+ /// stay: the rest read as zeros). Where a system refuses, the new library
+ /// is left beside it as [`NEXT_FILE`] for the next start.
+ fn replace_library(dir: &std::path::Path, tmp: &std::path::Path) -> std::io::Result<()> {
+-    std::fs::rename(tmp, dir.join(LIBRARY_FILE)).or_else(|_| std::fs::rename(tmp, dir.join(NEXT_FILE)))
++    std::fs::rename(tmp, dir.join(library_file())).or_else(|_| std::fs::rename(tmp, dir.join(next_file())))
+ }
+ 
+ /// Writes `bytes` to a temporary file beside `path`, then renames it over
+@@ -690,7 +708,7 @@ fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
+     if used.is_none() {
+         let listed = DIR
+             .get()
+-            .and_then(|d| std::fs::read_to_string(d.join(EARLY_FILE)).ok())
++            .and_then(|d| std::fs::read_to_string(d.join(early_file())).ok())
+             .unwrap_or_default();
+         let set: HashSet<String> = listed.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
+         tracing::info!(pipelines = set.len(), "title pipelines to start early");
+@@ -746,7 +764,7 @@ mod tests {
+     #[test]
+     fn the_library_file_is_mapped_and_replaced() {
+         let dir = tempfile::tempdir().unwrap();
+-        let path = dir.path().join(LIBRARY_FILE);
++        let path = dir.path().join(library_file());
+         assert!(matches!(Blob::of(dir.path()), Blob::None), "no file yet");
+         std::fs::write(&path, b"").unwrap();
+         assert!(matches!(Blob::of(dir.path()), Blob::None), "an empty file");
+@@ -770,7 +788,7 @@ mod tests {
+         drop(blob);
+         // The next start reads the new one, wherever the save left it.
+         assert_eq!(Blob::of(dir.path()).bytes(), &new[..]);
+-        assert!(!dir.path().join(NEXT_FILE).exists());
++        assert!(!dir.path().join(next_file()).exists());
+     }
+ 
+     /// The bytes at `at` of the pattern the test below writes.
+@@ -822,7 +840,7 @@ mod tests {
+     fn a_replaced_library_file_still_reads_from_the_disk() {
+         const LEN: usize = 8 << 20;
+         let dir = tempfile::tempdir().unwrap();
+-        let path = dir.path().join(LIBRARY_FILE);
++        let path = dir.path().join(library_file());
+         if !write_uncached(&path, LEN) {
+             return; // no uncached writes here: nothing to show
+         }
+diff --git a/crates/victory-gpu/src/ramline.rs b/crates/victory-gpu/src/ramline.rs
+index 2fb03be..113c703 100644
+--- a/crates/victory-gpu/src/ramline.rs
++++ b/crates/victory-gpu/src/ramline.rs
+@@ -301,7 +301,7 @@ rust_heap,d3d12_upload,d3d12_shared,d3d12_gpu_upload,d3d12_ours_unranged,sysmem_
+ other_private,other_private_res,other_mapped,unattributed_private,\
+ host_lists,preludes_made,idle_lists,list_scratch,\
+ card_copies,tex_filled,tex_filled_placed,tex_targets,tex_depth,tex_uav,tex_twins,tex_idle_held,\
+-detile_raw_used,detile_card_used,detile_raw_size,detile_card_size,detile_to_cpu,vram_commit_backing,residual_private,slot_evicted,slot_evicted_mb,slot_slots_reset,slot_came_back,slot_came_back_2s,slot_given_up,slot_evicting,slot_candidates,slot_kept_seen,slot_blocked";
++detile_raw_used,detile_card_used,detile_raw_size,detile_card_size,detile_to_cpu,vram_commit_backing,residual_private,slot_evicted,slot_evicted_mb,slot_slots_reset,slot_came_back,slot_came_back_2s,slot_given_up,slot_evicting,slot_candidates,slot_kept_seen,slot_blocked,fb_copies,fb_parked,fb_unparked";
+ 
+ /// (Neptune) Once a minute, from the resident sampler's thread: one row of the memory
+ /// breakdown into the memory CSV, and the same derived in one log line. What we track (title
+@@ -403,6 +403,9 @@ fn minute(r: &Resident) {
+         crate::resource::SLOT_STATE[3].load(Relaxed),
+         crate::resource::SLOT_STATE[1].load(Relaxed),
+         crate::resource::SLOT_STATE[2].load(Relaxed),
++        crate::feedback::STATS[0].load(Relaxed),
++        crate::descriptor::parked(),
++        crate::feedback::STATS[2].load(Relaxed),
+     ];
+     tracing::info!(
+         "memory minute: private {} MB (peak {} MB), working set {} MB, PC free {} MB, system commit {} of {} MB; \
+diff --git a/crates/victory-gpu/src/resource.rs b/crates/victory-gpu/src/resource.rs
+index 23f45eb..4af16f3 100644
+--- a/crates/victory-gpu/src/resource.rs
++++ b/crates/victory-gpu/src/resource.rs
+@@ -2161,7 +2161,7 @@ fn slot_evict(video: Option<[u64; 4]>, idle_ms: u64, frames: u64) {
+     let (Some((high, low, cap)), Some([budget, used, ..])) = (slot_evict_settings(), video) else {
+         return;
+     };
+-    // (Neptune) Frames by time, a point a sweep (once a second), two minutes of them: what
++    // (Neptune) Frames by time, a point a sweep (once a second), twelve minutes of them: what
+     // frame "`idle_ms` ago" was, for the slots' table stamps, which count frames.
+     static RING: std::sync::Mutex<std::collections::VecDeque<(u64, u64)>> = std::sync::Mutex::new(std::collections::VecDeque::new());
+     let now_ms = crate::host::now_ms();
+@@ -2169,11 +2169,20 @@ fn slot_evict(video: Option<[u64; 4]>, idle_ms: u64, frames: u64) {
+     let cutoff = {
+         let mut ring = RING.lock().unwrap_or_else(|e| e.into_inner());
+         ring.push_back((frame, now_ms));
+-        while ring.len() > 120 {
++        while ring.len() > 720 {
+             ring.pop_front();
+         }
+-        frame_at(&ring, now_ms.saturating_sub(idle_ms))
++        (
++            frame_at(&ring, now_ms.saturating_sub(idle_ms)),
++            // (Neptune) Bindless usage feedback: the frame its own, longer idle time back, if
++            // the feedback has watched every frame since (`crate::feedback::covers`).
++            crate::feedback::on()
++                .then(|| frame_at(&ring, now_ms.saturating_sub(crate::feedback::idle_ms())))
++                .flatten()
++                .filter(|&c| crate::feedback::covers(c)),
++        )
+     };
++    let (cutoff, fb_cutoff) = cutoff;
+     static EVICTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+     let (on, need) = slot_plan(EVICTING.load(Relaxed), budget, used, high, low, cap);
+     EVICTING.store(on, Relaxed);
+@@ -2209,7 +2218,7 @@ fn slot_evict(video: Option<[u64; 4]>, idle_ms: u64, frames: u64) {
+     if copies.is_empty() {
+         return;
+     }
+-    let (slots, kept, blocked) = crate::descriptor::evictable_slots(&raws, frame, cutoff);
++    let (slots, kept, blocked) = crate::descriptor::evictable_slots(&raws, frame, cutoff, fb_cutoff);
+     SLOT_STATE[3].store(raws.len() as u64, Relaxed);
+     SLOT_STATE[2].store(blocked, Relaxed);
+     SLOT_STATE[1].store(kept, Relaxed);
+diff --git a/crates/victory-shader/src/emit/descriptor_tests.rs b/crates/victory-shader/src/emit/descriptor_tests.rs
+index d0004d3..b6deb4b 100644
+--- a/crates/victory-shader/src/emit/descriptor_tests.rs
++++ b/crates/victory-shader/src/emit/descriptor_tests.rs
+@@ -101,7 +101,11 @@ fn translate(native: &NativeProgram) -> HostShader {
+ /// indices 0 and 1, on the hardware GPU and on WARP (each skipped without a device), and
+ /// returns per one that ran the UAV's dwords.
+ fn run(shader: &HostShader, s0: u32, texture: View) -> Vec<(&'static str, Vec<u32>)> {
+-    let views = [texture, View::RawUav(4)];
++    run_views(shader, s0, &[texture, View::RawUav(4)]).into_iter().map(|(label, words)| (label, words[0].clone())).collect()
++}
++
++/// [`run`] with any views at heap indices 0 on; every UAV's dwords, in order, per device.
++fn run_views(shader: &HostShader, s0: u32, views: &[View]) -> Vec<(&'static str, Vec<Vec<u32>>)> {
+     let mut out = Vec::new();
+     let _one = super::valu_tests::ONE_AT_A_TIME
+         .lock()
+@@ -128,13 +132,13 @@ fn run(shader: &HostShader, s0: u32, texture: View) -> Vec<(&'static str, Vec<u3
+                 &pso,
+                 &Dispatch {
+                     roots: vec![(0, Root::Constants(ud))],
+-                    views: &views,
++                    views,
+                     samplers: &[],
+                     groups: [1, 1, 1],
+                 },
+             )
+             .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+-        out.push((label, words[0].clone()));
++        out.push((label, words));
+     }
+     out
+ }
+@@ -230,3 +234,37 @@ fn a_sampler_each_arm_of_a_uniform_branch_sets_samples_as_that_arm_says() {
+         }
+     }
+ }
++
++/// (Neptune) Bindless usage feedback: with a feedback slot, a texture taken from the view heap
++/// stores 1 into dword `index` of the raw buffer at that slot, in a container `dxil.dll`
++/// accepts; the program's own work is unchanged.
++#[test]
++fn a_texture_taken_from_the_heap_is_noted_in_the_feedback_buffer() {
++    let program = native(&[
++        0xBE94_0380, // s_mov_b32 s20, 0
++        0xBE95_03FF,
++        0x00C0_0000, // s_mov_b32 s21, 0x00c00000 (levels up to 12)
++        0xBE96_0380, // s_mov_b32 s22, 0 (point filtering)
++        0xBE97_0380, // s_mov_b32 s23, 0
++        0x7E02_02FF,
++        0x3E80_0000, // v_mov_b32 v1, 0.25
++        0x7E04_02FF,
++        0x3F00_0000, // v_mov_b32 v2, 0.5
++        0xF09C_0F08,
++        0x00A2_0301, // image_sample_lz v[3:6], v[1:2], s[8:15], s[20:23] dmask:0xf 2D
++        0xE070_0000,
++        0x8004_0300, // buffer_store_dword v3, off, s[16:19], 0
++    ]);
++    // The feedback buffer at heap slot 2, for this thread's translation only.
++    super::shader::FEEDBACK_TEST.with(|f| f.set(Some(2)));
++    let shader = translate(&program);
++    super::shader::FEEDBACK_TEST.with(|f| f.set(None));
++    let plain = translate(&program);
++    assert_ne!(shader.dxil, plain.dxil, "the feedback store is in the translation");
++    let texels = [[3.0f32, 0.0, 0.0, 1.0], [5.0, 0.0, 0.0, 1.0]];
++    for (label, uavs) in run_views(&shader, 0, &[View::Texture(2, 1, &texels), View::RawUav(4), View::RawUav(4)]) {
++        assert_eq!(f32::from_bits(uavs[0][0]), 3.0, "{label}: the sample as without feedback");
++        // Slot 0 (the texture) noted; slot 1 (a raw buffer, not a texture) not.
++        assert_eq!(uavs[1], [1, 0, 0, 0], "{label}: the feedback buffer");
++    }
++}
+diff --git a/crates/victory-shader/src/emit/mod.rs b/crates/victory-shader/src/emit/mod.rs
+index 75facdc..5415a56 100644
+--- a/crates/victory-shader/src/emit/mod.rs
++++ b/crates/victory-shader/src/emit/mod.rs
+@@ -123,7 +123,7 @@ pub use rect::rect_list_gs;
+ pub use shader::{
+     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
+     SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+-    set_view_heap_limit, view_heap_limit,
++    bindless_feedback, feedback_slot, set_bindless_feedback, set_view_heap_limit, view_heap_limit,
+ };
+ 
+ /// The loop limit without an override: 2^20.
+@@ -217,6 +217,8 @@ pub fn translation_fingerprint() -> Vec<u8> {
+     }
+     out.extend_from_slice(&lower::host_max_wave().to_le_bytes());
+     out.extend_from_slice(&shader::view_heap_limit().to_le_bytes());
++    // (Neptune) Bindless usage feedback changes every shader that takes a texture from the heap.
++    out.push(u8::from(shader::bindless_feedback()));
+     out.extend_from_slice(&loop_limit().to_le_bytes());
+     out.push(group_sync());
+     out.extend_from_slice(&shader_opt().to_le_bytes());
+diff --git a/crates/victory-shader/src/emit/shader.rs b/crates/victory-shader/src/emit/shader.rs
+index 23bfc0e..a184f4e 100644
+--- a/crates/victory-shader/src/emit/shader.rs
++++ b/crates/victory-shader/src/emit/shader.rs
+@@ -81,6 +81,8 @@ pub(crate) mod flags {
+     pub const DOUBLES: u64 = 1 << 2;
+     pub const RAW_BUFFERS: u64 = 1 << 4;
+     pub const STENCIL_REF: u64 = 1 << 11;
++    /// (Neptune) UAV access outside pixel and compute shaders (the feedback store).
++    pub const UAVS_AT_EVERY_STAGE: u64 = 1 << 16;
+     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
+     pub const ROVS: u64 = 1 << 18;
+     pub const WAVE_OPS: u64 = 1 << 19;
+@@ -137,6 +139,45 @@ pub fn view_heap_limit() -> u32 {
+     VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
+ }
+ 
++/// (Neptune) Bindless usage feedback (`VICTORY_BINDLESS_FEEDBACK=1` on the host): every texture
++/// a shader takes from the view heap stores 1 into dword `index` of a raw buffer the host keeps
++/// at [`feedback_slot`], the slot below the null slot. The host reads it back and clears it every
++/// few frames, and so knows which slots shaders picked by index read: a texture only such slots
++/// show can be let go when none of them was read for a while. A plain store, not an atomic:
++/// every lane stores the same value, so there is nothing to read-modify-write, no contention
++/// and no branch (the handle helpers here emit into the caller's block and cannot branch).
++static FEEDBACK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
++
++/// See [`FEEDBACK`]. Set before the first shader is translated: a shader keeps what it was
++/// translated with (the translation fingerprint has it).
++pub fn set_bindless_feedback(on: bool) {
++    FEEDBACK.store(on, std::sync::atomic::Ordering::Relaxed);
++}
++
++/// See [`FEEDBACK`].
++pub fn bindless_feedback() -> bool {
++    FEEDBACK.load(std::sync::atomic::Ordering::Relaxed)
++}
++
++#[cfg(test)]
++thread_local! {
++    /// Tests: the feedback slot for translations on this thread (the globals stay alone, so
++    /// tests translating beside it are not changed).
++    pub(crate) static FEEDBACK_TEST: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
++}
++
++/// The view heap slot of the feedback buffer ([`FEEDBACK`]), if shaders translated now store to
++/// one: the slot below the null slot ([`VIEW_LIMIT`]), which the host keeps out of its dynamic
++/// slots.
++pub fn feedback_slot() -> Option<u32> {
++    #[cfg(test)]
++    if let Some(slot) = FEEDBACK_TEST.with(std::cell::Cell::get) {
++        return Some(slot);
++    }
++    let limit = view_heap_limit();
++    (bindless_feedback() && limit > 1).then(|| limit - 1)
++}
++
+ pub(crate) struct Shader {
+     pub m: Module,
+     pub t: Types,
+@@ -176,6 +217,11 @@ pub(crate) struct Shader {
+     lds: Option<V>,
+     main: V,
+     pub entry: usize,
++    /// (Neptune) The feedback buffer's handle ([`FEEDBACK`]), made in the entry block once.
++    feedback: Option<V>,
++    /// Whether the shader stores to it (a stage other than pixel and compute then declares UAVs
++    /// at every stage).
++    feedback_stores: bool,
+ }
+ 
+ impl Shader {
+@@ -230,9 +276,37 @@ impl Shader {
+             lds: None,
+             main,
+             entry,
++            feedback: None,
++            feedback_stores: false,
+         }
+     }
+ 
++    /// (Neptune) [`FEEDBACK`]: stores 1 into dword `index` of the feedback buffer at `slot`.
++    fn feedback_store(&mut self, block: usize, index: V, slot: u32) {
++        let h = match self.feedback {
++            Some(h) => h,
++            None => {
++                let s = self.m.i32(slot);
++                let (no, uniform) = (self.m.bool(false), self.m.bool(false));
++                let entry = self.entry;
++                let h = self.op(entry, "createHandleFromHeap", Attr::ReadNone, self.t.handle, 218, &[s, no, uniform]);
++                let h = self.annotate(entry, h, 11 | 0x1000, 0);
++                self.flags |= flags::RESOURCE_HEAP;
++                self.feedback = Some(h);
++                h
++            }
++        };
++        let two = self.m.i32(2);
++        let byte = self.m.bin(block, super::bitcode::Bin::Shl, index, two);
++        let one = self.m.i32(1);
++        let iu = self.m.undef(self.t.i32);
++        let mask = self.m.i8(1);
++        let align = self.m.i32(4);
++        let void = self.t.void;
++        self.op(block, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &[h, byte, iu, one, iu, iu, iu, mask, align]);
++        self.feedback_stores = true;
++    }
++
+     /// The thread-group shared memory: `[lds_dwords x i32]` in address
+     /// space 3.
+     pub fn lds(&mut self) -> V {
+@@ -448,6 +522,14 @@ impl Shader {
+         } else {
+             props
+         };
++        // (Neptune) A texture of the view heap (resource kinds 1-9, read or written): noted in
++        // the feedback buffer, at its clamped index.
++        if !sampler
++            && (1..=9).contains(&(props.0 & 0xff))
++            && let Some(slot) = feedback_slot()
++        {
++            self.feedback_store(block, index, slot);
++        }
+         self.nonuniform_handles += u32::from(nonuniform);
+         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
+         let h = self.op(
+@@ -463,6 +545,11 @@ impl Shader {
+ 
+     /// The finished container.
+     pub fn finish(mut self) -> Vec<u8> {
++        // (Neptune) The feedback store from a stage other than pixel and compute.
++        let compute = self.threads.is_some() && self.mesh.is_none();
++        if self.feedback_stores && !self.pixel && !compute {
++            self.flags |= flags::UAVS_AT_EVERY_STAGE;
++        }
+         let ud_size = (self.user_data * 4).next_multiple_of(16);
+         self.fix_user_data_size(ud_size);
+         // The clean-up, before anything is declared about the code: a
+@@ -801,6 +888,9 @@ impl Shader {
+         if self.flags & flags::DOUBLES != 0 {
+             features |= 0x1;
+         }
++        if self.flags & flags::UAVS_AT_EVERY_STAGE != 0 {
++            features |= 0x4;
++        }
+         if self.flags & flags::STENCIL_REF != 0 {
+             features |= 0x200;
+         }
+-- 
+2.55.0.windows.3
+

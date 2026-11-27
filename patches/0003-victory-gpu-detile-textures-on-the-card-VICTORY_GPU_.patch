@@ -1,0 +1,2088 @@
+From f75bd3dd09dca09bc11109776abb37e6f2951e18 Mon Sep 17 00:00:00 2001
+From: skornuta <126527569+skornuta@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 11:57:53 -0800
+Subject: [PATCH 03/27] victory-gpu: detile textures on the card
+ (VICTORY_GPU_DETILE=1, off)
+
+With the switch a title texture has no staging buffer of its own. A list
+that uploads it reserves a slice of a ring of upload memory for the title
+bytes and one of a ring in the card's memory for the detiled texture,
+laid out as its copyable footprints; its CopyTextureRegions read the
+latter. At submission the title memory is read and hashed as the refresh
+reads it, copied into the raw slice, and a compute shader copies it by
+table (`Layout::copy_table`, packed: runs of at most 64 bytes, cached by
+layout, mip and pitches; an array slice of a thin layout is slice 0's
+table moved by a root constant) in a list that goes ahead of the
+submission's lists in the same call. The ring rests in the common state:
+COMMON -> UAV, the dispatches, UAV -> COPY_SOURCE (readbacks for
+verify), COPY_SOURCE -> COMMON, batched once per submission.
+
+Never waits, never overruns: both rings have a fixed size
+(VICTORY_GPU_DETILE_RAW_MB 256, VICTORY_GPU_DETILE_OUT_MB 192, made only
+with room under 85 % of the card's budget, halved down to 32 MB to find
+it; VICTORY_GPU_DETILE_TABLE_MB 32). Slices are first-fit in 64 KiB
+grains and go back when the list lets the upload go and the card has
+passed every submission that used it. A refusal (a ring full, the table
+buffer full, a table not in whole 32-bit words, a table reaching outside
+its slices) sends the upload the CPU's way at once: the staging buffer is
+made then, kept for the staging state's life, and its first refresh
+detiles whatever the memory says. Every table is bounded on the CPU and
+every word again in the shader. A list submitted again while its last
+submission may read its slices leaves them as they are.
+
+VICTORY_GPU_DETILE_VERIFY=<n>: n uploads a second are read back and
+compared with the CPU's detile of the same bytes. A status line every
+ten seconds counts uploads, dispatches, ring use and every refusal.
+
+Without the switch every staging state gets its buffer when it is made
+and the route returns the CPU's way before asking: the path is the old.
+
+Tests: the arena (full, out-of-order release by fence), packed tables
+emulated as the shader runs them against `detile` (slices by shift
+included), the shader itself on WARP, every part of real BC7 and RGBA
+footprints inside its slices (the last subresource's short last row),
+and a texture whose staging buffer was let go coming back with the rings
+full: refused at once, nothing half reserved, a staging buffer made, and
+the next refresh detiles although the memory is unchanged.
+
+(cherry picked from commit 0ab9ab8c2c90c53ebd244adbddcf7a97ee25103e)
+---
+ crates/victory-gpu/src/detile.rs              | 1246 +++++++++++++++++
+ crates/victory-gpu/src/host.rs                |   48 +-
+ crates/victory-gpu/src/lib.rs                 |    2 +
+ crates/victory-gpu/src/texture.rs             |  310 +++-
+ .../victory-gpu/src/texture_detile_tests.rs   |  240 ++++
+ 5 files changed, 1812 insertions(+), 34 deletions(-)
+ create mode 100644 crates/victory-gpu/src/detile.rs
+ create mode 100644 crates/victory-gpu/src/texture_detile_tests.rs
+
+diff --git a/crates/victory-gpu/src/detile.rs b/crates/victory-gpu/src/detile.rs
+new file mode 100644
+index 0000000..8689fb5
+--- /dev/null
++++ b/crates/victory-gpu/src/detile.rs
+@@ -0,0 +1,1246 @@
++//! (Neptune) Texture detiling on the card (`VICTORY_GPU_DETILE=1`; off by default).
++//!
++//! Without it every title texture a list samples has a staging buffer of its own in upload
++//! memory (system memory, the size of the texture, kept for as long as the texture is used:
++//! 9-12 GB of them in the open world), and the submitting thread detiles title memory into it
++//! on the CPU. With it a texture's upload is: title memory read once (and hashed, as the
++//! refresh hashes it), copied as it is into a slice of a ring of upload memory, and detiled
++//! by a compute shader into a slice of a ring in the card's memory, laid out as the texture's
++//! copyable footprints; the list's `CopyTextureRegion`s read that slice. Nothing is kept per
++//! texture but the staging state's bookkeeping.
++//!
++//! The shader copies by table (`victory_formats::texture::Layout::copy_table`): the runs the
++//! CPU's detile copies, the column runs once and the rows once, cached by layout, mip and
++//! pitch in a buffer of upload memory. An array slice of a thin layout is slice 0's table
++//! moved by a whole slice (`shift`, a root constant), so one table serves every slice.
++//!
++//! Safety of the card: both rings are fixed in size (`VICTORY_GPU_DETILE_RAW_MB`, 256;
++//! `VICTORY_GPU_DETILE_OUT_MB`, 192, made only while the card's budget has room for it), a
++//! slice is reserved when the list records the upload and given back only when the list has
++//! let it go and the card has run every submission that used it. Whatever does not fit (a
++//! ring full, the table buffer full, a table not in whole 32-bit words, a table reaching
++//! outside its slices) goes the CPU's way, at once: nothing waits, nothing is overrun. Every
++//! table is checked against its slices on the CPU, and the shader checks every word again.
++//!
++//! `VICTORY_GPU_DETILE_VERIFY=<n>`: up to `n` uploads a second are read back and compared
++//! with the CPU's detile of the same bytes; a difference is logged with the texture.
++
++use std::collections::{BTreeMap, HashMap};
++use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
++use std::sync::{Arc, Mutex, OnceLock};
++
++use victory_formats::texture::{CopyTable, Dimension, Layout};
++use windows::Win32::Graphics::Direct3D12::*;
++use windows::core::Interface;
++
++/// Whether textures are detiled on the card (`VICTORY_GPU_DETILE=1`).
++pub(crate) fn on() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_DETILE").is_some_and(|v| v == "1"))
++}
++
++/// Uploads a second read back and compared (`VICTORY_GPU_DETILE_VERIFY`, 0: none).
++fn verify_per_second() -> u64 {
++    static N: OnceLock<u64> = OnceLock::new();
++    *N.get_or_init(|| std::env::var("VICTORY_GPU_DETILE_VERIFY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
++}
++
++/// Megabytes from `var`, `default` unset, clamped to `[least, most]`, in bytes.
++fn mb(var: &str, default: u64, least: u64, most: u64) -> u64 {
++    std::env::var(var).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default).clamp(least, most) << 20
++}
++
++/// Why an upload went the CPU's way.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(crate) enum Why {
++    /// The rings or the shader could not be made.
++    NotReady,
++    /// A table not in whole 32-bit words (narrow levels of 1- and 2-byte formats).
++    Unaligned,
++    /// The layout has no table (`copy_table` refused it).
++    NoTable,
++    /// The buffer of tables is full.
++    Tables,
++    /// A table reaches outside the slices it would be given (never expected).
++    Bounds,
++    /// The upload is larger than a ring.
++    TooBig,
++    /// The ring of upload memory has no room now.
++    RawFull,
++    /// The ring in the card's memory has no room now.
++    OutFull,
++}
++
++/// Since the start: uploads detiled on the card and their bytes of title memory; uploads that
++/// went the CPU's way, by [`Why`] (8); refills left out because the slices were still in the
++/// air (a list submitted again); verified uploads and those that differed.
++pub(crate) static STATS: [AtomicU64; 14] = [const { AtomicU64::new(0) }; 14];
++const DONE: usize = 0;
++const DONE_BYTES: usize = 1;
++const WHY_AT: usize = 2;
++const REUSED: usize = 10;
++const CHECKED: usize = 11;
++const DIFFERED: usize = 12;
++const DISPATCHES: usize = 13;
++
++pub(crate) fn refused(why: Why) {
++    STATS[WHY_AT + why as usize].fetch_add(1, Relaxed);
++}
++
++// ---------------------------------------------------------------------------------------------
++// The allocator of both rings (no D3D12).
++
++/// Granularity of the rings' slices: a texture copy's placement wants 512 bytes, a root view
++/// 4; whole 64 KiB keeps the free list short.
++pub(crate) const GRAIN: u64 = 64 << 10;
++
++/// First-fit allocation of `size` bytes in `GRAIN`s. A slice given back with a fence value is
++/// free once the card has passed it ([`Arena::reclaim`]); slices go back in any order.
++#[derive(Debug)]
++pub(crate) struct Arena {
++    size: u64,
++    /// Free ranges: start, length; never touching (joined on release).
++    free: BTreeMap<u64, u64>,
++    /// Given back, waiting for the card: start, length, fence value.
++    waiting: Vec<(u64, u64, u64)>,
++    used: u64,
++}
++
++impl Arena {
++    pub(crate) fn new(size: u64) -> Arena {
++        let size = size / GRAIN * GRAIN;
++        let mut free = BTreeMap::new();
++        if size > 0 {
++            free.insert(0, size);
++        }
++        Arena { size, free, waiting: Vec::new(), used: 0 }
++    }
++
++    pub(crate) fn size(&self) -> u64 {
++        self.size
++    }
++
++    /// Bytes reserved or waiting for the card.
++    pub(crate) fn used(&self) -> u64 {
++        self.used
++    }
++
++    /// The start of `len` bytes (rounded up to `GRAIN`), or `None` if no free range holds
++    /// them now. Never waits.
++    pub(crate) fn alloc(&mut self, len: u64) -> Option<u64> {
++        let len = len.max(1).checked_next_multiple_of(GRAIN)?;
++        let (&at, &have) = self.free.iter().find(|&(_, &have)| have >= len)?;
++        self.free.remove(&at);
++        if have > len {
++            self.free.insert(at + len, have - len);
++        }
++        self.used += len;
++        Some(at)
++    }
++
++    /// Gives `[at, at + len)` back once the card has passed `fence` (0: now).
++    pub(crate) fn release(&mut self, at: u64, len: u64, fence: u64) {
++        let len = len.max(1).next_multiple_of(GRAIN);
++        if fence == 0 {
++            self.insert_free(at, len);
++        } else {
++            self.waiting.push((at, len, fence));
++        }
++    }
++
++    /// Frees what waits for fence values up to `completed`.
++    pub(crate) fn reclaim(&mut self, completed: u64) {
++        let mut i = 0;
++        while i < self.waiting.len() {
++            let (at, len, fence) = self.waiting[i];
++            if fence <= completed {
++                self.waiting.swap_remove(i);
++                self.insert_free(at, len);
++            } else {
++                i += 1;
++            }
++        }
++    }
++
++    fn insert_free(&mut self, mut at: u64, mut len: u64) {
++        debug_assert!(at + len <= self.size);
++        self.used -= len;
++        if let Some((&before, &blen)) = self.free.range(..at).next_back()
++            && before + blen == at
++        {
++            self.free.remove(&before);
++            at = before;
++            len += blen;
++        }
++        if let Some(&alen) = self.free.get(&(at + len)) {
++            self.free.remove(&(at + len));
++            len += alen;
++        }
++        self.free.insert(at, len);
++    }
++}
++
++// ---------------------------------------------------------------------------------------------
++// Tables as the shader reads them (no D3D12).
++
++/// The most bytes one run of a packed table copies: one thread's work.
++const RUN_MOST: u64 = 64;
++
++/// A table packed for the shader: `words` are the runs (tiled, linear, bytes) and then the
++/// rows (tiled, xor, linear), three 32-bit words each; `tiled_end` and `linear_end` bound
++/// every byte it reads and writes (slice 0, no shift).
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub(crate) struct Packed {
++    pub(crate) words: Vec<u32>,
++    pub(crate) runs: u32,
++    pub(crate) rows: u32,
++    pub(crate) tiled_end: u64,
++    pub(crate) linear_end: u64,
++}
++
++/// `table` packed for the shader, long runs cut into pieces of [`RUN_MOST`] bytes (where no
++/// row flips bits, as the console's XOR modes do); `Err` if it is not in whole 32-bit words
++/// or does not fit 32-bit offsets.
++pub(crate) fn pack(table: &CopyTable) -> Result<Packed, Why> {
++    if !table.aligned(4) {
++        return Err(Why::Unaligned);
++    }
++    let flips = table.rows.iter().any(|r| r.xor != 0);
++    let mut runs: Vec<(u64, u64, u64)> = Vec::with_capacity(table.runs.len());
++    for r in &table.runs {
++        let (tiled, linear, len) = (r.tiled, u64::from(r.linear), u64::from(r.len));
++        if flips || len <= RUN_MOST {
++            runs.push((tiled, linear, len));
++            continue;
++        }
++        let mut k = 0;
++        while k < len {
++            runs.push((tiled + k, linear + k, RUN_MOST.min(len - k)));
++            k += RUN_MOST;
++        }
++    }
++    let tiled_end = if flips {
++        table
++            .rows
++            .iter()
++            .flat_map(|row| runs.iter().map(move |&(t, _, n)| row.tiled + (t ^ u64::from(row.xor)) + n))
++            .max()
++            .unwrap_or(0)
++    } else {
++        table.rows.iter().map(|r| r.tiled).max().unwrap_or(0) + runs.iter().map(|&(t, _, n)| t + n).max().unwrap_or(0)
++    };
++    let small = |v: u64| u32::try_from(v).map_err(|_| Why::TooBig);
++    small(tiled_end)?;
++    small(table.linear_bytes)?;
++    let mut words = Vec::with_capacity(3 * (runs.len() + table.rows.len()));
++    for &(t, l, n) in &runs {
++        words.extend([small(t)?, small(l)?, small(n)?]);
++    }
++    for r in &table.rows {
++        words.extend([small(r.tiled)?, r.xor, small(r.linear)?]);
++    }
++    Ok(Packed {
++        words,
++        runs: runs.len() as u32,
++        rows: table.rows.len() as u32,
++        tiled_end,
++        linear_end: table.linear_bytes,
++    })
++}
++
++/// The slice whose table serves array slice `slice` of `layout`, and the bytes the table is
++/// moved by for it: slice 0 and a whole slice per slice for a thin layout without XOR bits
++/// (its rows then differ by that alone), the slice itself otherwise.
++pub(crate) fn table_slice(layout: &Layout, slice: u32) -> (u32, u64) {
++    if layout.desc.dimension != Dimension::Tex3d && !layout.thick && !layout.desc.swizzle.xor() {
++        (0, u64::from(slice) * layout.slice_size)
++    } else {
++        (slice, 0)
++    }
++}
++
++/// What the shader does with a packed table, on the CPU: for tests, and the reference of the
++/// shader's bounds (a word outside `raw` or `out` is left out, as on the card).
++#[cfg(test)]
++pub(crate) fn emulate(words: &[u32], runs: u32, rows: std::ops::Range<u32>, shift: u32, raw: &[u8], out: &mut [u8], out_at: u32) {
++    let w = |i: u32| words[i as usize];
++    let rows_at = 3 * runs;
++    for row in rows {
++        for r in 0..runs {
++            let (t, l, n) = (w(3 * r), w(3 * r + 1), w(3 * r + 2));
++            let (rt, rx, rl) = (w(rows_at + 3 * row), w(rows_at + 3 * row + 1), w(rows_at + 3 * row + 2));
++            let src = rt + shift + (t ^ rx);
++            let dst = out_at + rl + l;
++            let mut k = 0;
++            while k < n {
++                let (s, d) = ((src + k) as usize, (dst + k) as usize);
++                if s + 4 <= raw.len() && d + 4 <= out.len() {
++                    out[d..d + 4].copy_from_slice(&raw[s..s + 4]);
++                }
++                k += 4;
++            }
++        }
++    }
++}
++
++// ---------------------------------------------------------------------------------------------
++// The shader.
++
++/// One job: copy by a table, or (`run_count` 0) zeros.
++///
++/// Root constants: `runs_at` and `rows_at` are word offsets into the table buffer; a group's
++/// threads take runs (x) of one row (y, from `row_first`); `shift` moves every tiled offset
++/// (a slice of a thin layout); `out_at` is the subresource's offset in the output slice;
++/// `raw_len` and `out_len` bound the slices, which every word is checked against. Zeros:
++/// `rows_at` words from `out_at` on.
++pub(crate) const DETILE: &str = r#"
++#define RS "RootConstants(num32BitConstants=8, b0), SRV(t0), SRV(t1), UAV(u0)"
++cbuffer Job : register(b0) {
++    uint runs_at;
++    uint run_count;
++    uint rows_at;
++    uint row_first;
++    uint shift;
++    uint out_at;
++    uint raw_len;
++    uint out_len;
++};
++ByteAddressBuffer raw : register(t0);
++ByteAddressBuffer table : register(t1);
++RWByteAddressBuffer outb : register(u0);
++
++[RootSignature(RS)]
++[numthreads(64, 1, 1)]
++void main(uint3 id : SV_DispatchThreadID) {
++    if (run_count == 0) {
++        uint at = out_at + id.x * 4;
++        if (id.x < rows_at && at + 4 <= out_len) {
++            outb.Store(at, 0);
++        }
++        return;
++    }
++    if (id.x >= run_count) {
++        return;
++    }
++    uint3 run = table.Load3((runs_at + id.x * 3) * 4);
++    uint3 row = table.Load3((rows_at + (row_first + id.y) * 3) * 4);
++    uint src = row.x + shift + (run.x ^ row.y);
++    uint dst = out_at + row.z + run.y;
++    for (uint k = 0; k < run.z; k += 4) {
++        if (src + k + 4 <= raw_len && dst + k + 4 <= out_len) {
++            outb.Store(dst + k, raw.Load(src + k));
++        }
++    }
++}
++"#;
++
++/// Most groups along one axis of a dispatch.
++const GROUPS_MOST: u32 = 65_535;
++
++// ---------------------------------------------------------------------------------------------
++// The rings, the tables and the jobs of a submission.
++
++/// A table in the table buffer: where its words start, and its bounds.
++#[derive(Debug, Clone, Copy)]
++pub(crate) struct Table {
++    at: u32,
++    runs: u32,
++    rows: u32,
++    tiled_end: u64,
++    linear_end: u64,
++}
++
++/// What one subresource of an upload is: its mip, where it lies in the output slice and how
++/// many bytes, and its table (and the shift that moves the table to its slice).
++#[derive(Debug, Clone)]
++pub(crate) struct Part {
++    pub(crate) mip: u32,
++    offset: u64,
++    bytes: u64,
++    table: Table,
++    shift: u32,
++}
++
++/// The slices of one recorded upload. Given back to the rings when the last list that holds
++/// it lets it go, once the card has run every submission that used it.
++pub(crate) struct Upload {
++    raw: (u64, u64),
++    out: (u64, u64),
++    parts: Vec<Part>,
++    /// The fence value of the last submission that used it (0: none yet).
++    sent: AtomicU64,
++}
++
++impl Upload {
++    /// Where the output slice starts in [`out_buffer`].
++    pub(crate) fn out_offset(&self) -> u64 {
++        self.out.0
++    }
++
++    /// Bytes of title memory the upload copies (its raw slice).
++    pub(crate) fn raw_len(&self) -> u64 {
++        self.raw.1
++    }
++
++    /// Whether a submission that used it may still be running: its slices may not be
++    /// written now.
++    pub(crate) fn in_flight(&self) -> bool {
++        let sent = self.sent.load(Relaxed);
++        sent != 0 && crate::host::host().is_none_or(|h| h.completed() < sent)
++    }
++}
++
++impl Drop for Upload {
++    fn drop(&mut self) {
++        let sent = *self.sent.get_mut();
++        let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
++        if let Some(state) = state.as_mut() {
++            state.raw_arena.release(self.raw.0, self.raw.1, sent);
++            state.out_arena.release(self.out.0, self.out.1, sent);
++        }
++    }
++}
++
++struct Job {
++    constants: [u32; 8],
++    raw: u64,
++    out: u64,
++    groups: (u32, u32),
++}
++
++/// An upload to read back and compare ([`verify_per_second`]): the output slice's bytes
++/// (`len` from `at`), the CPU's detile of the same title bytes, and the ranges to compare.
++struct Check {
++    at: u64,
++    len: u64,
++    expected: Vec<u8>,
++    ranges: Vec<(u64, u64)>,
++    what: String,
++    back: Option<(ID3D12Resource, usize)>,
++    fence: u64,
++}
++
++struct State {
++    root: ID3D12RootSignature,
++    pso: ID3D12PipelineState,
++    raw: (ID3D12Resource, usize, u64),
++    raw_arena: Arena,
++    out: (ID3D12Resource, u64),
++    out_arena: Arena,
++    /// The table buffer: resource, mapping, address, bytes, bytes used.
++    tables: (ID3D12Resource, usize, u64, u64, u64),
++    cache: HashMap<Key, Result<Table, Why>>,
++    jobs: Vec<Job>,
++    /// Uploads this submission fills or uses again: told its fence value when it is sent.
++    filled: Vec<Arc<Upload>>,
++    /// Lists for the work before a submission: allocator, list, fence value of its last run
++    /// (`u64::MAX`: recorded, not sent yet).
++    lists: Vec<(ID3D12CommandAllocator, ID3D12GraphicsCommandList, u64)>,
++    checks: Vec<Check>,
++    /// When a check was last taken, and how many in that second.
++    checked: (u64, u64),
++}
++
++// SAFETY: D3D12 objects (free-threaded) and persistent mappings, used under `STATE`'s lock.
++unsafe impl Send for State {}
++
++static STATE: Mutex<Option<State>> = Mutex::new(None);
++
++/// A table's identity: the layout, mip and slice it is made for, and the pitches.
++#[derive(Debug, Clone, PartialEq, Eq, Hash)]
++struct Key {
++    layout: (u8, u32, u32, u32, u32, u32, u32, u32),
++    mip: u32,
++    slice: u32,
++    row_pitch: u64,
++    depth_pitch: u64,
++}
++
++fn key(layout: &Layout, mip: u32, slice: u32, row_pitch: u64, depth_pitch: u64) -> Key {
++    let d = &layout.desc;
++    let dimension = match d.dimension {
++        Dimension::Tex1d => 1,
++        Dimension::Tex2d => 2,
++        Dimension::Tex3d => 3,
++    };
++    Key {
++        layout: (dimension, d.width, d.height, d.depth, d.mips, d.element_bytes, d.block, d.swizzle.0),
++        mip,
++        slice,
++        row_pitch,
++        depth_pitch,
++    }
++}
++
++/// Whether the rings and the shader are there (made on the first ask; once).
++pub(crate) fn ready() -> bool {
++    static READY: OnceLock<bool> = OnceLock::new();
++    *READY.get_or_init(|| {
++        if !on() {
++            return false;
++        }
++        match make() {
++            Ok(state) => {
++                tracing::info!(
++                    raw_mb = state.raw_arena.size() >> 20,
++                    out_mb = state.out_arena.size() >> 20,
++                    table_mb = state.tables.3 >> 20,
++                    verify = verify_per_second(),
++                    "VICTORY_GPU_DETILE=1: textures are detiled on the card"
++                );
++                *STATE.lock().unwrap_or_else(|e| e.into_inner()) = Some(state);
++                true
++            }
++            Err(e) => {
++                tracing::warn!(error = %e, "VICTORY_GPU_DETILE=1: no detile on the card (textures are detiled on the CPU)");
++                false
++            }
++        }
++    })
++}
++
++fn make() -> windows::core::Result<State> {
++    let empty = windows::core::Error::empty;
++    let host = crate::host::host().ok_or_else(empty)?;
++    let code = crate::host::compile(DETILE, windows::core::s!("main"), windows::core::s!("cs_5_1"))?;
++    // SAFETY: the blob's bytes; the root signature is inside the shader.
++    let (root, pso) = unsafe {
++        let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &code)?;
++        let pso: ID3D12PipelineState = host.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
++            pRootSignature: std::mem::transmute_copy(&root),
++            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr().cast(), BytecodeLength: code.len() },
++            ..Default::default()
++        })?;
++        (root, pso)
++    };
++    let raw_size = mb("VICTORY_GPU_DETILE_RAW_MB", 256, 32, 2048);
++    let (raw, raw_data) = host.upload_buffer(raw_size).ok_or_else(empty)?;
++    crate::host::name(&raw, || "detile: title bytes".into());
++    // The card's ring: only with room under 85 % of the budget after it, halved down to
++    // 32 MB to find room; none at all, and no detile on the card, without.
++    let mut out_size = mb("VICTORY_GPU_DETILE_OUT_MB", 192, 32, 1024);
++    let out = loop {
++        let room = host.video_memory().is_none_or(|[budget, used, ..]| used + out_size <= budget / 100 * 85);
++        if room && let Some(buffer) = host.uav_buffer(out_size) {
++            break buffer;
++        }
++        out_size /= 2;
++        if out_size < 32 << 20 {
++            tracing::warn!("VICTORY_GPU_DETILE=1: no room in the card's budget for the detile ring");
++            return Err(empty());
++        }
++    };
++    crate::host::name(&out, || "detile: detiled textures".into());
++    let table_size = mb("VICTORY_GPU_DETILE_TABLE_MB", 32, 4, 256);
++    let (tables, table_data) = host.upload_buffer(table_size).ok_or_else(empty)?;
++    crate::host::name(&tables, || "detile: tables".into());
++    // SAFETY: live buffers.
++    let (raw_gpu, out_gpu, table_gpu) =
++        unsafe { (raw.GetGPUVirtualAddress(), out.GetGPUVirtualAddress(), tables.GetGPUVirtualAddress()) };
++    Ok(State {
++        root,
++        pso,
++        raw: (raw, raw_data as usize, raw_gpu),
++        raw_arena: Arena::new(raw_size),
++        out: (out, out_gpu),
++        out_arena: Arena::new(out_size),
++        tables: (tables, table_data as usize, table_gpu, table_size, 0),
++        cache: HashMap::new(),
++        jobs: Vec::new(),
++        filled: Vec::new(),
++        lists: Vec::new(),
++        checks: Vec::new(),
++        checked: (0, 0),
++    })
++}
++
++/// The ring the detiled textures are in: the source of the lists' copies.
++pub(crate) fn out_buffer() -> Option<ID3D12Resource> {
++    STATE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|s| s.out.0.clone())
++}
++
++/// One subresource of an upload, as the staging state lays it out: its mip and array slice,
++/// its footprint and rows.
++pub(crate) struct Sub {
++    pub(crate) mip: u32,
++    pub(crate) slice: u32,
++    pub(crate) offset: u64,
++    pub(crate) row_pitch: u64,
++    pub(crate) rows: u32,
++    pub(crate) depth: u32,
++}
++
++impl State {
++    /// The table for a subresource: from the cache, or made, checked and put in the table
++    /// buffer.
++    fn table(&mut self, layout: &Layout, sub: &Sub) -> Result<(Table, u64), Why> {
++        let (slice, shift) = table_slice(layout, sub.slice);
++        let depth_pitch = sub.row_pitch * u64::from(sub.rows);
++        let key = key(layout, sub.mip, slice, sub.row_pitch, depth_pitch);
++        if let Some(found) = self.cache.get(&key) {
++            return found.map(|t| (t, shift));
++        }
++        let made = layout
++            .copy_table(sub.mip, slice, sub.row_pitch as usize, depth_pitch as usize)
++            .map_err(|_| Why::NoTable)
++            .and_then(|t| pack(&t));
++        let packed = match made {
++            Ok(packed) => packed,
++            Err(why) => {
++                // What the layout is does not change: asked once.
++                self.cache.insert(key, Err(why));
++                return Err(why);
++            }
++        };
++        let bytes = 4 * packed.words.len() as u64;
++        let at = self.tables.4.next_multiple_of(16);
++        if at + bytes > self.tables.3 || at / 4 > u64::from(u32::MAX) {
++            // Not cached: a table refused for room is asked again (and refused again: the
++            // buffer only fills).
++            return Err(Why::Tables);
++        }
++        // SAFETY: inside the table buffer's mapping (checked above); the GPU reads only
++        // tables written before the lists that use them were sent.
++        unsafe {
++            std::ptr::copy_nonoverlapping(packed.words.as_ptr().cast::<u8>(), (self.tables.1 as *mut u8).add(at as usize), bytes as usize);
++        }
++        self.tables.4 = at + bytes;
++        let table = Table {
++            at: (at / 4) as u32,
++            runs: packed.runs,
++            rows: packed.rows,
++            tiled_end: packed.tiled_end,
++            linear_end: packed.linear_end,
++        };
++        self.cache.insert(key, Ok(table));
++        Ok((table, shift))
++    }
++}
++
++/// The slices and tables for an upload of `raw_len` bytes of title memory into `out_len`
++/// bytes laid out as `subs`, or why it goes the CPU's way. Never waits.
++pub(crate) fn reserve(layout: &Layout, subs: &[Sub], raw_len: u64, out_len: u64) -> Result<Arc<Upload>, Why> {
++    if !ready() {
++        return Err(Why::NotReady);
++    }
++    let completed = crate::host::host().map_or(0, |h| h.completed());
++    let mut guard = STATE.lock().unwrap_or_else(|e| e.into_inner());
++    let state = guard.as_mut().ok_or(Why::NotReady)?;
++    if raw_len > state.raw_arena.size() || out_len > state.out_arena.size() || raw_len > u64::from(u32::MAX) {
++        return Err(Why::TooBig);
++    }
++    let mut parts = Vec::with_capacity(subs.len());
++    for sub in subs {
++        let (table, shift) = state.table(layout, sub)?;
++        parts.push(part(sub, table, shift, raw_len, out_len)?);
++    }
++    state.raw_arena.reclaim(completed);
++    state.out_arena.reclaim(completed);
++    let (raw, out) = take_slices(&mut state.raw_arena, &mut state.out_arena, raw_len, out_len)?;
++    drop(guard);
++    Ok(Arc::new(Upload {
++        raw: (raw, raw_len),
++        out: (out, out_len),
++        parts,
++        sent: AtomicU64::new(0),
++    }))
++}
++
++/// The part of an upload for `sub`, its table moved by `shift`, checked against slices of
++/// `raw_len` and `out_len` bytes: every byte the table reads lies in the raw slice, every
++/// byte it writes in the subresource's part of the output slice. That part is whole rows of
++/// the pitch, but the last subresource's last row ends at its bytes (the footprints' total
++/// says no more).
++fn part(sub: &Sub, table: Table, shift: u64, raw_len: u64, out_len: u64) -> Result<Part, Why> {
++    let whole = sub.row_pitch * u64::from(sub.rows) * u64::from(sub.depth);
++    let bytes = whole.min(out_len.saturating_sub(sub.offset));
++    if shift + table.tiled_end > raw_len || table.linear_end > bytes {
++        return Err(Why::Bounds);
++    }
++    Ok(Part {
++        mip: sub.mip,
++        offset: sub.offset,
++        bytes,
++        table,
++        shift: u32::try_from(shift).map_err(|_| Why::TooBig)?,
++    })
++}
++
++/// [`part`] for a packed table at word 0 of the table buffer (tests).
++#[cfg(test)]
++pub(crate) fn check_part(sub: &Sub, packed: &Packed, shift: u64, raw_len: u64, out_len: u64) -> Result<u64, Why> {
++    let table = Table { at: 0, runs: packed.runs, rows: packed.rows, tiled_end: packed.tiled_end, linear_end: packed.linear_end };
++    part(sub, table, shift, raw_len, out_len).map(|p| p.bytes)
++}
++
++/// Both slices of an upload, or neither: a ring without room now refuses at once, and what
++/// the other ring gave is given back.
++pub(crate) fn take_slices(raw_arena: &mut Arena, out_arena: &mut Arena, raw_len: u64, out_len: u64) -> Result<(u64, u64), Why> {
++    let raw = raw_arena.alloc(raw_len).ok_or(Why::RawFull)?;
++    match out_arena.alloc(out_len) {
++        Some(out) => Ok((raw, out)),
++        None => {
++            raw_arena.release(raw, raw_len, 0);
++            Err(Why::OutFull)
++        }
++    }
++}
++
++/// Whether the upload being filled now is to be read back and compared.
++pub(crate) fn check_due() -> bool {
++    let most = verify_per_second();
++    if most == 0 {
++        return false;
++    }
++    let now = crate::host::now_ms() / 1000;
++    let mut guard = STATE.lock().unwrap_or_else(|e| e.into_inner());
++    let Some(state) = guard.as_mut() else {
++        return false;
++    };
++    if state.checked.0 != now {
++        state.checked = (now, 0);
++    }
++    if state.checked.1 >= most {
++        return false;
++    }
++    state.checked.1 += 1;
++    true
++}
++
++/// What a check compares: the CPU's detile of the same bytes into a buffer of the output
++/// slice's size, the ranges of it that are the texture's (rows without their padding), and
++/// the texture named.
++pub(crate) struct Expected {
++    pub(crate) bytes: Vec<u8>,
++    pub(crate) ranges: Vec<(u64, u64)>,
++    pub(crate) what: String,
++}
++
++/// At submission: `raw` (title memory as read now, [`Upload::raw_len`] bytes) goes into the
++/// upload's raw slice and its jobs into this submission's work; the subresources of mips
++/// not in `held` (a bit a mip; `u32::MAX`: all) are zeros. The upload must not be in the
++/// air ([`Upload::in_flight`]).
++pub(crate) fn fill(upload: &Arc<Upload>, raw: &[u8], held: u32, expected: Option<Expected>) {
++    let mut guard = STATE.lock().unwrap_or_else(|e| e.into_inner());
++    let Some(state) = guard.as_mut() else {
++        return;
++    };
++    let n = raw.len().min(upload.raw.1 as usize);
++    // SAFETY: inside the raw ring's mapping (the slice was reserved for `raw.1` bytes); no
++    // submission that reads the slice is in the air (the caller checked).
++    unsafe { std::ptr::copy_nonoverlapping(raw.as_ptr(), (state.raw.1 as *mut u8).add(upload.raw.0 as usize), n) };
++    let raw_gpu = state.raw.2 + upload.raw.0;
++    let out_gpu = state.out.1 + upload.out.0;
++    let (raw_len, out_len) = (n as u32, upload.out.1 as u32);
++    for part in &upload.parts {
++        if part.mip < 32 && held & (1 << part.mip) == 0 {
++            let words = (part.bytes / 4) as u32;
++            let mut done = 0;
++            while done < words {
++                let now = (words - done).min(GROUPS_MOST * 64);
++                let at = (part.offset + 4 * u64::from(done)) as u32;
++                state.jobs.push(Job {
++                    constants: [0, 0, now, 0, 0, at, raw_len, out_len],
++                    raw: raw_gpu,
++                    out: out_gpu,
++                    groups: (now.div_ceil(64), 1),
++                });
++                done += now;
++            }
++            continue;
++        }
++        let t = part.table;
++        let mut first = 0;
++        while first < t.rows {
++            let rows = (t.rows - first).min(GROUPS_MOST);
++            state.jobs.push(Job {
++                constants: [t.at, t.runs, t.at + 3 * t.runs, first, part.shift, part.offset as u32, raw_len, out_len],
++                raw: raw_gpu,
++                out: out_gpu,
++                groups: (t.runs.div_ceil(64), rows),
++            });
++            first += rows;
++        }
++    }
++    if let Some(e) = expected {
++        state.checks.push(Check {
++            at: upload.out.0,
++            len: upload.out.1,
++            expected: e.bytes,
++            ranges: e.ranges,
++            what: e.what,
++            back: None,
++            fence: u64::MAX,
++        });
++    }
++    state.filled.push(upload.clone());
++    STATS[DONE].fetch_add(1, Relaxed);
++    STATS[DONE_BYTES].fetch_add(n as u64, Relaxed);
++}
++
++/// At submission: a list that used `upload` is submitted again while its last submission may
++/// still read the slices. They are not written (the detile there is the one of that
++/// submission); the upload is noted for this submission's fence value.
++pub(crate) fn reuse(upload: &Arc<Upload>) {
++    STATS[REUSED].fetch_add(1, Relaxed);
++    let mut guard = STATE.lock().unwrap_or_else(|e| e.into_inner());
++    if let Some(state) = guard.as_mut() {
++        state.filled.push(upload.clone());
++    }
++}
++
++/// At submission, after the lists' steps: the list that detiles what they filled, to go
++/// ahead of them in the same call; `None` if they filled nothing.
++pub(crate) fn pre_list() -> Option<ID3D12CommandList> {
++    let host = crate::host::host()?;
++    let completed = host.completed();
++    let mut guard = STATE.lock().unwrap_or_else(|e| e.into_inner());
++    let state = guard.as_mut()?;
++    land_checks(state, completed);
++    if state.jobs.is_empty() {
++        return None;
++    }
++    let jobs = std::mem::take(&mut state.jobs);
++    let at = match state.lists.iter().position(|l| l.2 <= completed) {
++        Some(at) => at,
++        None => {
++            // SAFETY: plain object creation.
++            let made: windows::core::Result<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)> = unsafe {
++                (|| {
++                    let allocator: ID3D12CommandAllocator = host.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
++                    let list: ID3D12GraphicsCommandList =
++                        host.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)?;
++                    list.Close()?;
++                    Ok((allocator, list))
++                })()
++            };
++            match made {
++                Ok((allocator, list)) => {
++                    state.lists.push((allocator, list, 0));
++                    state.lists.len() - 1
++                }
++                Err(e) => crate::host::fail(format_args!("no list for the detile on the card ({e}, VICTORY_GPU_DETILE=1)")),
++            }
++        }
++    };
++    // Readbacks for the checks taken in this submission.
++    for check in state.checks.iter_mut().filter(|c| c.fence == u64::MAX && c.back.is_none()) {
++        check.back = host.shared_buffer(check.len).map(|(b, d)| (b, d as usize));
++    }
++    let (allocator, list, _) = &state.lists[at];
++    let out = &state.out.0;
++    let (common, uav, source) = (D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
++    // SAFETY: the allocator's last list has run (its fence value is passed); live buffers
++    // (the rings and the table buffer live for the run); every job's offsets were checked
++    // against its slices when the upload was reserved.
++    let recorded = unsafe {
++        (|| -> windows::core::Result<()> {
++            allocator.Reset()?;
++            list.Reset(allocator, None)?;
++            // The ring rests in the common state between submissions, as `through` does:
++            // the lists' copies after this one read it from there.
++            list.ResourceBarrier(&[crate::host::transition(out, common, uav)]);
++            list.SetComputeRootSignature(&state.root);
++            list.SetPipelineState(&state.pso);
++            list.SetComputeRootShaderResourceView(2, state.tables.2);
++            for job in &jobs {
++                list.SetComputeRoot32BitConstants(0, 8, job.constants.as_ptr().cast(), 0);
++                list.SetComputeRootShaderResourceView(1, job.raw);
++                list.SetComputeRootUnorderedAccessView(3, job.out);
++                list.Dispatch(job.groups.0, job.groups.1, 1);
++            }
++            list.ResourceBarrier(&[crate::host::transition(out, uav, source)]);
++            for check in state.checks.iter().filter(|c| c.fence == u64::MAX) {
++                if let Some((back, _)) = &check.back {
++                    list.CopyBufferRegion(back, 0, out, check.at, check.len);
++                }
++            }
++            list.ResourceBarrier(&[crate::host::transition(out, source, common)]);
++            list.Close()
++        })()
++    };
++    if let Err(e) = recorded {
++        crate::host::fail(format_args!("the detile on the card could not be recorded ({e}, VICTORY_GPU_DETILE=1)"));
++    }
++    STATS[DISPATCHES].fetch_add(jobs.len() as u64, Relaxed);
++    state.lists[at].2 = u64::MAX;
++    let list = state.lists[at].1.cast().ok();
++    drop(guard);
++    status();
++    list
++}
++
++/// After a submission is sent with fence value `fence`: what it filled or used again, its
++/// list and its checks are noted with it.
++pub(crate) fn sent(fence: u64) {
++    let filled = {
++        let mut guard = STATE.lock().unwrap_or_else(|e| e.into_inner());
++        let Some(state) = guard.as_mut() else {
++            return;
++        };
++        for l in state.lists.iter_mut().filter(|l| l.2 == u64::MAX) {
++            l.2 = fence;
++        }
++        for c in state.checks.iter_mut().filter(|c| c.fence == u64::MAX) {
++            c.fence = fence;
++        }
++        std::mem::take(&mut state.filled)
++    };
++    for upload in &filled {
++        upload.sent.fetch_max(fence, Relaxed);
++    }
++    // Dropped here, outside the lock: the last holder gives the slices back under it.
++    drop(filled);
++}
++
++/// The checks whose submission the card has run: compared, and let go.
++fn land_checks(state: &mut State, completed: u64) {
++    let mut i = 0;
++    while i < state.checks.len() {
++        let check = &state.checks[i];
++        if check.fence == u64::MAX || check.fence > completed {
++            i += 1;
++            continue;
++        }
++        let check = state.checks.swap_remove(i);
++        let Some((_, data)) = &check.back else {
++            continue;
++        };
++        // SAFETY: the readback buffer's mapping, `len` bytes, written by a list that has run.
++        let got = unsafe { std::slice::from_raw_parts(*data as *const u8, check.len as usize) };
++        STATS[CHECKED].fetch_add(1, Relaxed);
++        let first = check.ranges.iter().find_map(|&(at, len)| {
++            let (a, b) = (at as usize, (at + len) as usize);
++            (got[a..b] != check.expected[a..b]).then(|| a + got[a..b].iter().zip(&check.expected[a..b]).position(|(x, y)| x != y).unwrap_or(0))
++        });
++        if let Some(at) = first {
++            let n = STATS[DIFFERED].fetch_add(1, Relaxed);
++            if n < 32 {
++                tracing::error!(
++                    texture = %check.what,
++                    first_difference = at,
++                    card = got[at],
++                    cpu = check.expected[at],
++                    "VICTORY_GPU_DETILE_VERIFY: the card's detile differs from the CPU's"
++                );
++            }
++        }
++    }
++}
++
++/// Every ten seconds, with the switch on: what went to the card and what did not.
++fn status() {
++    static LAST: AtomicU64 = AtomicU64::new(0);
++    let now = crate::host::now_ms();
++    let last = LAST.load(Relaxed);
++    if now < last + 10_000 || LAST.compare_exchange(last, now, Relaxed, Relaxed).is_err() {
++        return;
++    }
++    let s = |i: usize| STATS[i].load(Relaxed);
++    let (raw, out) = STATE
++        .lock()
++        .unwrap_or_else(|e| e.into_inner())
++        .as_ref()
++        .map_or((0, 0), |st| (st.raw_arena.used() >> 20, st.out_arena.used() >> 20));
++    tracing::info!(
++        "gpu detile: {} uploads ({} MB of title memory), {} dispatches; rings in use {} MB raw, {} MB card; \
++         to the CPU: not ready {}, unaligned {}, no table {}, tables full {}, bounds {}, too big {}, raw ring full {}, card ring full {}; \
++         reused in the air {}; verify: {} checked, {} differed",
++        s(DONE),
++        s(DONE_BYTES) >> 20,
++        s(DISPATCHES),
++        raw,
++        out,
++        s(WHY_AT),
++        s(WHY_AT + 1),
++        s(WHY_AT + 2),
++        s(WHY_AT + 3),
++        s(WHY_AT + 4),
++        s(WHY_AT + 5),
++        s(WHY_AT + 6),
++        s(WHY_AT + 7),
++        s(REUSED),
++        s(CHECKED),
++        s(DIFFERED),
++    );
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use victory_formats::texture::{Desc, Pipes, Swizzle};
++
++    fn desc(w: u32, h: u32, mips: u32, bpe: u32, block: u32, depth: u32, swizzle: Swizzle) -> Desc {
++        Desc {
++            dimension: Dimension::Tex2d,
++            width: w,
++            height: h,
++            depth,
++            mips,
++            element_bytes: bpe,
++            block,
++            samples: 1,
++            swizzle,
++        }
++    }
++
++    fn layouts() -> Vec<Layout> {
++        let mut out = Vec::new();
++        for swizzle in [Swizzle::LINEAR, Swizzle::SW_256B_S, Swizzle::SW_4KB_S, Swizzle::SW_4KB_D, Swizzle::SW_64KB_S, Swizzle::SW_64KB_D] {
++            out.push(Layout::new(&desc(512, 256, 10, 16, 4, 1, swizzle)).unwrap());
++            out.push(Layout::new(&desc(300, 200, 9, 8, 4, 6, swizzle)).unwrap());
++            out.push(Layout::new(&desc(257, 129, 9, 4, 1, 3, swizzle)).unwrap());
++            out.push(Layout::new(&desc(96, 64, 7, 8, 1, 1, swizzle)).unwrap());
++        }
++        out.push(Layout::new(&Desc { dimension: Dimension::Tex3d, ..desc(64, 32, 6, 4, 1, 16, Swizzle::SW_4KB_S) }).unwrap());
++        out.push(Layout::for_gpu(&desc(256, 256, 1, 4, 1, 1, Swizzle::SW_64KB_S_X), Pipes::SERIES_X, 0x2d).unwrap());
++        out
++    }
++
++    #[test]
++    fn the_arena_fills_refuses_and_frees_by_fence() {
++        let mut a = Arena::new(4 * GRAIN);
++        let x = a.alloc(GRAIN).unwrap();
++        let y = a.alloc(2 * GRAIN - 1).unwrap();
++        assert_eq!(a.used(), 3 * GRAIN);
++        assert_eq!(a.alloc(2 * GRAIN), None, "full: refused, not waited for");
++        let z = a.alloc(1).unwrap();
++        assert_eq!(a.alloc(1), None);
++        // Given back in another order, waiting for the card.
++        a.release(y, 2 * GRAIN - 1, 7);
++        a.release(x, GRAIN, 5);
++        assert_eq!(a.alloc(1), None, "nothing free until the card passes the fences");
++        a.reclaim(5);
++        assert_eq!(a.alloc(2 * GRAIN), None, "x alone is free");
++        a.reclaim(7);
++        // x and y join: three grains in one range.
++        assert_eq!(a.alloc(3 * GRAIN), Some(0));
++        a.release(0, 3 * GRAIN, 0);
++        a.release(z, 1, 0);
++        assert_eq!(a.used(), 0);
++        assert_eq!(a.alloc(4 * GRAIN), Some(0));
++        assert_eq!(Arena::new(GRAIN - 1).alloc(1), None);
++    }
++
++    /// A packed table, run as the shader runs it, writes what the CPU's detile writes; every
++    /// array slice from slice 0's table and its shift.
++    #[test]
++    fn packed_tables_detile_as_the_cpu_does_and_slices_share_one() {
++        let mut checked = 0;
++        for l in layouts() {
++            let raw: Vec<u8> = (0..l.size).map(|i| (i.wrapping_mul(0x9e37_79b9) >> 24) as u8).collect();
++            let n = l.desc.element_bytes as usize;
++            let slices = if l.desc.dimension == Dimension::Tex3d { 1 } else { l.slices };
++            for mip in 0..l.desc.mips {
++                let m = l.mips[mip as usize];
++                let pitch = (m.width as usize * n).next_multiple_of(256);
++                let plane = pitch * m.height as usize;
++                let Ok(packed) = l.copy_table(mip, 0, pitch, plane).map_err(|_| Why::NoTable).and_then(|t| pack(&t)) else {
++                    continue;
++                };
++                assert!(packed.words.chunks(3).take(packed.runs as usize).all(|r| u64::from(r[2]) <= RUN_MOST || l.desc.swizzle.xor()));
++                for slice in 0..slices {
++                    let (keyed, shift) = table_slice(&l, slice);
++                    let table = if keyed == 0 { packed.clone() } else { pack(&l.copy_table(mip, keyed, pitch, plane).unwrap()).unwrap() };
++                    assert!(shift + table.tiled_end <= l.size, "{:?} mip {mip} slice {slice}", l.desc);
++                    let len = plane * m.depth as usize;
++                    let (mut cpu, mut card) = (vec![0xcc; len], vec![0xcc; len]);
++                    l.detile(&raw, mip, slice, &mut cpu, pitch, plane).unwrap();
++                    emulate(&table.words, table.runs, 0..table.rows, shift as u32, &raw, &mut card, 0);
++                    assert!(cpu == card, "{:?} mip {mip} slice {slice}", l.desc);
++                    checked += 1;
++                }
++            }
++        }
++        assert!(checked > 300, "{checked}");
++    }
++
++    #[test]
++    fn narrow_levels_of_small_elements_are_refused() {
++        let l = Layout::new(&desc(256, 256, 9, 1, 1, 1, Swizzle::SW_64KB_S)).unwrap();
++        let t = l.copy_table(8, 0, 256, 256).unwrap();
++        assert_eq!(pack(&t), Err(Why::Unaligned));
++    }
++
++    /// The shader's checks: a table reaching past the slices writes nothing outside them.
++    #[test]
++    fn words_outside_the_slices_are_left_out() {
++        let l = Layout::new(&desc(64, 64, 1, 16, 4, 1, Swizzle::SW_64KB_S)).unwrap();
++        let p = pack(&l.copy_table(0, 0, 256, 256 * 16).unwrap()).unwrap();
++        let raw = vec![7u8; p.tiled_end as usize];
++        let mut out = vec![0u8; 100];
++        emulate(&p.words, p.runs, 0..p.rows, 0, &raw, &mut out, 0);
++        assert!(out.iter().all(|&b| b == 0 || b == 7));
++        let mut tail = vec![0u8; 4096];
++        emulate(&p.words, p.runs, 0..p.rows, 1 << 30, &raw, &mut tail, 0);
++        assert!(tail.iter().all(|&b| b == 0), "nothing read past the raw slice");
++    }
++
++    /// The shader itself, on the software adapter, against the CPU's detile: BC-sized tiled
++    /// elements, an array slice by shift, a split dispatch and zeros.
++    #[test]
++    fn warp_the_shader_detiles_as_the_cpu_does() {
++        let Some(w) = warp::Warp::new() else {
++            eprintln!("no software adapter: skipped");
++            return;
++        };
++        let code = crate::host::compile(DETILE, windows::core::s!("main"), windows::core::s!("cs_5_1")).expect("the detile shader compiles");
++        for l in [
++            Layout::new(&desc(512, 512, 10, 16, 4, 2, Swizzle::SW_64KB_S)).unwrap(),
++            Layout::new(&desc(300, 200, 9, 8, 4, 1, Swizzle::SW_4KB_D)).unwrap(),
++            Layout::new(&desc(200, 100, 1, 4, 1, 1, Swizzle::LINEAR)).unwrap(),
++        ] {
++            let raw: Vec<u8> = (0..l.size).map(|i| (i.wrapping_mul(0x9e37_79b9) >> 24) as u8).collect();
++            let n = l.desc.element_bytes as usize;
++            for mip in [0, l.desc.mips - 1] {
++                let m = l.mips[mip as usize];
++                let pitch = (m.width as usize * n).next_multiple_of(256);
++                let plane = pitch * m.height as usize;
++                let slice = l.slices - 1;
++                let (keyed, shift) = table_slice(&l, slice);
++                let p = pack(&l.copy_table(mip, keyed, pitch, plane).unwrap()).unwrap();
++                let mut cpu = vec![0u8; plane + 512];
++                l.detile(&raw, mip, slice, &mut cpu[512..], pitch, plane).unwrap();
++                // The words of the table first, then 512 bytes of zeros the shader writes too.
++                let got = w.run(&code, &raw, &p, shift as u32, 512, plane + 512);
++                for y in 0..m.height as usize {
++                    let at = 512 + y * pitch;
++                    let len = m.width as usize * n;
++                    assert_eq!(&got[at..at + len], &cpu[at..at + len], "{:?} mip {mip} row {y}", l.desc);
++                }
++                assert!(got[..512].iter().all(|&b| b == 0), "zeros");
++            }
++        }
++    }
++
++    mod warp {
++        use super::super::*;
++        use windows::Win32::Foundation::HANDLE;
++        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
++        use windows::Win32::Graphics::Dxgi::*;
++        use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
++
++        pub(super) struct Warp {
++            device: ID3D12Device,
++            queue: ID3D12CommandQueue,
++            allocator: ID3D12CommandAllocator,
++            list: ID3D12GraphicsCommandList,
++            fence: ID3D12Fence,
++            event: HANDLE,
++            sent: std::cell::Cell<u64>,
++        }
++
++        impl Warp {
++            pub(super) fn new() -> Option<Warp> {
++                // SAFETY: plain DXGI queries and object creation on the software adapter.
++                unsafe {
++                    let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
++                    let adapter: IDXGIAdapter = factory.EnumWarpAdapter().ok()?;
++                    let mut device: Option<ID3D12Device> = None;
++                    D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
++                    let device = device?;
++                    let queue: ID3D12CommandQueue = device
++                        .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() })
++                        .ok()?;
++                    let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).ok()?;
++                    let list: ID3D12GraphicsCommandList = device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).ok()?;
++                    list.Close().ok()?;
++                    let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
++                    let event = CreateEventW(None, false, false, None).ok()?;
++                    Some(Warp { device, queue, allocator, list, fence, event, sent: std::cell::Cell::new(0) })
++                }
++            }
++
++            fn buffer(&self, kind: D3D12_HEAP_TYPE, size: u64, flags: D3D12_RESOURCE_FLAGS, state: D3D12_RESOURCE_STATES) -> ID3D12Resource {
++                let heap = D3D12_HEAP_PROPERTIES { Type: kind, ..Default::default() };
++                let desc = D3D12_RESOURCE_DESC {
++                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
++                    Width: size.max(4),
++                    Height: 1,
++                    DepthOrArraySize: 1,
++                    MipLevels: 1,
++                    SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
++                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
++                    Flags: flags,
++                    ..Default::default()
++                };
++                let mut buffer: Option<ID3D12Resource> = None;
++                // SAFETY: plain creation.
++                unsafe { self.device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut buffer).unwrap() };
++                buffer.unwrap()
++            }
++
++            fn upload(&self, bytes: &[u8]) -> ID3D12Resource {
++                let b = self.buffer(D3D12_HEAP_TYPE_UPLOAD, bytes.len() as u64, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
++                // SAFETY: a mapped upload buffer of at least `bytes.len()` bytes.
++                unsafe {
++                    let mut data = std::ptr::null_mut();
++                    b.Map(0, None, Some(&mut data)).unwrap();
++                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), data.cast::<u8>(), bytes.len());
++                    b.Unmap(0, None);
++                }
++                b
++            }
++
++            /// Runs the detile shader as `pre_list` records it: zeros over the first
++            /// `zeros` bytes, then the table at `zeros`, into a ring of `out_len` bytes;
++            /// gives the ring's bytes.
++            pub(super) fn run(&self, code: &[u8], raw: &[u8], p: &Packed, shift: u32, zeros: u32, out_len: usize) -> Vec<u8> {
++                let bytes: Vec<u8> = p.words.iter().flat_map(|w| w.to_le_bytes()).collect();
++                let (raw_b, table_b) = (self.upload(raw), self.upload(&bytes));
++                let out = self.buffer(D3D12_HEAP_TYPE_DEFAULT, out_len as u64, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
++                let back = self.buffer(D3D12_HEAP_TYPE_READBACK, out_len as u64, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
++                // SAFETY: our device, list and buffers; the root signature is in the shader.
++                unsafe {
++                    let root: ID3D12RootSignature = self.device.CreateRootSignature(0, code).unwrap();
++                    let pso: ID3D12PipelineState = self
++                        .device
++                        .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
++                            pRootSignature: std::mem::transmute_copy(&root),
++                            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr().cast(), BytecodeLength: code.len() },
++                            ..Default::default()
++                        })
++                        .unwrap();
++                    self.allocator.Reset().unwrap();
++                    self.list.Reset(&self.allocator, None).unwrap();
++                    let l = &self.list;
++                    l.ResourceBarrier(&[crate::host::transition(&out, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
++                    l.SetComputeRootSignature(&root);
++                    l.SetPipelineState(&pso);
++                    l.SetComputeRootShaderResourceView(1, raw_b.GetGPUVirtualAddress());
++                    l.SetComputeRootShaderResourceView(2, table_b.GetGPUVirtualAddress());
++                    l.SetComputeRootUnorderedAccessView(3, out.GetGPUVirtualAddress());
++                    let (raw_len, out_len) = (raw.len() as u32, out_len as u32);
++                    let words = zeros / 4;
++                    let c = [0u32, 0, words, 0, 0, 0, raw_len, out_len];
++                    l.SetComputeRoot32BitConstants(0, 8, c.as_ptr().cast(), 0);
++                    l.Dispatch(words.div_ceil(64), 1, 1);
++                    // The rows in two dispatches, as a table of more than 65,535 rows is.
++                    let half = p.rows / 2;
++                    for (first, rows) in [(0, half), (half, p.rows - half)] {
++                        if rows == 0 {
++                            continue;
++                        }
++                        let c = [0u32, p.runs, 3 * p.runs, first, shift, zeros, raw_len, out_len];
++                        l.SetComputeRoot32BitConstants(0, 8, c.as_ptr().cast(), 0);
++                        l.Dispatch(p.runs.div_ceil(64), rows, 1);
++                    }
++                    l.ResourceBarrier(&[crate::host::transition(&out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
++                    l.CopyBufferRegion(&back, 0, &out, 0, u64::from(out_len));
++                    l.ResourceBarrier(&[crate::host::transition(&out, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)]);
++                    l.Close().unwrap();
++                    self.queue.ExecuteCommandLists(&[Some(l.cast().unwrap())]);
++                    self.sent.set(self.sent.get() + 1);
++                    self.queue.Signal(&self.fence, self.sent.get()).unwrap();
++                    self.fence.SetEventOnCompletion(self.sent.get(), self.event).unwrap();
++                    WaitForSingleObject(self.event, INFINITE);
++                    let mut data = std::ptr::null_mut();
++                    back.Map(0, None, Some(&mut data)).unwrap();
++                    let got = std::slice::from_raw_parts(data.cast::<u8>(), out_len as usize).to_vec();
++                    back.Unmap(0, None);
++                    got
++                }
++            }
++        }
++    }
++}
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index f124f88..5b6a28a 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -2478,6 +2478,10 @@ enum Step {
+     /// Brings a texture's staging buffer up to date: once per submission,
+     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
+     Texture(std::sync::Arc<crate::texture::Staging>),
++    /// (Neptune) An upload of a texture detiled on the card (`crate::detile`): title memory
++    /// goes into the upload's slice and its detile into the submission's first list, every
++    /// time the list is submitted.
++    GpuTexture(std::sync::Arc<crate::texture::Staging>, std::sync::Arc<crate::detile::Upload>),
+ }
+ 
+ /// What a list does on the CPU when it is submitted: copies between host
+@@ -3083,7 +3087,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
+                         return Some(WHY_READ);
+                     }
+                 }
+-                Step::Texture(staging) => {
++                Step::Texture(staging) | Step::GpuTexture(staging, _) => {
+                     let (at, len) = staging.memory();
+                     if touches(written, at, at + len) {
+                         if count {
+@@ -6034,6 +6038,17 @@ impl Host {
+             lists.push(list.list.cast().ok());
+         }
+         batch.flush();
++        // (Neptune) What the steps filled for the card's detile (`crate::detile`): its list
++        // goes ahead of every list of the submission, in the same call. (The first run's
++        // lists still start at 0: with timing on, the first group takes it with them.)
++        if crate::detile::on()
++            && let Some(pre) = crate::detile::pre_list()
++        {
++            lists.insert(0, Some(pre));
++            for first in firsts.iter_mut().skip(1) {
++                *first += 1;
++            }
++        }
+         crate::watch::ask_once_end();
+         // The snapshots of the ranges shaders may write, if they were left
+         // for now (`crate::shadow::wide_back`): the refreshes are done, the
+@@ -6066,6 +6081,9 @@ impl Host {
+                 self.queue.ExecuteCommandLists(&lists);
+                 self.queue.Signal(&self.fence, *submitted)
+             };
++            if crate::detile::on() {
++                crate::detile::sent(*submitted);
++            }
+             self.card_sent();
+             if let Err(e) = signalled {
+                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
+@@ -6146,6 +6164,10 @@ impl Host {
+             }
+             let _ = (i, started);
+         }
++        // (Neptune) The last group's value: every group of this submission is behind it.
++        if crate::detile::on() {
++            crate::detile::sent(*submitted);
++        }
+         let _ = &firsts;
+         FINISHED.store(this_submission, Ordering::Release);
+         bury(this_submission);
+@@ -7293,6 +7315,16 @@ impl HostList {
+         self.deferred().copies.push(Step::Texture(staging));
+     }
+ 
++    /// (Neptune) [`HostList::defer_texture`] for an upload detiled on the card: its slices are
++    /// filled when the list is submitted, and held until it is reset.
++    pub(crate) fn defer_gpu_texture(
++        &self,
++        staging: std::sync::Arc<crate::texture::Staging>,
++        upload: std::sync::Arc<crate::detile::Upload>,
++    ) {
++        self.deferred().copies.push(Step::GpuTexture(staging, upload));
++    }
++
+     /// Runs the list's submission-time steps; refreshes go into `batch`
+     /// (the title's big buffers, a 174 MB one among them, are read by most
+     /// lists of a submission, through many ranges).
+@@ -7372,6 +7404,13 @@ impl HostList {
+                     }
+                     continue;
+                 }
++                Step::GpuTexture(staging, upload) => {
++                    // Filled whatever the check says: the list's copy reads this slice. Later
++                    // checks of the texture in this submission find it current.
++                    batch.texture_due(staging);
++                    staging.gpu_fill(upload);
++                    continue;
++                }
+             };
+             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+@@ -8829,6 +8868,13 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
+ }
+ 
+ impl Host {
++    /// (Neptune) The last value the card reached on the host queue's fence: every
++    /// submission signalled at or below it has run.
++    pub(crate) fn completed(&self) -> u64 {
++        // SAFETY: a plain query.
++        unsafe { self.fence.GetCompletedValue() }
++    }
++
+     /// The card's memory as the system accounts it to this process, in
+     /// bytes: the budget and the use of the card's own memory, then of the
+     /// PC's memory shared with the card (where the system moves what does
+diff --git a/crates/victory-gpu/src/lib.rs b/crates/victory-gpu/src/lib.rs
+index acaee1e..293f7e1 100644
+--- a/crates/victory-gpu/src/lib.rs
++++ b/crates/victory-gpu/src/lib.rs
+@@ -21,6 +21,8 @@ pub mod console;
+ #[cfg(all(windows, feature = "diagnostics"))]
+ mod copystat;
+ pub mod descriptor;
++#[cfg(windows)]
++mod detile;
+ pub mod device;
+ #[cfg(windows)]
+ mod ambient;
+diff --git a/crates/victory-gpu/src/texture.rs b/crates/victory-gpu/src/texture.rs
+index 7afb6af..92f0df8 100644
+--- a/crates/victory-gpu/src/texture.rs
++++ b/crates/victory-gpu/src/texture.rs
+@@ -33,11 +33,15 @@ macro_rules! once {
+ /// A texture's upload state: the staging buffer laid out as the host
+ /// texture's subresources, and what was last detiled.
+ pub(crate) struct Staging {
+-    buffer: ID3D12Resource,
++    /// The staging buffer and its mapping. (Neptune) Made with the staging state, unless the
++    /// texture is detiled on the card (`crate::detile`): then only when an upload has to go
++    /// the CPU's way after all, and from then on for as long as the staging state lives (a
++    /// list that recorded a copy from it holds the state, so the buffer is never let go under
++    /// a list, and the detile always has it to write into).
++    cpu: std::sync::OnceLock<(ID3D12Resource, usize)>,
+     /// Its bytes.
+     #[cfg(feature = "diagnostics")]
+     total: u64,
+-    data: *mut u8,
+     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
+     rows: Vec<u32>,
+     layout: victory_formats::texture::Layout,
+@@ -407,6 +411,10 @@ static STAGED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::A
+ impl Drop for Staging {
+     fn drop(&mut self) {
+         use std::sync::atomic::Ordering::Relaxed;
++        // (Neptune) Detiled on the card and never sent the CPU's way: no buffer to count.
++        let Some((buffer, data)) = self.cpu.take() else {
++            return;
++        };
+         STAGED[0].fetch_sub(1, Relaxed);
+         STAGED[1].fetch_sub(self.bytes, Relaxed);
+         // (Neptune) Its upload buffer is kept for the next staging buffer of its size class.
+@@ -420,7 +428,7 @@ impl Drop for Staging {
+                 if pool.free.len() <= class {
+                     pool.free.resize_with(class + 1, Vec::new);
+                 }
+-                pool.free[class].push((self.buffer.clone(), self.data as usize));
++                pool.free[class].push((buffer, data));
+                 pool.bytes += size;
+             }
+         }
+@@ -512,7 +520,7 @@ pub(crate) fn memory() -> [u64; 3] {
+ /// For the resident line: the mapped staging buffers, as (address, length) each.
+ pub(crate) fn cpu_ranges() -> Vec<(usize, usize)> {
+     let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+-    map.iter().flat_map(|m| m.values()).filter(|s| !s.data.is_null()).map(|s| (s.data as usize, s.bytes as usize)).collect()
++    map.iter().flat_map(|m| m.values()).filter_map(|s| s.cpu.get().map(|&(_, data)| (data, s.bytes as usize))).collect()
+ }
+ 
+ /// Staging buffers let go as idle since the start, and their bytes.
+@@ -551,10 +559,12 @@ pub(crate) fn let_go_idle() {
+         let keep = Arc::strong_count(s) > 1
+             || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES);
+         if !keep {
++            // (Neptune) Detiled on the card: no buffer let go with it.
++            let held = if s.cpu.get().is_some() { s.bytes } else { 0 };
+             LET_GO[0].fetch_add(1, Relaxed);
+-            LET_GO[1].fetch_add(s.bytes, Relaxed);
++            LET_GO[1].fetch_add(held, Relaxed);
+             went += 1;
+-            bytes += s.bytes;
++            bytes += held;
+         }
+         keep
+     });
+@@ -731,6 +741,26 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
+         list.defer_texture(staging);
+         return;
+     }
++    // (Neptune) Detiled on the card (`crate::detile`): the copies read a slice of its ring,
++    // filled and detiled at this list's submission. What cannot go there now (a ring full,
++    // no table) goes the CPU's way at once, with a staging buffer of its own from now on.
++    let routed = route(
++        &staging,
++        || crate::detile::reserve(&staging.layout, &staging.subs(), staging.size as u64, staging.bytes),
++        |bytes| host().and_then(|host| stage_buffer(host, bytes)),
++    );
++    let staging_buffer = match routed {
++        Route::Card(upload) => {
++            upload_on_card(list, resource, texture, staging, upload);
++            return;
++        }
++        // No memory for a staging buffer either: no upload recorded; the next list asks again.
++        Route::Nothing => return,
++        Route::Cpu => match staging.cpu.get() {
++            Some((buffer, _)) => buffer,
++            None => return,
++        },
++    };
+     #[cfg(feature = "diagnostics")]
+     crate::copystat::add(crate::copystat::C::TexUploads, 1);
+     const COPY_DEST: u32 = 0x400;
+@@ -742,7 +772,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
+         {
+             let f = footprint.Footprint;
+             // SAFETY: live resources.
+-            let (gpu, d) = unsafe { (staging.buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
++            let (gpu, d) = unsafe { (staging_buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
+             let len = u64::from(f.RowPitch) * u64::from(staging.rows[i]) * u64::from(f.Depth);
+             list.note_read(
+                 || {
+@@ -775,7 +805,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
+         };
+         let from = D3D12_TEXTURE_COPY_LOCATION {
+             // SAFETY: as above.
+-            pResource: unsafe { std::mem::transmute_copy(&staging.buffer) },
++            pResource: unsafe { std::mem::transmute_copy(staging_buffer) },
+             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                 PlacedFootprint: *footprint,
+@@ -1259,20 +1289,13 @@ impl Staging {
+     /// Detiles `tiled` (the texture's memory) into the staging buffer.
+     fn detile(&self, tiled: &[u8]) {
+         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+-        // Levels on demand: which levels are the title's is judged here,
+-        // once, for what the staging buffer holds from now on. The step
+-        // that gives levels their memory goes by this answer.
+-        let held = if self.on_demand {
+-            use std::sync::atomic::Ordering::Relaxed;
+-            let judged = self.judgement();
+-            self.judged[0].store(judged[0], Relaxed);
+-            self.judged[1].store(judged[1], Relaxed);
+-            let held = self.held_levels(judged);
+-            self.detiled.store(held, Relaxed);
+-            held
+-        } else {
+-            u32::MAX
++        let held = self.judge_levels();
++        // (Neptune) Detiled on the card and no staging buffer: what changed is noted (dirty,
++        // the levels judged), and the next list that samples the texture uploads it.
++        let Some(&(_, data)) = self.cpu.get() else {
++            return;
+         };
++        let data = data as *mut u8;
+         #[cfg(feature = "diagnostics")]
+         if tiled.iter().all(|&b| b == 0) {
+             tracing::debug!(
+@@ -1288,7 +1311,7 @@ impl Staging {
+             let len = pitch * rows as usize * f.Depth as usize;
+             // SAFETY: the subresource's part of the mapped staging buffer.
+             let linear = unsafe {
+-                std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
++                std::slice::from_raw_parts_mut(data.add(footprint.Offset as usize), len)
+             };
+             if mip < 32 && held & (1 << mip) == 0 {
+                 // Not the title's: zeros, not what lies in that memory.
+@@ -1304,6 +1327,222 @@ impl Staging {
+             }
+         }
+     }
++
++    /// Levels on demand: which levels are the title's is judged here, once, for what the
++    /// staging buffer (or the card's detile) holds from now on. The step that gives levels
++    /// their memory goes by this answer. `u32::MAX` (all) for other textures.
++    fn judge_levels(&self) -> u32 {
++        use std::sync::atomic::Ordering::Relaxed;
++        if !self.on_demand {
++            return u32::MAX;
++        }
++        let judged = self.judgement();
++        self.judged[0].store(judged[0], Relaxed);
++        self.judged[1].store(judged[1], Relaxed);
++        let held = self.held_levels(judged);
++        self.detiled.store(held, Relaxed);
++        held
++    }
++
++    /// (Neptune) The staging buffer of a texture detiled on the card, made now for an upload
++    /// that goes the CPU's way (`crate::detile` had no room, or no table for it): kept from
++    /// now on, as without the switch. What it holds is nothing yet, so the next refresh
++    /// detiles whatever the memory says. Whether there is one.
++    fn ensure_cpu(&self, make: impl FnOnce(u64) -> Option<(ID3D12Resource, *mut u8)>) -> bool {
++        if self.cpu.get().is_some() {
++            return true;
++        }
++        let Some(made) = make(self.bytes) else {
++            return false;
++        };
++        let memory = self.memory as usize;
++        crate::host::name(&made.0, || format!("staging of {memory:#x} (detiled on the CPU after all)"));
++        // Another thread may have made one first: then this one is let go, and theirs is it.
++        if self.cpu.set((made.0, made.1 as usize)).is_ok() {
++            use std::sync::atomic::Ordering::Relaxed;
++            STAGED[0].fetch_add(1, Relaxed);
++            STAGED[1].fetch_add(self.bytes, Relaxed);
++            self.forget();
++            self.dirty.store(true, Relaxed);
++        }
++        true
++    }
++
++    /// (Neptune) The subresources of the staging layout, for `crate::detile::reserve`.
++    fn subs(&self) -> Vec<crate::detile::Sub> {
++        self.footprints
++            .iter()
++            .zip(&self.rows)
++            .enumerate()
++            .map(|(i, (f, &rows))| {
++                let (mip, slice) = self.part(i);
++                crate::detile::Sub {
++                    mip,
++                    slice,
++                    offset: f.Offset,
++                    row_pitch: u64::from(f.Footprint.RowPitch),
++                    rows,
++                    depth: f.Footprint.Depth,
++                }
++            })
++            .collect()
++    }
++
++    /// (Neptune) At submission, for an upload detiled on the card: title memory as it is now
++    /// goes into the upload's slice and its detile into the submission's first list, whether
++    /// or not it changed since the last check (the list's copy reads this slice). Read as a
++    /// refresh reads it (through the copy, which stands unmapped pages as zeros), and noted
++    /// as a refresh notes it, so that the next check of the texture finds it as filled now.
++    /// A list submitted again while its last submission may still read the slice leaves it.
++    pub(crate) fn gpu_fill(&self, upload: &Arc<crate::detile::Upload>) {
++        use std::sync::atomic::Ordering::Relaxed;
++        if upload.in_flight() {
++            crate::detile::reuse(upload);
++            return;
++        }
++        let started = std::time::Instant::now();
++        let (start, size) = (self.memory as usize, self.size);
++        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
++        let asked = crate::watch::writes(start, start + size, false).or_else(|| crate::watch::writes(start, start + size, true));
++        if let Some((now, _)) = asked {
++            last.asked = now;
++        }
++        with_read(size, |read| {
++            crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
++            last.hash = Some(blake3::hash(read));
++            let held = self.judge_levels();
++            let expected = if crate::detile::check_due() { self.expected(read, held) } else { None };
++            crate::detile::fill(upload, &read[..(upload.raw_len() as usize).min(size)], held, expected);
++        });
++        drop(last);
++        let preparing = &crate::host::PREPARING;
++        preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
++        preparing[3].fetch_add(size as u64, Relaxed);
++    }
++
++    /// (Neptune) What the card's detile of `read` must give (`VICTORY_GPU_DETILE_VERIFY`):
++    /// the CPU's detile into a buffer laid out as the staging buffer, with the ranges that
++    /// are the texture's (rows without their padding; the whole part for levels not held,
++    /// which are zeros). `None` if the CPU cannot detile it.
++    fn expected(&self, read: &[u8], held: u32) -> Option<crate::detile::Expected> {
++        let mut bytes = vec![0u8; self.bytes as usize];
++        let mut ranges = Vec::new();
++        let n = u64::from(self.layout.desc.element_bytes);
++        for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
++            let (mip, slice) = self.part(i);
++            let f = footprint.Footprint;
++            let pitch = f.RowPitch as usize;
++            let at = footprint.Offset as usize;
++            // The last subresource's last row ends at its bytes, not at a whole pitch.
++            let len = (pitch * rows as usize * f.Depth as usize).min(bytes.len().saturating_sub(at));
++            if mip < 32 && held & (1 << mip) == 0 {
++                ranges.push((at as u64, len as u64));
++                continue;
++            }
++            self.layout.detile(read, mip, slice, bytes.get_mut(at..at + len)?, pitch, pitch * rows as usize).ok()?;
++            let m = self.layout.mips.get(mip as usize)?;
++            for z in 0..u64::from(m.depth) {
++                for y in 0..u64::from(m.height) {
++                    ranges.push((at as u64 + z * (pitch as u64 * u64::from(rows)) + y * pitch as u64, u64::from(m.width) * n));
++                }
++            }
++        }
++        Some(crate::detile::Expected {
++            bytes,
++            ranges,
++            what: format!("{:?} at {:#x}", self.layout.desc, self.memory as usize),
++        })
++    }
++}
++
++#[cfg(test)]
++#[path = "texture_detile_tests.rs"]
++mod detile_fallback_tests;
++
++/// (Neptune) Which way a recorded upload goes.
++enum Route {
++    /// Detiled on the card, from these slices.
++    Card(Arc<crate::detile::Upload>),
++    /// The CPU's way: the staging buffer is there.
++    Cpu,
++    /// Neither could be had now.
++    Nothing,
++}
++
++/// (Neptune) The way of an upload of `staging` about to be recorded: a staging state with a
++/// staging buffer keeps it (the CPU's way, as without `crate::detile`); one without asks
++/// `reserve` for the card's slices, and on any refusal (a ring full, no table, the rings not
++/// made) has `make` make its staging buffer at once and goes the CPU's way from now on. Never
++/// waits.
++fn route(
++    staging: &Staging,
++    reserve: impl FnOnce() -> Result<Arc<crate::detile::Upload>, crate::detile::Why>,
++    make: impl FnOnce(u64) -> Option<(ID3D12Resource, *mut u8)>,
++) -> Route {
++    if staging.cpu.get().is_some() {
++        return Route::Cpu;
++    }
++    match reserve() {
++        Ok(upload) => Route::Card(upload),
++        Err(why) => {
++            crate::detile::refused(why);
++            if staging.ensure_cpu(make) { Route::Cpu } else { Route::Nothing }
++        }
++    }
++}
++
++/// (Neptune) Records `staging`'s upload from `upload`'s slice of the card's detile ring
++/// (`crate::detile`): the copies here, the fill and detile at the list's submission.
++fn upload_on_card(list: &HostList, resource: This, texture: &ID3D12Resource, staging: Arc<Staging>, upload: Arc<crate::detile::Upload>) {
++    use std::sync::atomic::Ordering::Relaxed;
++    let Some(out) = crate::detile::out_buffer() else {
++        return;
++    };
++    #[cfg(feature = "diagnostics")]
++    crate::copystat::add(crate::copystat::C::TexUploads, 1);
++    const COPY_DEST: u32 = 0x400;
++    crate::list::ensure_state(list, resource, COPY_DEST);
++    for (i, footprint) in staging.footprints.iter().enumerate() {
++        let to = D3D12_TEXTURE_COPY_LOCATION {
++            // SAFETY: a borrowed pointer the location never releases.
++            pResource: unsafe { std::mem::transmute_copy(texture) },
++            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
++            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
++                SubresourceIndex: staging.subresource(i),
++            },
++        };
++        let mut placed = *footprint;
++        placed.Offset += upload.out_offset();
++        let from = D3D12_TEXTURE_COPY_LOCATION {
++            // SAFETY: as above; the ring lives for the run.
++            pResource: unsafe { std::mem::transmute_copy(&out) },
++            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
++            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: placed },
++        };
++        // SAFETY: an open list; both locations name live resources.
++        unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
++    }
++    // As the CPU's upload: current from this list's submission on. The fill below does not
++    // say dirty (it is the upload); a later check that finds the memory changed does.
++    {
++        let staging = staging.clone();
++        list.defer_host(move || {
++            staging.uploaded.store(true, Relaxed);
++            staging.dirty.store(false, Relaxed);
++        });
++    }
++    list.defer_gpu_texture(staging.clone(), upload);
++    // Levels on demand: as the CPU's upload, after the fill judged the levels.
++    let on_demand = if staging.on_demand { crate::resource::host_tiled(resource) } else { None };
++    if let Some(on_demand) = on_demand {
++        list.defer_host(move || {
++            let waiting = on_demand.uploaded(staging.detiled.load(Relaxed), staging.memory as u64);
++            staging.waiting.store(if waiting { crate::host::moment().max(1) } else { 0 }, Relaxed);
++            if waiting {
++                crate::descriptor::host::levels_waiting(staging.memory as u64);
++            }
++        });
++    }
+ }
+ 
+ /// Lets go of a title texture's staging buffer (lists that recorded an
+@@ -1643,21 +1882,26 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
+             Some(&mut total),
+         );
+     }
+-    let (buffer, data) = stage_buffer(host, total)?;
+-    crate::host::name(&buffer, || {
+-        format!(
+-            "staging of {resource:?} {}x{}x{} f{}",
+-            d.Width, d.Height, d.DepthOrArraySize, d.Format.0
+-        )
+-    });
++    // (Neptune) Detiled on the card (`crate::detile`): no staging buffer unless an upload has
++    // to go the CPU's way. Without the switch, made here as always.
++    let cpu = std::sync::OnceLock::new();
++    if !(crate::detile::on() && crate::detile::ready()) {
++        let (buffer, data) = stage_buffer(host, total)?;
++        crate::host::name(&buffer, || {
++            format!(
++                "staging of {resource:?} {}x{}x{} f{}",
++                d.Width, d.Height, d.DepthOrArraySize, d.Format.0
++            )
++        });
++        STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++        STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
++        let _ = cpu.set((buffer, data as usize));
++    }
+     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
+-    STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+-    STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
+     let s = Arc::new(Staging {
+-        buffer,
++        cpu,
+         #[cfg(feature = "diagnostics")]
+         total,
+-        data,
+         footprints,
+         rows,
+         layout,
+diff --git a/crates/victory-gpu/src/texture_detile_tests.rs b/crates/victory-gpu/src/texture_detile_tests.rs
+new file mode 100644
+index 0000000..be635d3
+--- /dev/null
++++ b/crates/victory-gpu/src/texture_detile_tests.rs
+@@ -0,0 +1,240 @@
++//! (Neptune) The fallback of the card's detile (`crate::detile`) to the CPU's, on the
++//! software adapter: a child module of `crate::texture`.
++
++use super::*;
++use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
++use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
++use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
++use windows::Win32::Graphics::Dxgi::Common::*;
++use windows::Win32::Graphics::Dxgi::*;
++
++fn warp() -> Option<ID3D12Device> {
++    // SAFETY: plain DXGI queries and device creation on the software adapter.
++    unsafe {
++        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
++        let adapter: IDXGIAdapter = factory.EnumWarpAdapter().ok()?;
++        let mut device: Option<ID3D12Device> = None;
++        D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
++        device
++    }
++}
++
++/// A mapped upload buffer for `bytes` on `device`, as `stage_buffer` gives (zeros, its size
++/// class: the next power of two from 64 KiB).
++fn upload(device: &ID3D12Device, bytes: u64) -> Option<(ID3D12Resource, *mut u8)> {
++    let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() };
++    let desc = D3D12_RESOURCE_DESC {
++        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
++        Width: stage_class(bytes).1,
++        Height: 1,
++        DepthOrArraySize: 1,
++        MipLevels: 1,
++        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
++        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
++        ..Default::default()
++    };
++    let mut buffer: Option<ID3D12Resource> = None;
++    let mut data = std::ptr::null_mut();
++    // SAFETY: plain creation and mapping.
++    unsafe {
++        device
++            .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut buffer)
++            .ok()?;
++        buffer.as_ref()?.Map(0, None, Some(&mut data)).ok()?;
++    }
++    Some((buffer?, data.cast()))
++}
++
++/// A 2D layout of `w` x `h` texels, `mips` levels and `slices` array slices: BC7 (`bc`) or
++/// four bytes a texel.
++fn layout(w: u32, h: u32, mips: u32, slices: u32, bc: bool, swizzle: Swizzle) -> Layout {
++    Layout::new(&Desc {
++        dimension: Dimension::Tex2d,
++        width: w,
++        height: h,
++        depth: slices,
++        mips,
++        element_bytes: if bc { 16 } else { 4 },
++        block: if bc { 4 } else { 1 },
++        samples: 1,
++        swizzle,
++    })
++    .unwrap()
++}
++
++/// A staging state for the texture `layout` describes at `title`, laid out by the device as
++/// the host texture is (every level of every slice); with a staging buffer from `device`, or
++/// none.
++fn staging(device: &ID3D12Device, title: &[u8], layout: &Layout, cpu: bool) -> Staging {
++    let desc = &layout.desc;
++    let d = D3D12_RESOURCE_DESC {
++        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
++        Width: u64::from(desc.width),
++        Height: desc.height,
++        DepthOrArraySize: desc.depth as u16,
++        MipLevels: desc.mips as u16,
++        Format: if desc.block == 4 { DXGI_FORMAT_BC7_UNORM } else { DXGI_FORMAT_R8G8B8A8_UNORM },
++        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
++        ..Default::default()
++    };
++    let count = desc.mips * desc.depth;
++    let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
++    let mut rows = vec![0u32; count as usize];
++    let mut total = 0;
++    // SAFETY: outputs for `count` subresources.
++    unsafe {
++        device.GetCopyableFootprints(&d, 0, count, 0, Some(footprints.as_mut_ptr()), Some(rows.as_mut_ptr()), None, Some(&mut total))
++    };
++    let side = std::sync::OnceLock::new();
++    if cpu {
++        let (buffer, data) = upload(device, total).expect("an upload buffer");
++        let _ = side.set((buffer, data as usize));
++    }
++    Staging {
++        cpu: side,
++        #[cfg(feature = "diagnostics")]
++        total,
++        footprints,
++        rows,
++        layout: layout.clone(),
++        mips: desc.mips,
++        first: 0,
++        size: layout.size as usize,
++        bytes: total,
++        memory: title.as_ptr(),
++        last: Mutex::default(),
++        dirty: AtomicBool::new(false),
++        uploaded: AtomicBool::new(false),
++        used: AtomicU64::new(0),
++        on_demand: false,
++        detiled: AtomicU32::new(0),
++        judged: [const { AtomicU64::new(0) }; 2],
++        waiting: AtomicU64::new(0),
++    }
++}
++
++/// The staging buffer as the CPU's detile of `title` lays it out.
++fn expected(s: &Staging, title: &[u8]) -> Vec<u8> {
++    let mut out = vec![0u8; s.bytes as usize];
++    for (i, (f, &rows)) in s.footprints.iter().zip(&s.rows).enumerate() {
++        let (mip, slice) = s.part(i);
++        let pitch = f.Footprint.RowPitch as usize;
++        let at = f.Offset as usize;
++        // The last subresource's last row ends at its bytes, not at a whole pitch.
++        let len = (pitch * rows as usize).min(out.len() - at);
++        s.layout.detile(title, mip, slice, &mut out[at..at + len], pitch, pitch * rows as usize).unwrap();
++    }
++    out
++}
++
++fn held(s: &Staging) -> Vec<u8> {
++    let &(_, data) = s.cpu.get().expect("a staging buffer");
++    // SAFETY: the mapping holds `bytes` bytes, written by the refresh on this thread.
++    unsafe { std::slice::from_raw_parts(data as *const u8, s.bytes as usize).to_vec() }
++}
++
++/// A texture whose staging buffer was let go (as `unstage` and the idle sweep let it go)
++/// comes back detiled on the card, and finds the rings full: the upload goes the CPU's way
++/// at once, with a staging buffer made for it, and the refresh detiles into that buffer
++/// although the memory did not change since the texture was last looked at (the state with
++/// no buffer had already taken its hash).
++#[test]
++fn warp_a_full_ring_after_the_staging_buffer_went_detiles_on_the_cpu() {
++    use crate::detile::{Arena, GRAIN, Why, take_slices};
++    use std::sync::atomic::Ordering::Relaxed;
++    let Some(device) = warp() else {
++        eprintln!("no software adapter: skipped");
++        return;
++    };
++    let layout = layout(256, 256, 9, 1, true, Swizzle::SW_64KB_S);
++    let title: Vec<u8> = (0..layout.size).map(|i| (i.wrapping_mul(0x9e37_79b9) >> 24) as u8).collect();
++
++    // 1. Detiled on the CPU into a staging buffer of its own, which then goes.
++    let first = Arc::new(staging(&device, &title, &layout, true));
++    first.refresh();
++    let want = expected(&first, &title);
++    assert!(want.iter().any(|&b| b != 0));
++    assert!(held(&first) == want, "the CPU's way, before");
++    drop(first);
++
++    // 2. The same texture, staged anew with the card's detile on: no staging buffer.
++    let again = Arc::new(staging(&device, &title, &layout, false));
++    assert!(again.cpu.get().is_none());
++    // A check of it (a list that samples it and uploads nothing): noted, nothing written.
++    again.refresh();
++    assert!(again.last.lock().unwrap().hash.is_some(), "the check took the memory's hash");
++    again.dirty.store(false, Relaxed);
++
++    // 3. The raw ring full: the card's way is refused at once, nothing stays reserved.
++    let (mut raw, mut out) = (Arena::new(GRAIN), Arena::new(1 << 20));
++    assert!(raw.alloc(1).is_some(), "fill the raw ring");
++    let (raw_used, out_used) = (raw.used(), out.used());
++    let routed = route(
++        &again,
++        || take_slices(&mut raw, &mut out, again.size as u64, again.bytes).map(|_| unreachable!("the ring is full")),
++        |bytes| upload(&device, bytes),
++    );
++    assert!(matches!(routed, Route::Cpu), "the CPU's way");
++    assert_eq!((raw.used(), out.used()), (raw_used, out_used), "no slice half taken");
++    assert!(again.cpu.get().is_some(), "a staging buffer made for it");
++    assert!(again.dirty.load(Relaxed), "to be uploaded");
++    assert!(again.last.lock().unwrap().hash.is_none(), "what it was detiled from is forgotten");
++
++    // 4. The submission's refresh: the memory unchanged, and detiled all the same.
++    again.refresh();
++    assert!(held(&again) == want, "the CPU's way, after the fallback");
++
++    // 5. From now on the CPU's way, without asking the card or making another buffer.
++    let routed = route(&again, || unreachable!("not asked again"), |_| unreachable!("made once"));
++    assert!(matches!(routed, Route::Cpu));
++
++    // 6. No memory for a staging buffer either: nothing recorded, and asked again later.
++    let bare = staging(&device, &title, &layout, false);
++    let routed = route(&bare, || Err(Why::OutFull), |_| None);
++    assert!(matches!(routed, Route::Nothing));
++    assert!(bare.cpu.get().is_none());
++
++    // 7. The card's ring full with the raw one free: refused the same way, the raw slice
++    // given back.
++    let (mut raw, mut out) = (Arena::new(1 << 20), Arena::new(GRAIN));
++    assert!(out.alloc(1).is_some());
++    assert_eq!(take_slices(&mut raw, &mut out, 1000, 1000).map(|_| ()), Err(Why::OutFull));
++    assert_eq!(raw.used(), 0, "the raw slice given back");
++}
++
++/// What `crate::detile::reserve` checks of each part, with the device's own footprints: every
++/// level of every slice passes (the last one's last row ends at its bytes, not at a whole
++/// pitch), and a slice's table is slice 0's moved by whole slices.
++#[test]
++fn warp_every_part_of_a_staging_layout_fits_its_slices() {
++    use crate::detile::{check_part, pack, table_slice};
++    let Some(device) = warp() else {
++        eprintln!("no software adapter: skipped");
++        return;
++    };
++    for l in [
++        layout(256, 256, 9, 1, true, Swizzle::SW_64KB_S),
++        layout(1024, 512, 11, 1, true, Swizzle::SW_64KB_D),
++        layout(512, 512, 10, 6, true, Swizzle::SW_4KB_S),
++        layout(300, 200, 9, 3, false, Swizzle::SW_64KB_S),
++    ] {
++        let title = vec![0u8; l.size as usize];
++        let s = staging(&device, &title, &l, false);
++        let subs = s.subs();
++        assert_eq!(subs.len(), (l.desc.mips * l.desc.depth) as usize);
++        for (i, sub) in subs.iter().enumerate() {
++            let (keyed, shift) = table_slice(&l, sub.slice);
++            assert_eq!(keyed, 0, "one table for every slice");
++            let depth_pitch = sub.row_pitch as usize * sub.rows as usize;
++            let packed = pack(&l.copy_table(sub.mip, keyed, sub.row_pitch as usize, depth_pitch).unwrap()).unwrap();
++            let bytes = check_part(sub, &packed, shift, s.size as u64, s.bytes).unwrap_or_else(|why| panic!("{:?} part {i}: {why:?}", l.desc));
++            assert!(sub.offset + bytes <= s.bytes);
++            if i + 1 == subs.len() {
++                assert!(bytes < sub.row_pitch * u64::from(sub.rows), "the last part ends inside its last row's pitch");
++            }
++            // Moved by its shift, slice 0's table reads what this slice's own table reads.
++            let own = pack(&l.copy_table(sub.mip, sub.slice, sub.row_pitch as usize, depth_pitch).unwrap()).unwrap();
++            assert_eq!(own.tiled_end, packed.tiled_end + shift);
++        }
++    }
++}
+-- 
+2.55.0.windows.3
+

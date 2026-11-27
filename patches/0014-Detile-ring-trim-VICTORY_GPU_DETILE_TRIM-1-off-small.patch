@@ -1,0 +1,251 @@
+From 838729a1a014037c5ba4f901ec78d4f44375975f Mon Sep 17 00:00:00 2001
+From: skornuta <126527569+skornuta@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 22:32:38 -0800
+Subject: [PATCH 14/27] Detile ring trim (VICTORY_GPU_DETILE_TRIM=1, off):
+ small rings outside bursts
+
+The GPU detile's rings (512 + 512 MB in play.ps1) are for loading; in
+the world they hold a few MB at most, and both take the process's
+commit (the card's ring its memory too) for the whole run.
+
+With the switch the rings shrink to VICTORY_GPU_DETILE_SMALL_MB each (64)
+once no upload has wanted more for VICTORY_GPU_DETILE_TRIM_S seconds
+(20), and grow back to their full sizes when one does: an upload of more
+than a quarter of the small rings, rings filled past half of them, or an
+upload refused for room. A resize is made at a submission that detiles
+nothing, only with both rings empty (nothing reserved, nothing waiting
+for the card; a list holds its uploads until its reset, so no list
+submitted again can still read a ring), no checks or jobs pending and
+the detile lists run; the old rings go behind the running submissions
+(`retire`). An upload the rings cannot take meanwhile is detiled on the
+CPU, as every refused one is.
+
+The memory CSV gets the rings shrunk and grown back.
+
+(cherry picked from commit 390d949a3eeec2387abf85f48a1a5792c1c741b8)
+---
+ crates/victory-gpu/src/detile.rs  | 132 ++++++++++++++++++++++++++----
+ crates/victory-gpu/src/ramline.rs |   4 +-
+ crates/victory-gpu/src/texture.rs |   3 +-
+ 3 files changed, 119 insertions(+), 20 deletions(-)
+
+diff --git a/crates/victory-gpu/src/detile.rs b/crates/victory-gpu/src/detile.rs
+index f25fc1f..8ffe4f6 100644
+--- a/crates/victory-gpu/src/detile.rs
++++ b/crates/victory-gpu/src/detile.rs
+@@ -439,6 +439,11 @@ struct State {
+     checks: Vec<Check>,
+     /// When a check was last taken, and how many in that second.
+     checked: (u64, u64),
++    /// (Neptune) The rings' full sizes (raw, card), when an upload last wanted more than the
++    /// small rings give, and when a resize was last made ([`trim`]).
++    full: (u64, u64),
++    busy_ms: u64,
++    tried_ms: u64,
+ }
+ 
+ // SAFETY: D3D12 objects (free-threaded) and persistent mappings, used under `STATE`'s lock.
+@@ -514,23 +519,7 @@ fn make() -> windows::core::Result<State> {
+         (root, pso)
+     };
+     let raw_size = mb("VICTORY_GPU_DETILE_RAW_MB", 256, 32, 2048);
+-    let (raw, raw_data) = host.upload_buffer(raw_size).ok_or_else(empty)?;
+-    crate::host::name(&raw, || "detile: title bytes".into());
+-    // The card's ring: only with room under 85 % of the budget after it, halved down to
+-    // 32 MB to find room; none at all, and no detile on the card, without.
+-    let mut out_size = mb("VICTORY_GPU_DETILE_OUT_MB", 192, 32, 1024);
+-    let out = loop {
+-        let room = host.video_memory().is_none_or(|[budget, used, ..]| used + out_size <= budget / 100 * 85);
+-        if room && let Some(buffer) = host.uav_buffer(out_size) {
+-            break buffer;
+-        }
+-        out_size /= 2;
+-        if out_size < 32 << 20 {
+-            tracing::warn!("VICTORY_GPU_DETILE=1: no room in the card's budget for the detile ring");
+-            return Err(empty());
+-        }
+-    };
+-    crate::host::name(&out, || "detile: detiled textures".into());
++    let (raw, raw_data, out, out_size) = make_rings(raw_size, mb("VICTORY_GPU_DETILE_OUT_MB", 192, 32, 1024))?;
+     let table_size = mb("VICTORY_GPU_DETILE_TABLE_MB", 32, 4, 256);
+     let (tables, table_data) = host.upload_buffer(table_size).ok_or_else(empty)?;
+     crate::host::name(&tables, || "detile: tables".into());
+@@ -551,9 +540,104 @@ fn make() -> windows::core::Result<State> {
+         lists: Vec::new(),
+         checks: Vec::new(),
+         checked: (0, 0),
++        full: (raw_size, out_size),
++        busy_ms: crate::host::now_ms(),
++        tried_ms: 0,
+     })
+ }
+ 
++/// The rings: the raw one of `raw_size` bytes (and its mapping), and the card's one of up to
++/// `out_size` bytes, with its size.
++fn make_rings(raw_size: u64, mut out_size: u64) -> windows::core::Result<(ID3D12Resource, usize, ID3D12Resource, u64)> {
++    let empty = windows::core::Error::empty;
++    let host = crate::host::host().ok_or_else(empty)?;
++    let (raw, raw_data) = host.upload_buffer(raw_size).ok_or_else(empty)?;
++    crate::host::name(&raw, || "detile: title bytes".into());
++    // The card's ring: only with room under 85 % of the budget after it, halved down to
++    // 32 MB to find room; none at all, and no detile on the card, without.
++    let out = loop {
++        let room = host.video_memory().is_none_or(|[budget, used, ..]| used + out_size <= budget / 100 * 85);
++        if room && let Some(buffer) = host.uav_buffer(out_size) {
++            break buffer;
++        }
++        out_size /= 2;
++        if out_size < 32 << 20 {
++            tracing::warn!("VICTORY_GPU_DETILE=1: no room in the card's budget for the detile ring");
++            return Err(empty());
++        }
++    };
++    crate::host::name(&out, || "detile: detiled textures".into());
++    Ok((raw, raw_data as usize, out, out_size))
++}
++
++/// (Neptune) `VICTORY_GPU_DETILE_TRIM=1` (off by default): the rings shrink to
++/// `VICTORY_GPU_DETILE_SMALL_MB` each (64) once no upload has wanted more than that for
++/// `VICTORY_GPU_DETILE_TRIM_S` seconds (20), and grow back to their full sizes when one does.
++/// In the world the rings hold a few MB at most; the full ones (512 + 512 MB in `play.ps1`)
++/// are for loading, and both take the process's commit (the card's one its memory too). A
++/// resize is made only when both rings are empty, with nothing reserved and nothing the card
++/// may still read, and the old rings go behind the submissions still running (`retire`); an
++/// upload the rings cannot take meanwhile is detiled on the CPU, as every refused one is.
++/// The seconds, and the small size in bytes.
++fn trim() -> Option<(u64, u64)> {
++    static T: OnceLock<Option<(u64, u64)>> = OnceLock::new();
++    *T.get_or_init(|| {
++        std::env::var_os("VICTORY_GPU_DETILE_TRIM").is_some_and(|v| v == "1").then(|| {
++            let secs = std::env::var("VICTORY_GPU_DETILE_TRIM_S").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(20u64).clamp(2, 3600);
++            (secs, mb("VICTORY_GPU_DETILE_SMALL_MB", 64, 32, 1024))
++        })
++    })
++}
++
++/// Since the start: the rings shrunk, and grown back ([`trim`]).
++pub(crate) static RESIZES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
++
++/// With [`trim`], at a submission that detiles nothing: the rings are made the size they
++/// should be now, if they hold nothing.
++fn fit(state: &mut State, completed: u64) {
++    let Some((secs, small)) = trim() else {
++        return;
++    };
++    let now = crate::host::now_ms();
++    let small = (small.min(state.full.0), small.min(state.full.1));
++    let want = if now.saturating_sub(state.busy_ms) < secs * 1000 { state.full } else { small };
++    let have = (state.raw_arena.size(), state.out_arena.size());
++    if (have.0 == want.0 / GRAIN * GRAIN && have.1 == want.1 / GRAIN * GRAIN) || now.saturating_sub(state.tried_ms) < 1000 {
++        return;
++    }
++    state.raw_arena.reclaim(completed);
++    state.out_arena.reclaim(completed);
++    let quiet = state.raw_arena.used() == 0
++        && state.out_arena.used() == 0
++        && state.jobs.is_empty()
++        && state.filled.is_empty()
++        && state.checks.is_empty()
++        && state.lists.iter().all(|l| l.2 <= completed);
++    if !quiet {
++        return;
++    }
++    state.tried_ms = now;
++    let grow = want.0 > have.0 || want.1 > have.1;
++    match make_rings(want.0, want.1) {
++        Ok((raw, raw_data, out, out_size)) => {
++            // SAFETY: live buffers.
++            let (raw_gpu, out_gpu) = unsafe { (raw.GetGPUVirtualAddress(), out.GetGPUVirtualAddress()) };
++            let old_raw = std::mem::replace(&mut state.raw, (raw, raw_data, raw_gpu));
++            let old_out = std::mem::replace(&mut state.out, (out, out_gpu));
++            state.raw_arena = Arena::new(want.0);
++            state.out_arena = Arena::new(out_size);
++            if grow {
++                // The card's ring may come back smaller than asked (no room): that is full now.
++                state.full.1 = out_size;
++            }
++            crate::host::retire((old_raw.0, old_out.0));
++            RESIZES[usize::from(grow)].fetch_add(1, Relaxed);
++            tracing::info!(raw_mb = want.0 >> 20, card_mb = out_size >> 20, "gpu detile: rings {}", if grow { "grown back" } else { "shrunk" });
++        }
++        Err(e) => tracing::warn!(error = %e, "gpu detile: the rings could not be resized (kept as they are)"),
++    }
++}
++
+ /// The ring the detiled textures are in: the source of the lists' copies.
+ pub(crate) fn out_buffer() -> Option<ID3D12Resource> {
+     STATE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|s| s.out.0.clone())
+@@ -626,6 +710,13 @@ pub(crate) fn reserve(layout: &Layout, subs: &[Sub], raw_len: u64, out_len: u64)
+     let completed = crate::host::host().map_or(0, |h| h.completed());
+     let mut guard = STATE.lock().unwrap_or_else(|e| e.into_inner());
+     let state = guard.as_mut().ok_or(Why::NotReady)?;
++    if let Some((_, small)) = trim() {
++        // An upload of more than a quarter of the small rings, or rings filled past half of
++        // them, is a burst: the full rings are wanted.
++        if raw_len.max(out_len) > small / 4 || state.raw_arena.used().max(state.out_arena.used()) > small / 2 {
++            state.busy_ms = crate::host::now_ms();
++        }
++    }
+     if raw_len > state.raw_arena.size() || out_len > state.out_arena.size() || raw_len > u64::from(u32::MAX) {
+         return Err(Why::TooBig);
+     }
+@@ -636,7 +727,11 @@ pub(crate) fn reserve(layout: &Layout, subs: &[Sub], raw_len: u64, out_len: u64)
+     }
+     state.raw_arena.reclaim(completed);
+     state.out_arena.reclaim(completed);
+-    let (raw, out) = take_slices(&mut state.raw_arena, &mut state.out_arena, raw_len, out_len)?;
++    let taken = take_slices(&mut state.raw_arena, &mut state.out_arena, raw_len, out_len);
++    if taken.is_err() && trim().is_some() {
++        state.busy_ms = crate::host::now_ms();
++    }
++    let (raw, out) = taken?;
+     drop(guard);
+     Ok(Arc::new(Upload {
+         raw: (raw, raw_len),
+@@ -798,6 +893,7 @@ pub(crate) fn pre_list() -> Option<ID3D12CommandList> {
+     let state = guard.as_mut()?;
+     land_checks(state, completed);
+     if state.jobs.is_empty() {
++        fit(state, completed);
+         return None;
+     }
+     let jobs = std::mem::take(&mut state.jobs);
+diff --git a/crates/victory-gpu/src/ramline.rs b/crates/victory-gpu/src/ramline.rs
+index 66e942b..70c848a 100644
+--- a/crates/victory-gpu/src/ramline.rs
++++ b/crates/victory-gpu/src/ramline.rs
+@@ -301,7 +301,7 @@ rust_heap,d3d12_upload,d3d12_shared,d3d12_gpu_upload,d3d12_ours_unranged,sysmem_
+ other_private,other_private_res,other_mapped,unattributed_private,\
+ host_lists,preludes_made,idle_lists,list_scratch,\
+ card_copies,tex_filled,tex_filled_placed,tex_targets,tex_depth,tex_uav,tex_twins,tex_idle_held,\
+-detile_raw_used,detile_card_used,detile_raw_size,detile_card_size,detile_to_cpu,vram_commit_backing,residual_private,slot_evicted,slot_evicted_mb,slot_slots_reset,slot_came_back,slot_came_back_2s,slot_given_up,slot_evicting,slot_candidates,slot_kept_seen,slot_blocked,fb_copies,fb_parked,fb_unparked,fb_queue_parked,alloc_renewed,prelude_alloc_renewed,idle_lists_trimmed";
++detile_raw_used,detile_card_used,detile_raw_size,detile_card_size,detile_to_cpu,vram_commit_backing,residual_private,slot_evicted,slot_evicted_mb,slot_slots_reset,slot_came_back,slot_came_back_2s,slot_given_up,slot_evicting,slot_candidates,slot_kept_seen,slot_blocked,fb_copies,fb_parked,fb_unparked,fb_queue_parked,alloc_renewed,prelude_alloc_renewed,idle_lists_trimmed,detile_shrunk,detile_grown";
+ 
+ /// (Neptune) Once a minute, from the resident sampler's thread: one row of the memory
+ /// breakdown into the memory CSV, and the same derived in one log line. What we track (title
+@@ -410,6 +410,8 @@ fn minute(r: &Resident) {
+         crate::host::ALLOCATOR_TRIMS[0].load(Relaxed),
+         crate::host::ALLOCATOR_TRIMS[1].load(Relaxed),
+         crate::list::TRIMMED_LISTS.load(Relaxed),
++        crate::detile::RESIZES[0].load(Relaxed),
++        crate::detile::RESIZES[1].load(Relaxed),
+     ];
+     tracing::info!(
+         "memory minute: private {} MB (peak {} MB), working set {} MB, PC free {} MB, system commit {} of {} MB; \
+diff --git a/crates/victory-gpu/src/texture.rs b/crates/victory-gpu/src/texture.rs
+index 92f0df8..10ec5a9 100644
+--- a/crates/victory-gpu/src/texture.rs
++++ b/crates/victory-gpu/src/texture.rs
+@@ -1514,7 +1514,8 @@ fn upload_on_card(list: &HostList, resource: This, texture: &ID3D12Resource, sta
+         let mut placed = *footprint;
+         placed.Offset += upload.out_offset();
+         let from = D3D12_TEXTURE_COPY_LOCATION {
+-            // SAFETY: as above; the ring lives for the run.
++            // SAFETY: as above; the ring is not resized while the upload, held by the
++            // list until its reset, lives (`crate::detile::fit`).
+             pResource: unsafe { std::mem::transmute_copy(&out) },
+             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: placed },
+-- 
+2.55.0.windows.3
+

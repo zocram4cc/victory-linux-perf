@@ -1,0 +1,116 @@
+# AGENTS.md: porting the memory stack
+
+Instructions for AI coding agents (Claude Code, Codex, Cursor) asked to **"port the memory stack
+from this branch / patch bundle into my fork"**. What the stack does and what it measured:
+[MEMORY_STACK.md](MEMORY_STACK.md). This file is how to move it.
+
+## What you are porting
+
+27 commits on `memory-portable` over the base `e94251a` (`skornuta/victory-fork`):
+switches that cut VRAM and private commit with no change to what is drawn. Each code change is
+behind a `VICTORY_*` switch that is **off by default**; `play.ps1` turns them on.
+
+| # | Feature | Switch | Files |
+|---|---|---|---|
+| 01, 03 | GPU detile (textures detiled on the card) | `VICTORY_GPU_DETILE=1`, `VICTORY_GPU_DETILE_VERIFY=0` | `victory-formats/src/texture.rs` (`Layout::copy_table`), new `victory-gpu/src/detile.rs`, `texture.rs` (upload route), `host.rs` (`Step::GpuTexture`, a pre-list at `lists[0]` in `submit`, `detile::sent`) |
+| 14, 15 | Detile ring trim | `VICTORY_GPU_DETILE_TRIM=1`, `..._OUT_MB=512`, `..._RAW_MB=512` | `detile.rs` |
+| 04, 05, 17 | Memory telemetry (a CSV row a minute) | always on (diagnostics) | new `ramline.rs`, `memtel.rs`; `victory-core/src/heapcount.rs` |
+| 06, 07 | Slot eviction | `VICTORY_SLOT_EVICT=1`, `..._PERCENT=60`, `..._LOW_PERCENT=50` | `resource.rs`, `descriptor.rs`, `descriptor/host.rs` |
+| 09-12 | Bindless usage feedback | `VICTORY_BINDLESS_FEEDBACK=1` | new `feedback.rs`, `victory-shader/src/emit/shader.rs` + `emit/mod.rs`, `descriptor/host.rs` (parking), `draw.rs::heap_textures`, `pipeline/library.rs`, a pre-list in `host.rs` |
+| 13, 17 | Allocator trim (+ spare scratch, idle lists) | `VICTORY_ALLOCATOR_TRIM=1` (`_S`, 30) | `host.rs` (`HostList::reset`, the prelude's record, `Spare::trim`), `list.rs` (`idle_trim`) |
+| 20 | Prelude pool | `VICTORY_PRELUDE_POOL=1` | `host.rs` (prelude record, both send paths) |
+| 23 | Indirect budgets packed | `VICTORY_BUDGET_PACK=1` | `host.rs` (`Budget`, `HostList::budget`) |
+| 24 | Compare in pieces | `VICTORY_COMPARE_PIECES=1` | `shadow.rs` (`Shadow::copy_now`) |
+| 16, 18, 19, 21, 25 | Launcher settings | (sets the above, plus `VICTORY_STAGE_POOL_MB=64`, `VICTORY_CARD_WINDOW_UPLOAD_MB=256`) | `play.ps1` only |
+| 02, 08 | Optional: test target fix; hang watch (diagnostic) | `VICTORY_HANG_WATCH_S=<s>` | |
+| 22, 26, 27 | Docs | | `MEMORY_STACK.md`, `AGENTS.md` |
+
+Left out on purpose: the copy profile and the heap profile (`VICTORY_HEAP_PROFILE`), both
+diagnostics; `VICTORY_VIEW_NO_ASK`; `VICTORY_GUARD_HOT` and `VICTORY_INPLACE` (worse in tests).
+
+## Path A: a fork close to the base `e94251a`
+
+```sh
+git am --3way /path/to/victory-memory-stack/patches/*.patch     # 0001 to 0027, in order
+# or, from a remote that has the branch:
+git cherry-pick e94251a..memory-portable
+```
+
+Take the series whole and in order. If your fork is a little past `e94251a`, `git am --3way` usually
+resolves; resolve a conflict in favour of keeping both behaviours, the switch's off path exactly
+as before.
+
+## Path B: a diverged fork (Vice-Tay, AnyXboxX, others)
+
+Patches will not apply (checked on Vice-Tay `a252348`: 24 of 26 failed, `host.rs` differs by
++5,514/-3,190 lines). Port **feature by feature**, reading each patch as a specification, in this
+order:
+
+1. **Measure first.** Port telemetry (04, 05, 17) or use your fork's own diagnostics memory line
+   (`--features diagnostics`). Decide from what holds the memory on *your* base, not from these
+   numbers: on Vice-Tay the textures the title fills were only 1.9 GB of 10.9 GB VRAM, and 3.7 GB
+   of RAM sat in buffer windows that descriptor slots keep.
+2. **`host.rs` wins** (13+17, 20, 23): small and self-contained. Check first whether the fork
+   already does it (Vice-Tay's lazy preludes already left only 94 preludes alive).
+3. **Eviction**: slot eviction (06+07), then bindless feedback (09-12) on top of it.
+4. **Detile** (01, 03, 14, 15): the largest re-port (the upload route).
+
+Port each as its own commit, switch off by default, with the original's tests.
+
+## Invariants: do not break these
+
+- **Every switch is opt-in.** Unset, the code takes exactly the old path. Read a switch once
+  (`OnceLock`). Never change a default in the same commit as the feature.
+- **06 and 07 go together, always.** 07 fixes a deadlock that 06 introduces (lock order between the
+  table of textures and `slot_evict`). Never port or cherry-pick one without the other.
+- **Bindless feedback changes translated shaders**, so it uses a pipeline library file of its own
+  (`pipeline/library.rs`). The first run with it makes every pipeline again (minutes of black or
+  missing draws while they compile); measure from the second run.
+- **Nothing is freed under the card.** An allocator, budget slot, prelude or buffer goes through
+  `retire` (behind the submissions running at that moment), or is reused only once its
+  submission's fence has passed. Only reset an allocator where its list's last commands have run.
+- **Prelude pool assumes one submission is prepared at a time** (`Host::submit` holds `submitted`):
+  untagged preludes are the next submission's. Tag them on **every** send path, including sends
+  ahead (`VICTORY_RELAY`).
+- **Budget pack** packs only budgets in CPU-mapped memory. A budget the list moves between resource
+  states (Vice-Tay's `VICTORY_INDIRECT_CARD_BUDGET` card copy) must stay a buffer of its own: other
+  lists sharing a buffer would wait on its barriers.
+- **Telemetry before counters.** Later commits add columns to `ramline.rs`; port 04/05 first or
+  drop those columns.
+- `VICTORY_CARD_WINDOW_UPLOAD_MB` and `VICTORY_STAGE_POOL_MB` **already exist** in the base: only the
+  launcher sets them. Do not reimplement them.
+- Keep the test fix 02 if your test target does not compile without it.
+
+## Verify
+
+1. `cargo build --release` (and `cargo build --profile diag -p victory --features diagnostics` if
+   your fork has that profile): no new warnings.
+2. `cargo test --release -p victory-gpu`: all pass, including the ported tests (compare in pieces
+   against the whole compare; spare trim window; idle-list age).
+3. With every switch **unset**, a run behaves as before.
+4. With the launcher's switches, **3 minutes in the world** (first area, warm shader and pipeline
+   cache; the first run after a translator change is not a measurement), then read the minute-3
+   row: private commit, working set, card memory, shared memory, fps median/p90, device losses.
+
+Targets measured with this stack (RTX 5080 16 GB, Ryzen 7 9800X3D, 32 GB, Series X path at 4K):
+
+| | Before | After |
+|---|---:|---:|
+| VRAM | ~12.6 GB | **8.55 GB** |
+| Private commit | ~26.0 GB | **~20.3-20.6 GB** |
+| Working set | 15.1 GB | **~12.85 GB** |
+| FPS | ~17 | 16.5 median / 17.8 p90 |
+| Pop-in, flicker, device losses | | **none seen** |
+
+## Gotchas seen
+
+- Measure the same way each time: same save, same spot, minute 3 in the world. Runs vary by
+  ~0.5 GB; one run is not a result.
+- The card's memory is charged to the process's private commit about 1:1 on NVIDIA (2,048 MB of
+  card buffers added 2,053 MB): a VRAM cut is also a commit cut.
+- Lowering a texture queue's "room" share to evict sooner also refuses new textures (pop-in). Use
+  the eviction lines (`VICTORY_SLOT_EVICT_*`), not the room.
+- On Vice-Tay, `VICTORY_WINDOW_KB=1024` + `VICTORY_WINDOW_TAILS=1` (both existing switches, off
+  there) cut 1.44 GB of commit and 0.74 GB of shared memory at the same fps.
+- `CloseMainWindow` does not close `victory.exe` (a console process): post `WM_CLOSE` to its game
+  window so the title ends and saves its pipeline library.
