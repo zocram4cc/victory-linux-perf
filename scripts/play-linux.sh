@@ -186,14 +186,11 @@ mkdir -p "$VKD3D_SHADER_CACHE_PATH"
 # the first 20-30 s of the world compiled 1,100-1,300 pipelines again with
 # 700-800 draws a frame left out (runs 20261126-232301 and -232829). The
 # same two settings as WASDeKeys' launcher; warm and shaders get them too.
-# Not 12 GB (12884901888, three times 2^32): the cache stayed at 0.997 GiB,
-# the driver's default, and deleted part of what the prebuild had made
-# before the game started (the prebuild's files of 22:04 gone by 22:15 on
-# 2026-11-27; that run compiled 800 pipelines in its opening, all of them
-# made by the prebuild). The driver holds the size even with
-# SKIP_CLEANUP=1: set to 1 MiB, 40 pipelines left a cache of 1,050,516
-# bytes. 4 GiB less 1 MiB fits 32 bits, and keeps each .bin below the 4 GiB
-# its index reaches (TuxBox PR #280).
+# 4 GiB less 1 MiB keeps each .bin below the 4 GiB its index reaches
+# (TuxBox PR #280). (Not because 12 GB was read as 32 bits: set to
+# 3 x 2^32 + 1 MiB, 40 pipelines kept 3.9 MB. The driver does hold the size
+# a process is given, SKIP_CLEANUP=1 or not: at 1 MiB they kept 1,050,500
+# bytes. Why ~/.cache/nvidia/GLCache stays just under 1 GiB is not known.)
 export __GL_SHADER_DISK_CACHE_SIZE="${__GL_SHADER_DISK_CACHE_SIZE:-4293918720}"
 export __GL_SHADER_DISK_CACHE_SKIP_CLEANUP="${__GL_SHADER_DISK_CACHE_SKIP_CLEANUP:-1}"
 
