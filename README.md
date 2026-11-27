@@ -90,7 +90,22 @@ The dump comes from one game run with `VICTORY_NATIVE_PSO_DUMP=Z:\…\pso-dump` 
 | 4 | fetches descriptors from the heap by index: `s_add_u32 addr, s[n-2], readfirstlane(index << 5)` (a waterfall over bindless descriptors); the heap bases are in the last two user SGPRs and the metadata does not list them | `ResourceHeap` at user SGPR n-2 and `SamplerHeap` at n-1 where nothing listed covers them (the host binds heap bases as 0) | `native::fspx_program` | "a descriptor outside the heaps" (362) gone; 544 → 574 |
 | 5 | writes an address's high half as `s_add_u32 hi, 0, src_scc` (the low add's carry) | accepted as the high half plus carry | `resource::plus_scc`, `high_half` | 574 → 587 |
 
-**Where it stands: 587 of 2,680 translate** (542 before the steps). 209 `victory-shader` tests pass. In game nothing changes by default.
+**More steps (27 Nov, 03:00-04:15):**
+
+| step | what the console code does | what the translator does now | where | effect |
+|---|---|---|---|---|
+| 6 | stores to an image only its first one, two or three channels (`dmask` 1, 3, 7) | the data in those channels, 0 in the rest (a format with that many channels has no others); other partial masks refused | `emit/lower.rs` image stores | 587 → 715 |
+| 7 | packs 16-bit halves: `s_pack_ll/lh/hh_b32_b16` | implemented (SCC untouched) | `emit/lower.rs` scalar ALU | → 798 |
+| 8 | `v_mad_u32_u16` / `v_mad_i32_i16`, 50 programs with **op_sel** (high halves) | implemented with op_sel; clamp refused | `emit/lower.rs` integer VALU | → 809 |
+| 9 | FSPX buffer records carry the **element size** in the word after the register (a multiple of 4, or 1 for raw: true of all 44,749 buffer records in the dump); textures carry the view dimension there | used as the stride for buffers | `native::fspx_program` | → 925 |
+| 10 | swaps 64-bit register pairs with `s_xor_b64` | XOR chains cancelled half by half | `resource::xor_operands` | "neither loaded nor built" 298 → 180 |
+| 11 | parks **VCC** in a VGPR lane beside other SGPRs | VCC (codes 106/107) counts as a parked scalar | `ir::unspill` (`parked`) | → 928 |
+
+**Where it stands: 928 of 2,680 translate** (542 before the steps); **6 families whole** (18 programs); the large ones at 362/525 and 235/330. 209 `victory-shader` tests pass. In game nothing changes by default.
+
+**The real wall: scalars parked in VGPR lanes.** When the console compiler runs out of SGPRs it saves one in a lane of a spare VGPR (`v_writelane_b32 vN, sX, K`) and takes it back later (`v_readlane_b32 sX, vN, K`). `ir::unspill` turns such saves and restores into plain scalar moves so that later stages see through them, but only when a VGPR's uses meet its conditions (every use one of the two forms with a constant lane, or from the first save on within one block, a pair saved and restored together…). Where it does not apply, **the analysis loses where a value came from**: in `218_0000000f002d6300` the table pointer `{s4, 0}` is parked in `v142` lanes 28/29 (~300 parked saves and restores in that VGPR) and brought back as `s[84:85]` → `s_mov_b64 s[20:21], s[84:85]`; an image descriptor loaded through `s[20:21]` then has "an address not from a root parameter". This is behind most of the 683 programs with that error and likely the 116 descriptors read back with four `v_readlane_b32`. Finding which condition such VGPRs fail, and lifting it, should unblock them together.
+
+How a blocking site is found: put one program in a directory of its own, `K_FULL_ERRORS=1 cargo run --release -p victory-shader --example p4_fspx -- that-dir` (the error with its code offset), then `llvm-mc --disassemble -arch=amdgcn -mcpu=gfx1030 -show-encoding` over its `w5_*.bin` and sum the encoding lengths to reach that offset.
 
 **Next blockers** (programs whose first remaining error it is):
 
