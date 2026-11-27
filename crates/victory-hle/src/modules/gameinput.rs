@@ -17,6 +17,8 @@ use std::sync::{Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
+mod record;
+
 use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleExport, HleModule};
@@ -1188,11 +1190,14 @@ mod host {
             // SAFETY: room for the state.
             if unsafe { XInputGetState(slot as u32, &mut state) } != 0 {
                 self.empty_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);
+                record(|r, now, out| r.pad(now, slot, None, out));
                 return None;
             }
             self.empty_until[slot] = None;
             #[allow(unused_mut)]
             let mut pad = convert(&state.Gamepad);
+            // The player's pad as it is, before the scripted keys.
+            record(|r, now, out| r.pad(now, slot, Some(&pad), out));
             // The scripted keys (`VICTORY_KEYS`) also press the first
             // pad's buttons, by the stand-in pad's table: with a real pad
             // connected the stand-in is not there, and a title that listens
@@ -1217,16 +1222,19 @@ mod host {
 
         fn keys(&mut self) -> Vec<KeyState> {
             let mut down = scripted();
+            let mut held: Vec<u8> = Vec::new();
             if focused() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
-                let held: Vec<u8> = (0x08..=0xFE_u8)
+                held = (0x08..=0xFE_u8)
                     .filter(|vk| !(0x10..=0x12).contains(vk) && !down.contains(vk))
                     // SAFETY: plain queries.
                     .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
                     .collect();
-                down.extend(held);
             }
+            // The player's keys, not the scripted ones (none without focus).
+            record(|r, now, out| r.keys(now, &held, out));
+            down.extend(held);
             down.into_iter()
                 .map(|vk| KeyState {
                     // SAFETY: plain query.
@@ -1249,38 +1257,57 @@ mod host {
         }
     }
 
+    /// The clock of [`scripted`] and [`record`]: from the first time input
+    /// is read.
+    fn input_clock() -> Instant {
+        static START: LazyLock<Instant> = LazyLock::new(Instant::now);
+        *START
+    }
+
+    /// `VICTORY_KEYS_RECORD=<file>`: what the player presses on the
+    /// keyboard (with the title's window in front) and on host pads is
+    /// appended to the file, on the clock [`scripted`] plays keys by
+    /// (`super::record`); `scripts/victory-route.py` makes a route of it.
+    /// Unset: nothing is recorded.
+    fn record(what: impl FnOnce(&mut super::record::Recorder, Duration, &mut String)) {
+        use std::io::Write;
+        type Recording = Mutex<(std::fs::File, super::record::Recorder)>;
+        static FILE: LazyLock<Option<Recording>> = LazyLock::new(|| {
+            let path = std::env::var_os("VICTORY_KEYS_RECORD").filter(|p| !p.is_empty())?;
+            match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                Ok(mut file) => {
+                    let _ = file.write_all(super::record::Recorder::HEADER.as_bytes());
+                    tracing::info!(path = %path.to_string_lossy(), "the player's input is recorded (VICTORY_KEYS_RECORD)");
+                    Some(Mutex::new((file, super::record::Recorder::default())))
+                }
+                Err(e) => {
+                    tracing::warn!(path = %path.to_string_lossy(), error = %e, "VICTORY_KEYS_RECORD: the file does not open; nothing is recorded");
+                    None
+                }
+            }
+        });
+        let Some(state) = &*FILE else { return };
+        let now = input_clock().elapsed();
+        let mut state = lock(state);
+        let (file, recorder) = &mut *state;
+        let mut out = String::new();
+        what(recorder, now, &mut out);
+        if !out.is_empty() {
+            // (Written at once: a run ended by a signal keeps what it had.)
+            let _ = file.write_all(out.as_bytes());
+        }
+    }
+
     /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
     /// 0.2 s that long after input starts (`<from>-<to>:<key>`: all that
-    /// time), with or without focus. A key is a
-    /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
-    /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
+    /// time), with or without focus. A key is a letter, a digit, or
+    /// `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`, `Left`, `Right`,
+    /// `Space`, `Shift`, `Ctrl` (the stand-in pad's table maps some to
+    /// buttons). Entries may be separated by new lines too.
     fn scripted() -> Vec<u8> {
         static SCRIPT: LazyLock<(Instant, Vec<(Duration, Duration, u8)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
-            let keys = list.split(',').filter_map(|entry| {
-                let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
-                let time = |t: &str| Duration::try_from_secs_f64(t.trim().parse().ok()?).ok();
-                let (from, to) = match at.split_once('-') {
-                    Some((from, to)) => (time(from)?, time(to)?),
-                    None => (time(at)?, time(at)? + Duration::from_millis(200)),
-                };
-                Some((from, to, vk))
-            });
-            (Instant::now(), keys.collect())
+            (input_clock(), super::record::parse(&list))
         });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
