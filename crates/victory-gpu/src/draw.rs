@@ -2399,6 +2399,22 @@ impl State {
                 }
             }
             for &(slot, param) in &stage.root_uavs {
+                if slot == victory_shader::emit::SLOT_SHEETS {
+                    // Ours: the frame recorder's notes of stretched geometry
+                    // (`sheets`); only programs translated with it on have it.
+                    if let Some(at) = crate::sheets::address() {
+                        // SAFETY: an open list; the buffer lives as long as
+                        // the process.
+                        unsafe {
+                            if compute {
+                                l.SetComputeRootUnorderedAccessView(param, at);
+                            } else {
+                                l.SetGraphicsRootUnorderedAccessView(param, at);
+                            }
+                        }
+                    }
+                    continue;
+                }
                 if slot == victory_shader::emit::SLOT_FAULTS {
                     // Ours: where shaders note the pages they found empty.
                     if let Some(m) = &memory {

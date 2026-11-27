@@ -121,12 +121,23 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     // `VICTORY_WAVE_WIDE_ONLY`: the wave-wide form for the containers it names, by the hash
     // the log names them with (the cache key holds the switch: `switch_values`).
+    // `VICTORY_RECORD_SHEETS=1`: the pre-skinned mesh programs with the frame
+    // recorder's watch (`crate::sheets`), under a key of their own.
+    let sheets = crate::sheets::watched(container);
     let translate = |c: &[u8]| {
         let wide = victory_shader::emit::wave_wide_only(&blake3::hash(c).to_hex()[..16]);
-        victory_shader::emit::with_wave_wide(wide, || victory_shader::emit::translate(c)).map_err(|e| e.to_string())
+        victory_shader::emit::with_sheet_watch(sheets, || {
+            victory_shader::emit::with_wave_wide(wide, || victory_shader::emit::translate(c))
+        })
+        .map_err(|e| e.to_string())
+    };
+    let key = if sheets {
+        *blake3::hash(&[&build()[..], b"sheet watch"].concat()).as_bytes()
+    } else {
+        build()
     };
     match CACHE.get() {
-        Some(cache) => cached(cache, &build(), container, translate),
+        Some(cache) => cached(cache, &key, container, translate),
         None => translate(container),
     }
 }
