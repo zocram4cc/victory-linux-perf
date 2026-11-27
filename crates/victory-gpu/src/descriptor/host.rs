@@ -267,6 +267,9 @@ pub(crate) struct HostHeap {
     /// sampler heaps. (Upstream falls back to 2^16 on a capped host heap;
     /// ours keeps 2^18 there: 2^16 and 2^17 both ran out in this title.)
     dynamic: u32,
+    /// Opt-in only. The matching null SRV dimension for a dynamic slot, or
+    /// RAW_UAV for a root UAV. Zero leaves the defensive slot hold in place.
+    release_views: Vec<std::sync::atomic::AtomicU8>,
     sampler: bool,
     /// Where the raw twins of the title's slots start
     /// (`victory_shader::emit::raw_views`; 0: there are none), and which of
@@ -1949,6 +1952,22 @@ fn dynamic_slots(count: u32, null: u32) -> u32 {
     null.saturating_sub(count).min(most).max(DYNAMIC)
 }
 
+/// Retire known dynamic views when their recording is destroyed. Synchronous
+/// lists keep their slots until reset so they can still be submitted again.
+pub(crate) fn reclaim_dynamic() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let enabled = std::env::var_os("VICTORY_RECLAIM_DYNAMIC").is_some_and(|v| v == "1") && staged(false, 0).is_some();
+        if enabled {
+            tracing::info!("dynamic view reclamation enabled; replayable lists reserve their slots until reset or drop");
+        }
+        enabled
+    });
+    *ON
+}
+
+const RAW_SRV: u8 = 1;
+const RAW_UAV: u8 = u8::MAX;
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -2062,6 +2081,7 @@ impl HostHeap {
             step,
             count,
             dynamic: extra,
+            release_views: (0..if reclaim_dynamic() { extra } else { 0 }).map(|_| 0.into()).collect(),
             sampler,
             raw,
             twins: (0..if raw == 0 { 0 } else { count + extra }).map(|_| std::sync::atomic::AtomicBool::new(false)).collect(),
@@ -3125,7 +3145,7 @@ impl HostHeap {
     /// (Tests) [`HostHeap::release_many`] of one range.
     #[cfg(test)]
     pub(crate) fn release(&self, first: u32, n: u32) {
-        self.release_many(self.id, &[(first, n)]);
+        self.release_many(self.id, &[(first, n)], false);
     }
 
     /// Gives back, for each `(first, n)`, `n` dynamic slots from `first` (an
@@ -3137,7 +3157,7 @@ impl HostHeap {
     /// slots ([`NEXT_ID`]).
     ///
     /// [`dynamic`]: HostHeap::dynamic
-    pub(crate) fn release_many(&self, id: u64, ranges: &[(u32, u32)]) {
+    pub(crate) fn release_many(&self, id: u64, ranges: &[(u32, u32)], confirmed: bool) {
         if id != self.id || ranges.is_empty() {
             return;
         }
@@ -3147,12 +3167,35 @@ impl HostHeap {
             if let Some(at) = first.checked_sub(self.count)
                 && (at as usize) < guard.1.len
             {
+                if confirmed && !self.release_views.is_empty() && staged(false, 0).is_some() {
+                    for slot in at as usize..(at as usize + n as usize).min(guard.1.len) {
+                        if guard.1.taken(slot) {
+                            let kind = self.release_views.get(slot).map_or(0, |k| k.load(std::sync::atomic::Ordering::Relaxed));
+                            self.null_released(self.count + slot as u32, kind);
+                        }
+                    }
+                }
                 given += guard.1.clear_taken(at as usize, n as usize);
             }
         }
         if given != 0 {
             self.free.fetch_add(given, std::sync::atomic::Ordering::Relaxed);
             self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Nulls slot `index`, released while it held the view `kind` notes.
+    fn null_released(&self, index: u32, kind: u8) {
+        match kind {
+            RAW_SRV => self.null_raw_at(index),
+            RAW_UAV => self.null_raw_uav_at(index),
+            dim @ 2..=10 => {
+                null_like(&[0, u32::from(dim), 0, 0, 0, 0, 0, 0, 0, 0], self.at(index));
+                self.put(index);
+                self.clear_twin(index);
+                self.keep(index, None);
+            }
+            _ => {}
         }
     }
 
@@ -3165,7 +3208,7 @@ impl HostHeap {
         }
         self.put(index);
         self.twin_made(index, kept.is_some() && twinned(view));
-        self.keep(index, kept.flatten());
+        self.keep_srv(index, kept.flatten(), view);
     }
 
     /// Makes slot `index` (a dynamic one) the view the record `words` names,
@@ -3213,7 +3256,7 @@ impl HostHeap {
             } else {
                 self.clear_twin(index);
             }
-            self.keep(index, made.kept.clone());
+            self.keep_srv(index, made.kept.clone(), &made.view);
             Some(made.listed)
         })
     }
@@ -3269,8 +3312,35 @@ impl HostHeap {
         }
     }
 
+    fn note_release_view(&self, index: u32, dimension: u8) {
+        if let Some(slot) = self.release_views.get(index.wrapping_sub(self.count) as usize) {
+            slot.store(dimension, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Only explicitly dimensioned texture SRVs have a known matching null
+    /// here. CBVs, including scratch, and other views keep their slot hold.
+    fn keep_srv(&self, index: u32, resource: Option<ID3D12Resource>, view: &View) {
+        let dimension = match view {
+            View::Placed(false, desc, srv) if desc[0] != 1 => srv[1],
+            View::Shader(_, Some(srv)) => srv[1],
+            _ => 0,
+        };
+        // Cached views can outlive their title object. Classify the live COM
+        // resource, so a buffer with a malformed texture dimension is skipped.
+        let texture = !self.release_views.is_empty() && (2..=10).contains(&dimension) && resource.as_ref().is_some_and(|r| {
+            // SAFETY: a descriptor query on the retained resource.
+            unsafe { r.GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_BUFFER }
+        });
+        self.keep(index, resource);
+        if texture {
+            self.note_release_view(index, dimension as u8);
+        }
+    }
+
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
+        self.note_release_view(index, 0);
         let Some(slot) = self.kept.get(index as usize) else {
             return;
         };
@@ -3327,6 +3397,7 @@ impl HostHeap {
         // (Bound by its handle, not read by index.)
         self.clear_twin(index);
         self.keep(index, Some(buffer.clone()));
+        self.note_release_view(index, RAW_SRV);
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view that reads
@@ -3373,6 +3444,7 @@ impl HostHeap {
         self.put(index);
         self.clear_twin(index);
         self.keep(index, Some(buffer.clone()));
+        self.note_release_view(index, RAW_UAV);
     }
 
     /// Makes slot `index` (a dynamic one) a raw unordered access view of
@@ -7163,6 +7235,45 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         // Long after the last table, a write is due at once.
         heap.queue_texture(2, true, false, frame + 3 + TABLED_FRAMES);
         assert_eq!(slots(frame + 3 + TABLED_FRAMES), [2]);
+    }
+
+    #[test]
+    #[ignore = "requires D3D12; the nulling needs VICTORY_RECLAIM_DYNAMIC=1"]
+    fn released_views_are_nulled_only_when_reclaimed() {
+        let heap = HostHeap::new(false, 4).expect("view heap");
+        let requested = std::env::var_os("VICTORY_RECLAIM_DYNAMIC").is_some_and(|v| v == "1");
+        // The title's committed-resource ABI uses these D3D12 layouts.
+        let properties = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 4,
+            Height: 4,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let null = std::ptr::null();
+        let mut texture = null;
+        assert_eq!(crate::resource::create_committed(
+            null, std::ptr::from_ref(&properties).cast(), 0, std::ptr::from_ref(&desc).cast(),
+            0, null.cast(), &crate::resource::PAGEABLE_IIDS[0], &mut texture,
+        ), 0);
+        let copy = crate::resource::host_copy(texture).expect("host copy");
+        let buffer = host().expect("host").upload_buffer(1024).expect("upload buffer").0;
+        let first = heap.dynamic(1).unwrap();
+        heap.make_at(first, &View::Shader(texture as usize, Some([28, 4, 5768, 0, 0, 1, 0, 0, 0, 0])));
+        assert_eq!(heap.kept_in(first).as_ref(), Some(&copy.texture));
+        let raw = heap.dynamic(1).unwrap();
+        heap.raw_at(raw, &buffer, 0, 1024);
+        assert_eq!(heap.kept_in(raw).as_ref(), Some(&buffer));
+        assert_eq!(reclaim_dynamic(), requested && staged(false, 0).is_some());
+        heap.release_many(&[(first, 1), (raw, 1)], true);
+        assert_eq!(heap.kept_in(first).is_none(), reclaim_dynamic(), "a texture SRV is nulled on release only when reclaimed");
+        assert_eq!(heap.kept_in(raw).is_none(), reclaim_dynamic(), "a raw SRV is nulled on release only when reclaimed");
+        let release: extern "system" fn(crate::object::This) -> u32 = crate::object::slot(texture, 16);
+        release(texture);
     }
 
     #[test]

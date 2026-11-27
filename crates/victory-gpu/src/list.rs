@@ -210,6 +210,26 @@ impl Detached {
     pub(crate) fn host(&self) -> &crate::host::HostList {
         &self.host
     }
+
+    /// Its submission has run (its flight landed): its dynamic descriptor
+    /// slots go back now, not when it is dropped [`crate::host`]'s bury lag
+    /// later (64 submissions, about two frames). (Belobug/VIctory-Belobug-AMD
+    /// e9428969, beloooo: "preventing dynamic slot exhaustion at ~10k
+    /// draws/frame"; `VICTORY_EARLY_TABLES=0`: at the drop, as before.) In a
+    /// scene of 11,800 draws a frame the 852,000 slots ran out with the lag:
+    /// 2,757 tables a frame refused, the search for room seconds long, 1.3
+    /// fps (session 7900-play, 2026-11-27).
+    pub(crate) fn release_tables(&mut self) {
+        if early_tables() {
+            self._state.tables_done();
+        }
+    }
+}
+
+/// [`Detached::release_tables`]'s switch (on unless `VICTORY_EARLY_TABLES=0`).
+#[cfg(windows)]
+fn early_tables() -> bool {
+    crate::toggled!("VICTORY_EARLY_TABLES")
 }
 
 /// A host list that has run and waits to be used again, and the bytes of

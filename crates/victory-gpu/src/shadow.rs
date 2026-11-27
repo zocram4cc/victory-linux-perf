@@ -4209,7 +4209,8 @@ impl Shadow {
         to - from
     }
 
-    /// Diagnostic (`VICTORY_REFRESH_CHECK=1`; off by default): after a
+    /// Diagnostic (`VICTORY_REFRESH_CHECK=1`; off by default; counted in
+    /// [`REFRESH_CHECKS`]): after a
     /// refresh of `[from, to)` that trusted the write watch or the guards,
     /// the first 256 bytes of every 64 KiB block of it are read from title
     /// memory and compared with the copy. A block that differs on three
@@ -4230,9 +4231,11 @@ impl Shadow {
         let start = self.start as usize;
         let mut title = [0u8; SAMPLE];
         let mut at = from;
+        REFRESH_CHECKS[0].fetch_add(1, Ordering::Relaxed);
         while at < to {
             let n = SAMPLE.min(to - at);
             if crate::host::read_into(at as *const u8, &mut title[..n]) {
+                REFRESH_CHECKS[1].fetch_add(1, Ordering::Relaxed);
                 // SAFETY: `[from, to)` lies inside the buffer (`update`),
                 // so these bytes are inside the copy's mapping.
                 let copy = unsafe { std::slice::from_raw_parts(self.data.add(at - start).cast_const(), n) };
@@ -4241,9 +4244,11 @@ impl Shadow {
                 if copy == &title[..n] {
                     map.remove(&at);
                 } else {
+                    REFRESH_CHECKS[2].fetch_add(1, Ordering::Relaxed);
                     let times = map.entry(at).or_insert(0);
                     *times += 1;
                     if *times == 3 {
+                        REFRESH_CHECKS[3].fetch_add(1, Ordering::Relaxed);
                         let said = SAID.fetch_add(1, Ordering::Relaxed) + 1;
                         if said <= 64 || said.is_power_of_two() {
                             tracing::warn!(
@@ -6632,6 +6637,26 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// Copies of single views' bytes made since the start.
 pub(crate) static OWN_MADE: AtomicU64 = AtomicU64::new(0);
 
+/// With `VICTORY_REFRESH_CHECK=1`, since the last line: the refreshes
+/// checked, the 64 KiB blocks compared, those found differing (once or
+/// more; three in a row is said on its own), and those found stale (three
+/// refreshes in a row).
+static REFRESH_CHECKS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// With the frame line: [`REFRESH_CHECKS`] per frame over `frames`, and the
+/// stale ones since the last line.
+pub(crate) fn refresh_check_line(frames: f64) {
+    let [refreshes, blocks, differing, stale] = [0, 1, 2, 3].map(|i| REFRESH_CHECKS[i].swap(0, Ordering::Relaxed));
+    if refreshes > 0 {
+        tracing::info!(
+            "refreshes checked against title memory per frame (VICTORY_REFRESH_CHECK=1): {:.0}, {:.0} blocks compared, {:.1} differing (a write since the refresh, or missed); {stale} copies stale (three refreshes in a row) since the last line",
+            refreshes as f64 / frames,
+            blocks as f64 / frames,
+            differing as f64 / frames
+        );
+    }
+}
+
 /// With the frame line: the buffer views that got a copy of their own
 /// bytes ([`exact`]), per frame over `frames`, and the copies kept now.
 /// Nothing while there are none.
@@ -6873,4 +6898,34 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod refresh_check_tests {
+    use super::{REFRESH_CHECKS, Shadow};
+    use std::sync::atomic::Ordering;
+
+    /// A block that differs on three refreshes in a row is said once, as
+    /// stale (`REFRESH_CHECKS[3]`); a fourth refresh that finds it differing
+    /// says nothing more. Needs `VICTORY_REFRESH_CHECK=1` in the process.
+    #[test]
+    #[ignore = "needs VICTORY_REFRESH_CHECK=1 for the whole process (read once)"]
+    fn a_block_stale_on_three_refreshes_is_counted_once() {
+        const BLOCK: usize = 64 << 10;
+        const LEN: usize = 2 * BLOCK;
+        let room = vec![0u8; LEN + BLOCK];
+        let title = (room.as_ptr() as usize).next_multiple_of(BLOCK);
+        let mut side = vec![0u8; LEN];
+        let copy = Shadow::unbacked(title as u64, side.as_mut_ptr(), LEN as u64, false);
+        // SAFETY: inside `room`.
+        unsafe { ((title + 9) as *mut u8).write_volatile(1) };
+        let stale = || REFRESH_CHECKS[3].load(Ordering::Relaxed);
+        let before = stale();
+        for _ in 0..3 {
+            copy.refresh_check(title, title + LEN);
+        }
+        assert_eq!(stale() - before, 1, "three refreshes in a row are said once");
+        copy.refresh_check(title, title + LEN);
+        assert_eq!(stale() - before, 1, "a fourth one is not said again");
+    }
 }
