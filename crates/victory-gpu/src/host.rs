@@ -8537,8 +8537,8 @@ struct Batch {
     /// Fills not done yet (destination, source, bytes): [`wide_fills`].
     fills: Vec<(usize, usize, usize)>,
     /// Copies (by address) brought up to date ahead of the steps, and the
-    /// range (from, to) ([`Batch::refresh_ahead`]).
-    ahead: ByCopy<(usize, usize)>,
+    /// ranges (from, to) ([`Batch::refresh_ahead`], [`Batch::refresh_front`]).
+    ahead: ByCopy<Vec<(usize, usize)>>,
     /// `ahead` holds everything the submission refreshes
     /// ([`Batch::refresh_front`]).
     front: bool,
@@ -8672,12 +8672,14 @@ fn refresh_front() -> bool {
 /// shaders in each part of the submission (`Touch::Part`: another begins).
 /// What a part refreshes of a copy it has given to its shaders stays where it
 /// stands: around what they write. What a later part refreshes is the
-/// title's bytes of before either.
-fn front_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize)> {
+/// title's bytes of before either. With `split` (`VICTORY_REFRESH_RANGES=1`)
+/// a copy's refreshes are the ranges they cover, joined as [`add_range`]
+/// joins them, not their one envelope.
+fn front_spans(steps: impl Iterator<Item = Touch>, split: bool) -> Vec<(usize, usize, usize)> {
     let mut at: ByCopy<usize> = ByCopy::default();
-    // (Copy, from, to), in the order they come, and the part that gave it to
-    // shaders last.
-    let mut spans: Vec<(usize, usize, usize)> = Vec::new();
+    // (Copy, the ranges refreshed in front of it), in the order they come, and
+    // the part that gave it to shaders last.
+    let mut spans: Vec<(usize, Vec<(usize, usize)>)> = Vec::new();
     let mut given: Vec<u32> = Vec::new();
     let (mut part, mut last) = (1, usize::MAX);
     for step in steps {
@@ -8688,20 +8690,19 @@ fn front_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize)>
                     last
                 } else {
                     *at.entry(copy).or_insert_with(|| {
-                        spans.push((copy, usize::MAX, 0));
+                        spans.push((copy, Vec::new()));
                         given.push(0);
                         spans.len() - 1
                     })
                 };
                 last = i;
                 if given[i] != part {
-                    let span = &mut spans[i];
-                    (span.1, span.2) = (span.1.min(from), span.2.max(to));
+                    front_join(&mut spans[i].1, from, to, split);
                 }
             }
             Touch::Write(copy) => {
                 let i = *at.entry(copy).or_insert_with(|| {
-                    spans.push((copy, usize::MAX, 0));
+                    spans.push((copy, Vec::new()));
                     given.push(0);
                     spans.len() - 1
                 });
@@ -8711,8 +8712,17 @@ fn front_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize)>
             Touch::Title | Touch::Nothing => {}
         }
     }
-    spans.retain(|s| s.1 < s.2);
+    flat_spans(spans)
+}
+
+/// The copies' ranges as spans `(copy, from, to)`, each copy's in order, the
+/// empty ones left out.
+fn flat_spans(spans: Vec<(usize, Vec<(usize, usize)>)>) -> Vec<(usize, usize, usize)> {
     spans
+        .into_iter()
+        .flat_map(|(copy, ranges)| ranges.into_iter().map(move |(from, to)| (copy, from, to)))
+        .filter(|s| s.1 < s.2)
+        .collect()
 }
 
 /// Steps of a submission's lists from which [`Batch::refresh_front`] makes
@@ -8754,15 +8764,18 @@ fn list_front(steps: &[Step], textures: bool) -> ListFront {
         }
         _ => None,
     });
-    let copies = fold_touches(touches);
+    let copies = fold_touches(touches, refresh_ranges());
     ListFront { copies, shadows, textures: staged }
 }
 
-/// Touches of one list, per copy in the order of their first touch: the span
-/// of its refreshes before its first write, and whether it is written.
-fn fold_touches(touches: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize, bool)> {
+/// Touches of one list, per copy in the order of their first touch: the ranges
+/// of its refreshes before its first write (see [`front_spans`]), and whether
+/// it is written. A written copy also gets an entry of no range, which only
+/// marks it given.
+fn fold_touches(touches: impl Iterator<Item = Touch>, split: bool) -> Vec<(usize, usize, usize, bool)> {
     let mut at: ByCopy<usize> = ByCopy::default();
-    let mut copies: Vec<(usize, usize, usize, bool)> = Vec::new();
+    // (Copy, its ranges before the first write, written)
+    let mut copies: Vec<(usize, Vec<(usize, usize)>, bool)> = Vec::new();
     let mut last = usize::MAX;
     for touch in touches {
         let (key, range) = match touch {
@@ -8775,27 +8788,35 @@ fn fold_touches(touches: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usiz
             last
         } else {
             *at.entry(key).or_insert_with(|| {
-                copies.push((key, usize::MAX, 0, false));
+                copies.push((key, Vec::new(), false));
                 copies.len() - 1
             })
         };
         last = i;
         let c = &mut copies[i];
         match range {
-            Some((from, to)) if !c.3 => (c.1, c.2) = (c.1.min(from), c.2.max(to)),
+            Some((from, to)) if !c.2 => front_join(&mut c.1, from, to, split),
             Some(_) => {}
-            None => c.3 = true,
+            None => c.2 = true,
         }
     }
     copies
+        .into_iter()
+        .flat_map(|(key, ranges, written)| {
+            ranges
+                .into_iter()
+                .map(move |(from, to)| (key, from, to, false))
+                .chain(written.then_some((key, usize::MAX, 0, true)))
+        })
+        .collect()
 }
 
 /// [`front_spans`] of the lists whose parts are `lists` ([`fold_touches`]), a
 /// new part of the submission beginning at each of `parts`: the same spans,
 /// in the same order (`front_tests`).
-fn join_keys<'a>(lists: impl Iterator<Item = &'a [(usize, usize, usize, bool)]>, parts: &[usize]) -> Vec<(usize, usize, usize)> {
+fn join_keys<'a>(lists: impl Iterator<Item = &'a [(usize, usize, usize, bool)]>, parts: &[usize], split: bool) -> Vec<(usize, usize, usize)> {
     let mut at: ByCopy<usize> = ByCopy::default();
-    let mut spans: Vec<(usize, usize, usize)> = Vec::new();
+    let mut spans: Vec<(usize, Vec<(usize, usize)>)> = Vec::new();
     let mut given: Vec<u32> = Vec::new();
     let mut part = 1;
     for (n, copies) in lists.enumerate() {
@@ -8804,22 +8825,21 @@ fn join_keys<'a>(lists: impl Iterator<Item = &'a [(usize, usize, usize, bool)]>,
         }
         for &(key, from, to, written) in copies {
             let i = *at.entry(key).or_insert_with(|| {
-                spans.push((key, usize::MAX, 0));
+                spans.push((key, Vec::new()));
                 given.push(0);
                 spans.len() - 1
             });
             // What the list refreshes before it writes the copy counts unless
             // an earlier list of this part gave the copy to shaders.
             if given[i] != part && from < to {
-                (spans[i].1, spans[i].2) = (spans[i].1.min(from), spans[i].2.max(to));
+                front_join(&mut spans[i].1, from, to, split);
             }
             if written {
                 given[i] = part;
             }
         }
     }
-    spans.retain(|s| s.1 < s.2);
-    spans
+    flat_spans(spans)
 }
 
 /// [`join_keys`] of the lists' parts, with their copies.
@@ -8830,9 +8850,9 @@ fn join_fronts(fronts: &[ListFront], parts: &[usize]) -> Vec<(std::sync::Arc<cra
             shadows.entry(*key).or_insert_with(|| shadow.clone());
         }
     }
-    join_keys(fronts.iter().map(|f| f.copies.as_slice()), parts)
+    join_keys(fronts.iter().map(|f| f.copies.as_slice()), parts, refresh_ranges())
         .into_iter()
-        .filter_map(|(key, from, to)| Some((shadows.remove(&key)?, from, to)))
+        .filter_map(|(key, from, to)| Some((shadows.get(&key)?.clone(), from, to)))
         .collect()
 }
 
@@ -8843,7 +8863,9 @@ mod front_tests {
     /// Random submissions of lists (refreshes and shaders' writes of a few
     /// copies, new parts now and then): each list folded on its own and the
     /// folds joined in order give what the whole submission's touches give,
-    /// span for span, in the same order (renderer port #6's planning).
+    /// span for span, in the same order (renderer port #6's planning). With
+    /// `split` the refreshes lie apart (`VICTORY_REFRESH_RANGES=1`), so they
+    /// are joined as ranges.
     #[test]
     fn lists_folded_apart_and_joined_give_the_submissions_spans() {
         let mut seed = 0x9e37_79b9_u64;
@@ -8851,36 +8873,50 @@ mod front_tests {
             seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
             (seed >> 33) as usize % n
         };
-        for _ in 0..3000 {
-            let lists = 1 + next(8);
-            let copies = 1 + next(6);
-            let mut parts = Vec::new();
-            let mut whole: Vec<Touch> = Vec::new();
-            let mut folds = Vec::new();
-            for n in 0..lists {
-                if n > 0 && next(4) == 0 {
-                    parts.push(n);
-                    whole.push(Touch::Part);
-                }
-                let mut mine: Vec<Touch> = Vec::new();
-                for _ in 0..next(12) {
-                    let key = 0x1000 * (1 + next(copies));
-                    if next(5) == 0 {
-                        mine.push(Touch::Write(key));
-                        whole.push(Touch::Write(key));
-                    } else {
-                        let from = next(100);
-                        let to = from + 1 + next(50);
-                        mine.push(Touch::Refresh(key, from, to));
-                        whole.push(Touch::Refresh(key, from, to));
+        for split in [false, true] {
+            // (Steps of 40 KB: some refreshes join, others lie apart.)
+            let step = if split { 40_000 } else { 1 };
+            for _ in 0..3000 {
+                let lists = 1 + next(8);
+                let copies = 1 + next(6);
+                let mut parts = Vec::new();
+                let mut whole: Vec<Touch> = Vec::new();
+                let mut folds = Vec::new();
+                for n in 0..lists {
+                    if n > 0 && next(4) == 0 {
+                        parts.push(n);
+                        whole.push(Touch::Part);
                     }
+                    let mut mine: Vec<Touch> = Vec::new();
+                    for _ in 0..next(12) {
+                        let key = 0x1000 * (1 + next(copies));
+                        if next(5) == 0 {
+                            mine.push(Touch::Write(key));
+                            whole.push(Touch::Write(key));
+                        } else {
+                            let from = next(100) * step;
+                            let to = from + 1 + next(50);
+                            mine.push(Touch::Refresh(key, from, to));
+                            whole.push(Touch::Refresh(key, from, to));
+                        }
+                    }
+                    folds.push(fold_touches(mine.into_iter(), split));
                 }
-                folds.push(fold_touches(mine.into_iter()));
+                let want = front_spans(whole.into_iter(), split);
+                let got = join_keys(folds.iter().map(|f| f.as_slice()), &parts, split);
+                assert_eq!(got, want, "split {split}, parts {parts:?}");
             }
-            let want = front_spans(whole.into_iter());
-            let got = join_keys(folds.iter().map(|f| f.as_slice()), &parts);
-            assert_eq!(got, want, "parts {parts:?}");
         }
+    }
+
+    /// `VICTORY_REFRESH_RANGES=1`: a copy refreshed in front of a submission's steps is refreshed in its
+    /// ranges, joined as `add_range` joins them, not in one envelope from its lowest to its highest.
+    #[test]
+    fn refreshes_in_front_stay_apart_under_refresh_ranges() {
+        use Touch::{Part, Refresh, Write};
+        let steps = || [Refresh(1, 0, 10), Refresh(1, 1 << 20, (1 << 20) + 10), Refresh(2, 0, 5), Write(2), Refresh(2, 9, 99), Part, Refresh(1, 30, 40)].into_iter();
+        assert_eq!(front_spans(steps(), false), [(1, 0, (1 << 20) + 10), (2, 0, 5)]);
+        assert_eq!(front_spans(steps(), true), [(1, 0, 40), (1, 1 << 20, (1 << 20) + 10), (2, 0, 5)]);
     }
 }
 
@@ -8951,6 +8987,7 @@ mod written_spans_tests {
                 Refresh(4, 0, 9),
             ]
             .into_iter(),
+            false,
         );
         assert_eq!(found, [(1, 10, 40), (2, 0, 5), (4, 7, 9)]);
     }
@@ -9029,7 +9066,7 @@ impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
-        if self.ahead.get(&key).is_some_and(|&(from, to)| from <= address && end <= to) {
+        if self.ahead.get(&key).is_some_and(|ranges| ranges.iter().any(|&(from, to)| from <= address && end <= to)) {
             return;
         }
         // (`VICTORY_REFRESH_ONCE=1`) Brought up to date by a flush of this
@@ -9229,9 +9266,9 @@ impl Batch {
             }
         }
         planning.next("refreshes in front: the spans");
-        let spans: Vec<_> = front_spans(touches.into_iter())
+        let spans: Vec<_> = front_spans(touches.into_iter(), refresh_ranges())
             .into_iter()
-            .filter_map(|(key, from, to)| Some((copies.remove(&key)?, from, to)))
+            .filter_map(|(key, from, to)| Some((copies.get(&key)?.clone(), from, to)))
             .collect();
         self.refresh_spans(spans, due, planning);
     }
@@ -9246,8 +9283,9 @@ impl Batch {
     ) {
         planning.end();
         self.front = true;
-        for (shadow, from, to) in &spans {
-            self.ahead.insert(std::sync::Arc::as_ptr(shadow) as usize, (*from, *to));
+        let mut spans = group_spans(spans);
+        for (shadow, ranges) in &spans {
+            self.ahead.entry(std::sync::Arc::as_ptr(shadow) as usize).or_default().extend(ranges.iter().copied());
         }
         #[cfg(feature = "diagnostics")]
         {
@@ -9260,20 +9298,22 @@ impl Batch {
         // Those known to copy nothing are said so here, unless they are very
         // many: then beside the others.
         const FEW: usize = 256;
-        let mut spans = spans;
         // (Renderer port #6: on the threads beside, whatever their number.)
         let many = spans.len() > FEW || crate::watch::port_guard_plan() && spans.len() + due.len() >= 4;
         if !many {
             let _known = crate::timeline::span("refreshes in front: those known to copy nothing");
             #[cfg(feature = "diagnostics")]
             let all = spans.len();
-            spans.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
+            spans.retain_mut(|(shadow, ranges)| {
+                ranges.retain(|&(from, to)| !shadow.nothing_new(from, to - from));
+                !ranges.is_empty()
+            });
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
         }
         let ahead = spans.len() > 1;
         if ahead {
-            let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
+            let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).flat_map(|r| r.1.iter().copied()).collect();
             crate::watch::ask_ahead(&ranges);
         }
         #[cfg(feature = "diagnostics")]
@@ -9288,13 +9328,16 @@ impl Batch {
                 due[i].refresh();
                 return;
             };
-            let (shadow, from, to) = &spans[i];
-            if many && refresh_timed(0, || shadow.nothing_new(*from, *to - *from)) {
-                #[cfg(feature = "diagnostics")]
-                FLUSHES[2].fetch_add(1, Ordering::Relaxed);
-                return;
+            // A copy's ranges are refreshed by one thread, one after the other.
+            let (shadow, ranges) = &spans[i];
+            for &(from, to) in ranges {
+                if many && refresh_timed(0, || shadow.nothing_new(from, to - from)) {
+                    #[cfg(feature = "diagnostics")]
+                    FLUSHES[2].fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                refresh_timed(1, || Self::update(shadow, from, to));
             }
-            refresh_timed(1, || Self::update(shadow, *from, *to));
         });
         #[cfg(feature = "diagnostics")]
         REFRESH_SPLIT[4].fetch_add(wall.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -9336,7 +9379,7 @@ impl Batch {
             .filter_map(|(key, from, to)| Some((copies.get(&key)?.clone(), from, to)))
             .collect();
         for (shadow, from, to) in &due {
-            self.ahead.insert(std::sync::Arc::as_ptr(shadow) as usize, (*from, *to));
+            self.ahead.insert(std::sync::Arc::as_ptr(shadow) as usize, vec![(*from, *to)]);
         }
         #[cfg(feature = "diagnostics")]
         let began = std::time::Instant::now();
@@ -9524,6 +9567,7 @@ impl Batch {
 /// ranges a frame, 33 ms (run cpuframe, 2026-11-26 00:19), for some 130 MB
 /// actually copied. A page between two ranges is left as it is: no list of
 /// the submission reads it, and it is still stale for the next that does.
+/// The submission's refreshes in front ([`front_spans`]) are ranges the same way.
 fn refresh_ranges() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("VICTORY_REFRESH_RANGES").is_some_and(|v| v == "1"));
@@ -9550,6 +9594,34 @@ fn add_range(ranges: &mut Vec<(usize, usize)>, from: usize, to: usize) {
         ranges.clear();
         ranges.push(envelope);
     }
+}
+
+/// Adds `[from, to)` to the ranges a copy is refreshed in front by: with `split`
+/// (`VICTORY_REFRESH_RANGES=1`) joined as [`add_range`] joins them, else into
+/// the one envelope they made before.
+fn front_join(ranges: &mut Vec<(usize, usize)>, from: usize, to: usize, split: bool) {
+    if !split {
+        match ranges.first_mut() {
+            Some(r) => *r = (r.0.min(from), r.1.max(to)),
+            None => ranges.push((from, to)),
+        }
+    } else if from < to {
+        add_range(ranges, from, to);
+    }
+}
+
+/// The spans of a submission's front ([`flat_spans`] of its copies, each copy's
+/// ranges in a row), grouped by copy again: [`Batch::refresh_spans`] refreshes one
+/// copy's ranges one after the other, on one thread.
+fn group_spans(spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> {
+    let mut grouped: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
+    for (shadow, from, to) in spans {
+        match grouped.last_mut() {
+            Some((last, ranges)) if std::sync::Arc::ptr_eq(last, &shadow) => ranges.push((from, to)),
+            _ => grouped.push((shadow, vec![(from, to)])),
+        }
+    }
+    grouped
 }
 
 #[cfg(test)]
