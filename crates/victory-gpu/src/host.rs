@@ -257,7 +257,7 @@ struct Aside {
     list: ID3D12CommandList,
     fence: ID3D12Fence,
     event: windows::Win32::Foundation::HANDLE,
-    value: u64,
+    progress: mapping_fence::Progress,
     _keep: (ID3D12CommandAllocator, [ID3D12Resource; 2]),
 }
 // SAFETY: D3D12 objects are free-threaded, the event is waited on by one
@@ -316,18 +316,15 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
                 list: list.cast()?,
                 fence: device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?,
                 event: CreateEventW(None, false, false, None)?,
-                value: 0,
+                progress: Default::default(),
                 _keep: (allocator, [from, to]),
             });
         }
         let Some(a) = aside.as_mut() else { return Ok(()) };
-        a.queue.ExecuteCommandLists(&[Some(a.list.clone())]);
-        a.value += 1;
-        a.queue.Signal(&a.fence, a.value)?;
-        if a.fence.GetCompletedValue() < a.value {
-            a.fence.SetEventOnCompletion(a.value, a.event)?;
-            WaitForSingleObject(a.event, INFINITE);
-        }
+        a.progress.run(
+            || a.queue.ExecuteCommandLists(&[Some(a.list.clone())]),
+            |value, recovering| mapping_fence::confirm(device, &a.queue, &a.fence, a.event, value, recovering),
+        )?;
     }
     let us = started.elapsed().as_micros() as u64;
     MAPPED[0].fetch_add(1, Ordering::Relaxed);
@@ -4304,6 +4301,7 @@ fn late_line(frames: f64) {
 pub(crate) mod aside;
 pub(crate) mod awake;
 pub(crate) mod framecsv;
+mod mapping_fence;
 mod card_steps;
 mod compare;
 #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
