@@ -150,11 +150,12 @@ impl Pending {
         self.make_with(|| self.build());
     }
 
-    /// The host pipeline, made here and now.
+    /// The host pipeline, made now, on a stack that holds its making
+    /// ([`on_a_large_stack`]).
     fn build(&self) -> Option<HostPipeline> {
         let _building = crate::timeline::span("pipeline: build a host pipeline");
         let began = Instant::now();
-        let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+        let made = on_a_large_stack(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
         super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
         made
     }
@@ -180,6 +181,57 @@ impl Pending {
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
+    }
+}
+
+thread_local! {
+    /// Whether this thread has a stack made for pipelines (a worker's, the
+    /// rescue's, one of [`on_a_large_stack`]).
+    static LARGE_STACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether what goes deep is run on a stack made for it when the thread
+/// that asks has none ([`on_a_large_stack`]). On by default;
+/// `VICTORY_LARGE_STACK=0`: on the asking thread's own stack, as before.
+fn large_stacks() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_LARGE_STACK").is_none_or(|v| v != "0"));
+    *ON
+}
+
+/// Runs `make` (a host pipeline's making, a shader's translation) on a
+/// stack large enough for it: here if this thread has one (a worker) or
+/// [`large_stacks`] says no, else on a thread of its own with a worker's
+/// stack ([`worker_stack`]), waited for.
+///
+/// The host converts a pipeline's code on the thread that asks, deep into
+/// its control flow, and the translator goes as deep. A thread of the
+/// title's that makes a pipeline itself ([`now`], a first use that finds no
+/// worker) or translates a shader at its first use has the stack the title
+/// gave it, 1 MiB by default. Under Wine the overflow does not end the
+/// process: the thread stands still (zeex64 502e905: a world's loading
+/// stood so at 59 s), or a fault taken on a nearly full stack faults again
+/// inside the handler and the process ends with no exception for anyone to
+/// log. (A larger default for every thread is no way, upstream found: at
+/// 64 MiB the title stops at its start.)
+pub(crate) fn on_a_large_stack<T: Send>(make: impl FnOnce() -> T + Send) -> T {
+    static STACK: LazyLock<usize> = LazyLock::new(worker_stack);
+    if !large_stacks() || LARGE_STACK.with(|l| l.get()) {
+        return make();
+    }
+    let mut make = Some(make);
+    let made = std::thread::scope(|s| {
+        let spawned = std::thread::Builder::new().name("victory-pipeline-now".into()).stack_size(*STACK).spawn_scoped(s, || {
+            LARGE_STACK.with(|l| l.set(true));
+            (make.take().expect("taken once"))()
+        });
+        spawned.ok().map(|thread| thread.join())
+    });
+    match made {
+        Some(Ok(made)) => made,
+        // What it threw is the caller's to see, as if made here.
+        Some(Err(thrown)) => std::panic::resume_unwind(thrown),
+        // No thread to be had: here after all.
+        None => (make.take().expect("not run on a thread"))(),
     }
 }
 
@@ -827,6 +879,7 @@ static NOW: Mutex<Vec<Option<Arc<Pending>>>> = Mutex::new(Vec::new());
 /// the process runs.
 fn spawn_worker(i: usize, screens_only: bool, stack: usize) -> std::io::Result<std::thread::JoinHandle<()>> {
     std::thread::Builder::new().name(format!("victory-pipelines-{i}")).stack_size(stack).spawn(move || {
+        LARGE_STACK.with(|l| l.set(true));
         // Below the title's own threads (loading, recording),
         // and the streaming one, which is below normal itself
         // (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before).
@@ -982,7 +1035,10 @@ fn rescue_with(
     std::thread::Builder::new()
         .name("victory-pipeline-rescue".to_owned())
         .stack_size(stack)
-        .spawn(move || p.make_with(|| build(&p)))
+        .spawn(move || {
+            LARGE_STACK.with(|l| l.set(true));
+            p.make_with(|| build(&p))
+        })
         .ok()
 }
 
@@ -1363,6 +1419,42 @@ mod tests {
         assert!(ready(&p).is_none());
         assert!(started.elapsed() <= wait_budget() + Duration::from_millis(500));
         COMPUTE_MS_IN_TEST.set(None);
+    }
+
+    /// What a thread without a stack for it asks is run on a thread with
+    /// one, once, and its answer (or what it threw) comes back; a thread
+    /// that has such a stack runs it itself.
+    #[test]
+    fn what_goes_deep_is_run_on_a_large_stack() {
+        #[inline(never)]
+        fn deep(n: usize) -> usize {
+            let frame = std::hint::black_box([n as u8; 4096]);
+            if n == 0 { 0 } else { std::hint::black_box(deep(n - 1)) + usize::from(frame[0] == frame[4095]) }
+        }
+        if !large_stacks() {
+            // (Switched off: run where asked.)
+            let here = std::thread::current().id();
+            assert_eq!(on_a_large_stack(|| std::thread::current().id()), here);
+            return;
+        }
+        let here = std::thread::current().id();
+        let borrowed = vec![1u8, 2, 3];
+        // 8 MiB of frames from a thread with 1 MiB, as the title's are.
+        let asked = std::thread::Builder::new().stack_size(1 << 20).spawn(move || {
+            let asker = std::thread::current().id();
+            let (ran_on, depth, sum) =
+                on_a_large_stack(|| (std::thread::current().id(), deep(2048), borrowed.iter().map(|&b| usize::from(b)).sum::<usize>()));
+            // Inside such a thread, nothing is started again.
+            let inner = on_a_large_stack(|| on_a_large_stack(|| LARGE_STACK.with(|l| l.get())));
+            (asker, ran_on, depth, sum, inner)
+        });
+        let (asker, ran_on, depth, sum, inner) = asked.unwrap().join().unwrap();
+        assert_eq!((depth, sum), (2048, 6));
+        assert_ne!(asker, here);
+        assert_ne!(ran_on, asker);
+        assert!(inner);
+        let thrown = std::panic::catch_unwind(|| on_a_large_stack(|| -> u32 { panic!("thrown on the large stack") }));
+        assert!(thrown.is_err());
     }
 
     #[test]
