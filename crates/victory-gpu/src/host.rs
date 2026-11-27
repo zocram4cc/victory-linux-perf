@@ -3754,6 +3754,7 @@ impl RelayBack {
         land::spent(land::stat::BACK, merging);
         for ((_, from, to), written) in self.work.iter().zip(written) {
             COPY_BACK[1].fetch_add(written, Ordering::Relaxed);
+            crate::wc::back(*from, written);
             #[cfg(feature = "diagnostics")]
             crate::copystat::compared(*from, to - from, written as usize);
             let _ = (from, to);
@@ -4124,6 +4125,7 @@ fn hand_back(back: &[Declared]) {
         for ((shadow, from, to), found) in work.iter().zip(found) {
             let written = shadow.copy_back_with(*from, to - from, Some(found));
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+            crate::wc::back(*from, written as u64);
             #[cfg(feature = "diagnostics")]
             crate::copystat::compared(*from, to - from, written);
         }
@@ -4156,6 +4158,7 @@ fn hand_back(back: &[Declared]) {
         for (from, to) in spans {
             let written = shadow.copy_back(from, to - from);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+            crate::wc::back(from, written as u64);
             #[cfg(feature = "diagnostics")]
             crate::copystat::compared(from, to - from, written);
         }
@@ -5046,7 +5049,9 @@ impl Host {
                     // SAFETY: the mapping of the fetched bytes, `total` of
                     // them; the copy into it has run, and the next waits
                     // for this call.
-                    put.fetch_add(unsafe { run[0].0.land_card(&addressed, after, &mut notes) }, Ordering::Relaxed);
+                    let landed = unsafe { run[0].0.land_card(&addressed, after, &mut notes) };
+                    crate::wc::back(run[0].1, landed);
+                    put.fetch_add(landed, Ordering::Relaxed);
                 }
                 notes.flush();
                 land::spent(land::stat::CARD_ALL, working);
@@ -5065,6 +5070,7 @@ impl Host {
                 let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
                 let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
                 shadow.walls_merged(gpu.len(), merged);
+                crate::wc::back(*lo, merged as u64);
                 written += merged as u64;
             }
         }
@@ -5359,6 +5365,7 @@ impl Host {
         for (r, written) in plan.ranges.iter().zip(written) {
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             let (from, to) = r.declared;
+            crate::wc::back(from, written as u64);
             #[cfg(feature = "diagnostics")]
             crate::copystat::compared(from, to - from, written);
             let _ = (from, to);
@@ -7666,6 +7673,7 @@ impl HostList {
                     if wide_fills() {
                         batch.fills.push((dst, src, len));
                         bytes += len as u64;
+                        crate::wc::up(src, len as u64);
                         continue;
                     }
                     let started = std::time::Instant::now();
@@ -7752,6 +7760,15 @@ impl HostList {
             };
             us += started.elapsed();
             bytes += copied as u64;
+            if crate::wc::on() {
+                let at = match step {
+                    &Step::Copy(dst, ..) => dst,
+                    &Step::Fill(_, src, ..) => src,
+                    Step::Placed(p) => p.src,
+                    _ => 0,
+                };
+                crate::wc::up(at, copied as u64);
+            }
         }
         PREPARING[0].fetch_add(us.as_micros() as u64, Ordering::Relaxed);
         PREPARING[1].fetch_add(bytes, Ordering::Relaxed);
@@ -8450,6 +8467,7 @@ impl Batch {
         let started = std::time::Instant::now();
         let _one = crate::timeline::span("a copy's refresh");
         let copied = shadow.update(from, to - from);
+        crate::wc::up(from, copied as u64);
         let us = started.elapsed().as_micros() as u64;
         #[cfg(feature = "diagnostics")]
         crate::copystat::range(from, to - from, us, 0);
@@ -9531,6 +9549,7 @@ impl Meter {
                         per_frame(6) / 1e3
                     );
                 }
+                crate::wc::log(frames);
                 tracing::info!(
                     "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                      {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
