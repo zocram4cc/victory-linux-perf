@@ -748,9 +748,13 @@ static SYNC_SPLIT: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomi
 #[cfg(windows)]
 pub(crate) fn sync_line(frames: f64) {
     crate::port_descriptors::line(frames);
-    let [twins, moved, lost, exact] = [0, 1, 2, 3].map(|i| host::TWINS[i].swap(0, std::sync::atomic::Ordering::Relaxed));
-    if exact > 0 {
-        tracing::info!(exact, "raw twins made from their own dword, not on 16 bytes (VICTORY_TWIN_EXACT=0: null views), since the last line");
+    let [twins, moved, lost, exact, off_dword] = [0, 1, 2, 3, 4].map(|i| host::TWINS[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    if exact > 0 || off_dword > 0 {
+        tracing::info!(
+            exact,
+            off_dword,
+            "raw twins made from their own dword, not on 16 bytes (VICTORY_TWIN_EXACT=0: null views), and twins not on a dword (as before: moved to the byte or null), since the last line"
+        );
     }
     if twins > 0 {
         tracing::info!(

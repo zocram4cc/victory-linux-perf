@@ -3847,8 +3847,9 @@ fn buffer_view_ok(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw:
 
 /// Raw twins ([`raw_twins`]) made since the last frame line, and those of them that
 /// do not begin on 16 bytes, as a raw view must ([`move_raw`]), and those of
-/// these that could not be moved there (null).
-pub(crate) static TWINS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// these that could not be moved there (null), and those made exact
+/// ([`twin_exact`]), and those that do not begin on a dword either (never exact).
+pub(crate) static TWINS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// Whether raw twins of buffer views that do not begin on 16 bytes begin at
 /// the view's own dword (on by default; `VICTORY_TWIN_EXACT=0`: a null view,
@@ -3864,6 +3865,12 @@ pub(crate) static TWINS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync:
 /// "Just Like Paradise" title shot, frames 1 and 2 of capture title3; up to
 /// 1,000 such twins a frame in play). With the twins exact: 0 flicker frames
 /// (run titleTX).
+///
+/// Only a twin whose view begins on a dword is made exact: a raw view's first
+/// element is a dword, so a view of 16-bit or byte values that begins inside
+/// one would begin up to 3 bytes early, and every load would read the values
+/// beside the ones asked for. Those stay as before: [`move_raw`] moves a
+/// staged one to the byte, else null.
 fn twin_exact() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_TWIN_EXACT").is_none_or(|v| v != "0"))
@@ -3924,6 +3931,9 @@ fn twin_window(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw: bo
     let dwords = u32::try_from((end - from) / 4).ok()?;
     if from != start {
         TWINS[1].fetch_add(1, Relaxed);
+        if (start - from) % 4 != 0 {
+            TWINS[4].fetch_add(1, Relaxed);
+        }
     }
     Some((from / 4, dwords, (start - from) as u32))
 }
@@ -4019,7 +4029,7 @@ fn buffer_srv(
                     .CreateShaderResourceView(&shadow.buffer, Some(&desc), twin);
                 shadow.buffer.GetGPUVirtualAddress() + first * 4
             };
-            if by > 0 && twin_exact() {
+            if by > 0 && by % 4 == 0 && twin_exact() {
                 // The raw twin from the view's own first dword (on 4 bytes, not
                 // 16), not a null view ([`twin_exact`]).
                 TWINS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4151,7 +4161,7 @@ fn buffer_uav(
                     .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), twin);
                 shadow.buffer.GetGPUVirtualAddress() + first * 4
             };
-            if by > 0 && twin_exact() {
+            if by > 0 && by % 4 == 0 && twin_exact() {
                 // The raw twin from the view's own first dword (on 4 bytes, not
                 // 16), not a null view ([`twin_exact`]).
                 TWINS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
