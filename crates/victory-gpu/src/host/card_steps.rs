@@ -677,6 +677,11 @@ mod late {
         pages.as_ref().is_some_and(|p| (from / PAGE..to.div_ceil(PAGE)).any(|page| p.contains(&page)))
     }
 
+    #[cfg(test)]
+    pub(super) fn forget() {
+        *PAGES.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
     /// The submission has landed: what the fills of `sent` (place, length,
     /// place in the buffer between) read, in `back`, compared with title
     /// memory now.
@@ -1155,6 +1160,8 @@ pub(super) fn log(frames: f64) {
 mod tests {
     use super::*;
 
+    static LEARNING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn copy(dst: usize, src: usize, len: usize, asked: bool) -> Does {
         Does::Copy { dst, src, len, asked }
     }
@@ -1176,6 +1183,8 @@ mod tests {
     /// one left alone is not.
     #[test]
     fn places_written_after_sending_are_learned() {
+        let _one = LEARNING.lock().unwrap_or_else(|e| e.into_inner());
+        late::forget();
         // Two pages of memory of our own, page-aligned, as title memory.
         let memory = vec![0u8; 4 * 4096];
         let page = (memory.as_ptr() as usize).next_multiple_of(4096);
@@ -1199,6 +1208,8 @@ mod tests {
     /// again before landing, is learned; one that still matches is not.
     #[test]
     fn fills_done_on_the_cpu_are_learned_too() {
+        let _one = LEARNING.lock().unwrap_or_else(|e| e.into_inner());
+        late::forget();
         let memory = vec![0u8; 4 * 4096];
         let page = (memory.as_ptr() as usize).next_multiple_of(4096);
         let (kept, changed) = (page + 16, page + 4096 + 0xbd0);
