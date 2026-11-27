@@ -530,7 +530,8 @@ fn dump_one(
             list.list
                 .ResourceBarrier(&[crate::host::transition(texture, state, copy)]);
         }
-        let read = read_back(&host.device, &list.list, texture);
+        // A buffer of its own: the kept one is the presented frame's.
+        let read = read_back_of(&host.device, &list.list, texture, 0, false);
         // The stencil plane of a depth-stencil target, which the title's
         // lighting reads (material class in the low bits; 0x08 "inside a
         // room", which the lamps of a room are multiplied by): the plane
