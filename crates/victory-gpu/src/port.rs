@@ -96,18 +96,23 @@ pub(crate) fn on() -> bool {
 /// heap whose bytes a second CPU mapping sees. On Windows the world is drawn
 /// with it (RX 9070 XT, alone and with port #7), and the same heap fixture
 /// passes. So it stays off under Wine. Both halves read it here:
-/// this crate's [`on`] and `victory_hle`'s xmem.
-pub fn constants_switch(setting: Option<&str>, wine_setting: Option<&str>, wine: bool) -> bool {
+/// this crate's [`on`] and `victory_hle`'s xmem. `home` (`VICTORY_PORT_HOME=1`
+/// with `VICTORY_WINE_MAP=1`) counts as `VICTORY_PORT_CONSTANTS_WINE=1`: that
+/// path opens the heap on the title's own private pages, which is what the
+/// black world lacked.
+pub fn constants_switch(setting: Option<&str>, wine_setting: Option<&str>, wine: bool, home: bool) -> bool {
     let one = |v: Option<&str>| v.is_some_and(|v| v.trim() == "1");
-    one(setting) && (!wine || one(wine_setting))
+    one(setting) && (!wine || home || one(wine_setting))
 }
 
 /// [`constants_switch`] from the environment and the platform.
 pub fn constants_switch_here() -> bool {
     let setting = std::env::var("VICTORY_PORT_CONSTANTS").ok();
     let wine_setting = std::env::var("VICTORY_PORT_CONSTANTS_WINE").ok();
+    let asked = |name: &str| std::env::var(name).is_ok_and(|v| v.trim() == "1");
+    let home = asked("VICTORY_PORT_HOME") && asked("VICTORY_WINE_MAP");
     let wine = crate::wine::on_wine();
-    let on = constants_switch(setting.as_deref(), wine_setting.as_deref(), wine);
+    let on = constants_switch(setting.as_deref(), wine_setting.as_deref(), wine, home);
     if wine && setting.as_deref().is_some_and(|v| v.trim() == "1") && !on {
         tracing::warn!(
             "VICTORY_PORT_CONSTANTS=1 is left off under Wine (a black world was reported there); \
@@ -456,16 +461,19 @@ mod tests {
 
     /// `VICTORY_PORT_CONSTANTS=1` turns the port on on Windows; under Wine it
     /// also needs `VICTORY_PORT_CONSTANTS_WINE=1` (a black world was reported
-    /// there); anything but `1` leaves it off everywhere.
+    /// there) or the home path (`VICTORY_PORT_HOME=1` with `VICTORY_WINE_MAP=1`);
+    /// anything but `1` leaves it off everywhere.
     #[test]
     fn the_constants_port_stays_off_under_wine_unless_asked_for_there() {
-        assert!(constants_switch(Some("1"), None, false), "off on Windows with the switch");
-        assert!(!constants_switch(Some("1"), None, true), "on under Wine without VICTORY_PORT_CONSTANTS_WINE=1");
-        assert!(constants_switch(Some(" 1 "), Some("1"), true), "off under Wine though both were asked for");
-        assert!(!constants_switch(Some("1"), Some("0"), true));
-        assert!(!constants_switch(None, Some("1"), true));
-        assert!(!constants_switch(Some("0"), None, false));
-        assert!(!constants_switch(None, None, false));
+        assert!(constants_switch(Some("1"), None, false, false), "off on Windows with the switch");
+        assert!(!constants_switch(Some("1"), None, true, false), "on under Wine without VICTORY_PORT_CONSTANTS_WINE=1");
+        assert!(constants_switch(Some(" 1 "), Some("1"), true, false), "off under Wine though both were asked for");
+        assert!(!constants_switch(Some("1"), Some("0"), true, false));
+        assert!(!constants_switch(None, Some("1"), true, false));
+        assert!(!constants_switch(Some("0"), None, false, false));
+        assert!(!constants_switch(None, None, false, false));
+        assert!(constants_switch(Some("1"), None, true, true), "off under Wine with the home path asked for");
+        assert!(!constants_switch(None, None, true, true), "the home path alone turned the port on");
     }
 
     /// Under Wine, on the card (nothing is tried elsewhere): a stretch whose
