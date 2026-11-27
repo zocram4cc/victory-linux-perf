@@ -5,6 +5,9 @@
 # of its last four frame lines), where a good one has ~9,000. (fps was a poor
 # test: broken runs went from 29 to 36 fps.) Usage: scripts/p4-bisect.sh [LOW] [HIGH]
 set -uo pipefail
+# P.4 runs make native pipelines: a cache of their own, so that the pipeline
+# library of normal play does not start them early every run (27 Nov).
+export K_CACHE=${K_CACHE:-$HOME/Games/victory-data/perfiles/kroeeee/cache-p4}
 cd "$(dirname "$0")/.."
 lo=${1:-0} hi=${2:-2700}   # lo: known good (0 = none made), hi: known broken
 while ((hi - lo > 1)); do

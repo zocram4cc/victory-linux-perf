@@ -14,6 +14,9 @@
 #
 #   scripts/p4-hunt.sh [ROUNDS]     (default 6; K_DUMP= the dump directory)
 set -uo pipefail
+# P.4 runs make native pipelines: a cache of their own, so that the pipeline
+# library of normal play does not start them early every run (27 Nov).
+export K_CACHE=${K_CACHE:-$HOME/Games/victory-data/perfiles/kroeeee/cache-p4}
 cd "$(dirname "$0")/.."
 DUMP=${K_DUMP:-$HOME/Games/victory-data/pso-dump}
 BAD=bench/p4-bad.txt

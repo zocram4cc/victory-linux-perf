@@ -19,6 +19,9 @@
 #
 #   scripts/p4-grow.sh
 set -uo pipefail
+# P.4 runs make native pipelines: a cache of their own, so that the pipeline
+# library of normal play does not start them early every run (27 Nov).
+export K_CACHE=${K_CACHE:-$HOME/Games/victory-data/perfiles/kroeeee/cache-p4}
 cd "$(dirname "$0")/.."
 W=bench/p4-grow
 mkdir -p "$W/queue"
