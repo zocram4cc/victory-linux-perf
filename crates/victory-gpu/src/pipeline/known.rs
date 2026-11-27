@@ -199,7 +199,8 @@ pub fn keys(dir: &Path) -> Vec<String> {
 
 /// What a driver's cached pipelines depend on besides the title's: the
 /// translator with its settings, the driver, and the switches that change a
-/// host pipeline's own state (cull mode, target formats, root signature).
+/// host pipeline's own state (cull mode, target formats, root signature,
+/// depth bias).
 /// Without the last, `warm` counted pipelines made with `VICTORY_CULL_NONE=1`
 /// as made for a run with it off, and that run made them all again while
 /// it drew.
@@ -219,7 +220,8 @@ pub fn fingerprint() -> String {
 
 /// The switches read where host pipelines are made that change what is
 /// made ([`fingerprint`]).
-const STATE_SWITCHES: [&str; 3] = ["VICTORY_CULL_NONE", "VICTORY_E5_TARGETS", "VICTORY_ROOT_SRV_DIRECT"];
+const STATE_SWITCHES: [&str; 4] =
+    ["VICTORY_CULL_NONE", "VICTORY_E5_TARGETS", "VICTORY_ROOT_SRV_DIRECT", "VICTORY_DEPTH_BIAS_SCALE"];
 
 #[cfg(test)]
 #[test]

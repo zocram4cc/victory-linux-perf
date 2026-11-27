@@ -150,6 +150,42 @@ fn host_blend(blend: &D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D1
     host
 }
 
+/// `VICTORY_DEPTH_BIAS_SCALE=<n>`: the constant depth bias of pipelines that
+/// draw into a float depth buffer, times `n` (1, the title's own, unless
+/// set; at most 1024). The title draws about 9,000 of its pipelines as
+/// layers over a mesh already drawn (reversed depth, `GREATER_EQUAL`, depth
+/// writes off) with a constant bias of 1 and a slope bias of 1.0: on float
+/// depth one unit is 2^(e-23), about one step of the depth value, so the
+/// layer stays in front only while both draws make bit for bit the same
+/// depth. On the console they do. On the host each pipeline's vertex code
+/// is compiled on its own (DXIL, then SPIR-V, then the driver), and a
+/// multiply-add fused in one and not the other moves a depth by a step or
+/// more: the layer and the mesh under it trade places pixel by pixel and
+/// frame by frame (a bunk bed's sheet, run 20261126-235437). A larger bias
+/// keeps the layer in front. Shadow maps (16-bit depth, a slope bias and
+/// no constant one) are left as they are.
+fn depth_bias_scale() -> i32 {
+    static SCALE: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    *SCALE.get_or_init(|| {
+        std::env::var("VICTORY_DEPTH_BIAS_SCALE")
+            .ok()
+            .and_then(|v| v.trim().parse::<i32>().ok())
+            .unwrap_or(1)
+            .clamp(1, 1024)
+    })
+}
+
+/// `r` as the host draws it into a depth buffer of `format`, with the
+/// constant depth bias times `scale` on float depth
+/// ([`depth_bias_scale`]).
+fn scaled_depth_bias(mut r: D3D12_RASTERIZER_DESC, format: DXGI_FORMAT, scale: i32) -> D3D12_RASTERIZER_DESC {
+    let float = format == DXGI_FORMAT_D32_FLOAT || format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+    if float && scale > 1 {
+        r.DepthBias = r.DepthBias.saturating_mul(scale);
+    }
+    r
+}
+
 /// `VICTORY_CULL_NONE=1`: every pipeline draws both faces. Under Proton the
 /// characters' head and hair meshes are culled away as if wound the other
 /// way (meeyao/victory-8gb-linux, patch 8); drawing both faces brings them
@@ -160,6 +196,13 @@ fn cull_none() -> bool {
 }
 
 impl GraphicsState {
+    /// The rasterizer state the host pipeline is made with: the title's,
+    /// its constant depth bias scaled on float depth
+    /// ([`depth_bias_scale`]).
+    pub(crate) fn host_rasterizer(&self) -> D3D12_RASTERIZER_DESC {
+        scaled_depth_bias(self.rasterizer, self.depth_format, depth_bias_scale())
+    }
+
     /// Whether the draws are a pass over the screen: no vertex input, no
     /// depth or stencil, a target. Such passes fill tables once; their shaders
     /// are few. (After Belobug/VIctory-Belobug-AMD 18e57db8.)
@@ -740,7 +783,7 @@ impl HostPipeline {
             }),
             BlendState: host_blend(&g.blend, &g.targets),
             SampleMask: g.sample_mask,
-            RasterizerState: g.rasterizer,
+            RasterizerState: g.host_rasterizer(),
             DepthStencilState: g.depth,
             InputLayout: D3D12_INPUT_LAYOUT_DESC {
                 pInputElementDescs: g.inputs.as_ptr(),
@@ -987,7 +1030,7 @@ fn mesh_pipeline(
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
             blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, host_blend(&g.blend, &g.targets)),
             mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
-            raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
+            raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.host_rasterizer()),
             depth,
             targets: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, g.targets),
             dsv: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, g.depth_format),
@@ -1006,7 +1049,7 @@ fn mesh_pipeline(
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
             blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, host_blend(&g.blend, &g.targets)),
             mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
-            raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
+            raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.host_rasterizer()),
             depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, g.depth1()),
             targets: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, g.targets),
             dsv: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, g.depth_format),
@@ -1085,6 +1128,22 @@ mod tests {
 
     use super::*;
 
+    /// `VICTORY_DEPTH_BIAS_SCALE`: the constant depth bias grows on float
+    /// depth only, and a zero bias, the slope bias and other formats stay.
+    #[test]
+    fn depth_bias_scales_on_float_depth_only() {
+        let r = D3D12_RASTERIZER_DESC { DepthBias: 1, SlopeScaledDepthBias: 1.0, ..Default::default() };
+        let scaled = scaled_depth_bias(r, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, 16);
+        assert_eq!((scaled.DepthBias, scaled.SlopeScaledDepthBias), (16, 1.0));
+        assert_eq!(scaled_depth_bias(r, DXGI_FORMAT_D32_FLOAT, 4).DepthBias, 4);
+        assert_eq!(scaled_depth_bias(r, DXGI_FORMAT_D16_UNORM, 16).DepthBias, 1);
+        assert_eq!(scaled_depth_bias(r, DXGI_FORMAT_D24_UNORM_S8_UINT, 16).DepthBias, 1);
+        assert_eq!(scaled_depth_bias(r, DXGI_FORMAT_D32_FLOAT, 1).DepthBias, 1);
+        let zero = D3D12_RASTERIZER_DESC { SlopeScaledDepthBias: 1.8, ..Default::default() };
+        assert_eq!(scaled_depth_bias(zero, DXGI_FORMAT_D32_FLOAT, 16).DepthBias, 0);
+        let big = D3D12_RASTERIZER_DESC { DepthBias: i32::MAX / 2, ..Default::default() };
+        assert_eq!(scaled_depth_bias(big, DXGI_FORMAT_D32_FLOAT, 1024).DepthBias, i32::MAX);
+    }
     /// A triangle mesh shader of our own and a pixel shader for it.
     const MS: &str = "struct V { float4 p : SV_Position; };
         [outputtopology(\"triangle\")] [numthreads(1, 1, 1)]
