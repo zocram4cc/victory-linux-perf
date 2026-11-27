@@ -349,7 +349,31 @@ fn select_version(query_fn: Call, device: &ID3D12Device) -> Result<(u64, String)
             offered.push((id, name));
         }
     }
+    // Under Wine the SDK offers FSR 4.1.2 whenever Proton's amdxc64 is there,
+    // but the FSR 4 code itself (amdxcffx64.dll, which GE-Proton's
+    // PROTON_FSR4_UPGRADE=1 installs, for RDNA3 and RDNA4) may be missing: a
+    // context made on it then upscales wrongly (doubled, smeared outlines
+    // behind the prison window, 2026-11-27, "Failed to load FSR4 dll" in the
+    // log). Without that DLL, 4.1.2 is not offered and FSR 3.1 is chosen.
+    if crate::modules::xmem::on_wine() && !fsr4_code_loads() {
+        offered.retain(|(_, name)| !is_fsr_4_1_2(name));
+    }
     choose(offered)
+}
+
+/// Whether AMD's FSR 4 code (`amdxcffx64.dll`) can be loaded (it is let go
+/// again at once; the SDK loads it itself).
+fn fsr4_code_loads() -> bool {
+    use windows_sys::Win32::System::LibraryLoader::LoadLibraryW;
+    let name: Vec<u16> = "amdxcffx64.dll".encode_utf16().chain(Some(0)).collect();
+    // SAFETY: a NUL-terminated wide name.
+    let module = unsafe { LoadLibraryW(name.as_ptr()) };
+    if module.is_null() {
+        return false;
+    }
+    // SAFETY: the reference taken just above.
+    unsafe { windows_sys::Win32::Foundation::FreeLibrary(module) };
+    true
 }
 
 /// The patch number of an FSR 3.1 provider's name (`3.1.5` → 5); `None` for
