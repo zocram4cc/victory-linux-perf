@@ -97,6 +97,9 @@ pub(crate) struct Staging {
     /// recorded again about a second later if the card has room by then
     /// ([`upload`]).
     waiting: std::sync::atomic::AtomicU64,
+    /// Recorded for a bake (`BAKING`): its first refresh may read title memory
+    /// through the kernel before it waits ([`exact_read_first`]).
+    exact: std::sync::atomic::AtomicBool,
     /// (`VICTORY_PARTIAL_DELTA=1`) Which subresources the list's copy leaves
     /// out, when this upload is one ([`delta`]).
     delta: Mutex<Option<delta::Plan>>,
@@ -460,6 +463,24 @@ fn fill_unlocked() -> bool {
 /// filled from the pages there ([`fill_unlocked`]), and of them those that
 /// got less than was mapped (their slots are looked at again).
 pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Since the last frame-rate line, with [`exact_read_first`]: exact refreshes
+/// read whole through the kernel ([0]), and those that waited because a page
+/// was away ([1]).
+pub(crate) static EXACT_UNLOCKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Whether an exact refresh (of a texture uploaded for a bake, `BAKING`) that
+/// finds the runtime remapping title memory reads the texture whole through
+/// the kernel first, and waits for the remapping to end only if a page of it
+/// is away (`VICTORY_EXACT_NO_WAIT=1`, off by default). Under [`no_wait`] such
+/// a refresh would not wait, and a texture it cannot read whole is left for a
+/// later refresh or filled with the pages there, zeros for the rest, which a
+/// bake may read. A read through the kernel that succeeds got every byte as
+/// title memory holds it at that moment, as a read under the lock would.
+fn exact_read_first() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::switch::on("VICTORY_EXACT_NO_WAIT"));
+    *ON
+}
 
 /// Since the last frame-rate line, of texture refreshes on every thread, in
 /// microseconds: waiting for the texture's own lock (another thread is
@@ -998,6 +1019,9 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         return;
     };
     use std::sync::atomic::Ordering::Relaxed;
+    if BAKING.get() {
+        staging.exact.store(true, Relaxed);
+    }
     let picking = PICKING.get();
     if picking.is_none() {
         // A draw samples it through a table: kept and checked from here on.
@@ -1571,6 +1595,7 @@ impl Staging {
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
         let alone = self.once.load(std::sync::atomic::Ordering::Relaxed);
+        let exact = self.exact.swap(false, std::sync::atomic::Ordering::Relaxed);
         if alone && last.hash.is_some() {
             return 0;
         }
@@ -1645,7 +1670,22 @@ impl Staging {
         // stays mapped (see `crate::watch::title_memory_reading`; without
         // it a page went between the asking and the read in runs 71 and
         // 74).
-        let _mapped = if no_wait() {
+        let _mapped = if no_wait() && exact && exact_read_first() {
+            // A bake's refresh: read through the kernel first, and waited for
+            // only where a page is away (`exact_read_first`).
+            match crate::watch::title_memory_reading_now_in(self.memory as usize, size) {
+                Some(mapped) => mapped,
+                None => match self.refresh_exact_unlocked(last, size) {
+                    Some(changed) => {
+                        if changed {
+                            found_blind(last);
+                        }
+                        return size;
+                    }
+                    None => waited(2, || crate::watch::title_memory_reading_in(self.memory as usize, size)),
+                },
+            }
+        } else if no_wait() {
             // Not waited for: while the runtime remaps title memory the
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
@@ -1767,6 +1807,31 @@ impl Staging {
             last.asked = 0;
             0
         }
+    }
+
+    /// An exact refresh ([`exact_read_first`]) that finds the runtime
+    /// remapping title memory: the texture is read whole through the kernel,
+    /// which needs no lock and fails if a page of it is away. `Some(changed)`
+    /// if it was read; `None` if not, and the refresh waits for the lock as
+    /// before.
+    fn refresh_exact_unlocked(&self, last: &mut Last, size: usize) -> Option<bool> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut changed = false;
+        let read = with_read(size, |read| {
+            if !crate::host::read_into(self.memory, read) {
+                return false;
+            }
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+            changed = last.convert(Some(digest(read)), || {
+                let converted = self.detile(read);
+                self.keep_whole(read);
+                converted
+            });
+            true
+        });
+        EXACT_UNLOCKED[usize::from(!read)].fetch_add(1, Relaxed);
+        read.then_some(changed)
     }
 
     /// The first filling of the staging buffer while the runtime is
@@ -2349,6 +2414,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         detiled: std::sync::atomic::AtomicU32::new(0),
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
+        exact: std::sync::atomic::AtomicBool::new(BAKING.get()),
         delta: Mutex::new(None),
     });
     map.insert(resource as usize, s.clone());
