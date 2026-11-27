@@ -12,6 +12,30 @@ bimodal; differences under ~5 ms need ≥4 runs an arm).
   world (`draws > 100`). Figure = median `ms_per_frame` of those rows; "prep" = median `cpu_prepare_ms`.
 - Release build (`--features scripted`), caches warm (prebuild + full `warm`, 93,821 pipelines).
 
+## Latest (2026-11-28 night): `main` = 506a3bc75
+
+Same method; old save; play set + `VICTORY_SHADER_OPT=63 VICTORY_WINDOWS_BAR_MB=4096` (both new in
+play). Two identical baselines in one batch differed by 3.9 ms (ab25: 47.4 vs 43.5), so single
+150-row runs only resolve effects of ~4 ms and more.
+
+| Change | Frame | Prep | Heap | Notes |
+|---|---|---|---|---|
+| `VICTORY_SHADER_OPT=63` (was forced 0 by `run-i19.sh`) | 48.3 vs 49.0 | 39.9 vs 39.8 | | ab20; card as busy (RADV's compiler already cleans up) |
+| + `VICTORY_WINDOWS_BAR_MB=4096` | **45.9** vs 48.3 | 38.9 | | ab20; card 77 → 68 % busy, worst p95 199 → 133 |
+| submit-thread Vecs kept/pre-sized (d08f825a3, no switch) | 44.9 vs 43.7 | 37.0 vs 35.8 | | ab21; result-identical |
+| list-thread hashing and resource borrows (18749873f, af023c26f, no switch) | 43.5 vs 43.7 | 36.7 | | ab21; result-identical |
+| `VICTORY_MAPPED_CACHE=1` (506a3bc75, off by default) | 43.8 vs 44.4 | 37.2 | **11.0 vs 15.5** | ab22; heap pass −29 % |
+| fast-4 (all four) + `MAPPED_CACHE=1` | 43.9 vs 43.5 / 47.4 | 34.7 | 10.9 | ab25 arm F; p90 53.8 |
+| `VICTORY_ASK_EARLY=2`, `VICTORY_GUARD_HOT=200`, both | 47.8 / 46.8 / 45.8 | | | ab25; no effect seen; off |
+| spin-before-sleep shim on Wine's `virtual_mutex` (LD_PRELOAD, not merged) | 45.8 vs 44.9 (2 pairs) | | 11.8 vs 15.6 | ab24; heap faster, frame not |
+
+- Where the frame goes (diag timeline, 15 frames): the card runs 18 ms a frame and idles 19 ms between
+  its ~13 submissions, waiting on the submitting thread's serial preparation; half of that idle is
+  `refreshes ahead of writes` (notes: `submit-overlap.md`). Wine's `virtual_mutex` is held 35 % of the
+  time but waited on 18 s per 10 s (55k acquisitions/s: the heap pass's working-set queries, guard
+  faults' protection changes, write-watch asks); relieving it speeds the heap pass, not the frame.
+- Kernel write watches (userfaultfd + PAGEMAP_SCAN) and ntsync are active in this Proton.
+
 ## Latest (2026-11-27 night): `main` = 505d89688
 
 Each step merged into `main` after an A/B against the step before (single runs, 150–200 world rows,
