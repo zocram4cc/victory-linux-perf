@@ -269,6 +269,27 @@ pub fn use_console_timers() {
         timeBeginPeriod(1);
     }
     ahead_of_other_programs();
+    quit_after();
+}
+
+/// `VICTORY_QUIT_AFTER_S=<seconds>`: an unattended test run ends itself that
+/// long after the start (the process exits with code 0). Unset: the run lasts
+/// as long as it is played.
+#[cfg(windows)]
+fn quit_after() {
+    let Some(seconds) = std::env::var("VICTORY_QUIT_AFTER_S").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&s| s > 0)
+    else {
+        return;
+    };
+    tracing::info!(seconds, "the run ends itself after this long (VICTORY_QUIT_AFTER_S)");
+    std::thread::Builder::new()
+        .name("victory-quit-after".into())
+        .spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(seconds));
+            tracing::info!(seconds, "the run's time is up (VICTORY_QUIT_AFTER_S): exiting");
+            std::process::exit(0);
+        })
+        .ok();
 }
 
 /// The title's streaming thread runs below normal priority (on the console
