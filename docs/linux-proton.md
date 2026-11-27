@@ -19,7 +19,7 @@ Tested on: AMD RX 6800 XT (RDNA2), Mesa RADV, CachyOS, our Proton build (see
 | Input: live keys from a file (`VICTORY_KEYS_FILE`, diagnostics builds) | lines appended to a file while the game runs are pressed (`<key>[+<key>...][:<ms>]`), on top of `VICTORY_KEYS` and a connected controller: for hands-free and scripted test runs |
 | Linux: our Proton build as a submodule, `proton-ge`; this file | see below |
 | GPU: the ray-tracing builder is its 52 programs, not any program that spills its user data | with ray tracing off, every compute program whose user data spills was dropped as a builder stage; now the builder is the 52 programs of `XboxBvhBuilder.dll` (by hash, build 1.0.2.1), and other spilled programs run (logged once each) |
-| Linux: Proton fork at 5fc510e2 | its Wine imports section memory as dma-bufs (udmabuf): `VICTORY_PORT_CONSTANTS` needs it (see below) |
+| Linux: Proton fork at 8fed4516 | its Wine imports section memory as dma-bufs (udmabuf): `VICTORY_PORT_CONSTANTS` needs it (see below); it keeps the views VIctory maps the title's GPU pages through away from the wineserver (`WINE_VICTORY_LOCAL_VIEWS=1`, set by `scripts/play-linux.sh`): loading 60 → 49 s on an RX 6800 XT |
 | FidelityFX: under Wine FSR 4.1.2 only when its code loads | Proton's builtin `amdxc64` makes AMD's SDK offer FSR 4.1.2 although its code (`amdxcffx64.dll`) is missing; the context made on it upscaled wrongly (doubled, smeared outlines). Without the DLL the newest FSR 3.1 is used |
 | GPU: raw twins of buffer views off 16 bytes begin at the view's own dword (lloyd's change from avatarmanz's fork, #437; views beginning inside a dword stay as before; `VICTORY_TWIN_EXACT=0` turns it off) | under D3D12's 16-byte rule such twins were null views and shaders read zeros (about 370 a frame in the jail): trees and palms dropped out for single frames (the intro's title shot) and the print on the back of Lucia's jumpsuit was missing. Known issue: in about half of the runs the diner waitress's face shows coloured speckles; the cause is not found yet |
 | GPU: under Wine the first use of a compute pass waits for its pipeline by a budget of its own, and those pipelines are made first (borntofrag's change from avatarmanz's fork, #440; `VICTORY_COMPUTE_WAIT_MS`, half a second; 0: as before) | a pass the title runs once when a character is made (it fills the table the face is deformed by) was dropped while its pipeline was still being made: on a first run with cold caches Lucia and Jason showed only eyes and teeth to the end of the run. The intro with cold caches: eyes and teeth without the change, normal faces with it |
@@ -131,6 +131,18 @@ for 4,194,304 when the build has the switch: through the extension, RADV
 (Mesa 26.3) compiles typed UAV loads and stores without their coherence bits,
 and shaders whose waves share data through them read stale values (the face
 network that animates Lucia went wrong this way; her mouth hung open).
+VIctory maps the title's GPU pages one 64 KiB view at a time, thousands a
+second while the title streams. Our Wine keeps the memfd behind each such view
+in the view (the dma-buf import's table of them was searched whole on every map
+and unmap, most of a map's cost with tens of thousands of views), and with
+`WINE_VICTORY_LOCAL_VIEWS=1` (set by `scripts/play-linux.sh`) does not register
+views of anonymous committed sections with the wineserver and keeps what it
+said of such a section by handle: each of those round trips ran under the lock
+that every protection change and page fault waits for. A page map in the game
+went from 64-107 to 9-28 µs; loading the jail save from 60 to 49 s, and the
+title streams a quarter more texture data in the same time (about 0.5 GB more
+GPU-mapped memory). Its ntdll also copies with fast strings (`memcpy` moved a
+byte at a time; Wine's heap moves growing blocks with it).
 More fixes for VIctory under Wine go there as they come. It is not supported
 by GloriousEggroll: report problems with it here, not to GE-Proton.
 

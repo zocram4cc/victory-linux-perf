@@ -47,13 +47,16 @@ fi
 if [ "$SAFE" = 0 ]; then
   # VICTORY_CARD_BUFFERS_MIN_MB=1: shader-written copies of title buffers from 1 MiB up live on the card (the default
   # on a 16 GB card starts at 4 MiB); the scene is GPU-bound and the card waited on reads over the bus: 57.7 -> 48.6 ms
-  # a frame on an RX 6800 XT (2026-11-27).
+  # a frame on an RX 6800 XT (2026-11-27). WINE_VICTORY_LOCAL_VIEWS=1: our Proton's Wine keeps the views VIctory maps
+  # the title's GPU pages through to itself instead of telling the wineserver of each (two round trips under the lock
+  # every protection change and page fault waits for): loading 60 -> 49 s, the title streams more (2026-11-27).
+  # Other Protons ignore it.
   export VICTORY_TEXTURE_NO_WAIT=1 VICTORY_RELAY=2 VICTORY_WIDE_BACK=1 VICTORY_CARD_REHASH_RUNS=1 \
     VICTORY_JOIN_COPIES=1 VICTORY_INDIRECT_WINDOW=1 VICTORY_RELAY_COPY=1 VICTORY_CARD_STEPS=2 \
     VICTORY_INDIRECT_BATCH=2 VICTORY_MAP_THREADS=1 VICTORY_CARD_AWAKE=1 VICTORY_SHOW_AFTER=1 \
     VICTORY_THIN=1 VICTORY_JOIN_PARTS=8 VICTORY_UPLOAD_AHEAD=1 \
     VICTORY_PORT_CONSTANTS=1 VICTORY_PORT_DESCRIPTORS=1 VICTORY_PORT_CBV=1 VICTORY_PORT_GUARD=1 \
-    VICTORY_PORT_JOURNAL=1 VICTORY_WC_NO_BACK=1 VICTORY_CARD_BUFFERS_MIN_MB=1
+    VICTORY_PORT_JOURNAL=1 VICTORY_WC_NO_BACK=1 VICTORY_CARD_BUFFERS_MIN_MB=1 WINE_VICTORY_LOCAL_VIEWS=1
 fi
 if [ -n "$FSR" ]; then
   VICTORY_FIDELITYFX_DIR=$(win "$FFX"); export VICTORY_FIDELITYFX_DIR VICTORY_FSR_4K=$FSR
