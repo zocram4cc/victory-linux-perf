@@ -2537,4 +2537,52 @@ mod tests {
             assert_eq!(release(object), 0);
         }
     }
+
+    /// A back-copied texture written, whose memory the title then reuses
+    /// (its ticket goes stale), and written again in the same list: the
+    /// second write registers the read-back again (fxceless 86d446b, PR
+    /// #1376). The check for one already wanted stopped at the stale entry
+    /// and the read-back was dropped (the title's ocean height map read
+    /// back nothing).
+    #[cfg(windows)]
+    #[test]
+    fn a_rewritten_back_texture_after_reuse_is_read_back() {
+        use crate::object::guid;
+        use crate::resource::{create_committed, readback_test_descriptions};
+        let Some(_) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        // 256x256 R32_FLOAT a back-copied kind, whatever the environment.
+        let _test_kinds = ResetTestKinds(crate::texback::TEST_KINDS.replace(Some(&[(256, 256, 41)])));
+        struct ResetTestKinds(Option<&'static [(u64, u32, u32)]>);
+        impl Drop for ResetTestKinds {
+            fn drop(&mut self) {
+                crate::texback::TEST_KINDS.set(self.0);
+            }
+        }
+        let null = std::ptr::null();
+        let (heap, desc) = readback_test_descriptions();
+        let resource = guid(0x696442be, 0xa72e, 0x4059, [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad]);
+        let mut tex = null;
+        assert_eq!(create_committed(null, &heap, 0, &desc, 0, null.cast(), &resource, &mut tex), S_OK);
+        let (_, at, _) = crate::resource::title_texture(tex).expect("a title texture");
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        let mut allocator = null;
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        let mut list = null;
+        assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list), S_OK);
+        let host = host_list(list).expect("a host list");
+        host.texture_written(tex);
+        assert!(host.back_wanted_fresh(tex), "the write registered a read-back");
+        // The title reuses the texture's memory: the ticket goes stale.
+        crate::texback::replaced(at);
+        assert!(!host.back_wanted_fresh(tex), "the reuse invalidated the read-back");
+        host.texture_written(tex);
+        assert!(host.back_wanted_fresh(tex), "the second write registered it again");
+        host.close();
+        assert_eq!(host.texture_back_count(), 1, "the rewritten texture was read back");
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+        assert_eq!(release(tex), 0);
+    }
 }

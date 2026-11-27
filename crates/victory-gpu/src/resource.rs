@@ -119,6 +119,17 @@ pub(crate) struct AllocationInfo {
     alignment: u64,
 }
 
+#[cfg(test)]
+pub(crate) fn readback_test_descriptions() -> (HeapProperties, ResourceDesc) {
+    (
+        HeapProperties { kind: 1, cpu_pages: 0, pool: 0, creation_nodes: 0, visible_nodes: 0 },
+        ResourceDesc {
+            dimension: 3, alignment: 0, width: 256, height: 256, depth_or_array_size: 1,
+            mip_levels: 1, format: 41, sample_count: 1, sample_quality: 0, layout: 0, flags: 4,
+        },
+    )
+}
+
 const _: () = assert!(size_of::<HeapProperties>() == 20);
 const _: () = assert!(size_of::<HeapDesc>() == 48);
 const _: () = assert!(size_of::<ResourceDesc>() == 56);
