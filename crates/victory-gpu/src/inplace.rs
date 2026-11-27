@@ -229,6 +229,8 @@ pub(crate) enum From {
     Part(usize, usize),
     /// A section made with `SEC_COMMIT`, by its handle.
     Section(usize),
+    /// Memory the runtime has behind a handle to it ([`title_memory_home_handle`]).
+    Shared(usize),
 }
 
 /// Opens a heap on memory the process has.
@@ -240,6 +242,11 @@ pub(crate) fn open(device: &ID3D12Device, from: From) -> windows::core::Result<I
             From::Region(at) => device.cast::<ID3D12Device3>()?.OpenExistingHeapFromAddress(at as *const c_void),
             From::Part(at, bytes) => device.cast::<ID3D12Device13>()?.OpenExistingHeapFromAddress1(at as *const c_void, bytes),
             From::Section(handle) => device.cast::<ID3D12Device3>()?.OpenExistingHeapFromFileMapping(HANDLE(handle as *mut c_void)),
+            From::Shared(handle) => {
+                let mut heap: Option<ID3D12Heap> = None;
+                device.OpenSharedHandle(HANDLE(handle as *mut c_void), &mut heap)?;
+                heap.ok_or_else(windows::core::Error::empty)
+            }
         }
     }
 }
@@ -262,8 +269,11 @@ fn buffer_desc(size: u64, flags: D3D12_RESOURCE_FLAGS) -> D3D12_RESOURCE_DESC {
 /// opened heap, which shaders may read and write, in the common state.
 pub(crate) fn place(device: &ID3D12Device, heap: &ID3D12Heap, offset: u64, size: u64) -> windows::core::Result<ID3D12Resource> {
     let mut placed: Option<ID3D12Resource> = None;
-    // The heap is cross-adapter shared, so the buffer must say so too.
-    let flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    // A heap opened on memory the process has is cross-adapter shared, so the
+    // buffer must say so too; one opened by a handle ([`From::Shared`]) is not.
+    // SAFETY: a plain query of a live heap.
+    let cross = unsafe { heap.GetDesc() }.Flags.contains(D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER);
+    let flags = if cross { D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER } else { D3D12_RESOURCE_FLAG_NONE } | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     // SAFETY: plain creation in a live heap.
     unsafe { device.CreatePlacedResource(heap, offset, &buffer_desc(size, flags), D3D12_RESOURCE_STATE_COMMON, None, &mut placed)? };
     placed.ok_or_else(windows::core::Error::empty)
@@ -858,13 +868,49 @@ pub(crate) fn home_touches(at: usize, len: usize) -> bool {
     homes.get(n).is_some_and(|h| h.0 < end)
 }
 
+/// Under Wine, with `VICTORY_HOME_BO=1` (`victory-hle`'s `wine_map`): pages at
+/// home that are a memfd of the runtime's, and a handle to a dma-buf of its
+/// pages: start, end, handle. A heap on them is opened by the handle
+/// ([`From::Shared`]), not by their address: the card's driver then holds the
+/// pinned pages of an imported buffer, not a user pointer, which amdgpu walks
+/// at every submission (~90 a frame, 64-512 us each for the 185 MB home).
+static HANDLES: std::sync::RwLock<Vec<(usize, usize, usize)>> = std::sync::RwLock::new(Vec::new());
+
+/// The runtime made `[at, at + len)` anew: the memory behind `handle`, or
+/// (`None`) memory with none ([`HANDLES`]).
+pub fn title_memory_home_handle(at: usize, len: usize, handle: Option<usize>) {
+    let end = at.saturating_add(len);
+    let mut handles = HANDLES.write().unwrap_or_else(|e| e.into_inner());
+    handles.retain(|h| h.1 <= at || end <= h.0);
+    handles.extend(handle.map(|handle| (at, end, handle)));
+}
+
+/// The handle of the memory behind all of `[at, at + len)` ([`HANDLES`]), and
+/// the bytes from that memory's first to `at`.
+pub(crate) fn home_handle(at: usize, len: usize) -> Option<(usize, u64)> {
+    let end = at.saturating_add(len);
+    let handles = HANDLES.read().unwrap_or_else(|e| e.into_inner());
+    handles.iter().find(|h| h.0 <= at && end <= h.1).map(|h| (h.2, (at - h.0) as u64))
+}
+
+/// Whether the host's device opens a heap by `handle` ([`From::Shared`]): the
+/// runtime asks before it makes pages at home the memory behind it. `Err` says
+/// why not (vkd3d-proton opens a heap by such a handle only with
+/// `victory/home-heap-import`, and Wine's win32u imports it only when patched
+/// to take a handle that is no D3DKMT object).
+pub fn opens_heap_by_handle(handle: usize) -> Result<(), String> {
+    let host = crate::host::host().ok_or("no host device")?;
+    open(&host.device, From::Shared(handle)).map(drop).map_err(|e| e.to_string())
+}
+
 /// Whether the card reads the memory's bytes through `heap`, opened on
-/// `[memory, memory + bytes)`: the first 4 KiB of its first 32 MiB that are
-/// not all zeros are fetched through a buffer placed there and compared with
-/// the memory as it is before and after. `Some(false)`: the card reads zeros
-/// there (the host gave the heap memory of its own, [`HOMES`]). `None`:
-/// nothing to tell by (all zeros so far, or changing under the look).
-pub(crate) fn heap_shows(device: &ID3D12Device, heap: &ID3D12Heap, memory: usize, bytes: usize) -> Option<bool> {
+/// `[memory, memory + bytes)` from its byte `offset` on: the first 4 KiB of
+/// its first 32 MiB that are not all zeros are fetched through a buffer placed
+/// there and compared with the memory as it is before and after.
+/// `Some(false)`: the card reads zeros there (the host gave the heap memory of
+/// its own, [`HOMES`]). `None`: nothing to tell by (all zeros so far, or
+/// changing under the look).
+pub(crate) fn heap_shows(device: &ID3D12Device, heap: &ID3D12Heap, offset: u64, memory: usize, bytes: usize) -> Option<bool> {
     const PAGE: usize = 4096;
     // No mapping change while the memory is read; not waited for (the caller
     // may hold what such a change waits for).
@@ -876,7 +922,7 @@ pub(crate) fn heap_shows(device: &ID3D12Device, heap: &ID3D12Heap, memory: usize
     let at = all.chunks_exact(PAGE).position(|page| page.iter().any(|b| *b != 0))? * PAGE;
     let before = all[at..at + PAGE].to_vec();
     let from = at / K64 * K64;
-    let buffer = place(device, heap, from as u64, K64.min(bytes - from) as u64).ok()?;
+    let buffer = place(device, heap, offset + from as u64, K64.min(bytes - from) as u64).ok()?;
     let got = Rig::new(device).and_then(|mut rig| rig.fetch(&buffer, (at - from) as u64, PAGE)).ok()?;
     if got == before || got == all[at..at + PAGE] {
         Some(true)
