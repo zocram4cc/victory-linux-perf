@@ -1,166 +1,108 @@
-# VIctory on an RX 7900 XTX
+# RYUKI: VIctory on an RX 7900 XT
 
 A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
-that runs an Xbox Series title natively on Windows from files the user supplies.
+that runs an Xbox Series title natively on Windows from files the user supplies,
+tuned and measured on an **RX 7900 XT with 32 GB of RAM** by **ryuki**.
 
-## The goal
-
-**A stable 30 fps or more without ray tracing, then as high a frame rate and as
-low frame times as the PC allows**, on an AMD RX 7900 XTX first and on PCs with
-32 GB (later 16 GB) of RAM.
-
-The way there is **porting, not emulating**: patching the title's renderer so it
-behaves the way a PC renderer does, rather than having the layer watch and copy
-the console's shared memory every frame. Shaders are translated ahead of time
-into a versioned store that is kept between builds. Ray tracing stays optional
-and off by default. The picture comes after the frame rate: texture pop-in and
-lighting that is too bright or too dark when walking indoors are next in line.
+It is [Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)
+(`a-publier`, itself [avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)'s
+latest with Belobug's AMD changes) with RYUKI's work on top: frame generation,
+an audio fix that lets the title load on any output, a faster copy-back, and the
+settings measured on this PC. The older RYUKI line is kept as the branch
+`xtx-2026-11-27`.
 
 **This repository contains no game files, code or assets.** You need your own
 copy of the game. It is not affiliated with or endorsed by the game's developer
 or publisher.
 
-## Where it stands (2026-11-26)
-
-The measurements below come from one Windows 11 PC with an Intel i9-12900K,
-64 GB of system RAM and a Radeon RX 7900 XTX (24 GB of dedicated video memory).
-Ray tracing was off for these runs.
+## The PC it was tested on
 
 | | |
 |---|---|
-| City street, Series S profile, renderer patches 1, 2, 5, 6 and 7 on | about 45 ms a frame (about 22 fps, 44.9 ms in run merge-5) |
-| Same, patches 1, 2, 5 and 6 | 45.6 ms, p95 47 ms |
-| Same, patches 1, 2 and 5 | 47.3 ms (about 21 fps), p95 49 ms |
-| Series X profile, patches 1+2 | about 53 ms (about 19 fps) |
-| Same scene before the patches | 57-75 ms (13-17 fps) |
-| Shaders the title uses that translate | all of them (25,790 of 25,985; the rest are unused geometry shaders) |
-| Memory | about 30 GB of private memory, 10.5 GB of VRAM: **64 GB of RAM recommended** for now |
+| GPU | AMD Radeon RX 7900 XT, 20 GB (driver 32.0.32015.7029), Resizable BAR on |
+| CPU | AMD Ryzen 7 7800X3D (8 cores, 16 threads) |
+| RAM | 32 GB DDR5 |
+| OS | Windows 11 Pro, build 26300 |
+| Display | 2560x1440 |
+| Page file | 32 GB initial, 88 GB most |
 
-It started at 280 ms a frame in the same scenes three days earlier. What sets
-the frame now is the one thread that submits the title's work to the card
-(about 40 ms); the card itself needs about 36 ms and now waits about 7 ms a frame with nothing queued.
+## Where it stands (2026-11-27)
 
-### Reports from other GPUs
+Release build, free roam from a fixed save (standing, then walking), pipelines
+built ahead, `scripts\play.ps1 -FrameGen`:
 
-| GPU and build | What the contributor observed |
-|---|---|
-| Radeon RX 9060 XT (16 GB), `cd8dfc0` with local changes | In the same Series X interior at 1080p, the game averaged 19.8 fps with ray tracing off and 15.6 fps with it on. Indirect lighting showed white patches and dark smears. [Run settings and results](https://github.com/Belobug/VIctory-Belobug-AMD/issues/313) |
-| GeForce RTX 3090 (24 GB), `a-publier@cd8dfc0` | The prison rendered. Two warm Series S runs averaged 545 and 532 ms per frame. The contributor reported 10.0 and 10.2 GB of VRAM in those runs. [Run settings and results](https://github.com/Belobug/VIctory-Belobug-AMD/issues/333) |
-| Intel Arc B580 (12 GB), revision unreported | Startup and initial menu navigation worked. Further menu interaction slowed to about 0.7 fps before D3D12 device removal. [Crash report](https://github.com/Belobug/VIctory-Belobug-AMD/issues/98) |
+| | Rendered | Shown (frame generation) |
+|---|---|---|
+| Free roam, 6 minutes | median 26.7 fps | **median 51.6 fps, slowest 1 % 37.6, every second at 30 or more** |
+| Free roam, 10 minutes (four list threads) | median 21.3 fps | median 42.6 fps, 99 % of seconds at 30 or more |
+| The older RYUKI line, no frame generation | 16-17 standing, 14.5-15.6 walking | the same |
 
-The 10.5 GB of VRAM in the RX 7900 XTX table is the usage reported for that run.
-Memory use and frame time depend on the scene and settings. The [ray-tracing notes](docs/fork-ray-tracing.md)
-describe which lighting paths run and the remaining rendering issues.
-
-### Renderer patches (off by default while they are tested)
-
-| Switch | What it does |
-|---|---|
-| `VICTORY_PORT_CONSTANTS=1` | The title's 174 MB constants heap is read by the card where the title writes it: no uploads, no fills |
-| `VICTORY_PORT_DESCRIPTORS=1` | The title's descriptor-table stores are patched (byte-checked) to report the slots they write, instead of a scan of ~600,000 slots a frame |
-| `VICTORY_PORT_CBV=1` | Translated shaders read constant buffers in place as raw bytes (~22,000 fills a frame to none; -4.7 ms) |
-| `VICTORY_PORT_GUARD=1` | The write guards' lock is shared by faults and refreshes, with a claim per 64 KiB block; the submission's planning runs beside it (title threads' waits 29 ms to ~2 ms a frame; -2 ms) |
-| `VICTORY_PORT_JOURNAL=1` | The heaps' records are asked for at the title's submit, and the journal's notes are split into 64 parts with locks of their own (the submit thread's waits ~5 ms + 1 ms to ~0.3 ms; -1 to -3 ms) |
-
-### Other switches
-
-| Switch | What it does |
-|---|---|
-| `--console series-s` | The Series S profile: 1080p output, about 5 ms faster, a softer picture |
-| `VICTORY_OUTPUT=1920x1080` | The title renders to that output size itself (Series X profile; about 16 ms less card time) |
-| `VICTORY_FRAME_INTERVAL_MS=16.667` | Lets the title go above 30 fps (menus and videos reach 60; the game's clock stays right) |
-| `VICTORY_AMBIENT_SETTLE` | How fast light settles after walking indoors (on by default, `250,3`; `0` turns it off) |
-| `VICTORY_TEXTURE_STORE=1` | Converted textures kept between runs (about 8 ms a frame for now: off) |
-| `VICTORY_KBM_GTA=1` | Optional GTA V PC-style keyboard and mouse mapping on the stand-in pad: `F2` or `` ` `` (`~`) toggles mouse-look and auto-hides the cursor while locked (`Esc`/`P`/focus loss unlocks and restores it), LMB/RMB = RT/LT, MMB/`C` = R3, `Shift` = A, `Space` = X, `R` = B, `F` = Y, `Tab` = LB, `Q` = RB, `Ctrl` = L3, `E` = D-pad Right, `V` = View. Tune with `VICTORY_MOUSE_SENS` (default `1.0`) and `VICTORY_MOUSE_INVERT_Y=1` (or pass via `scripts\play.ps1 -More @{VICTORY_KBM_GTA='1'}`) |
-
-What is known to be wrong:
-
-- Trees, signs and far objects flicker in the distance in some places.
-- Lighting is too bright or too dark after walking indoors, until the title has
-  run for a while; rooms with little direct light are too dark without `-RayTracing`.
-- Textures of what just came into view appear late while the title streams.
-- The first run of a new build stutters while the driver makes pipelines
-  (`victory warm` makes them ahead).
-- Recording a frame in the world makes the title's own watchdog end it.
+- **Frame generation** is AMD's, through its swap chain, fed by the title's own
+  FidelityFX upscale. It needs the **Series S profile**: in the Series X profile
+  the title has no FidelityFX upscale and nothing is generated. Fast motion
+  ghosts: the frames between are guessed from about 25 real ones.
+- About 20 ms of every frame is the title's own CPU work; rendering itself is not
+  at 30 fps yet.
+- The first run after a new build or driver stutters while pipelines are made:
+  build them ahead (below).
 
 ## How to run it
 
-You need Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader
-model 6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build
-tools, and your own dump of the title.
+Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader model 6.6 and
+mesh shaders, Rust (the toolchain is pinned), the MSVC build tools, your own dump
+of the title, and AMD's FidelityFX SDK DLLs (`Kits\FidelityFX\signedbin` of
+[GPUOpen-LibrariesAndSDKs/FidelityFX-SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK);
+tested with the build that reports 4.1.2).
+
+**With 32 GB of RAM, raise the page file first**: the process commits 35-40 GB.
 
 ```powershell
-git clone https://github.com/avatarmanz/VIctory-7900XTX
-cd VIctory-7900XTX
-copy victory.example.toml victory.toml      # then set your paths, outside this folder
-cargo build --locked --profile diag -p victory --features diagnostics
-scripts\play.ps1 -Exe <path of your copy's executable>
+git clone https://github.com/YukiRyuu/RYUKI-7900XT
+cd RYUKI-7900XT
+copy victory.example.toml victory.toml      # set game_dir, cache_dir, data_dir: all outside this folder
+cargo build --release --locked -p victory
 ```
 
-The launcher requests light device removal diagnostics (DRED) by default with
-`-Build diag`. DRED requires `--features diagnostics`. For a release binary
-built with that feature, request DRED with
-`-Build release -More @{VICTORY_D3D12_DRED='light'}`.
-
-`scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it first when
-something is wrong. `-RayTracing` turns the title's ray-traced indirect light on.
-
-For PC FSR 4.1.2, set `[paths].fidelityfx_dir` in `victory.toml` or
-`VICTORY_FIDELITYFX_DIR` to the folder containing AMD's signed
-`amd_fidelityfx_upscaler_dx12.dll`. Use the DirectX 12 upscaler in
-`Kits/FidelityFX/signedbin`. [AMD FSR SDK 2.4.0](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/tree/v2.4.0/Kits/FidelityFX/signedbin)
-
-`scripts\play.ps1 -Exe <path> -Fsr4K quality` selects 2560×1440 input for
-the retail 1.0.2.1 Series X 4K SDR profile. `balanced` selects 2258×1270
-and `performance` selects 1920×1080. All three output 3840×2160. With
-`victory run` directly, set `VICTORY_FSR_4K` to the preset name.
-AMD's SDK offers FSR 4.1.2 for some cards only. Where it does not, the
-newest FSR 3.1 it offers is used in its place and the log says so; its
-picture differs from FSR 4's. Where it offers neither, the run stops
-before the title starts and names the versions that were offered.
-The log reports the provider at context creation and the actual input and
-output sizes at the first successful temporal dispatch. The title profile
-and PC FidelityFX bridge were ported from [DexNom/VIctory](https://github.com/DexNom/VIctory/commit/ab34a8b21477c94da2a6cf07249138e8bc84602e).
-
-On a hybrid-graphics PC, the runtime and offline pipeline checks prefer a
-high-performance adapter with Shader Model 6.6. The runtime logs its adapter
-name, PCI vendor and device IDs, and dedicated VRAM. Set
-`VICTORY_D3D12_ADAPTER` to a zero-based DXGI index or part of the adapter's
-name to select it explicitly. With the launcher, pass
-`-More @{VICTORY_D3D12_ADAPTER='NVIDIA'}`.
-
-Before the first run, ahead of time (both can be stopped and go on later):
+Translate the shaders ahead **with the renderer-port switches set**, since port 5
+changes them (translating with other settings makes the game translate again
+while it plays):
 
 ```powershell
-target\diag\victory.exe shaders <the shader archives>   # every shader translated, minutes
-target\diag\victory.exe warm --used                     # pipelines earlier runs drew with, for a new driver or build
+$env:VICTORY_PORT_CONSTANTS='1'; $env:VICTORY_PORT_DESCRIPTORS='1'; $env:VICTORY_PORT_CBV='1'
+$env:VICTORY_PORT_GUARD='1'; $env:VICTORY_PORT_JOURNAL='1'
+targeteleaseictory.exe shaders --jobs 14 <your game folder>
 ```
 
-Commands, debugging switches and upstream's own description:
-[docs/README-fxceless.md](docs/README-fxceless.md). Every `VICTORY_...` switch is
-described in a comment where it is read.
+Then play:
 
-## What is different here
+```powershell
+scripts\play.ps1 -Build release -FrameGen -Exe <your game folder>\<the game's .exe> -FidelityFxDir <FidelityFX SDK>\Kits\FidelityFX\signedbin
+```
 
-In short; the reasons and the measurements are in [docs/findings.md](docs/findings.md).
+After a first session, `targeteleaseictory.exe warm --jobs 10` (with the same
+port switches set) builds every pipeline the game used, so later sessions start
+smooth.
 
-- **List calls are written down, not carried out, on the title's threads**
-  (`VICTORY_THIN`): eight threads of ours translate them.
-- **Submissions are prepared by a thread of ours and joined**
-  (`VICTORY_ASYNC_SUBMIT`, `VICTORY_JOIN_PARTS`), with what can be spread over
-  threads spread: refreshes, compares (AVX2), descriptor records, landings.
-- **What shaders wrote comes back beside the write guards**, by the dwords that
-  changed, on a thread of its own (`VICTORY_RELAY`, `VICTORY_LAND`).
-- **Buffer fills that need bytes still on the card are done on the card**
-  (`VICTORY_CARD_STEPS`) instead of waiting for it.
-- **The title's writes are caught more cheaply**: one view opened at a fault,
-  blocks that rest, places in the title's code that look before they write.
-- **Textures go up on a copy queue of their own** and a slot shows one only after
-  its upload ran, which also ended a device loss that came every 15 minutes or so.
-- **Boats float**: textures that shaders write and the title's CPU reads go back
-  to title memory (from fxceless and Geckomacabre, on by default here).
-- **Frame record and replay** with per-pass times and shader variants compared
-  turn by turn ([docs/replay.md](docs/replay.md)).
+If PowerShell refuses scripts: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`,
+then `Unblock-File scripts\play.ps1`.
+
+## What RYUKI adds
+
+| | |
+|---|---|
+| `-FrameGen` | Series S, renderer ports 1, 2, 5, 6 and 7, the 60 fps unlock, AMD frame generation, Resizable BAR windows, six list threads and the RX 7900 XT settings below, in one switch |
+| Audio as a console has it | The title talks to Windows audio itself and expects a console's output: always there, 48 kHz. With a monitor's HDMI audio (it will not open), a 44.1 kHz Bluetooth speaker or no output at all, its loading screen never ended. `modules::endpoint` gives it an output that opens, read as 48 kHz with Windows converting, else a silent one. `VICTORY_AUDIO_DEVICE=<part of a name>` or `silent` picks one; `VICTORY_AUDIO_CONSOLE=0` turns it off. |
+| Frame generation | `VICTORY_FRAMEGEN=1` (from gleaf-6, after MrSkelee): AMD's swap chain, fed by the host upscaler that answers the title's FidelityFX calls. `VICTORY_FFX_HOST=1`: the host upscaler alone. |
+| Copy-back | `VICTORY_SKIP_WC_BACK` (on; from PastiiJay/klbf-lab, after fxceless/victory-fork #868 and #1268): shader writes to memory the title reserved write-combined are not fetched back, for buffers of 1 MiB and more. 9.6 to 4.4 ms a frame. |
+| Freeze fix | `VICTORY_SOFT_VIEWS=copies` (off by default; from Op-lite/victory-scarlett): views of the title's page-mapping copies kept in our books and mapped only if touched. Unit-tested, not yet measured in the game; `=verify` checks it. |
+| Caption | The window reads `RYUKI`, then fps, ms and draws (`VICTORY_CAPTION_GAME=1` adds the game's name) |
+| Tests | `VICTORY_QUIT_AFTER_S=<seconds>`: an unattended run ends itself |
+
+The RX 7900 XT settings `-FrameGen` sets are listed in `scripts\play.ps1`: memory
+windows of 1 MiB with 12 MB at roots, shader-write compares on the card for buffers
+of 1 MiB and more, title memory in place, texture steps of 80 ms at scene cuts,
+the list threads joined, among others. All measurements and what was tried and not
+kept: CHANGELOG.md on the `xtx-2026-11-27` branch.
 
 ## Credits
 
@@ -183,7 +125,16 @@ commits taken from elsewhere name the commit and its author.
 - **Geckomacabre** and **cxy0072019-sketch**: the texture read-back.
 - **[XCL](https://github.com/ivall/xcl)** (GPL-2.0-only) was read for how the same
   title behaves under another layer; no code of it is here.
-- This fork's changes were made with [Claude Code](https://claude.com/claude-code).
+- **[avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)**: the
+  renderer ports and the 60 fps unlock this build runs with.
+- **[gleaf-6/VIctory-7900XTX-](https://github.com/gleaf-6/VIctory-7900XTX-)** and
+  **MrSkelee/VIctory-MrSkele-AMD**: frame generation.
+- **[Op-lite/victory-scarlett](https://github.com/Op-lite/victory-scarlett)**: the
+  freeze fix (soft views).
+- **[PastiiJay/klbf-lab](https://github.com/PastiiJay/klbf-lab)**, Chipsraine,
+  iGoldenNinja and Proudnoob4: the write-combining copy-back skip.
+- RYUKI's changes (audio, frame generation port, measurements) were made by ryuki
+  with [Claude Code](https://claude.com/claude-code).
 
 ## License
 
