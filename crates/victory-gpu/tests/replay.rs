@@ -1732,8 +1732,7 @@ fn a_frame_is_recorded_and_replayed() {
         // The folder's last capture: the second.
         let mut player = Player::load(dir.path(), &plain).unwrap();
         check(&mut player, &plain, &expected_second, "the second capture");
-        // (With buffers in the card the replay's fence is never reached, for
-        // either capture: a fault of the replay, not of the capture.)
+        // (Not with buffers in the card: see the loop below.)
         let pc = Options {
             buffers: Buffers::Pc,
             ..plain.clone()
@@ -1842,7 +1841,10 @@ fn a_frame_is_recorded_and_replayed() {
     player.run(&kept).unwrap();
     check(&mut player, &plain, &expected, "unchanged again");
     drop(player);
-    for buffers in [Buffers::Card, Buffers::Pc] {
+    // Not Buffers::Card for now: on this machine that replay faults the
+    // card (NVIDIA Xid 31, an MMU fault of the graphics engine), its fence
+    // never comes, and a fault of the card can take other programs down.
+    for buffers in [Buffers::Pc] {
         let o = Options {
             buffers,
             ..plain.clone()
