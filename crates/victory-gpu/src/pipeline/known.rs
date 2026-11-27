@@ -253,6 +253,31 @@ pub fn use_translations(dir: PathBuf) {
     crate::shader_cache::use_shader_cache(dir);
 }
 
+/// `VICTORY_WARM_LIBRARY=1`: pipelines are made through the pipeline library
+/// in `dir` as the game makes them, loaded where it has them, instead of
+/// created anew (unset or 0: created, as before; the launcher's prebuild
+/// sets 1). The game loads nearly all of its pipelines from the library
+/// (`made=0` in every warm run), and the driver's cache does not serve a
+/// load with what a create left: 40 pipelines created took 7.1 s, the same
+/// 40 loaded from the library right after, against the same driver cache,
+/// 6.2 s (2 under 10 ms), and loaded again 0.6 s (39 under 10 ms). So the
+/// first run after every rebuild compiled what its prebuild had just made
+/// (run 20261127-224016: 1,243 of 3,056 loads 0.1 s or more). Nothing is
+/// saved: what the library lacks is created, as the game will create it.
+pub fn use_library_if_asked(dir: PathBuf) -> bool {
+    let asked = std::env::var_os("VICTORY_WARM_LIBRARY").is_some_and(|v| v == "1");
+    if asked {
+        super::library::use_pipeline_cache(dir);
+    }
+    asked
+}
+
+/// Pipelines loaded from the library and created anew in this process.
+pub fn library_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (super::library::LOADED.load(Relaxed), super::library::MADE.load(Relaxed))
+}
+
 /// Makes the host pipelines of those of `which` (numbers in the file) and
 /// lets each go again: the driver's cache on disk keeps them. `each` is told
 /// the number before, and what came of it after: milliseconds and whether

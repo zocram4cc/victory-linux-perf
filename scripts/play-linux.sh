@@ -372,7 +372,11 @@ if [[ "${VICTORY_PREBUILD:-1}" != 0 ]]; then
       sed 's/\x1b\[[0-9;]*m//g' "$log" | grep -E 'shaders in the cache, .*translate' >&2 || true
       if [[ -s "$cache/pipelines/early-pipelines.txt" ]]; then
         echo "making the pipelines earlier runs drew..." >&2
-        VICTORY_LOG=warn "${unrecorded[@]}" umu-run "$win_exe" warm --used >> "$log" 2>&1 || true
+        # Through the pipeline library, as the game makes them: the driver's
+        # cache does not serve the game's library loads with what a create
+        # left (pipeline/known.rs, use_library_if_asked). 0: created, as before.
+        VICTORY_WARM_LIBRARY="${VICTORY_WARM_LIBRARY:-1}" VICTORY_LOG=warn "${unrecorded[@]}" \
+          umu-run "$win_exe" warm --used >> "$log" 2>&1 || true
         sed 's/\x1b\[[0-9;]*m//g' "$log" | grep -E ' made in ' | tail -1 >&2 || true
       fi
       printf '%s\n' "$stamp" > "$stamp_file"

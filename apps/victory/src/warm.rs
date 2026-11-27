@@ -193,6 +193,7 @@ fn make(dir: &Path, these: &str) -> Result<()> {
     let these: Vec<usize> = these.split(',').map(|n| n.parse().context("--these")).collect::<Result<_>>()?;
     let cfg = victory_core::Config::load()?;
     victory_hle::known_pipelines::use_translations(cfg.cache_subdir("shaders")?);
+    let library = known::use_library_if_asked(dir.to_path_buf());
     let mut out = std::io::stdout();
     known::make(dir, &these, |n, came| {
         let told = match came {
@@ -204,6 +205,10 @@ fn make(dir: &Path, these: &str) -> Result<()> {
             std::process::exit(1);
         }
     });
+    if library {
+        let (loaded, made) = known::library_counts();
+        let _ = writeln!(out, "library loaded {loaded} made {made}");
+    }
     // Without what a run's end does (nothing to save, the host's threads).
     let _ = out.flush();
     std::process::exit(0)
