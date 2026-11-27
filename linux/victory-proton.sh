@@ -91,7 +91,8 @@ thp_watch() {
         pid=$(for p in $(pgrep -f 'victory\.exe run'); do echo "$(ls /proc/$p/task 2>/dev/null | wc -l) $p"; done \
             | sort -rn | awk 'NR==1{print $2}')
         [ -n "$pid" ] || continue
-        ranges=$(grep -aoE "32-bit heap are private memory.*at=0x[0-9a-f]+ len=[0-9]+" "$log" 2>/dev/null \
+        # (the log may carry ANSI colour codes between a field's name and value)
+        ranges=$(sed 's/\x1b\[[0-9;]*m//g' "$log" 2>/dev/null | grep -aoE "32-bit heap are private memory.*at=0x[0-9a-f]+ len=[0-9]+" \
             | sed -E 's/.*at=0x([0-9a-f]+) len=([0-9]+)/\1 \2/' | sort -u \
             | while read -r a l; do printf "%x %x " $((16#$a)) $((16#$a + l)); done)
         [ -n "$ranges" ] || continue
