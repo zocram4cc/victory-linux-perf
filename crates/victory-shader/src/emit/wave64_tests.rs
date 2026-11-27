@@ -134,6 +134,7 @@ fn lowered_counted(
     let lowered = lowered?;
     Ok(HostShader {
         stage: HwStage::Cs,
+        half_views: Vec::new(),
         dxil: lowered.dxil,
         user_data: lowered.user_data,
         samplers: lowered.samplers,
@@ -273,6 +274,7 @@ fn on_64_lanes(native: &NativeProgram, p: &ir::Program) -> HostShader {
     assert_eq!(lowered.wave_size, Some(64));
     let shader = HostShader {
         stage: HwStage::Cs,
+        half_views: Vec::new(),
         dxil: lowered.dxil,
         user_data: lowered.user_data,
         samplers: lowered.samplers,
@@ -1196,6 +1198,7 @@ fn partial_dispatch_with_a_cross_half_wave_op_runs_in_32_lane_waves() {
         .expect("USER_DISPATCH_THREADS_X");
     let shader = HostShader {
         stage: HwStage::Cs,
+        half_views: Vec::new(),
         dxil: lowered.dxil,
         user_data: lowered.user_data,
         samplers: lowered.samplers,

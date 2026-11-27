@@ -407,6 +407,7 @@ mod tests {
         }
         let host = |stage, s: Shader| super::super::HostShader {
             stage,
+            half_views: Vec::new(),
             dxil: s.finish(),
             user_data: Vec::new(),
             samplers: Vec::new(),

@@ -76,6 +76,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
     assert!(!lowered.wave_ops);
     let shader = HostShader {
         stage: HwStage::Cs,
+        half_views: Vec::new(),
         dxil: lowered.dxil,
         user_data: lowered.user_data,
         samplers: lowered.samplers,
@@ -378,6 +379,7 @@ fn immediate_sampler_chosen_by_control_flow() {
             .collect();
         let shader = HostShader {
             stage: HwStage::Cs,
+            half_views: Vec::new(),
             dxil: lowered.dxil,
             user_data: lowered.user_data,
             samplers: lowered.samplers,

@@ -24,6 +24,7 @@ fn probe() {
         let name = file.file_stem().unwrap_or_default().to_string_lossy().into_owned();
         let shader = HostShader {
             stage: HwStage::Cs,
+            half_views: Vec::new(),
             dxil: std::fs::read(&file).expect("the file"),
             user_data: (0..4)
                 .map(|n| super::UserData { index: n, slot: 0, root: RootType::Constants, dword: n })

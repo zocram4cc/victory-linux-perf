@@ -65,6 +65,7 @@ fn build(words: &[u32], srv: (u8, u32)) -> Result<HostShader, ShaderError> {
     })?;
     let shader = HostShader {
         stage: HwStage::Cs,
+        half_views: Vec::new(),
         dxil: lowered.dxil,
         user_data: lowered.user_data,
         samplers: lowered.samplers,

@@ -178,6 +178,7 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
 
     let shader = HostShader {
         stage: HwStage::Cs,
+        half_views: Vec::new(),
         dxil: lowered.dxil,
         user_data: lowered.user_data,
         samplers: lowered.samplers,
@@ -2084,6 +2085,7 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
 
     let shader = HostShader {
         stage: HwStage::Cs,
+        half_views: Vec::new(),
         dxil: lowered.dxil,
         user_data: lowered.user_data,
         samplers: lowered.samplers,

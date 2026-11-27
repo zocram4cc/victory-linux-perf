@@ -186,6 +186,7 @@ pub(super) fn build_compute_shader(
     })?;
     let shader = HostShader {
         stage: HwStage::Cs,
+        half_views: Vec::new(),
         dxil: lowered.dxil,
         user_data: lowered.user_data,
         samplers: lowered.samplers,

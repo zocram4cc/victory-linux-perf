@@ -2552,6 +2552,7 @@ mod tests {
             };
             let cs = super::HostShader {
                 stage: super::HwStage::Cs,
+                half_views: Vec::new(),
                 dxil,
                 user_data: l.user_data,
                 samplers: Vec::new(),
@@ -3116,6 +3117,7 @@ mod barycentric_tests {
         s.m.terminate(s.entry, Term::Ret);
         let vs = HostShader {
             stage: HwStage::Vs,
+            half_views: Vec::new(),
             dxil: s.finish(),
             user_data: Vec::new(),
             samplers: Vec::new(),
