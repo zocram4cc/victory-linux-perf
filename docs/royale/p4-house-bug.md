@@ -96,3 +96,13 @@ Before step 17 that stopped translation ("a descriptor outside the heaps"). **St
   3. **The visible-list counter** (raw buffer atomics).
 
   A way to tell them apart: run one program of the family against a captured dispatch (inputs from a frame), and compare its output with the console's.
+
+## Meticulous tests on the isolated family (27 Nov, from 17:30)
+
+- **The end of the program**, the visible-list write:
+  - the record word `s8` (dword 4 of a 24-byte record per group, loaded with `s_buffer_load_dwordx2 s[8:9]`) carries a counter slot in bits 20-29 and an output base in bits 0-19;
+  - `buffer_atomic_add` (returning) on the counter buffer (table + 0x80, made raw in code) at `slot * (s5 & 0x3ffffff) & -4`, where s5 is the first root constant;
+  - `buffer_store_format_xyzw … idxen` of the visible entries into a typed buffer (table + 0x60) at `base + old count + lane`.
+- **A hypothesis dropped:** at first I read `s8` as the group id. With TGID_X enabled in RSRC2 (0x90: 8 user SGPRs, then the group id), the group id *is* s8 at the start, and its bits 20+ would have collided with the layer's 2^20-group clamp on indirect dispatches. But the program overwrites s8 with the record word before that use: the group id only picks the record (`s8 * 24`). Not the cause.
+- **The trace** (`VICTORY_NATIVE_TRACE=60`) printed nothing for these 4 programs. Their dispatches do not go through `draw::dispatch`'s native trace, so they are most likely indirect (ExecuteIndirect). Next: trace there.
+- **One program at a time** (`bench/p4-cull/<program>.txt`, runs `bench/k-…-cull-one-*`): results below.
