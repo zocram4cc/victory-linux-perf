@@ -10457,20 +10457,31 @@ impl Meter {
         // which may not pump for a while), so a thread of ours does it and
         // presenting never waits; it takes the newest text when free.
         static PENDING: Mutex<Option<(usize, Vec<u16>)>> = Mutex::new(None);
+        static THERE: std::sync::Condvar = std::sync::Condvar::new();
         static SETTER: std::sync::Once = std::sync::Once::new();
         *PENDING.lock().unwrap_or_else(|e| e.into_inner()) = Some((hwnd.0 as usize, text));
+        THERE.notify_one();
         SETTER.call_once(|| {
             let _ = std::thread::Builder::new()
                 .name("victory-caption".into())
                 .spawn(|| {
                     loop {
-                        let next = PENDING.lock().unwrap_or_else(|e| e.into_inner()).take();
-                        match next {
+                        let next = if crate::watch::woken_waits() {
+                            // Asleep until a text is there (it looked every 100 ms before).
+                            let pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+                            THERE.wait_while(pending, |p| p.is_none()).unwrap_or_else(|e| e.into_inner()).take()
+                        } else {
+                            let next = PENDING.lock().unwrap_or_else(|e| e.into_inner()).take();
+                            if next.is_none() {
+                                std::thread::sleep(std::time::Duration::from_millis(100));
+                            }
+                            next
+                        };
+                        if let Some((hwnd, text)) = next {
                             // SAFETY: a window handle and a NUL-terminated text.
-                            Some((hwnd, text)) => unsafe {
+                            unsafe {
                                 let _ = SetWindowTextW(HWND(hwnd as *mut _), PCWSTR(text.as_ptr()));
-                            },
-                            None => std::thread::sleep(std::time::Duration::from_millis(100)),
+                            }
                         }
                     }
                 });
