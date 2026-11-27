@@ -51,6 +51,8 @@ pub(crate) enum Role {
     /// Adds the lamps' light to what the air scatters (the last program
     /// that writes that volume before it is summed up along the view).
     Air,
+    /// Writes the title's reflections for the last time in a frame.
+    Reflected,
 }
 
 /// The program's part in this, by its name in the container.
@@ -62,6 +64,8 @@ pub(crate) fn role(container: &[u8]) -> Option<Role> {
         Some(Role::Radiance)
     } else if has(b"CS_AccumulateLocalLightInscatteringVolume") {
         Some(Role::Air)
+    } else if has(b"CS_UpdateHistory") {
+        Some(Role::Reflected)
     } else {
         None
     }
@@ -75,6 +79,9 @@ pub(crate) const DEPTH: (u8, u32) = (0, 464);
 pub(crate) const RADIANCE: (u8, u32) = (1, 16);
 /// Where the light the air scatters is.
 pub(crate) const AIR: (u8, u32) = (1, 32);
+/// Where the reflections are (R9G9B9E5 as 32-bit integers): beloooo's find
+/// (VIctory-Belobug-AMD 44dcd43, GPL-3.0-or-later).
+pub(crate) const REFLECTIONS: (u8, u32) = (1, 40);
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Set {
@@ -128,6 +135,20 @@ fn air() -> f32 {
     static SET: OnceLock<f32> = OnceLock::new();
     *SET.get_or_init(|| {
         let set = std::env::var("VICTORY_AMBIENT_AIR").unwrap_or_default();
+        set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0)
+    })
+}
+
+/// The most a reflection holds, as a multiple of the light around
+/// (`VICTORY_AMBIENT_REFLECT=<multiple>`; unset or 0: what the title has).
+/// Without rays the reflections are the open sky's wherever a surface is
+/// glossy, indoors too: a wooden floor wears a white glaze (beloooo's finding
+/// and remedy, VIctory-Belobug-AMD 44dcd43; there held to a part of a
+/// constant, here to the slow mean of what the room sends out).
+fn reflect() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let set = std::env::var("VICTORY_AMBIENT_REFLECT").unwrap_or_default();
         set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0)
     })
 }
@@ -388,6 +409,41 @@ void zero_u(uint3 at : SV_DispatchThreadID) {
 }
 #endif
 
+#ifdef HOLD
+RWTexture2D<uint> reflected : register(u0);
+float3 unpack(uint v) {
+    return float3(v & 511, (v >> 9) & 511, (v >> 18) & 511) * exp2(float(v >> 27) - 24.0);
+}
+uint pack(float3 c) {
+    c = clamp(c, 0.0, 65408.0);
+    float top = max(c.r, max(c.g, c.b));
+    int e = clamp(int(floor(log2(max(top, 1e-9)))) + 16, 0, 31);
+    float scale = exp2(float(24 - e));
+    if (top * scale >= 511.5) { e = min(e + 1, 31); scale = exp2(float(24 - e)); }
+    uint3 m = min(uint3(c * scale + 0.5), 511u);
+    return m.r | (m.g << 9) | (m.b << 18) | (uint(e) << 27);
+}
+// Reflections: bounded softly by a multiple (`air` carries it for this
+// pass) of the light around, as the last seconds showed it.
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void hold(uint3 at : SV_DispatchThreadID) {
+    if (at.x >= width || at.y >= height) return;
+    float cap = max(air * dot(cells[CELLS].rgb, LUMA), 1e-6);
+    float3 c = unpack(reflected[at.xy]);
+#ifdef MAGENTA_FILTER
+    // What the rays' memory held where nothing was traced: single pixels
+    // of magenta, bright enough to throw a star of bloom over the picture.
+    if (is_garbage(c)) c = 0.0;
+#endif
+    float has = dot(c, LUMA);
+    // A soft bound, not a cut: has / (1 + has / cap) nears the cap and
+    // never reaches it, so what is reflected keeps its shape (a cut left
+    // every glossy surface one flat value: no sheen on a wooden floor).
+    reflected[at.xy] = pack(c / (1.0 + has / cap));
+}
+#endif
+
 #ifdef RAISE
 RWTexture2D<uint> light : register(u0);
 float3 unpack(uint v) {
@@ -502,6 +558,7 @@ struct Pass {
     gather: ID3D12PipelineState,
     raise: ID3D12PipelineState,
     air: ID3D12PipelineState,
+    hold: ID3D12PipelineState,
     zero_f: ID3D12PipelineState,
     zero_u: ID3D12PipelineState,
     cells: ID3D12Resource,
@@ -543,6 +600,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     let gather = pipeline("GATHER", s!("gather"))?;
     let raise = pipeline("RAISE", s!("raise"))?;
     let air = pipeline("AIR", s!("clear_air"))?;
+    let hold = pipeline("HOLD", s!("hold"))?;
     let zero_f = pipeline("ZEROF", s!("zero_f"))?;
     let zero_u = pipeline("ZEROU", s!("zero_u"))?;
     let made = |bytes| buffer(bytes).ok_or_else(windows::core::Error::empty);
@@ -554,6 +612,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
         gather,
         raise,
         air,
+        hold,
         zero_f,
         zero_u,
         cells: made(CELL_BYTES)?,
@@ -656,6 +715,9 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     if role == Role::Air && (constant > 0.0 || air() == 0.0) {
         return false;
     }
+    if role == Role::Reflected && (constant > 0.0 || reflect() == 0.0) {
+        return false;
+    }
     static SAID: Mutex<u32> = Mutex::new(0);
     {
         let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
@@ -663,6 +725,10 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
             *said += 1;
             tracing::info!(?role, size = ?views.size, level, constant, "a stand-in for the indirect light");
         }
+    }
+    if role == Role::Reflected {
+        static HELD: std::sync::Once = std::sync::Once::new();
+        HELD.call_once(|| tracing::info!(size = ?views.size, multiple = reflect(), "reflections held to the light around (VICTORY_AMBIENT_REFLECT)"));
     }
     list.keep(&pass.cells);
     list.keep(&pass.points);
@@ -677,7 +743,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[7] = views.size[1];
     words[8] = follow(role).to_bits();
     words[9] = 4.0f32.to_bits();
-    words[10] = air().to_bits();
+    words[10] = if role == Role::Reflected { reflect() } else { air() }.to_bits();
     words[11] = u32::from(crate::lightprobe::on());
     words[12] = settle().map_or(0.0, |s| s.jump).to_bits();
     words[13] = settle().map_or(0.0, |s| s.fresh).to_bits();
@@ -706,6 +772,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                 run(&pass.mean, 1, 1, 1);
                 KEPT.store(true, Ordering::Relaxed);
             }
+            Role::Reflected => run(&pass.hold, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1),
             Role::Air => run(&pass.air, views.size[0].div_ceil(8), views.size[1].div_ceil(8), views.slices.div_ceil(2)),
             Role::Resolve => {
                 if constant == 0.0 {
@@ -738,6 +805,7 @@ mod tests {
         assert_eq!(role(b"..CS_ScreenProbes_TemporalResolve_a911b49c_Wrapped.."), Some(Role::Resolve));
         assert_eq!(role(b"..CS_CacheScreenSpaceRadiance_eed2fc35.."), Some(Role::Radiance));
         assert_eq!(role(b"CS_AccumulateLocalLightInscatteringVolume_7e2f5eef"), Some(Role::Air));
+        assert_eq!(role(b"..CS_UpdateHistory_0badf00d.."), Some(Role::Reflected));
         assert_eq!(role(b"CS_TemporalResolve"), None);
     }
 
@@ -760,6 +828,14 @@ mod tests {
         assert_ne!(raise(2), one);
         assert_ne!(raise(3), one);
         assert_ne!(raise(3), raise(2));
+    }
+
+    /// The reflection hold takes the filter of the mode, and only of a mode.
+    #[test]
+    fn magenta_reaches_the_hold() {
+        let hold = |m| crate::host::compile(&source("HOLD", m), s!("hold"), s!("cs_5_1")).expect("hold");
+        assert_ne!(hold(1), hold(0));
+        assert_ne!(hold(2), hold(1));
     }
 
     /// The passes compile with the system's compiler and the host takes them.
