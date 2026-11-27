@@ -5,9 +5,8 @@
 # because pipelines are made on several threads).
 #
 # A run makes only the programs listed in a file (VICTORY_NATIVE_COMPUTE_ONLY)
-# and is broken when the scene empties: fewer than K_MIN_DRAWS (default 7,500)
-# draws a frame (second lowest of its last four frame lines; a good one has
-# ~9,000-11,000). Its fps is noted, not judged (loading skews it).
+# and is broken when a screenshot shows no picture: contrast under K_MIN_STD
+# (default 15). Its fps is noted, not judged.
 #
 # Each round: all candidates on; if the scene holds, done. Otherwise halve:
 # the half that breaks it alone is kept, until one program is left; it goes
@@ -24,16 +23,26 @@ touch "$BAD"
 rounds=${1:-6}
 say() { printf '\e[1;35mp4-hunt:\e[0m %s\n' "$*"; }
 winpath() { local p; p=$(readlink -f "$1"); echo "Z:${p//\//\\}"; }
-# Draws a frame of run LABEL (second lowest of the last four lines), and fps.
+# The lowest screenshot contrast of run LABEL (luminance standard deviation:
+# ~70 for a real scene, under 5 for a grey, black or white screen), and fps.
+# (Draws a frame were a wrong test: the camera cuts indoors by itself.)
 measure() {
-    local d log
+    local d
     d=$(ls -d bench/k-*"$1" 2>/dev/null | tail -1)
-    log=$(awk -F'\t' 'NR==2 {print $13}' "$d/runs.tsv" 2>/dev/null)
-    echo "$(sed 's/\x1b\[[0-9;]*m//g' "$log" 2>/dev/null | grep -oE '\), [0-9]+ draws/frame' | tail -4 | grep -oE '[0-9]+' | sort -n | sed -n 2p) $(awk -F'\t' 'NR==2 {print $5}' "$d/runs.tsv" 2>/dev/null)"
+    echo "$(python3 -I - "$d" <<'PY'
+import glob, sys
+from PIL import Image, ImageStat
+v = []
+for p in glob.glob(sys.argv[1] + "/run-1*.png"):
+    im = Image.open(p).convert("L"); w, h = im.size
+    v.append(ImageStat.Stat(im.crop((int(w * .05), int(h * .15), int(w * .95), int(h * .95)))).stddev[0])
+print(int(min(v)) if v else "")
+PY
+) $(awk -F'\t' 'NR==2 {print $5}' "$d/runs.tsv" 2>/dev/null)"
 }
 # Runs with only the addresses in FILE made; prints "draws fps".
 try() { # LABEL FILE
-    scripts/ktrials.sh -n 1 -l "$1" -s 15 VICTORY_NATIVE_COMPUTE=1 "VICTORY_NATIVE_COMPUTE_ONLY=$(winpath "$2")" >/dev/null 2>&1
+    K_SHOTS=2 scripts/ktrials.sh -n 1 -l "$1" -s 15 VICTORY_NATIVE_COMPUTE=1 "VICTORY_NATIVE_COMPUTE_ONLY=$(winpath "$2")" >/dev/null 2>&1
     measure "$1"
 }
 # K_ALL=<file>: the candidates (e.g. the programs that translate, from
@@ -43,9 +52,9 @@ for ((round = 1; round <= rounds; round++)); do
     grep -vxFf "$BAD" "$WORK/all.txt" >"$WORK/cand.txt" || true
     n=$(wc -l <"$WORK/cand.txt")
     read -r draws fps < <(try "p4-hunt-r$round-all" "$WORK/cand.txt")
-    say "round $round: $n programs on (skipping $(wc -l <"$BAD")): draws=${draws:-?} fps=${fps:-?}"
+    say "round $round: $n programs on (skipping $(wc -l <"$BAD")): std=${draws:-?} fps=${fps:-?}"
     [[ -z $draws ]] && { say "no measurement; stopping"; break; }
-    ((draws >= ${K_MIN_DRAWS:-7500})) && { say "the scene holds with all of them: done"; break; }
+    ((draws >= ${K_MIN_STD:-15})) && { say "the scene holds with all of them: done"; break; }
     cp "$WORK/cand.txt" "$WORK/set.txt"
     step=0
     while (($(wc -l <"$WORK/set.txt") > 1)); do
@@ -55,12 +64,12 @@ for ((round = 1; round <= rounds; round++)); do
         tail -n +"$((half + 1))" "$WORK/set.txt" >"$WORK/b.txt"
         read -r draws fps < <(try "p4-hunt-r$round-s$step" "$WORK/a.txt")
         [[ -z $draws ]] && { say "no measurement; stopping"; exit 1; }
-        if ((draws < ${K_MIN_DRAWS:-7500})); then
+        if ((draws < ${K_MIN_STD:-15})); then
             cp "$WORK/a.txt" "$WORK/set.txt"; verdict="first half breaks it"
         else
             cp "$WORK/b.txt" "$WORK/set.txt"; verdict="first half holds"
         fi
-        say "  step $step: first $half of $((half + $(wc -l <"$WORK/b.txt"))): draws=$draws fps=$fps, $verdict"
+        say "  step $step: first $half of $((half + $(wc -l <"$WORK/b.txt"))): std=$draws fps=$fps, $verdict"
     done
     bad=$(cat "$WORK/set.txt")
     echo "$bad" >>"$BAD"
