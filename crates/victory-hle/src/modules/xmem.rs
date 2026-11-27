@@ -848,6 +848,9 @@ struct Physical {
     /// Placeholders that are some view's own, left by its unmapping: address
     /// and length. The title may have joined one with others since.
     holes: HashMap<usize, usize>,
+    /// When a view was last mapped, by its address, in [`JOIN_TICK`]s: the
+    /// joining leaves views alone that changed lately ([`joiner`]).
+    mapped_at: HashMap<usize, u64>,
 }
 
 impl Physical {
@@ -1539,6 +1542,7 @@ pub extern "system" fn XMemMapPhysicalPages(
     // the mapping call that holds them.
     // SAFETY: the title passes `n` page numbers, or null.
     let pages = (!pages.is_null()).then(|| unsafe { std::slice::from_raw_parts(pages, n) }.to_vec());
+    joiner();
     if port_on()
         && let Some(pages) = &pages
     {
@@ -1878,6 +1882,7 @@ fn change(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
                 if let Some((size, slice)) = physical.views.remove(&op.at) {
                     shown_mut().forget(op.at, size, &slice);
                 }
+                physical.mapped_at.remove(&op.at);
                 victory_gpu::title_memory_unmapping(op.at, PAGE);
                 physical.holes.remove(&op.at);
                 (op.had, op.own) = (true, lean());
@@ -1910,6 +1915,7 @@ fn change(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
                 victory_gpu::title_memory_remapped(op.at, PAGE);
                 victory_gpu::title_memory_view(op.at, PAGE, slice.section.handle as usize, (slice.index * PAGE) as u64);
                 physical.views.insert(op.at, (PAGE, slice));
+                physical.mapped_at.insert(op.at, JOIN_TICK.load(Ordering::Relaxed));
             }
             None if op.had && done => {
                 physical.holes.insert(op.at, PAGE);
@@ -2056,7 +2062,165 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     // What the range shows now, for the GPU side's in-place census.
     victory_gpu::title_memory_view(base, len, slice.section.handle as usize, (slice.index * PAGE) as u64);
     physical.views.insert(base, (len, slice));
+    physical.mapped_at.insert(base, JOIN_TICK.load(Ordering::Relaxed));
     true
+}
+
+/// Whether views that continue each other are joined into one
+/// (`VICTORY_JOIN_VIEWS=1`; off by default; refused under `wine_map`, which maps pages without views.)
+///
+/// Wine (Proton) keeps a process's views in a list and walks it on every map
+/// and unmap (wineserver's `is_valid_view_addr`, `req_unmap_view`): with
+/// 90,000-130,000 views alive in the world, 0.35 ms a call, 2,000 calls a
+/// second walking, the wineserver at 74% of a core (2026-11-26). The views
+/// form a tenth as many runs of the same section's pages one after the other
+/// (the GPU's page mappings make one view per page): joined, the list is that
+/// much shorter and every call that much cheaper.
+fn join_views_on() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_JOIN_VIEWS").is_some_and(|v| v == "1"));
+    *ON
+}
+
+/// The joining's clock: one tick a pass ([`joiner`]).
+static JOIN_TICK: AtomicU64 = AtomicU64::new(0);
+
+/// Ticks a view must have stood unchanged to be joined: a page the GPU's
+/// mappings move about all the time stays a view of its own (joining it would
+/// cost a cut each time it moves).
+const JOIN_AFTER: u64 = 30;
+
+/// Views joined at most at once: each costs a call to unmap it, and the
+/// title's mapping calls wait meanwhile. A longer run is joined over passes.
+const JOIN_AT_MOST: usize = 32;
+
+/// Views joined and runs made of them since the start (for the log).
+static JOINED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Starts the thread that joins views, once.
+fn joiner() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    // (Tests join by calling `join_run`: views they check are not joined
+    // behind their backs.)
+    if !join_views_on() || cfg!(test) {
+        return;
+    }
+    STARTED.call_once(|| {
+        if wine_map::on() {
+            tracing::warn!("VICTORY_JOIN_VIEWS ignored: VICTORY_WINE_MAP=1 maps pages without views");
+            return;
+        }
+        let spawned = std::thread::Builder::new().name("victory-join-views".into()).spawn(|| {
+            let mut said = 0u64;
+            loop {
+                // A pass every 100 ms, a run at a time with the locks taken
+                // for it alone, at most 5 ms of each pass: the title's mapping
+                // calls get in between.
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                let tick = JOIN_TICK.fetch_add(1, Ordering::Relaxed) + 1;
+                let started = std::time::Instant::now();
+                let mut from = 0;
+                while started.elapsed() < std::time::Duration::from_millis(5) {
+                    let mut physical = physical();
+                    let Some(run) = cold_run(&physical, from, tick) else { break };
+                    from = run.last().map_or(from, |&(at, len)| at + len);
+                    let _changing = victory_gpu::title_memory_remapping();
+                    join_run(&mut physical, &run);
+                }
+                let joined = JOINED[0].load(Ordering::Relaxed);
+                if joined >= 2 * said.max(512) {
+                    said = joined;
+                    let views = physical().views.len();
+                    tracing::info!(joined, runs = JOINED[1].load(Ordering::Relaxed), views, "views joined into runs (VICTORY_JOIN_VIEWS)");
+                }
+            }
+        });
+        if spawned.is_err() {
+            tracing::warn!("no thread to join views");
+        }
+    });
+}
+
+/// The first run of two or more views at or after `from` that continue each
+/// other and have all stood unchanged [`JOIN_AFTER`] ticks: (address,
+/// length) of each.
+fn cold_run(physical: &Physical, from: usize, tick: u64) -> Option<Vec<(usize, usize)>> {
+    let cold = |at: &usize| physical.mapped_at.get(at).is_none_or(|&t| tick.saturating_sub(t) >= JOIN_AFTER);
+    let mut run: Vec<(usize, usize)> = Vec::new();
+    let mut next: Option<(usize, *const Section, usize)> = None;
+    for (&at, (len, slice)) in physical.views.range(from..) {
+        let section = Arc::as_ptr(&slice.section);
+        let continues = next.is_some_and(|(end, s, index)| end == at && s == section && index == slice.index);
+        if !(continues && cold(&at)) {
+            if run.len() >= 2 {
+                return Some(run);
+            }
+            run.clear();
+        }
+        if cold(&at) {
+            run.push((at, *len));
+            if run.len() == JOIN_AT_MOST {
+                return Some(run);
+            }
+        }
+        next = Some((at + len, section, slice.index + len / PAGE));
+    }
+    (run.len() >= 2).then_some(run)
+}
+
+/// Joins `run` (views that continue each other, in order) into one view: the
+/// same pages at the same addresses, so the GPU side is told of no new
+/// contents, only that the old views' protections went with them
+/// (`title_memory_unmapping`). Where the host does not join their
+/// placeholders, each view is mapped again as it was. With [`PHYSICAL`] and
+/// the change of mapping held.
+fn join_run(physical: &mut Physical, run: &[(usize, usize)]) -> bool {
+    if wine_map::on() {
+        return false;
+    }
+    let (Some(&(base, _)), Some(&(last, last_len))) = (run.first(), run.last()) else { return false };
+    let len = last + last_len - base;
+    let Some(first) = physical.views.get(&base).map(|(_, slice)| slice.clone()) else { return false };
+    let mut taken: Vec<(usize, usize, Slice)> = Vec::new();
+    for &(at, size) in run {
+        let Some((size, slice)) = physical.views.remove(&at).filter(|v| v.0 == size) else { break };
+        physical.mapped_at.remove(&at);
+        shown_mut().forget(at, size, &slice);
+        victory_gpu::title_memory_unmapping(at, size);
+        // SAFETY: a view we mapped; it becomes a placeholder again.
+        let gone = counted(Call::Unmap, || unsafe {
+            UnmapViewOfFile2(GetCurrentProcess(), MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut c_void }, MEM_PRESERVE_PLACEHOLDER)
+        });
+        if gone == 0 {
+            // Still mapped as it was: keep it so.
+            shown_mut().note(at, size, &slice);
+            physical.views.insert(at, (size, slice));
+            break;
+        }
+        taken.push((at, size, slice));
+    }
+    let whole = taken.len() == run.len();
+    const MEM_COALESCE_PLACEHOLDERS: u32 = 1;
+    // SAFETY: placeholders of ours, the views over them just unmapped.
+    let joined = whole
+        && counted(Call::Split, || unsafe { VirtualFree(base as *mut c_void, len, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) }) != 0;
+    if joined && show(base, len, &first, true) {
+        shown_mut().note(base, len, &first);
+        victory_gpu::title_memory_view(base, len, first.section.handle as usize, (first.index * PAGE) as u64);
+        physical.views.insert(base, (len, first));
+        JOINED[0].fetch_add(run.len() as u64, Ordering::Relaxed);
+        JOINED[1].fetch_add(1, Ordering::Relaxed);
+        return true;
+    }
+    if joined {
+        tracing::warn!(base = format_args!("{base:#x}"), len, "a joined placeholder could not be mapped: its views are mapped again one by one");
+    }
+    // Each as it was (`map` cuts its placeholder out again where joined).
+    for (at, size, slice) in taken {
+        if !map(physical, at, size, slice) {
+            tracing::warn!(at = format_args!("{at:#x}"), size, "a view could not be mapped again after a join was given up");
+        }
+    }
+    false
 }
 
 /// Cuts `[base, base + len)` out of the placeholder it is in (which fails
@@ -2239,6 +2403,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
         };
+        physical.mapped_at.remove(&at);
         shown_mut().forget(at, size, &slice);
         if at < base || at + size > end {
             // Parts of it stay, and are mapped again below.
@@ -3092,6 +3257,172 @@ mod tests {
             );
         }
         assert_eq!(XMemFreePhysicalPages(1024, pages.as_ptr()), 1);
+    }
+
+    /// Single-page views of pages that follow each other are joined into
+    /// one view: the same bytes at the same addresses, writes still land, and
+    /// a page inside the joined view can be mapped anew with the others kept.
+    /// Views mapped lately are left alone.
+    #[test]
+    fn views_that_continue_each_other_are_joined() {
+        const N: usize = 4;
+        let pages = allocate(N + 1);
+        let a = XMemVirtualAlloc(std::ptr::null_mut(), N * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE) as usize;
+        assert_ne!(a, 0);
+        let at = |k: usize| (a + k * PAGE) as *mut c_void;
+        let first = |k: usize| at(k).cast::<u64>();
+        // One view per page, as the GPU's page mappings make them.
+        let to: Vec<*mut c_void> = (0..N).map(at).collect();
+        assert_eq!(XMemMapPhysicalPagesScatter(to.as_ptr(), N, pages.as_ptr()), 1);
+        // SAFETY (the test): mapped read-write.
+        unsafe {
+            for k in 0..N {
+                first(k).write(100 + k as u64);
+            }
+        }
+        let views_here = || physical().views.range(a..a + N * PAGE).count();
+        assert_eq!(views_here(), N);
+        let mapped = *physical().mapped_at.get(&a).expect("noted when mapped");
+        // Lately mapped: not a run to join yet.
+        assert!(cold_run(&physical(), a, mapped + JOIN_AFTER - 1).is_none_or(|run| run.first().is_none_or(|r| r.0 >= a + N * PAGE)));
+        let run = cold_run(&physical(), a, mapped + JOIN_AFTER).expect("a run");
+        assert_eq!(run.first(), Some(&(a, PAGE)));
+        assert_eq!(run.len(), N);
+        {
+            let mut physical = physical();
+            let _changing = victory_gpu::title_memory_remapping();
+            assert!(join_run(&mut physical, &run));
+        }
+        assert_eq!(views_here(), 1);
+        assert_eq!(physical().views.get(&a).map(|v| v.0), Some(N * PAGE));
+        unsafe {
+            for k in 0..N {
+                assert_eq!(first(k).read(), 100 + k as u64);
+            }
+            first(2).write(7);
+            assert_eq!(page_bytes(pages[2])[..8], 7u64.to_le_bytes());
+        }
+        // Another page at the third address: the rest keep theirs.
+        assert_eq!(XMemMapPhysicalPagesScatter([at(2)].as_ptr(), 1, [pages[N]].as_ptr()), 1);
+        unsafe {
+            assert_eq!((first(0).read(), first(1).read(), first(3).read()), (100, 101, 103));
+            first(2).write(9);
+            assert_eq!(page_bytes(pages[N])[..8], 9u64.to_le_bytes());
+        }
+        assert_eq!(XMemMapPhysicalPages(at(0), N, std::ptr::null()), at(0));
+        assert_eq!(XMemFreePhysicalPages(N + 1, pages.as_ptr()), 1);
+    }
+
+    /// A page the title keeps using while the rest of its view is cut off
+    /// and joined to it again, thousands of times, with busy threads beside
+    /// it: every read gives what the last write left. Under Wine before
+    /// `keep/wine-placeholder-map.patch` the page went accessible as blank
+    /// memory a moment before the section was mapped over it again, and the
+    /// title's thread read zeros there or wrote what was then lost (about one
+    /// in fifteen runs of the tests above, 2026-11-26).
+    #[test]
+    fn a_page_in_use_keeps_its_bytes_while_its_view_is_cut_and_joined() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let pages = allocate(2);
+        let a = XMemVirtualAlloc(std::ptr::null_mut(), 2 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        assert!(!a.is_null());
+        let second = a.wrapping_byte_add(PAGE);
+        assert_eq!(XMemMapPhysicalPages(a, 2, pages.as_ptr()), a);
+        let (first, stop) = (a as usize, AtomicBool::new(false));
+        struct Stop<'a>(&'a AtomicBool);
+        impl Drop for Stop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        // SAFETY: mapped read-write.
+        unsafe { (first as *mut u64).write_volatile(0) };
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let cuts = std::thread::scope(|s| {
+            let _stop = Stop(&stop);
+            // Threads that map views of their own again and again, as the
+            // GPU's page mappings do beside the title: the mapping calls of
+            // this one meet theirs at any of their steps.
+            for _ in 0..threads.min(4) {
+                s.spawn(|| {
+                    let pages = allocate(3);
+                    let b = XMemVirtualAlloc(std::ptr::null_mut(), 3 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+                    assert!(!b.is_null());
+                    while !stop.load(Ordering::Relaxed) {
+                        assert_eq!(XMemMapPhysicalPages(b, 3, pages.as_ptr()), b);
+                    }
+                    assert_eq!(XMemMapPhysicalPages(b, 3, std::ptr::null()), b);
+                    assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+                });
+            }
+            let title = s.spawn(|| {
+                let mut n = 0u64;
+                // SAFETY (the block): the first page is the title's all the
+                // time; a fault would end the process.
+                unsafe {
+                    while !stop.load(Ordering::Relaxed) {
+                        let seen = (first as *const u64).read_volatile();
+                        if seen != n {
+                            return Err((seen, n));
+                        }
+                        n += 1;
+                        (first as *mut u64).write_volatile(n);
+                    }
+                }
+                Ok(n)
+            });
+            let mut cuts = 0;
+            for _ in 0..3000 {
+                if title.is_finished() {
+                    break;
+                }
+                // Cut: the first page is mapped again on its own.
+                assert_eq!(XMemMapPhysicalPages(second, 1, std::ptr::null()), second);
+                assert_eq!(XMemMapPhysicalPages(second, 1, pages[1..].as_ptr()), second);
+                // Joined: the first page is mapped again with the second.
+                let mut physical = physical();
+                let _changing = victory_gpu::title_memory_remapping();
+                assert!(join_run(&mut physical, &[(first, PAGE), (first + PAGE, PAGE)]));
+                cuts += 1;
+            }
+            stop.store(true, Ordering::Relaxed);
+            let done = title.join().expect("the title's thread never faulted");
+            assert!(matches!(done, Ok(n) if n > 0), "the title's page read {done:?} (seen, last written) after {cuts} cuts");
+            cuts
+        });
+        assert_eq!(cuts, 3000);
+        assert_eq!(XMemMapPhysicalPages(a, 2, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
+    /// Under `VICTORY_WINE_MAP=1` the pages are not views, so a join is refused
+    /// before any view is unmapped. Needs `VICTORY_WINE_MAP=1` and
+    /// `VICTORY_DSTORAGE_LOG` (the system calls are counted only while it is
+    /// set) for the whole process.
+    #[test]
+    #[ignore = "needs VICTORY_WINE_MAP=1 and VICTORY_DSTORAGE_LOG for the whole process"]
+    fn a_join_is_refused_under_wine_map() {
+        const N: usize = 3;
+        let a = 0x10_0000_0000usize;
+        let section = Arc::new(Section {
+            handle: std::ptr::null_mut(),
+            pages: N,
+            window: std::sync::OnceLock::new(),
+            committed: vec![std::sync::atomic::AtomicU64::new(0)].into_boxed_slice(),
+            fd: None,
+            home: AtomicUsize::new(0),
+            at_home: vec![std::sync::atomic::AtomicU64::new(0)].into_boxed_slice(),
+        });
+        let mut physical = Physical::default();
+        for k in 0..N {
+            physical.views.insert(a + k * PAGE, (PAGE, Slice { section: section.clone(), index: k }));
+        }
+        let run: Vec<(usize, usize)> = (0..N).map(|k| (a + k * PAGE, PAGE)).collect();
+        let unmaps = || MAPPING[Call::Unmap as usize].load(Ordering::Relaxed);
+        let before = unmaps();
+        assert!(!join_run(&mut physical, &run));
+        assert_eq!(unmaps() - before, 0, "a join under wine_map unmaps nothing");
+        assert_eq!(physical.views.len(), N);
     }
 
     /// `n` pages of one new allocation.
