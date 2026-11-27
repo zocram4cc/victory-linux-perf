@@ -549,6 +549,22 @@ fn worker_count_for(asked: Option<usize>, processors: usize, limited_ram: bool) 
     }
 }
 
+/// The stack a worker is given, in bytes: `asked` MiB
+/// (`VICTORY_PIPELINE_STACK_MB`, at most 1,024), else 64 MiB; `None` for 0,
+/// the default stack as before (2 MiB). Reserved, not committed. The host
+/// driver compiles on the worker's thread, and under Wine vkd3d-proton's
+/// conversion of DXIL to SPIR-V recurses over the program's control flow:
+/// past the default stack the thread ends without a word and its pipeline
+/// is never made (avatarmanz 14709c5; Belobug PR #421 gives 64 MiB too,
+/// Legendary a1058fa 8 MiB).
+fn worker_stack(asked: Option<usize>) -> Option<usize> {
+    match asked {
+        Some(0) => None,
+        Some(mib) => Some(mib.min(1024) << 20),
+        None => Some(64 << 20),
+    }
+}
+
 /// Starts the workers ([`worker_count`]) on first use.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
@@ -561,12 +577,16 @@ fn workers() -> bool {
             std::thread::available_parallelism().map_or(2, |n| n.get()),
             crate::residency::limited_host_ram(),
         );
-        tracing::info!(workers, "pipeline workers");
+        let stack = worker_stack(std::env::var("VICTORY_PIPELINE_STACK_MB").ok().and_then(|v| v.trim().parse().ok()));
+        tracing::info!(workers, stack_mib = stack.map_or(0, |s| s >> 20), "pipeline workers");
         let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
         for i in 0..workers + screens {
             let screens_only = i >= workers;
-            let spawned = std::thread::Builder::new()
-                .name(format!("victory-pipelines-{i}"))
+            let mut builder = std::thread::Builder::new().name(format!("victory-pipelines-{i}"));
+            if let Some(stack) = stack {
+                builder = builder.stack_size(stack);
+            }
+            let spawned = builder
                 .spawn(move || {
                     // Below the title's own threads (loading, recording),
                     // and the streaming one, which is below normal itself
@@ -636,6 +656,31 @@ mod tests {
         assert_eq!(worker_count_for(None, 16, true), 8);
         assert_eq!(worker_count_for(None, 24, true), 8);
         assert_eq!(worker_count_for(Some(12), 8, true), 12);
+    }
+
+    #[test]
+    fn workers_get_a_stack_of_64_mib_or_what_the_switch_says() {
+        assert_eq!(worker_stack(None), Some(64 << 20));
+        assert_eq!(worker_stack(Some(256)), Some(256 << 20));
+        assert_eq!(worker_stack(Some(1 << 20)), Some(1 << 30));
+        assert_eq!(worker_stack(Some(0)), None);
+    }
+
+    /// A thread with a worker's stack takes recursion the default 2 MiB
+    /// does not: 16 MiB of frames here.
+    #[test]
+    fn a_workers_stack_takes_deep_recursion() {
+        #[inline(never)]
+        fn deep(n: usize) -> usize {
+            let frame = std::hint::black_box([n as u8; 4096]);
+            if n == 0 { 0 } else { std::hint::black_box(deep(n - 1)) + usize::from(frame[0] == frame[4095]) }
+        }
+        let made = std::thread::Builder::new()
+            .stack_size(worker_stack(None).unwrap())
+            .spawn(|| deep(4096))
+            .unwrap()
+            .join();
+        assert_eq!(made.ok(), Some(4096));
     }
 
     /// A first use queues the pipeline and, within the budget, gets the
