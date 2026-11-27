@@ -5918,6 +5918,41 @@ mod tests {
         assert_ne!(crate::descriptor::view_and_key(handle).unwrap().1, key);
     }
 
+    /// A slot the title writes after an early pass took it is due again, and
+    /// the early pass's `done` for the write it took, which finishes late,
+    /// does not take the newer write out of the queue.
+    #[test]
+    fn a_write_after_an_early_pass_stays_due() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        // 64x64 BC7, one mip, at an address no test and no title uses.
+        let view = |at: u64| {
+            let mut desc = [0u32; 16];
+            (desc[0], desc[1], desc[2], desc[5]) = (98, 4, 5768, 1);
+            (desc[10], desc[11]) = (at as u32, (at >> 32) as u32);
+            View::Placed(false, [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0], desc)
+        };
+        let title = [0u32; 8];
+        let handle = title.as_ptr() as u64;
+        crate::descriptor::record(handle, view(0x7fec_0000_0000));
+        let (first, _) = crate::descriptor::view_and_key(handle).unwrap();
+        assert!(heap.note_buffer(1, Some(&first), false).is_empty());
+        // The early pass takes slot 1, with the write it sees.
+        let (index, early) = heap.texture_slots_due(u64::MAX, 8, true).0[0];
+        assert_eq!(index, 1);
+        // The title writes it again before its first use.
+        crate::descriptor::record(handle, view(0x7feb_0000_0000));
+        let (second, _) = crate::descriptor::view_and_key(handle).unwrap();
+        assert!(heap.note_buffer(1, Some(&second), false).is_empty());
+        // The early pass's `done` for the write it took arrives late.
+        heap.texture_slot_done(1, early, None);
+        // The pass of the first use finds slot 1 due, with the newer write.
+        let due = heap.texture_slots_due(u64::MAX, 8, true).0;
+        assert_eq!(due.len(), 1, "a write after the early pass stays due: {due:?}");
+        assert_ne!(due[0].1, early);
+    }
+
     /// A first upload's slot waits for the drawing queue's lists begun
     /// before its texture under Wine; elsewhere, or with none of those
     /// left, it changes when the upload has run.

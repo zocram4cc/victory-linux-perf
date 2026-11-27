@@ -28,7 +28,10 @@
 //!   for that draw, still run on the recording thread; the worker makes way
 //!   for them ([`urgent`]).
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::{Acquire, Relaxed, Release}};
+use std::sync::atomic::{
+    AtomicBool, AtomicU64, AtomicUsize,
+    Ordering::{Acquire, Relaxed, Release},
+};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
 
@@ -286,6 +289,42 @@ pub(crate) fn kick(heap: &Heap) -> bool {
     true
 }
 
+/// Whether the pass over the next frame's textures begins at the title's
+/// present (`VICTORY_HEAP_WORKER_EARLY=1`, with `VICTORY_HEAP_WORKER=1`; off
+/// by default).
+fn early_on() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("VICTORY_HEAP_WORKER_EARLY").is_some_and(|v| v == "1")
+    });
+    *ON && on()
+}
+
+/// The heap the frame's first use ran its pass over, by address ([`early`]).
+static EARLY_HEAP: AtomicUsize = AtomicUsize::new(0);
+
+/// Notes `heap` as the one [`early`] begins a pass over at the next present.
+pub(crate) fn note_heap(heap: &Heap) {
+    if early_on() {
+        EARLY_HEAP.store(std::ptr::from_ref(heap) as usize, Relaxed);
+    }
+}
+
+/// Begins the pass over the noted heap when the title's present is over, so
+/// that it runs while the title does its own work before its first list. The
+/// first submission after it waits for it, as for any pass begun before it.
+/// What the title writes to the heap meanwhile is queued again, and the
+/// frame's first use runs its pass ([`kick`]) over those: a pass still
+/// pending for the heap covers them, one begun or running does not.
+pub(crate) fn early() {
+    if !early_on() {
+        return;
+    }
+    let at = EARLY_HEAP.load(Relaxed);
+    if at != 0 {
+        crate::descriptor::with_heap(at, kick);
+    }
+}
+
 /// Takes the pass from the worker for the caller, which cannot wait for a
 /// later submission: the worker stops at its next look ([`make_way`]).
 pub(crate) fn urgent() -> MutexGuard<'static, ()> {
@@ -364,6 +403,32 @@ mod tests {
             });
             passes.wait_for_begun();
             assert!(passes.done.load(Acquire) >= ticket, "returned before the pass was finished");
+        });
+    }
+
+    /// An early pass, begun at the title's present, is one the first
+    /// submission after it waits for, however long the title's own work is
+    /// in between: the pass overlaps that work and no more.
+    #[test]
+    fn a_submission_waits_for_an_early_pass_begun_before_the_title_work() {
+        let passes = Passes {
+            begun: AtomicU64::new(0),
+            done: AtomicU64::new(0),
+            wait: Mutex::new(()),
+            finished: Condvar::new(),
+        };
+        let early = passes.begin();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                passes.finish(early);
+            });
+            std::thread::sleep(std::time::Duration::from_millis(12));
+            passes.wait_for_begun();
+            assert!(
+                passes.done.load(Acquire) >= early,
+                "returned before the early pass was finished"
+            );
         });
     }
 }

@@ -2703,6 +2703,7 @@ impl State {
             .map(|&h| crate::descriptor::heap(h as This))
             .find(|h| !h.samplers())?;
         let host = heap.host()?;
+        crate::heap_worker::note_heap(heap);
         let gpu = host.strides_gpu()?;
         // One key per list, as textures have: no title resource is there.
         // (`VICTORY_SWEEP_PER_HEAP=1`, codec-d/cool_fox c64fc9b4: one per

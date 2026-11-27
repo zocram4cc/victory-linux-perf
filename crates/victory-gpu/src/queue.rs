@@ -1048,6 +1048,8 @@ extern "system" fn present(
             overlay.map(|(_, copy, state)| (copy, state)),
             Shown { frame, resource },
         );
+        #[cfg(windows)]
+        crate::heap_worker::early();
         called.end();
         #[cfg(feature = "diagnostics")]
         frame_ends();
@@ -1092,6 +1094,8 @@ extern "system" fn present(
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
+    #[cfg(windows)]
+    crate::heap_worker::early();
     called.end();
     #[cfg(all(windows, feature = "diagnostics"))]
     frame_ends();
