@@ -3253,26 +3253,48 @@ impl State {
     /// (`crate::ambient`). Whether it recorded anything.
     fn ambient(&self, list: &HostList, p: &HostPipeline, role: crate::ambient::Role) -> bool {
         use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, REFLECTIONS, Role, Views};
+        let Some(t) = p.stages.first().map(|s| s.translated()) else {
+            return false;
+        };
+        if role == Role::Reflect {
+            self.note_reflection_images(p, &t.used);
+        }
         // Every `CS_UpdateHistory` has this role; only those with the
         // reflections at their place are held, and only when asked for.
         if role == Role::Reflect && !crate::ambient::holding() {
             return false;
         }
-        let Some(t) = p.stages.first().map(|s| s.translated()) else {
-            return false;
-        };
         let Some(heap) = (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This).host()).flatten()
         else {
             return false;
         };
         let entry = |kind: ResourceType, (slot, offset): (u8, u32)| {
-            t.used.iter().find(|u| {
-                u.kind == kind && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, offset)
-            })?;
+            if role == Role::Reflect {
+                // A used entry marks where a range of views the program
+                // reads begins, not each view in it: the reflections at 40
+                // lie in a range that begins before them (Air's at 32). So a
+                // range of unordered views of that table must begin at or
+                // before them; then the view itself is looked up, as
+                // Neptune_VI does, and the format check below keeps any other
+                // image at that place alone.
+                t.used.iter().find(|u| {
+                    u.kind == kind && u.root == RootType::Table && u.slot == slot && u.table_offset_dwords <= offset
+                })?;
+            } else {
+                t.used.iter().find(|u| {
+                    u.kind == kind && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, offset)
+                })?;
+            }
             let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
                 return None;
             };
-            let resource = match (kind, crate::descriptor::view(table + u64::from(offset) * 4)?) {
+            let mut view = crate::descriptor::view(table + u64::from(offset) * 4)?;
+            // An unordered view of memory the title placed a texture in:
+            // the resource made for that memory (DoubleGhosty e11479a).
+            if role == Role::Reflect && matches!(view, View::Placed(true, ..)) {
+                view = crate::descriptor::host::placed_texture(&view)?;
+            }
+            let resource = match (kind, view) {
                 (ResourceType::Srv, View::Shader(r, _))
                 | (ResourceType::Uav, View::Unordered(r, ..)) => r,
                 _ => return None,
@@ -3294,7 +3316,9 @@ impl State {
         };
         let Some((of, image)) = entry(ResourceType::Uav, at) else {
             // (Other programs of that name write other histories.)
-            if role != Role::Reflect {
+            if role == Role::Reflect {
+                once!("reflections not held: no unordered view of a texture at their place in this program");
+            } else {
                 once!(?role, "no stand-in for the indirect light: missing image UAV");
             }
             return false;
@@ -3335,6 +3359,82 @@ impl State {
             size: [of.Width as u32, of.Height],
             slices: u32::from(of.DepthOrArraySize),
         })
+    }
+
+    /// Once per pipeline (32 at most): the unordered views a
+    /// `CS_UpdateHistory` program writes through its tables, at the place
+    /// each range of them begins and the places after it, with the kind,
+    /// format and size of what each names, so a release run shows where the
+    /// reflections are ([`crate::ambient::REFLECTIONS`]; their place came
+    /// from Neptune_VI's tree and did not match in run 20261127-010017).
+    fn note_reflection_images(&self, p: &HostPipeline, used: &[UsedResource]) {
+        static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+        {
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            if seen.is_empty() {
+                tracing::info!(
+                    pipeline = p.name,
+                    holding = crate::ambient::holding(),
+                    "a reflection history program (CS_UpdateHistory) runs: the role VICTORY_AMBIENT_REFLECT holds"
+                );
+            }
+            let key = std::ptr::from_ref(p) as usize;
+            if seen.contains(&key) || seen.len() >= 32 {
+                return;
+            }
+            seen.push(key);
+        }
+        let describe = |view: View| -> String {
+            let (kind, view) = match view {
+                View::Placed(true, ..) => ("placed uav", crate::descriptor::host::placed_texture(&view)),
+                View::Unordered(..) => ("uav", Some(view)),
+                View::Shader(..) => ("srv", Some(view)),
+                View::Constant(..) => return "cbv".to_owned(),
+                View::Placed(false, ..) => return "placed srv".to_owned(),
+                _ => return "sampler".to_owned(),
+            };
+            let resource = match view {
+                Some(View::Unordered(r, ..)) | Some(View::Shader(r, _)) => r,
+                _ => return format!("{kind} (no texture made)"),
+            };
+            // (The program has just written through these views: their host
+            // copies are made already, so asking is no first use.)
+            match crate::resource::host_resource(resource as This) {
+                Some(host) => {
+                    // SAFETY: a live resource.
+                    let d = unsafe { host.GetDesc() };
+                    format!(
+                        "{kind} {}x{}x{} format {} dimension {}",
+                        d.Width, d.Height, d.DepthOrArraySize, d.Format.0, d.Dimension.0
+                    )
+                }
+                None => format!("{kind} (no host copy yet)"),
+            }
+        };
+        let mut places = std::collections::BTreeMap::new();
+        for u in used.iter().filter(|u| u.kind == ResourceType::Uav && u.root == RootType::Table) {
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(u.slot)) else {
+                continue;
+            };
+            let step = u32::from(u.dwords.max(4));
+            for k in 0..8 {
+                let offset = u.table_offset_dwords + k * step;
+                if let std::collections::btree_map::Entry::Vacant(e) = places.entry((u.slot, offset)) {
+                    let Some(view) = crate::descriptor::view(table + u64::from(offset) * 4) else {
+                        break;
+                    };
+                    e.insert(describe(view));
+                }
+            }
+        }
+        let places: Vec<String> =
+            places.into_iter().map(|((slot, at), what)| format!("({slot}, {at}) {what}")).collect();
+        tracing::info!(
+            pipeline = p.name,
+            reflections_at = ?crate::ambient::REFLECTIONS,
+            ?places,
+            "unordered views of a reflection history program (CS_UpdateHistory): table place, then what it names"
+        );
     }
 
     /// What a draw or dispatch runs, for the device-removed report
