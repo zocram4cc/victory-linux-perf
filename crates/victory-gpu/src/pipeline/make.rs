@@ -33,7 +33,7 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::Shader;
@@ -67,6 +67,8 @@ pub(crate) struct Pending {
     /// The worker that was making it ended in the middle ([`watch`]): it
     /// will never be made, and nothing waits for it.
     lost: AtomicBool,
+    /// Said once that a worker has held it past the stall bound ([`stall_bound`]).
+    stall_noted: AtomicBool,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -99,11 +101,34 @@ impl Pending {
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
             lost: AtomicBool::new(false),
+            stall_noted: AtomicBool::new(false),
         }
     }
 
     pub(super) fn key(&self) -> &str {
         &self.key
+    }
+
+    /// Whether a worker has held it for `bound` or longer at `now`, longer
+    /// than any compile should take ([`stall_bound`]). Said once. The worker
+    /// is left to finish: a pipeline it makes later is used as any other.
+    fn stalled(&self, now: Instant, bound: Option<Duration>) -> bool {
+        let (Some(bound), Some(&since)) = (bound, self.making_since.get()) else {
+            return false;
+        };
+        let held = now.saturating_duration_since(since);
+        if held < bound || self.made.get().is_some() {
+            return false;
+        }
+        if !self.stall_noted.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                shaders = ?self.shaders,
+                key = %self.key,
+                held_s = held.as_secs(),
+                "a host pipeline worker has not returned from making a pipeline: its draws and dispatches no longer wait for it (VICTORY_PIPELINE_STALL_S, 0: waited for as any other)"
+            );
+        }
+        true
     }
 
     /// A compute pass where those wait apart from the frame's budget
@@ -193,6 +218,20 @@ fn wait_budget() -> Duration {
     })
 }
 
+/// How long a worker may hold a pipeline before its draws and dispatches
+/// stop waiting for it: `VICTORY_PIPELINE_STALL_S` seconds, 15 if unset,
+/// well past the longest compile measured (3.4 s); `None` for 0, no such
+/// bound. Under Wine a worker can stay inside the host's compile of a
+/// compute pipeline for good (Legendary a1058fa: NVIDIA's compiler hangs on
+/// one compute shader), and a wait for it is time the frame never gets back.
+fn stall_bound() -> Option<Duration> {
+    static BOUND: LazyLock<Option<Duration>> = LazyLock::new(|| {
+        let secs = std::env::var("VICTORY_PIPELINE_STALL_S").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(15);
+        (secs != 0).then(|| Duration::from_secs(secs))
+    });
+    *BOUND
+}
+
 /// As [`wait_budget`], for passes over the screen (`VICTORY_SCREEN_WAIT_MS`,
 /// 10 s; 0: like the others). Below the title's 30 s watchdog.
 fn screen_budget() -> Duration {
@@ -229,7 +268,10 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
             return None;
         }
         start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        // A pipeline its worker has held past the bound is not waited for.
+        if !p.stalled(Instant::now(), stall_bound()) {
+            wait(p, crate::frame::current());
+        }
         // (Which first uses go without: once a pipeline.)
         #[cfg(feature = "diagnostics")]
         if p.made.get().is_none() && !p.lost.load(Ordering::Relaxed) && !p.noted.swap(true, Ordering::Relaxed) {
@@ -987,6 +1029,42 @@ mod tests {
         let started = Instant::now();
         assert!(ready(&p).is_none());
         assert!(started.elapsed() <= wait_budget() + Duration::from_millis(500));
+    }
+
+    /// A worker that never returns from the host's compile (seen under Wine)
+    /// is no longer waited for once it has held the pipeline past the bound;
+    /// it is not given up on, and what it makes is used.
+    #[test]
+    fn draws_stop_waiting_for_a_worker_that_does_not_return() {
+        let p = Arc::new(Pending::new(Vec::new(), None));
+        let bound = Duration::from_secs(15);
+        let later = Instant::now() + bound + Duration::from_secs(1);
+        assert!(!p.stalled(later, Some(bound)), "not taken by a worker");
+        p.queue_state.store(MAKING, Ordering::Relaxed);
+        p.making_since.set(Instant::now()).unwrap();
+        assert!(!p.stalled(Instant::now(), Some(bound)), "a compile under the limit");
+        assert!(!p.stalled(later, None), "the switch at 0: no bound");
+        assert!(!p.stall_noted.load(Ordering::Relaxed));
+        assert!(p.stalled(later, Some(bound)));
+        assert!(p.stall_noted.load(Ordering::Relaxed));
+        assert!(p.stalled(later, Some(bound)), "said once, still not waited for");
+        // A first use of it waits for nothing (timed where the budget is long
+        // enough to tell).
+        if let Some(bound) = stall_bound() {
+            let stuck = Arc::new(Pending::new(Vec::new(), None));
+            stuck.queue_state.store(MAKING, Ordering::Relaxed);
+            stuck.making_since.set(Instant::now().checked_sub(bound * 2).unwrap_or_else(Instant::now)).unwrap();
+            let started = Instant::now();
+            assert!(ready(&stuck).is_none());
+            if wait_budget() >= Duration::from_millis(100) {
+                assert!(started.elapsed() < wait_budget() / 2, "{:?}", started.elapsed());
+            }
+        }
+        // The worker returns at last: its answer is the pipeline's, and
+        // nothing calls it stalled any more.
+        p.make();
+        assert!(matches!(p.made.get(), Some(None)));
+        assert!(!p.stalled(later, Some(bound)));
     }
 
     /// (Filip Michalski, fxceless/victory-fork#1353) A build that panics is
