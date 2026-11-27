@@ -1392,6 +1392,7 @@ mod tests {
                 container: Vec::new(),
                 ambient: None,
                 probe: None,
+                clear_after: Vec::new(),
                 translated: OnceLock::new(),
             });
             let p = Pending::new(vec![shader], None);
