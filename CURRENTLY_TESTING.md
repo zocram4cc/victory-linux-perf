@@ -12,7 +12,20 @@ bimodal; differences under ~5 ms need ≥4 runs an arm).
   world (`draws > 100`). Figure = median `ms_per_frame` of those rows; "prep" = median `cpu_prepare_ms`.
 - Release build (`--features scripted`), caches warm (prebuild + full `warm`, 93,821 pipelines).
 
-## Latest (2026-11-28 night): `main` = 6092804c5
+## Latest (2026-11-28 night): `main` = 123ea30a0
+
+**Play set now: `play-fast8.sh`** (exe `bin/main-f5` = `main` 6092804c5 code, on the `-homebo` Proton; saves
+shared with the play prefix; rollback `play-fast7.sh`): the play-fast settings below + combined +
+`VICTORY_SKIP_WC_BACK=1 VICTORY_AMBIENT_MAGENTA=1` + the landings and fast track 1 switches +
+`VICTORY_HOME_BO=1 VICTORY_ASK_SPREAD=1 VICTORY_WATCH_SPANS=1 VICTORY_EARLY_TEXTURES_MS=40
+VICTORY_BAKE_TEXTURES_MS=10000` + new tonight: `VICTORY_SHADER_OPT=63 VICTORY_WINDOWS_BAR_MB=4096
+VICTORY_MAPPED_CACHE=1 VICTORY_STORE_BESIDE=1 VICTORY_COPY_BESIDE=1`. `VICTORY_LATE_WAIT=default` in the set
+is unset by `run-i19.sh` (stage 3 with the relay).
+
+**Start of the night against now, one batch, 3 interleaved pairs (ab34, rows 15–89):** 48.2 / 48.1 / 47.7 ms
+(play set of 00:53: `bin/main-homebo`, `SHADER_OPT=0`, none of tonight's switches) against **40.5 / 41.6 /
+40.1 ms** (`play-fast8`): **−7.3 ms a frame (−15 %), 20.8 → 24.6 fps**; prep 40.0 → 33.1 ms, heap pass
+16.5 → 9.6 ms, 8.40 → 7.23 ms per 1,000 draws. No exceptions, warm caches (0 misses) in all six runs.
 
 Same method; old save; play set + `VICTORY_SHADER_OPT=63 VICTORY_WINDOWS_BAR_MB=4096` (both new in
 play). Single 150-row runs moved by up to 3.9 ms between identical setups (ab25: 47.4 vs 43.5). Two
@@ -27,7 +40,14 @@ interleaved in one batch, plus ms per 1,000 draws; identical runs then agree wit
 | `VICTORY_WIDE_SPIN=50` | 42.4 / 42.3 vs 41.5 / 42.5 | | | ab26; no effect; off |
 | nice −10 on the submitting, relay and wide threads | 42.3 / 42.8 vs 42.6 / 43.0 | | | ab27; no effect |
 | `VICTORY_REFRESH_PREFETCH=1` (branch `perf/refresh-prefetch`, not merged) | 64.5 / 64.2 vs 45.0 / 45.9 | | | ab28; +19 ms: the prefetch ran on the list threads before a list was handed over |
+| `VICTORY_REFRESH_PREFETCH=2` (a helper thread, the submitting thread never waits; not merged) | 42.8 / 44.3 vs 40.3 / 40.9 | 36.2 / 33.9 vs 32.4 / 32.0 | | ab31; +3 ms: its own write-watch asks and memory traffic cost more than the earlier refresh saves |
+| `VICTORY_ASK_NORESET=1`, `VICTORY_PLACED_CONSTANTS=1`, `VICTORY_PICKED_WRITES=1`, `VICTORY_UNMAP_RUNS=1` | +1.2 / +2.1 / +1.0 / 40.9 and a stop | | | ab30 vs 39.5 / 40.4; all off |
+| kroeeee's measured Linux defaults we lacked: `VICTORY_COPY_COMPARE=1`, `VICTORY_FRAME_INTERVAL_MS=0`, `VICTORY_PORT_DESCRIPTORS=1` | 42.9 / 41.8–42.0 / 41.1–42.2 vs 40.3 / 40.9 | | | ab31; no consistent effect; off |
 | upstream fixes: `..` stops at a mounted drive's root (cwWwWwW), TLS callback lists over the limit rejected (pwu2775-dev) | | | | correctness; ported tests red without the fixes |
+| PR #2 (GiovanniFadanelli): exact raw twins only under Wine | | | | native D3D12 removed the device at the first twin off 16 bytes; Wine/Proton unchanged (`on_wine()`); merged 4aaf2ff01 |
+| PR #3 (GiovanniFadanelli): `VICTORY_LATE_WAIT=default` means the default | | | | was off when passed to the exe directly (Windows: 70.0 → 43.4 ms); our `run-i19.sh` already unset it; merged 123ea30a0 |
+| `VICTORY_ASK_TEXTURES=1` | 44.4 / 44.2 / 42.4 vs 44.4 / 43.8 / 45.8 | | | ab33; texture asks 47.8 → 0.9 a frame, frame no consistent effect; off |
+| `VICTORY_UP_QUEUE=1`, `VICTORY_JOIN_BARRIERS=1`, `VICTORY_AHEAD_GAP_MB=64` (kroeeee, branch `perf/ahead-gap`) | 43.6 / 40.7, 41.8 / 41.5, 42.7 / 45.7 vs 42.6 / 42.1 | | | ab32; no consistent effect; off (`VICTORY_LANE_CORE=1` did not act on this CPU) |
 
 | Change | Frame | Prep | Heap | Notes |
 |---|---|---|---|---|
@@ -94,7 +114,7 @@ same play-fast set; caches prebuilt and warm, no builds during runs).
   waits for the worker's pass, so it is still in series. Its first run crashed at start-up (the
   `then_some` bug above, hit at once by the worker). Off until the pass can begin at present.
 
-Play set now: the play-fast settings below + combined + `VICTORY_SKIP_WC_BACK=1
+Play set then (superseded by `play-fast8.sh`, see the top section): the play-fast settings below + combined + `VICTORY_SKIP_WC_BACK=1
 VICTORY_AMBIENT_MAGENTA=1` + the landings and fast track 1 switches + `VICTORY_HOME_BO=1
 VICTORY_ASK_SPREAD=1` (`play-fast6.sh`, on the `-homebo` Proton; saves shared with the play prefix).
 List-recording threads: 8 (default) stays; 12 and 14 raised the heap pass to 19-20 ms (ab14).
