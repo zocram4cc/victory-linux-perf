@@ -33,6 +33,7 @@ pub mod diverge;
 pub mod look;
 mod merge;
 pub mod pixel;
+mod sheets;
 pub mod reach;
 mod upcopies;
 
@@ -697,6 +698,8 @@ pub struct Player {
     results: Option<ID3D12Resource>,
     /// Other buffers of ours that commands name.
     extra: HashMap<u32, ID3D12Resource>,
+    /// `VICTORY_RECORD_SHEETS=1` ([`sheets`]).
+    sheets: Option<sheets::Watch>,
     commands: Vec<Vec<Cmd>>,
     /// Resources in the states of the start (not those of the end).
     fresh: bool,
@@ -746,6 +749,7 @@ impl Player {
             .map(|l| Cmd::all(&l.commands.0))
             .collect::<std::result::Result<_, _>>()?;
         let mut player = Player {
+            sheets: sheets::Watch::new(&device)?,
             folder,
             worker: Worker::new(&device, &queue)?,
             device,
@@ -1046,8 +1050,11 @@ impl Player {
                 continue;
             }
             // SAFETY: a blob the host took.
-            let root = unsafe { self.device.CreateRootSignature(0, &blob.0) }
-                .with_context(|| format!("root signature {id}"))?;
+            let root = match &mut self.sheets {
+                Some(w) => w.root(&self.device, *id, &blob.0),
+                None => unsafe { self.device.CreateRootSignature(0, &blob.0) },
+            }
+            .with_context(|| format!("root signature {id}"))?;
             self.roots.insert(*id, root);
         }
         for s in &self.frame.signatures {
@@ -2931,12 +2938,15 @@ impl Player {
                         .collect();
                     l.SetDescriptorHeaps(&all);
                 }
-                Cmd::RootSignature { graphics, root } => {
-                    let root = self.roots.get(root);
+                Cmd::RootSignature { graphics, root: id } => {
+                    let root = self.roots.get(id);
                     if *graphics {
                         l.SetGraphicsRootSignature(root)
                     } else {
                         l.SetComputeRootSignature(root)
+                    }
+                    if let Some(w) = &self.sheets {
+                        w.bind(l, *graphics, *id);
                     }
                 }
                 Cmd::Table {
@@ -3279,6 +3289,9 @@ impl Player {
         self.restore(o.restore)?;
         self.fresh = false;
         let stamps = self.send(built, o)?;
+        if let Some(w) = &self.sheets {
+            report.notes.push(w.take());
+        }
         if let Some((db, _, hash, _)) = self.picture_now()? {
             report.pictures.push((db, hash));
         }

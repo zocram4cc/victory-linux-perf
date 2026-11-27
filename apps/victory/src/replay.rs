@@ -531,7 +531,14 @@ fn retranslate(folder: &std::path::Path, into: &std::path::Path, view_limit: u32
                     let Ok(bytes) = std::fs::read(kept.join(format!("{hash}.cdxil"))) else { continue };
                     // (`VICTORY_WAVE_WIDE_ONLY`, as a run has it)
                     let wide = victory_shader::emit::wave_wide_only(hash);
-                    match victory_shader::emit::with_wave_wide(wide, || victory_shader::emit::translate(&bytes)) {
+                    // (`VICTORY_RECORD_SHEETS=1`: the pre-skinned programs with the
+                    // frame recorder's watch, as a run has them.)
+                    let sheets = std::env::var_os("VICTORY_RECORD_SHEETS").is_some_and(|v| v == "1")
+                        && victory_hle::replay::pre_skinned(&bytes);
+                    let translated = victory_shader::emit::with_sheet_watch(sheets, || {
+                        victory_shader::emit::with_wave_wide(wide, || victory_shader::emit::translate(&bytes))
+                    });
+                    match translated {
                         Ok(t) => {
                             if std::fs::write(into.join(format!("{hash}.dxil")), &t.dxil).is_ok() {
                                 done.fetch_add(1, Ordering::Relaxed);
