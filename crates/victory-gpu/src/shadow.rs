@@ -3144,6 +3144,12 @@ impl Shadow {
         self.watched.load(Ordering::Relaxed) == NOT_WATCHED
     }
 
+    /// Whether the memory behind the copy is write-watched, by the kernel
+    /// or the guards, as of its last refresh (not before the first).
+    pub(crate) fn watched_known(&self) -> bool {
+        matches!(self.watched.load(Ordering::Relaxed), 1 | GUARDED)
+    }
+
     /// Whether a submission asks the kernel about the copy's ranges ahead:
     /// not of memory that is not watched, nor of view memory, which the
     /// kernel would refuse (and with it the ranges asked about together).
@@ -3982,7 +3988,9 @@ impl Shadow {
         // part whole over what shaders wrote beside them ([`send_changed`]:
         // the CPU's side holds what title memory held, as nothing comes back).
         if self.card.is_some() {
-            self.keep_stores();
+            if crate::wc::keep_stores() {
+                self.keep_stores();
+            }
         } else {
             crate::wc::uncarded((to - from) as u64);
         }

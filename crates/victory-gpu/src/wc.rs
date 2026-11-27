@@ -74,7 +74,21 @@ fn no_back_min() -> usize {
 /// there does not go up: [`unwatched`]), and their bytes; and bytes left to
 /// a copy that is not in the card's memory ([`uncarded`]). Taken by
 /// [`take`].
-static SKIPPED: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+/// Then bytes kept as before because the copy is not known to be
+/// write-watched, or is not in the card's memory ([`skip_back`]).
+static SKIPPED: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+
+/// Whether copies the card keeps ranges of send up only the dwords the
+/// title changed (`VICTORY_WC_KEEP_STORES=1`; off: the parts written
+/// since, whole, as for any copy). Whole, a part the CPU wrote in part goes
+/// up with title memory's older bytes beside the CPU's, over what shaders
+/// wrote there; dword by dword, a value the title writes over the same
+/// value is not seen (a counter the CPU sets back to what title memory
+/// still holds stays as the shaders left it).
+pub(crate) fn keep_stores() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WC_KEEP_STORES").is_some_and(|v| v == "1"))
+}
 
 /// A refresh left out `bytes` the card keeps, the memory not being watched.
 pub(crate) fn unwatched(bytes: u64) {
@@ -90,8 +104,13 @@ pub(crate) fn uncarded(bytes: u64) {
 
 /// Whether shaders' writes to `[address, address + len)` stay on the card
 /// ([`no_back`]): the whole range lies in write-combined title memory and
-/// is not small.
-pub(crate) fn skip_back(address: usize, len: usize) -> bool {
+/// is not small, and its copy is in the card's memory (`carded`) and known
+/// to be write-watched (`watched`). Where the memory is not watched a
+/// refresh cannot tell what the CPU wrote, and would either put title
+/// memory's older bytes over the card's or never send the CPU's up; a copy
+/// in host memory holds what shaders wrote itself, and a refresh of a part
+/// the CPU wrote goes over it. Those are copied back as before.
+pub(crate) fn skip_back(address: usize, len: usize, carded: bool, watched: bool) -> bool {
     if !no_back() || len == 0 {
         return false;
     }
@@ -102,6 +121,10 @@ pub(crate) fn skip_back(address: usize, len: usize) -> bool {
     if len < no_back_min() {
         SKIPPED[2].fetch_add(1, Ordering::Relaxed);
         SKIPPED[3].fetch_add(len as u64, Ordering::Relaxed);
+        return false;
+    }
+    if !carded || !watched {
+        SKIPPED[if carded { 7 } else { 8 }].fetch_add(len as u64, Ordering::Relaxed);
         return false;
     }
     SKIPPED[0].fetch_add(1, Ordering::Relaxed);
@@ -256,7 +279,7 @@ pub(crate) fn back(address: usize, bytes: u64) {
 }
 
 /// MB per frame, by kind, copied up and copied back.
-pub(crate) type Sample = Option<([f64; KINDS], [f64; KINDS], [f64; 7])>;
+pub(crate) type Sample = Option<([f64; KINDS], [f64; KINDS], [f64; 9])>;
 
 /// Takes the counters as the frame-rate line takes its own (every second,
 /// over the same frames), so that the line printed beside it matches it.
@@ -293,18 +316,21 @@ pub(crate) fn log(sample: Sample) {
         (0..KINDS).skip(1).map(|i| format!("{} {} MB", NAMES[i], noted[i] >> 20)).collect::<Vec<_>>().join(", ")
     );
     if no_back() {
-        let [n, bytes, small, small_bytes, unwatched, unwatched_bytes, uncarded] = skipped;
+        let [n, bytes, small, small_bytes, unwatched, unwatched_bytes, uncarded, kept_unwatched, kept_uncarded] = skipped;
         tracing::info!(
             "shaders' writes into write-combined title memory left on the card (VICTORY_WC_NO_BACK, under {} KiB kept), \
              per frame: {n:.0} declarations, {:.0} MB declared (a range counted each time it is declared); \
              small ones kept and copied back as before: {small:.0}, {:.1} MB declared; \
              refreshes that left them out, the memory not watched: {unwatched:.1}, {:.2} MB; \
-             left to copies not in the card's memory: {:.2} MB",
+             left to copies not in the card's memory: {:.2} MB; \
+             kept as before, the copy not known to be watched: {:.1} MB, not in the card's memory: {:.1} MB declared",
             no_back_min() >> 10,
             bytes / 1e6,
             small_bytes / 1e6,
             unwatched_bytes / 1e6,
-            uncarded / 1e6
+            uncarded / 1e6,
+            kept_unwatched / 1e6,
+            kept_uncarded / 1e6
         );
     }
 }

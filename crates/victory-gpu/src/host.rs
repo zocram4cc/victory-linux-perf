@@ -5935,7 +5935,7 @@ impl Host {
         // (`VICTORY_WC_NO_BACK`), as with `HostList::defer_gpu_write`.
         if crate::wc::no_back() {
             picked.written.retain(|(shadow, at, len)| {
-                let keep = !crate::wc::skip_back(*at, *len);
+                let keep = !crate::wc::skip_back(*at, *len, shadow.carded(), shadow.watched_known());
                 if !keep {
                     shadow.card_owns(*at, *len);
                 }
@@ -7265,7 +7265,7 @@ impl HostList {
     ) {
         // Into write-combined title memory: the card keeps it, nothing is
         // declared (`VICTORY_WC_NO_BACK`).
-        if crate::wc::skip_back(address, len) {
+        if crate::wc::skip_back(address, len, shadow.carded(), shadow.watched_known()) {
             shadow.card_owns(address, len);
             return;
         }
