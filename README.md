@@ -153,7 +153,9 @@ The dump comes from one game run with `VICTORY_NATIVE_PSO_DUMP=Z:\…\pso-dump` 
   *shortcut*: right where each texel has one writing thread per dispatch, as there. `VICTORY_PARTIAL_IMAGE_STORES=0` refuses them as before. **1,228 → 1,239**, none lost.
 - 28, **dead descriptor dwords in joins are 0** (joins are per register; the compiler reuses a register whose descriptor dword is dead, here as a lane mask: `218_0000000f002d6300` at 0x14e50, `s_and_b32 s37, s37, exec_lo`), and **buffer dword 1 carries the stride** (`s_bfe_u32 x, d1, 0xe0010`). **1,239 → 1,304**, none lost.
 - **Shortcuts that rest on assumptions are listed, with their switches and how to verify them in game, in [docs/royale/p4-shortcuts.md](docs/royale/p4-shortcuts.md).** The user rightly asked that the programs get correct data: a program that translates is not proven right.
-- Next wall: "a descriptor's address or format read as data" (405 left), then "an opaque lane mask" (209), "a lane mask holding lanes elsewhere read as data" (150), "lane conditions too large" (128).
+- Next wall: "a descriptor's address or format read as data" (405 left). Census of where it is read (first 60 programs, by the instruction at the error): `s_and_b32 sX, sX, exec_lo` 27, `s_andn2_b32 exec_lo, sX, exec_lo` 5, `v_cmpx_ne_i32 -1, vX` 4, `s_mov_b32 exec_lo, sX` 4, a few real uses (`v_mul_f32`, `v_mul_lo_u32`, an `s_load` base).
+
+  The first kind is the same dead-register case as step 28, but read directly by the compiler's lane-mask merge (`s16 = (s16 & ~exec) | (s37 & exec)`) and not through a join. Taking it as 0 in `operand()` had no effect: these instructions go through the lane-mask simulation (`Val` of masks, `get()` → `Val::Missing`), which refuses first. **Next: apply the same rule there**: a dead descriptor dword read as a lane mask counts as no lanes, under `VICTORY_DEAD_DESCRIPTOR_JOINS`., then "an opaque lane mask" (209), "a lane mask holding lanes elsewhere read as data" (150), "lane conditions too large" (128).
 
 ### Deferred on purpose (done 27 Nov, step 27): image stores of the alpha channel alone (69 programs then, 553 later)
 
