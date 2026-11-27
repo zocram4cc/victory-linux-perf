@@ -420,6 +420,12 @@ struct Tracer<'a> {
     read_first_lane: std::cell::Cell<bool>,
     /// Each block's immediate dominator, made when first asked for.
     idom: std::cell::OnceCell<Vec<usize>>,
+    /// Sources already traced, by words and what lanes know: a descriptor
+    /// reaching a use through many joins meets the same words again on
+    /// many paths (P.4's large programs).
+    memo: std::cell::RefCell<std::collections::HashMap<String, Result<Source, &'static str>>>,
+    /// Tracing steps left for the descriptor being traced ([`WORK`]).
+    work: std::cell::Cell<u32>,
     /// What the conditions asked of `lanes` so far came down to: the proofs
     /// of one program ask about the same blocks and masks again and again.
     meets: std::cell::RefCell<Meets>,
@@ -434,7 +440,13 @@ struct Tracer<'a> {
 type Known = Vec<(Bool, bool)>;
 
 const MAX_ROUNDS: usize = 64;
-const MAX_JOINS: usize = 8;
+const MAX_JOINS: usize = 24;
+
+/// Tracing steps (classifications) one descriptor may take: the bound on
+/// work that the join depth was (raising that alone ran out of memory, 27
+/// Nov: the sources multiply at each join). With [`Tracer::memo`] each
+/// distinct state is traced once.
+const WORK: u32 = 3000;
 /// VGPR values followed for one dword of a descriptor kept per lane.
 const MAX_COPIES: usize = 64;
 
@@ -492,6 +504,8 @@ impl<'a> Tracer<'a> {
             lanes,
             read_first_lane: Default::default(),
             idom: Default::default(),
+            memo: Default::default(),
+            work: std::cell::Cell::new(WORK),
             meets: Default::default(),
             rpo,
             at: Default::default(),
@@ -1223,12 +1237,37 @@ impl<'a> Tracer<'a> {
         }
         // Only the lanes that reach the access read the descriptor.
         let mut known = Vec::from_iter(self.lanes.map(|l| (l.reach[at], true)));
+        self.work.set(WORK);
         self.classify(&words, &mut Vec::new(), &mut known)
     }
 
     /// The source of a descriptor's words; `joins` are the phi blocks
     /// being resolved, `known` holds in every lane that reads them.
     fn classify(
+        &self,
+        words: &[Term],
+        joins: &mut Vec<usize>,
+        known: &mut Known,
+    ) -> Result<Source, &'static str> {
+        let left = self.work.get();
+        if left == 0 {
+            return Err("a descriptor joined too often");
+        }
+        self.work.set(left - 1);
+        let key = format!("{words:?}{known:?}");
+        if let Some(r) = self.memo.borrow().get(&key) {
+            return r.clone();
+        }
+        let r = self.classify_new(words, joins, known);
+        // What failed for the path (a loop on it, the work spent) may hold
+        // on another: only the rest is kept.
+        if !matches!(r, Err("a descriptor joined too often" | "a descriptor that changes in a loop")) {
+            self.memo.borrow_mut().insert(key, r.clone());
+        }
+        r
+    }
+
+    fn classify_new(
         &self,
         words: &[Term],
         joins: &mut Vec<usize>,
@@ -1490,8 +1529,10 @@ impl<'a> Tracer<'a> {
         };
         let args = (0..self.p.blocks[block].preds.len())
             .map(|j| self.classify(&edge(j), joins, known))
-            .collect::<Result<_, _>>();
+            .collect::<Result<Vec<Source>, _>>();
         let source = match args {
+            // The same source on every edge: that source.
+            Ok(args) if args.windows(2).all(|w| w[0] == w[1]) && !args.is_empty() => Ok(args.into_iter().next().unwrap()),
             Ok(args) => Ok(Source::Phi { block, args }),
             // An edge holds no descriptor. With only one edge the lanes
             // that read the descriptor can have come by, it is what the
