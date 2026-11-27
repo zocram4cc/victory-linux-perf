@@ -9978,6 +9978,10 @@ impl Meter {
                 );
                 {
                     let [unset, unmade] = [0, 1].map(|i| crate::draw::NO_PIPELINE[i].swap(0, Ordering::Relaxed) as f64 / frames);
+                    let placed_uav = crate::descriptor::host::PLACED_UAV.load(Ordering::Relaxed);
+                    if placed_uav > 0 {
+                        tracing::info!("P.4: placed unordered texture views made on their host texture so far (VICTORY_PLACED_UAV): {placed_uav}");
+                    }
                     let native = [0, 1, 2].map(|i| crate::device::NATIVE_COMPUTE[i].load(Ordering::Relaxed));
                     if native.iter().any(|&n| n > 0) {
                         tracing::info!(
