@@ -596,6 +596,88 @@ pub(crate) fn host_written(resource: This) {
                 .insert(at as u64, (bytes, words[4], words[6], words[7], words[8], resource as usize));
         }
     }
+    views_due(resource, 1);
+}
+
+/// Whether a texture the title placed where a texture the host copied into
+/// lies (same address, size, levels, layers and texel or block width) is
+/// read from that texture's host copy (`crate::resource::alias_of`), as one
+/// placed over a target is. On by default; `VICTORY_ALIAS_HOST_WRITTEN=0`:
+/// filled from title memory, as before. (After Legendary 65498fd: the
+/// title's decoration atlas is a 2048x2048 BC3 texture a bake copies
+/// 256x256 of at most; title memory never has those texels.)
+///
+/// shortcut: the view then takes nothing from title memory for as long as
+/// that texture lives, as the texture itself does once the host wrote it
+/// ([`upload_from`]): what the title's CPU writes there afterwards is not
+/// shown.
+pub(crate) fn alias_host_written() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_HOST_WRITTEN").is_none_or(|v| v != "0"))
+}
+
+/// The texture the host copied into whose title memory starts at `address`
+/// ([`host_written`]), if [`alias_host_written`], with the table's lock:
+/// the texture is not freed while that is held ([`forget`]).
+pub(crate) fn host_written_at(address: u64) -> Option<(This, impl Sized)> {
+    if !alias_host_written() {
+        return None;
+    }
+    let map = HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner());
+    let resource = map.get(&address)?.5 as This;
+    Some((resource, map))
+}
+
+/// Whether the textures the title placed in the memory of a texture the
+/// host writes are brought up to date after each such write
+/// (`VICTORY_UAV_RECHECK=0`: only when their slot is written or their
+/// memory mapped, as before; the name is Legendary's, 54ebfc1). A write on
+/// the card changes no title memory, writes no descriptor and maps nothing,
+/// so nothing told the texture pass: a view picked by index kept what the
+/// other texture held when its slot was last looked at.
+fn uav_recheck() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UAV_RECHECK").is_none_or(|v| v != "0"))
+}
+
+/// Since the start: writes of title textures through unordered access and
+/// by copies that a placed view reads ([`views_due`]).
+pub(crate) static GPU_WRITES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Shaders of `list` write title texture `resource` through unordered
+/// access (`crate::draw`): the textures placed in its memory that are read
+/// from it are looked at again ([`views_due`]). Asked once a list.
+pub(crate) fn gpu_written(list: &HostList, resource: This) {
+    if uav_recheck() && list.first_use(1 << 62 | resource as usize) {
+        views_due(resource, 0);
+    }
+}
+
+/// The host writes title texture `resource` (`how`: 0 through unordered
+/// access, 1 by a copy or resolve). If a texture the title placed at its
+/// address is read from it (`crate::resource::alias_of`), the memory is
+/// told to the texture pass as memory that changed
+/// (`crate::descriptor::host::remapped`): the slots that show it are due
+/// from the next frame, and the pass copies the texture into the view's
+/// ([`unchanged`], [`alias`]). Slots draws read through tables are left to
+/// those draws, which copy at their first read in every list.
+fn views_due(resource: This, how: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !uav_recheck() || !crate::resource::aliased_by_a_view(resource) {
+        return;
+    }
+    let Some((at, len)) = title_span(resource, 0) else {
+        return;
+    };
+    crate::descriptor::host::remapped(at as usize, len as usize);
+    let n = GPU_WRITES[how].fetch_add(1, Relaxed) + 1;
+    if n == 1 || n.is_multiple_of(10_000) {
+        tracing::info!(
+            "writes on the card of textures a placed view is read from, the view looked at again the frame after (VICTORY_UAV_RECHECK=1), since the start: {} through unordered access (once a list), {} by copies",
+            GPU_WRITES[0].load(Relaxed),
+            GPU_WRITES[1].load(Relaxed)
+        );
+    }
 }
 
 /// The title memory of textures the host copied into, by address: bytes
@@ -1797,6 +1879,14 @@ fn staged_from(resource: This) -> u32 {
 pub(crate) fn unchanged(resource: This, first: u32) -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SAME").is_none_or(|v| v != "0")) {
+        return false;
+    }
+    // A view read from a texture the host writes ([`alias`]) takes nothing
+    // from title memory: that it holds what an upload before the other
+    // texture was written left there says nothing, and the look that found
+    // it so left the view as it was (Legendary 65498fd copies at that look;
+    // here the look is not made and the pass goes on to the copy).
+    if (uav_recheck() || alias_host_written()) && crate::resource::alias_of(resource).is_some() {
         return false;
     }
     let Some(copy) = crate::resource::made_copy(resource) else {

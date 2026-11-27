@@ -5223,6 +5223,9 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             crate::capture::note_target(*resource as This);
             // Some compute-written textures are also read by the title CPU.
             list.texture_written(*resource as This);
+            // Textures the title placed in its memory that are read from it
+            // are looked at again (`VICTORY_UAV_RECHECK=0`: not told).
+            crate::texture::gpu_written(list, *resource as This);
             // Unordered access to a depth texture is its colour twin's.
             if !list.twin_use(*resource as This, true, true) {
                 crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
