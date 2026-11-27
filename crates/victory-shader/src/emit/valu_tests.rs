@@ -955,6 +955,34 @@ fn float_compares_that_are_always_false_or_true() {
     }
 }
 
+/// A legacy multiply-add with a zero factor is +0 plus the addend, so a -0
+/// addend gives +0: the sum of +0 and -0 is +0, which a host that adds a
+/// constant zero as an identity would give as -0 (Vice-Tay #308).
+#[test]
+fn v_mad_legacy_with_a_zero_factor_and_a_negative_zero_addend_is_positive_zero() {
+    // v_mad_legacy_f32 v0, v1, v2, v3 (VOP3 opcode 0x140)
+    let shader = build_valu_cs(&vop3(0x140, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let numbers = [0.0f32, -0.0, 1.0, -2.5];
+    let mut cases = Vec::new();
+    for a in numbers {
+        for b in numbers {
+            for c in numbers {
+                cases.push([a.to_bits(), b.to_bits(), c.to_bits(), 0]);
+            }
+        }
+    }
+    run_cases(&shader, &cases, |backend, _, [a, b, c, _], got| {
+        let (a, b, c) = (f32::from_bits(a), f32::from_bits(b), f32::from_bits(c));
+        let want = if a == 0.0 || b == 0.0 { 0.0 + c } else { a.mul_add(b, c) };
+        assert_eq!(
+            got,
+            want.to_bits(),
+            "{backend}: mad_legacy({a}, {b}, {c}) = {}",
+            f32::from_bits(got)
+        );
+    });
+}
+
 #[test]
 fn v_cvt_off_f32_i4_uses_the_signed_low_nibble() {
     // v_cvt_off_f32_i4 v0, v1 (VOP1 opcode 0x00e)
