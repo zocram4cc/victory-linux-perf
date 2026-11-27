@@ -10,6 +10,12 @@
 # Options for a game run:
 #   --diag          the diagnostics build (scripts/build-linux.sh --diag)
 #   --safe          without the newest, faster ways (scripts/play.ps1 -Safe)
+#   --strict        a reference run, slow: --safe, and every speed-up off that changes
+#                   when the title's memory is read or lets the title run on without
+#                   waiting (relay, late wait, card steps, upload ahead, texture no-wait,
+#                   thin lists and the skips of re-reads). A fault that is gone here is
+#                   a timing fault; set one switch back in the environment
+#                   (e.g. VICTORY_CARD_STEPS=2) to find which speed-up brings it back
 #   --ray-tracing   the title's ray-traced indirect light
 #   --bench <route> a scripted run: keys from scripts/bench/<route>.keys, stopped when it ends
 #   --skip-intro    press through the boot screens and logos (meeyao's timings, same
@@ -60,11 +66,12 @@ winpath() { local p; p="$(realpath -m -- "$1")"; printf 'Z:%s' "${p//\//\\}"; }
 usage() { sed -n '2,8p' "$0" >&2; exit 2; }
 
 # Options that apply to every command, taken out first.
-profile=release safe=0 bench="" proton_log=0 mangohud=0 stock_wineserver=0 new_game=0 headless=0 args=()
+profile=release safe=0 strict=0 bench="" proton_log=0 mangohud=0 stock_wineserver=0 new_game=0 headless=0 args=()
 while (( $# )); do
   case "$1" in
     --diag) profile=diag ;;
     --safe) safe=1 ;;
+    --strict) strict=1 safe=1 ;;
     --ray-tracing) export VICTORY_BVH_BUILDER="${VICTORY_BVH_BUILDER:-1}" ;;
     --bench) shift; bench="${1:?--bench needs a route name}" ;;
     --proton-log) proton_log=1 ;;
@@ -205,6 +212,27 @@ game="${VICTORY_GAME_DIR:-}"
 
 # The same defaults as Play-VIctory.cmd.
 d() { [[ -n "${!1:-}" ]] || export "$1=$2"; }
+if (( strict )); then
+  # --strict: set before the defaults below, which then leave these alone. A
+  # switch already in the environment stays as given, which is how one
+  # speed-up is turned back on. The first group the launcher turns on below;
+  # the second is on in the code when unset.
+  strict_off=(
+    VICTORY_TEXTURE_NO_WAIT VICTORY_RELAY VICTORY_LATE_WAIT VICTORY_RELAY_COPY VICTORY_CARD_STEPS
+    VICTORY_WIDE_BACK VICTORY_INDIRECT_WINDOW VICTORY_INDIRECT_BATCH VICTORY_THIN VICTORY_UPLOAD_AHEAD
+    VICTORY_ASK_ONCE VICTORY_LIGHT_REFRESH VICTORY_KNOWN_HOLES VICTORY_TAKE_PARTS VICTORY_TEXTURE_ONCE
+    VICTORY_TEXTURE_SAME VICTORY_RECHECK_SOON VICTORY_WRITE_SKIP VICTORY_LAZY_TEXTURES
+    VICTORY_LAND_ANYTIME VICTORY_LAND_BESIDE VICTORY_SAME_RECORDS VICTORY_QUICK_MIRROR
+    VICTORY_TEXTURE_CATCHUP
+  )
+  kept=()
+  for name in "${strict_off[@]}"; do
+    [[ -n "${!name:-}" ]] && kept+=("$name=${!name}")
+    d "$name" 0
+  done
+  d VICTORY_JOIN_PARTS 1
+  echo "strict: ${#strict_off[@]} speed-ups off (a reference run, expect a low frame rate)${kept[*]:+; kept from the environment: ${kept[*]}}" >&2
+fi
 d VICTORY_AMBIENT_AIR 1.5
 d VICTORY_TEXTURE_NO_WAIT 1
 d VICTORY_RELAY 2
