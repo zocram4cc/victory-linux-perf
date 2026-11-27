@@ -1292,7 +1292,7 @@ impl<'a> Tracer<'a> {
                 if self.def(v).is_some_and(|i| i.name().starts_with("s_load_")))
         };
         // P.4 census (`VICTORY_WHY_DESCRIPTOR=1`): what made each word.
-        if std::env::var_os("VICTORY_WHY_DESCRIPTOR").is_some() && words.iter().any(loaded) {
+        if std::env::var_os("VICTORY_WHY_DESCRIPTOR").is_some() {
             let what: Vec<String> = words
                 .iter()
                 .map(|w| match *w {
@@ -1309,7 +1309,11 @@ impl<'a> Tracer<'a> {
                     },
                 })
                 .collect();
-            eprintln!("WHY-DESCRIPTOR {}", what.join(" | "));
+            eprintln!(
+                "WHY-DESCRIPTOR {} {}",
+                if words.iter().any(loaded) { "changed" } else { "neither" },
+                what.join(" | ")
+            );
         }
         Err(if words.iter().any(loaded) {
             "a descriptor changed after loading"
@@ -2233,7 +2237,7 @@ impl<'a> Tracer<'a> {
         let Term::Value(v) = w else {
             return w;
         };
-        if self.sop2(v, &["s_xor_b32"]).is_none() {
+        if self.xor_operands(v).is_none() {
             return w;
         }
         let mut odd: Vec<Value> = Vec::new();
@@ -2242,8 +2246,8 @@ impl<'a> Tracer<'a> {
         while let Some((t, depth)) = stack.pop() {
             match t {
                 Term::Const(c) => constant ^= c,
-                Term::Value(x) => match self.sop2(x, &["s_xor_b32"]) {
-                    Some((_, [a, b])) if depth < 8 => {
+                Term::Value(x) => match self.xor_operands(x) {
+                    Some([a, b]) if depth < 8 => {
                         stack.push((a, depth + 1));
                         stack.push((b, depth + 1));
                     }
@@ -2261,6 +2265,31 @@ impl<'a> Tracer<'a> {
             ([one], 0) => Term::Value(*one),
             _ => w,
         }
+    }
+
+    /// The operands of the XOR that made `v`: an `s_xor_b32`'s, or for each
+    /// half of an `s_xor_b64` the same half of its two operands.
+    fn xor_operands(&self, v: Value) -> Option<[Term; 2]> {
+        if let Some((_, ops)) = self.sop2(v, &["s_xor_b32"]) {
+            return Some(ops);
+        }
+        let inst = self.def(v)?;
+        if inst.name() != "s_xor_b64" {
+            return None;
+        }
+        let half = inst.writes.iter().position(|w| w.1 == v)? as u8;
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return None;
+        };
+        let op = |o: &Operand| match *o {
+            Operand::Scalar { code, .. } if code != NULL => Some(self.origin(inst.read(Reg::S(code + half))?)),
+            Operand::Scalar { .. } => Some(Term::Const(0)),
+            // A 64-bit constant: its low dword, 0 (or all ones, sign) above.
+            Operand::Const(c) => inline(c).map(|k| Term::Const(if half == 0 { k } else if (k as i32) < 0 { u32::MAX } else { 0 })),
+            Operand::Literal(x) => Some(Term::Const(if half == 0 { x } else { 0 })),
+            _ => None,
+        };
+        Some([op(src.first()?)?, op(src.get(1)?)?])
     }
 
     /// A loaded buffer descriptor made into a byte-address (raw) view of the
