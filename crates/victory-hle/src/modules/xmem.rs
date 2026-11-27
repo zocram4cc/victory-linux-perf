@@ -3321,6 +3321,7 @@ mod tests {
     /// title's thread read zeros there or wrote what was then lost (about one
     /// in fifteen runs of the tests above, 2026-11-26).
     #[test]
+    #[ignore = "races on stock Wine: needs the source's keep/wine-placeholder-map.patch (Slaktarn); run with --ignored on a patched Wine"]
     fn a_page_in_use_keeps_its_bytes_while_its_view_is_cut_and_joined() {
         use std::sync::atomic::{AtomicBool, Ordering};
         let pages = allocate(2);
