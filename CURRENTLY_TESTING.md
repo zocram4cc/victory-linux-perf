@@ -22,15 +22,26 @@ bimodal; differences under ~5 ms need ≥4 runs an arm).
   hand-off included. The card's own timestamps (`VICTORY_CARD_SPANS=1`, diag) give the real figure (below).
 - Release build (`--features scripted`), caches warm (prebuild + full `warm`, 93,821 pipelines).
 
-## Latest (2026-11-28 day): `main` = e352af4a8
+## Latest (2026-11-28 day): `main` = 195754956
 
-**Play set now: `play-fast9.sh`** = `play-fast8.sh`'s settings on a **thin-LTO + x86-64-v3 build**
-(`bin/main-f6`, `main` e352af4a8) and the Proton copy **`Proton-Experimental-viewtree-homebo-ww`**, whose
-hand-built `ntdll.so` runs `NtGetWriteWatch`'s kernel scan (`PAGEMAP_SCAN`) after Wine's `virtual_mutex`
-is left instead of under it (patch and build script in the lab notes `wine-writewatch/`; the same idea was
-found independently in Some1sm/clankerVI). `VICTORY_SKIP_MOVIES=end` is no longer set (movies play). Its
-prefix is a symlink to the play prefix (saves shared). `DIAG=1` uses `bin/main-f6/victory-diag.exe`.
-Rollback: `play-fast8.sh`.
+**Play set now: `play-fast10.sh`** = `play-fast9.sh` on `main` 195754956 (`bin/main-f8`): + clankerVI waves 24a/24b/29c
+(`send_copied` tests a copy's range before upgrading it; refresh jobs of 32 copies; `Batch::add` remembers its last
+hit; Some1sm) + **`VICTORY_BUFFER_NO_WAIT=1`** (eikkapine/victory-amd: new buffers of the submissions are not waited
+for until mapped; textures keep the wait that guards against the 2026-11-25 device losses; set for fewer hitches).
+If a device loss ever appears in play, drop `VICTORY_BUFFER_NO_WAIT` first. Rollback: `play-fast9.sh`.
+
+`play-fast9.sh` (the step before): `play-fast8.sh`'s settings on a **thin-LTO + x86-64-v3 build** and the Proton copy
+**`Proton-Experimental-viewtree-homebo-ww`**, whose hand-built `ntdll.so` runs `NtGetWriteWatch`'s kernel scan
+(`PAGEMAP_SCAN`) after Wine's `virtual_mutex` is left instead of under it (patch and build script in the lab notes
+`wine-writewatch/`; the same idea was found independently in Some1sm/clankerVI). `VICTORY_SKIP_MOVIES=end` is no
+longer set (movies play). Its prefix is a symlink to the play prefix (saves shared).
+
+**Method since 13:00:** scripted runs restore the save from the zip before every run; `scripted-i19.sh` holds an
+exclusive lock for a run's whole life (two agents' runs once overlapped in one prefix) and clears the run folder only
+once it holds it. Switches read through `crate::ab::pick` are measured **in one run** with `VICTORY_AB=15,<switch>`
+(the A/B tick now runs in release builds too): 15-second phases alternate, and `tools/abphase.py` compares each
+on-phase with its neighbouring off-phases, **only where their draws match within 10 %** (the idle camera swings draws
+6k–8.8k within a phase's length), plus ms per 1k draws. Exe-level changes still use interleaved pairs.
 
 ### Where the frame goes now (restored save, ~8.6k draws, Series S)
 
@@ -70,6 +81,17 @@ graphics pool 15 %, the rest 4 %. Only 0.4 MB of the ~30 MB refreshed a frame ac
 | `VICTORY_TRACK_VIEWS=1` (view memory tracked by userfaultfd instead of guards) | 220.9 vs 54.5 (diag) | copies 236 vs 20 | one kernel scan per check (~3,600 a frame, mostly clean) vs the guards' bits; off |
 | crashbashash's sync guards (`VICTORY_SYNC_GUARDS=1` + Proton `-homebo-ww-uffd` with his Wine patch 1860c50) | 50.2 / 49.4 / 51.4 vs 50.8 / 49.7 / 48.4 | prep +3.6…+6; copies +3…+5 | zc-ab7, restored save: title threads lose their fault cost, the submitting thread gains bookkeeping + a syscall per arm/disarm; off |
 | refused-ask cache (dfmbrollins, `VICTORY_REFUSED_CACHE=1`) | — | ~0.1 ms | refusals are 3–10 a frame now (were ~240 before 11-26); off |
+| **clankerVI waves 24a/24b/29c** (`send_copied` range filter, 32-copy refresh jobs, `Batch::add` last-hit) | **47.9 / 47.8 vs 50.4 / 48.6** | prep 32.9 / 33.8 vs 34.9 / 34.1; submit thread 36.5 / 37.2 vs 38.3 / 37.1 | cw-ab1, restored, 2 pairs: −1.7 ms mean; copies barely moved (the walk was not the big cost); bit-identical; **in main / `play-fast10`** |
+| clankerVI wave 16 `VICTORY_BVH_INPUT_SKIP=1` | 47.8 / 48.5 vs 48.0 / 49.2 | prep −1.0; submit thread −1.25 | cw-ab2: frame noise on Series S (~50 skips a frame); fires 112 a frame on Series X; picture check inconclusive; parked, off |
+| `VICTORY_WIDE_CASCADE=1` + `VICTORY_REFRESH_BIG_FIRST=1` (SubmitChain) | 50.0 / 49.8 vs 50.7 / 51.1 | per 1k draws 5.84 / 5.68 vs 5.75 / 5.67 | sc-ab1: the frame difference is draws (−6 %); no effect; off |
+| list threads at nice +5 (RYUKI's below-normal list threads) | in-run: −1.12 / +0.66 | | cw-renice1: no effect (like nice −10 earlier); not ported |
+| **`VICTORY_BUFFER_NO_WAIT=1`** (eikkapine) | in-run draw-matched: +0.2 | mapping waits 96/s (~4 ms a frame across threads, max 35 ms) → 0; p90 64.7 → 62.7 | sc-buf1: 0 device losses; frame neutral (the waits are off the critical chain); **in `play-fast10` (for hitches)** |
+| `VICTORY_LIST_HOLDS=1` (RYUKI) | in-run, 6 matched pairs: −0.15 | per 1k draws +0.2 | cw-holds1: no gain; off |
+| sync guards with the re-arm pause timed from the write | 50.3 / 50.9 vs 48.1 / 50.3 | prep +5…+7 | zc-ab8: refresh calls stay 191 vs 80 a frame; route closed |
+| **`VICTORY_ASK_ONE_WAVE=1`** (clankerVI wave 31b, adapted by ZeroCopy: a submission's write-watch asks in one parallel wave) | in-run, 5 matched pairs: **−3.0** (−6.3…−0.2, all negative) | prep 34.3 → 32.7; card idle behind the submitting thread 15.1 → 13.6 | zc-ab9 on ZeroCopy's branch; ported onto main as `perf/ask-one-wave`; in the validation stack |
+| `VICTORY_ASK_REST_CHUNKS=1` (clankerVI A4) | in-run: +0.9 | | zc-ab9: no gain; off |
+| **`VICTORY_SWEEP_ASYNC=1`** (RAZDA4A XEN d16ca9a7d, sweep part: the periodic sweep on a thread of its own, no drain of the flights) | in-run, 9 matched pairs: −0.8 | **worst frame per second −9.0 ms** (6 pairs; the 9–11 ms sweep stalls) | sc-swp2: 0 device losses; in the validation stack |
+| fewer allocations on the submitting thread (SubmitChain 8a35163e9/7d464be82, result-identical) | 48.9 / 47.9 vs 47.8 / 49.4 | per 1k draws 5.67 / 5.63 vs 5.36 / 5.66 | sc-ab2: pairs disagree; neutral; kept out of the stack |
 
 - Wine microbenchmark (`GetWriteWatch` latency while 4 threads storm the lock): with others asking too,
   p99 124–175 µs → 4–6 µs and 5–6× the throughput; with others taking guard faults the asking thread
@@ -101,12 +123,27 @@ readback reuse (diag), ruvenesh's `VICTORY_NO_WATCHDOG` hook (off; targets this 
 `image+0x2215c35`; hung instead of stopping in 3 of 6 runs on a 6900 XT in its PR thread). Five more
 fixes from that list were already on `main`.
 
+### Tails (restored save, every baseline run of the day)
+
+| Build | Runs | Frame p50 | Frame p95 | Worst frame per second, p95 | Seconds with a frame >100 ms (of 75) |
+|---|---|---|---|---|---|
+| `play-fast9` | 11 | 50.1 | 63.1 | 159 | 14 (4–19) |
+| `play-fast10` code | 4 | 47.9 | 61.2 | 169 | 10 (5–15) |
+
+The median moved; the 100–280 ms hitches did not (they vary 4–19 seconds a run between identical runs).
+
+### Not applicable here (checked against our logs)
+
+RAZDA4A's unlocked fence/value settle and 2 MB compare buffer (those settles cost 0.0 ms here), victory-amd's
+`HOLES_ONCE` (0–4 hole questions a frame here), RYUKI's list-thread priority and count, fat LTO.
+
 ### In progress
 
-- clankerVI wave 24a (`send_copied` tests a copy's range before upgrading it; our `send_copied` walked all
-  ~3,500 carded copies a call) + 24b + 29c on `perf/clanker-waves`: A/B `cw-ab1` running.
-- Submitting-thread breakdown and the other upstream leads (`perf/submit-chain`), card-side merges and
-  Series X GPU levers (`perf/gpu-load`), batching the sync guards' arm/disarm (`perf/zero-copy`).
+- **Validation:** one stack exe (`perf/stack-1` = `main` + `ASK_ONE_WAVE` + `SWEEP_ASYNC`) against `play-fast10`,
+  2 interleaved pairs; if it holds, into `main` and `play-fast10`.
+- Then: list translation (clankerVI waves 27/28/30: the submitting thread waits ~2–3 ms a frame for list threads),
+  the Lane's 1 ms poll granularity (1–2.6 ms a frame idle), GPU detile (skornuta's port), mimalloc, an upstream
+  re-triage (`notes/upstream-triage-1600.md`).
 
 ## Latest (2026-11-28 night): `main` = 123ea30a0
 
