@@ -1038,6 +1038,40 @@ pub(crate) fn dispatched() -> u64 {
     DISPATCHED.load(Ordering::Relaxed)
 }
 
+/// Whether a shader view shows the stencil plane of a depth-stencil texture:
+/// in a stencil format (X32_TYPELESS_G8X24_UINT, X24_TYPELESS_G8_UINT), or a
+/// 2D view of plane 1. (The words are `D3D12_SHADER_RESOURCE_VIEW_DESC`'s:
+/// its union begins at word 4, so a 2D view's levels are word 5 and its
+/// plane word 6.) A view of memory the title placed a texture in carries the
+/// same words.
+fn stencil_plane(view: &View) -> bool {
+    let d: &[u32] = match view {
+        View::Shader(_, Some(d)) => d,
+        View::Placed(false, _, d) => &d[..10],
+        _ => return false,
+    };
+    matches!(crate::resource::pc_format(d[0]), 22 | 47) || (d[1] == 4 && d[6] == 1)
+}
+
+/// Whether a host texture is one a depth is read from: 2D, in a 32-bit or
+/// 24-bit depth format or its typeless one, with or without stencil.
+fn depth_like(d: &D3D12_RESOURCE_DESC) -> bool {
+    use windows::Win32::Graphics::Dxgi::Common::{
+        DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+        DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32G8X24_TYPELESS,
+    };
+    d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        && matches!(
+            d.Format,
+            DXGI_FORMAT_R32_TYPELESS
+                | DXGI_FORMAT_D32_FLOAT
+                | DXGI_FORMAT_R32G8X24_TYPELESS
+                | DXGI_FORMAT_D32_FLOAT_S8X24_UINT
+                | DXGI_FORMAT_R24G8_TYPELESS
+                | DXGI_FORMAT_D24_UNORM_S8_UINT
+        )
+}
+
 /// What a render target or depth view of the host is made from: the host
 /// texture, and [`crate::descriptor::RtvRecord::key`].
 type TargetKey = (usize, (usize, [u32; 7]));
@@ -3801,12 +3835,13 @@ impl State {
             let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
                 return None;
             };
-            let mut view = crate::descriptor::view(table + u64::from(offset) * 4)?;
-            // An unordered view of memory the title placed a texture in:
-            // the resource made for that memory (DoubleGhosty e11479a).
-            if role == Role::Reflect && matches!(view, View::Placed(true, ..)) {
-                view = crate::descriptor::host::placed_texture(&view)?;
-            }
+            let view = crate::descriptor::view(table + u64::from(offset) * 4)?;
+            // A view of memory the title placed a texture in: the resource
+            // made for that memory, as the draw took it (DoubleGhosty
+            // e11479a for the unordered ones; trustno1 bda6e59: the depth
+            // and most textures of a program were such views, taken for
+            // nothing).
+            let view = crate::descriptor::host::placed_texture(&view).unwrap_or(view);
             let resource = match (kind, view) {
                 (ResourceType::Srv, View::Shader(r, _))
                 | (ResourceType::Uav, View::Unordered(r, ..)) => r,
@@ -3845,9 +3880,50 @@ impl State {
             }
             once!(width = of.Width, height = of.Height, "reflections held to the light around (VICTORY_AMBIENT_REFLECT)");
         }
+        // The view at a place of the tables shows a stencil plane
+        // ([`stencil_plane`]): no depth.
+        let stencil_at = |(slot, offset): (u8, u32)| {
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
+                return false;
+            };
+            crate::descriptor::view(table + u64::from(offset) * 4).is_some_and(|view| stencil_plane(&view))
+        };
+        // The first view of that kind the program reads through its tables
+        // that fits (never a stencil plane as a shader view).
+        let scan = |kind: ResourceType, fits: &dyn Fn(&D3D12_RESOURCE_DESC) -> bool| {
+            t.used
+                .iter()
+                .filter(|u| u.kind == kind && u.root == RootType::Table)
+                .filter(|u| kind != ResourceType::Srv || !stencil_at((u.slot, u.table_offset_dwords)))
+                .filter_map(|u| entry(kind, (u.slot, u.table_offset_dwords)))
+                .find(|(desc, _)| fits(desc))
+        };
+        // The depth at its usual place, unless that names a stencil plane:
+        // the estimate made of one puts every point far away with its
+        // normal to the camera (flat floors; trustno1 d226814, after a
+        // variant of the resolve whose place (0, 464) named the scene
+        // depth's stencil plane; Vice-Tay 292adb5 is the same finding).
+        let usual_depth = |at: (u8, u32)| {
+            if stencil_at(at) {
+                static SAID: std::sync::Once = std::sync::Once::new();
+                SAID.call_once(|| {
+                    tracing::info!(
+                        ?role,
+                        ?at,
+                        "stand-in for the indirect light: the depth's place names a stencil plane; another depth view of the tables is taken"
+                    );
+                });
+                None
+            } else {
+                entry(ResourceType::Srv, at)
+            }
+        };
         let depth = match role {
             Role::Resolve => {
-                let Some((seen, depth)) = entry(ResourceType::Srv, DEPTH) else {
+                let found = usual_depth(DEPTH).or_else(|| {
+                    scan(ResourceType::Srv, &|d| depth_like(d) && (d.Width, d.Height) == (of.Width, of.Height))
+                });
+                let Some((seen, depth)) = found else {
                     once!(?role, "no stand-in for the indirect light: missing depth SRV");
                     return false;
                 };
@@ -5730,6 +5806,42 @@ mod tests {
         assert_ne!(super::whole_fingerprint(at, len - 100), whole);
         // Nothing to read: still not 0.
         assert_ne!(super::whole_fingerprint(at, 0), 0);
+    }
+
+    /// A stencil plane is told by the view's format or its plane, not by
+    /// its number of levels (word 5; the plane is word 6); a view of placed
+    /// memory carries the same words; a depth view is none.
+    #[test]
+    fn a_stencil_plane_is_told_by_format_or_plane_not_by_levels() {
+        use super::{View, stencil_plane};
+        // R32_FLOAT_X8X24_TYPELESS (21), 2D, one level, plane 0: the depth.
+        let depth = [21, 4, 5768, 0, 0, 1, 0, 0, 0, 0];
+        assert!(!stencil_plane(&View::Shader(1, Some(depth))));
+        // The same in the stencil's format (22), or as plane 1.
+        let mut stencil = depth;
+        stencil[0] = 22;
+        assert!(stencil_plane(&View::Shader(1, Some(stencil))));
+        let mut plane = depth;
+        plane[6] = 1;
+        assert!(stencil_plane(&View::Shader(1, Some(plane))));
+        // X24_TYPELESS_G8_UINT (47), and the console's 16-bit one (120).
+        for format in [47, 120] {
+            let mut other = depth;
+            other[0] = format;
+            assert!(stencil_plane(&View::Shader(1, Some(other))), "{format}");
+        }
+        // A cube view (9) with 1 at word 6 (its levels are words 4 and 5).
+        let cube = [26, 9, 5768, 0, 0, 1, 1, 0, 0, 0];
+        assert!(!stencil_plane(&View::Shader(1, Some(cube))));
+        // No description: the texture's own, never a stencil plane alone.
+        assert!(!stencil_plane(&View::Shader(1, None)));
+        // A view of memory the title placed a texture in.
+        let mut placed = [0u32; 16];
+        placed[..10].copy_from_slice(&stencil);
+        assert!(stencil_plane(&View::Placed(false, [0; 14], placed)));
+        placed[..10].copy_from_slice(&depth);
+        assert!(!stencil_plane(&View::Placed(false, [0; 14], placed)));
+        assert!(!stencil_plane(&View::Unordered(1, 0, Some(stencil))));
     }
 
     #[test]
