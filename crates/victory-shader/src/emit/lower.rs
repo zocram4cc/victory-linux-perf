@@ -7167,6 +7167,9 @@ impl<'a> Lower<'a> {
                     0 => 1,
                     1 => 2,
                     2 => 4,
+                    // A cube sampled (or sized), as the image lowering takes it
+                    // (P.4: 261 programs size a cube from its descriptor).
+                    3 if un.starts_with("image_sample") || un.starts_with("image_gather") || un == "image_get_resinfo" => 5,
                     4 => 6,
                     5 => 7,
                     _ => return Err("an image dimension (cube or MSAA)"),
@@ -7236,6 +7239,9 @@ impl<'a> Lower<'a> {
                 let (height, depth) = match kind {
                     1 => (one, one),
                     2 => (field(self, 1), one),
+                    // A cube: its DEPTH field counts cubes less one (RADV:
+                    // layers / 6 - 1), one cube here.
+                    5 => (field(self, 1), one),
                     6 => (one, field(self, 1)),
                     _ => (field(self, 1), field(self, 2)),
                 };
@@ -7260,7 +7266,7 @@ impl<'a> Lower<'a> {
                 let hi = self.s.m.bin(c, Bin::And, hi, mask);
                 let ht = self.s.m.bin(c, Bin::Shl, height, k14);
                 let d2 = self.s.m.bin(c, Bin::Or, hi, ht);
-                let ty = [0, 8, 9, 0, 10, 0, 12, 13][kind as usize];
+                let ty = [0, 8, 9, 0, 10, 11, 12, 13][kind as usize];
                 let base = k(self, 0xFAC | ty << 28);
                 let last = self.s.m.bin(c, Bin::Shl, levels, k16);
                 let d3 = self.s.m.bin(c, Bin::Or, base, last);
