@@ -848,10 +848,10 @@ pub fn format(dxgi: u32) -> Option<Format> {
         1..=4 => (16, 1, false),
         9..=18 => (8, 1, false),
         19..=22 | 44..=47 => (4, 1, true),
-        23..=43 | 67 | 87..=93 | 116 | 117 => (4, 1, false),
-        48..=59 | 85 | 86 | 115 => (2, 1, false),
+        23..=43 | 67 | 87..=93 | 116 | 117 | 189 => (4, 1, false),
+        48..=59 | 85 | 86 | 115 | 191 => (2, 1, false),
         118..=120 => (2, 1, true),
-        60..=65 => (1, 1, false),
+        60..=65 | 190 => (1, 1, false),
         70..=72 | 79..=81 => (8, 4, false),
         73..=78 | 82..=84 | 94..=99 => (16, 4, false),
         _ => return None,
@@ -968,6 +968,17 @@ mod tests {
             samples: 1,
             swizzle,
         }
+    }
+
+    /// The console's 189 (signed 10-bit colour), 190 (two 4-bit channels)
+    /// and DXGI's 191 (A4B4G4R4_UNORM) have layouts: 4, 1 and 2 bytes a
+    /// texel. (avatarmanz PR #431.)
+    #[test]
+    fn formats_189_to_191_have_layouts() {
+        let bytes = |f| format(f).map(|f| (f.bytes, f.block, f.stencil));
+        assert_eq!(bytes(189), Some((4, 1, false)));
+        assert_eq!(bytes(190), Some((1, 1, false)));
+        assert_eq!(bytes(191), Some((2, 1, false)));
     }
 
     #[test]
