@@ -7278,6 +7278,15 @@ impl<'a> Lower<'a> {
                     n
                 };
                 let mut words = vec![(2, n)];
+                // Dword 1's stride (bits 16-29) where the element size is
+                // known, the address's high bits 0: P.4's programs read it
+                // (`s_bfe_u32 x, d1, 0xe0010`) to make the view raw, record
+                // count times stride. Replaced below where the host can tell
+                // the address.
+                let stride = used.map_or(0, |u| u.stride);
+                if stride > 1 && stride < 1 << 14 {
+                    words.push((1, self.s.m.i32(stride << 16)));
+                }
                 // Its address too, where the code computes with it and the
                 // host can tell it.
                 let computed = (0..2u8).any(|k| {
@@ -7290,6 +7299,7 @@ impl<'a> Lower<'a> {
                     && (computed || unused.is_some())
                     && let Some((lo, hi)) = self.view_address(site)
                 {
+                    words.retain(|w| w.0 != 1);
                     words.extend([(0, lo), (1, hi)]);
                 }
                 words
@@ -13556,6 +13566,21 @@ impl<'a> Lower<'a> {
                     }
                     (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
+                    }
+                    // A descriptor's address or format dword (no host value)
+                    // joined with what the register holds on other paths:
+                    // joins are per register, and the compiler reuses a
+                    // register whose descriptor dword is dead (P.4: a lane
+                    // mask on the paths that read the join, 470 programs).
+                    // shortcut: 0 on that edge; a program that did read
+                    // such a dword through the join reads 0.
+                    // `VICTORY_DEAD_DESCRIPTOR_JOINS=0` refuses, as before.
+                    (Some(Val::Missing(why)), false)
+                        if self.read_phis.contains(&phi.value)
+                            && why == "a descriptor's address or format read as data"
+                            && !std::env::var_os("VICTORY_DEAD_DESCRIPTOR_JOINS").is_some_and(|v| v == "0") =>
+                    {
+                        self.s.m.i32(0)
                     }
                     (Some(Val::Missing(why)), _) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, why));
