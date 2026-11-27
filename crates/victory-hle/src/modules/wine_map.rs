@@ -51,6 +51,7 @@ use windows_sys::Win32::System::Memory::{
 
 type Mmap = unsafe extern "sysv64" fn(*mut c_void, usize, i32, i32, i32, i64) -> *mut c_void;
 type Close = unsafe extern "sysv64" fn(i32) -> i32;
+type Madvise = unsafe extern "sysv64" fn(*mut c_void, usize, i32) -> i32;
 type HandleToFd = unsafe extern "C" fn(HANDLE, u32, *mut i32, *mut u32) -> i32;
 
 const PROT_READ: i32 = 1;
@@ -60,10 +61,13 @@ const MAP_PRIVATE: i32 = 2;
 const MAP_FIXED: i32 = 0x10;
 const MAP_ANONYMOUS: i32 = 0x20;
 const MAP_NORESERVE: i32 = 0x4000;
+const MADV_NOHUGEPAGE: i32 = 15;
 
 struct Direct {
     mmap: Mmap,
     close: Close,
+    /// The C library's `madvise`, if found ([`Direct::no_huge`] only).
+    madvise: Option<Madvise>,
     handle_to_fd: HandleToFd,
 }
 
@@ -122,12 +126,12 @@ fn host_folder(path: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// This process's memory map as the host has it (`/proc/<pid>/maps`).
+/// A file of this process's in the host's `/proc/<pid>` (`maps`, `smaps`).
 ///
 /// Wine's server opens the files, so `/proc/self` is the server; and nothing
 /// tells a Windows program its host process. A file of our own is mapped,
 /// and the process that has it in its map is this one.
-fn own_maps() -> Result<String, &'static str> {
+fn own_proc(what: &str) -> Result<String, &'static str> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::System::Memory::FILE_MAP_READ;
     let nanos = std::time::SystemTime::now()
@@ -170,7 +174,11 @@ fn own_maps() -> Result<String, &'static str> {
                 .ok()
                 .map(|m| String::from_utf8_lossy(&m).into_owned())
         };
-        let ours = |pid: &String| maps_of(pid).filter(|maps| maps.contains(&name));
+        let ours = |pid: &String| {
+            maps_of(pid)
+                .filter(|maps| maps.contains(&name))
+                .map(|maps| (pid.clone(), maps))
+        };
         // Those that run our program first; then any.
         let named = |pid: &&String| {
             host_file(&format!("/proc/{pid}/cmdline"))
@@ -198,7 +206,18 @@ fn own_maps() -> Result<String, &'static str> {
         found
     })();
     let _ = std::fs::remove_file(&path);
-    found
+    let (pid, maps) = found?;
+    if what == "maps" {
+        return Ok(maps);
+    }
+    host_file(&format!("/proc/{pid}/{what}"))
+        .map(|f| String::from_utf8_lossy(&f).into_owned())
+        .map_err(|_| "this process's file in the host's /proc was not read")
+}
+
+/// This process's memory map as the host has it (`/proc/<pid>/maps`).
+fn own_maps() -> Result<String, &'static str> {
+    own_proc("maps")
 }
 
 /// One line of `/proc/<pid>/maps`: start, end, executable, file offset, path.
@@ -276,8 +295,8 @@ fn symbols(elf: &[u8], names: &[&str]) -> Option<Vec<usize>> {
     found.iter().all(|&v| v != 0).then_some(found)
 }
 
-/// The C library's `mmap` and `close` in this process, and Wine's way to a
-/// handle's file descriptor.
+/// The C library's `mmap`, `close` and `madvise` in this process, and Wine's
+/// way to a handle's file descriptor.
 fn find() -> Result<Direct, &'static str> {
     // SAFETY: plain lookups in ntdll, always loaded.
     let handle_to_fd = unsafe {
@@ -315,12 +334,16 @@ fn find() -> Result<Direct, &'static str> {
     let (mmap, close) = at(values[0])
         .zip(at(values[1]))
         .ok_or("the C library's functions are not where its file says")?;
-    // SAFETY: the addresses of the C library's `mmap` and `close`, in its executable mappings,
-    // called as the host's calling convention has them; and ntdll's export, of this signature.
+    // (Looked up alone: without it pages are shown all the same.)
+    let madvise = symbols(&file, &["madvise"]).and_then(|values| at(values[0]));
+    // SAFETY: the addresses of the C library's `mmap`, `close` and `madvise`, in its executable
+    // mappings, called as the host's calling convention has them; and ntdll's export, of this
+    // signature.
     unsafe {
         Ok(Direct {
             mmap: std::mem::transmute::<usize, Mmap>(mmap),
             close: std::mem::transmute::<usize, Close>(close),
+            madvise: madvise.map(|at| std::mem::transmute::<usize, Madvise>(at)),
             handle_to_fd: std::mem::transmute::<unsafe extern "system" fn() -> isize, HandleToFd>(
                 handle_to_fd,
             ),
@@ -432,6 +455,17 @@ impl Direct {
         }
         true
     }
+
+    /// Keeps `[base, base + len)` off huge pages (`madvise`,
+    /// `MADV_NOHUGEPAGE`): the kernel neither faults it in as one nor
+    /// gathers its pages into one later, which moves them.
+    fn no_huge(&self, base: usize, len: usize) -> bool {
+        // SAFETY: the C library's `madvise` on a range of the caller's that is mapped: advice,
+        // no byte changes.
+        self.madvise.is_some_and(|madvise| {
+            unsafe { madvise(base as *mut c_void, len, MADV_NOHUGEPAGE) == 0 }
+        })
+    }
 }
 
 /// Makes `[base, base + len)`, a stretch of a reservation of [`Spaces`] that
@@ -464,7 +498,27 @@ pub(crate) fn own(base: usize, len: usize) -> bool {
             return false;
         }
     }
+    if home_no_huge() {
+        let kept = direct.no_huge(base, len);
+        tracing::info!(
+            at = format_args!("{base:#x}"),
+            len,
+            kept,
+            "memory of the process's own for pages at home, kept off huge pages (VICTORY_HOME_NOHUGE=1)"
+        );
+    }
     true
+}
+
+/// `VICTORY_HOME_NOHUGE=1` (off unless set; read here): memory [`own`] makes is
+/// kept off huge pages. The card's driver holds it by address (a heap opened
+/// there, read in place), and with transparent huge pages on (`always` on the
+/// rig) the kernel may move its pages to gather them into a huge one; the
+/// driver then waits for the card's work on them and takes them anew.
+fn home_no_huge() -> bool {
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("VICTORY_HOME_NOHUGE").is_some_and(|v| v == "1"));
+    *ON
 }
 
 /// The file descriptor behind `section`, to show its pages with; `None` if
@@ -655,5 +709,48 @@ mod tests {
             Some(vec![0x1000, 0x2000])
         );
         assert_eq!(super::symbols(&elf, &["mmap", "munmap"]), None);
+    }
+
+    /// The flags the host keeps for the mapping that holds `at` (`VmFlags`
+    /// of this process's `smaps`); `None`: not read.
+    fn own_flags(at: usize) -> Option<String> {
+        let smaps = own_proc("smaps").ok()?;
+        let mut inside = false;
+        for line in smaps.lines() {
+            let range = line.split_once(' ').and_then(|(range, _)| range.split_once('-'));
+            let bounds = range.and_then(|(from, to)| {
+                Some((usize::from_str_radix(from, 16).ok()?, usize::from_str_radix(to, 16).ok()?))
+            });
+            if let Some((from, to)) = bounds {
+                inside = from <= at && at < to;
+            } else if inside && let Some(flags) = line.strip_prefix("VmFlags:") {
+                return Some(flags.trim().to_owned());
+            }
+        }
+        None
+    }
+
+    /// `VICTORY_HOME_NOHUGE=1`'s call: memory made the process's own by
+    /// [`own`] is kept off huge pages (`nh` among the host's flags of its
+    /// mapping), so the kernel never moves its pages to make one under a
+    /// heap the card holds there. Needs pages shown by the host's mmap
+    /// (`VICTORY_WINE_MAP=1`, under Wine).
+    #[test]
+    fn memory_of_its_own_is_kept_off_huge_pages() {
+        let Some(direct) = DIRECT.as_ref() else {
+            eprintln!("not tried: not under Wine with pages shown by mmap (VICTORY_WINE_MAP=1)");
+            return;
+        };
+        const LEN: usize = 4 << 20;
+        // SAFETY: a reservation of the test's own, released below.
+        let base =
+            unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE, PAGE_NOACCESS) } as usize;
+        assert_ne!(base, 0, "no reservation for the test");
+        assert!(own(base, LEN), "made memory of the process's own");
+        assert!(direct.no_huge(base, LEN), "the host took the advice");
+        let flags = own_flags(base).expect("the host's flags of the mapping");
+        assert!(flags.split_whitespace().any(|f| f == "nh"), "kept off huge pages: {flags}");
+        // SAFETY: ours, from above.
+        unsafe { VirtualFree(base as *mut c_void, 0, MEM_RELEASE) };
     }
 }
