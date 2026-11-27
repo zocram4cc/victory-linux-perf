@@ -1443,6 +1443,53 @@ mod tests {
             desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
         );
     }
+
+    /// Title memory in place for the tests below: private memory of the
+    /// test's own, committed whole (never let go: the heap holds its pages a
+    /// moment past its last reference).
+    fn in_place(bytes: usize) -> (u64, std::sync::Arc<crate::shadow::Shadow>) {
+        use windows_sys::Win32::System::Memory::*;
+        let host = host().expect("these tests need the host GPU");
+        // SAFETY: an allocation of the test's own.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as u64;
+        assert_ne!(at, 0, "no memory for the test");
+        (at, crate::shadow::in_place_for_tests(&host.device, at, bytes as u64, false))
+    }
+
+    /// One owner per byte (S1): what shaders write in title memory in place
+    /// is declared with the list's writes, as for a copy, so that the
+    /// flights' written ranges hold it (`send_late`, `late_blocked`).
+    #[test]
+    fn writes_of_shaders_in_memory_in_place_are_declared() {
+        let (at, shadow) = in_place(0x2_0000);
+        let list = host().expect("the host GPU").new_list().expect("a list");
+        shadow.gpu_writes(&list, at + 0x100, 0x200);
+        let declared: Vec<(usize, usize)> = declared_writes(&[&list]).into_iter().flat_map(|(_, ranges)| ranges).collect();
+        assert_eq!(declared, vec![(at as usize + 0x100, at as usize + 0x300)], "the range shaders write in place is declared");
+    }
+
+    /// One owner per byte (S1), on the card's driver: a fill that reads
+    /// title memory in place waits for the flight whose shaders write it,
+    /// and what the card wrote is there once it ran, nothing copied back.
+    #[test]
+    #[ignore = "wants the card's driver (title memory in place): run under Proton"]
+    fn a_fill_of_memory_in_place_waits_for_the_flight_that_writes_it() {
+        let host = host().expect("the host GPU");
+        let (at, shadow) = in_place(0x2_0000);
+        let writer = host.new_list().expect("a list");
+        shadow.gpu_writes(&writer, at + 0x100, 0x200);
+        let reader = host.new_list().expect("a list");
+        let mut upload = vec![0u8; 0x200];
+        reader.defer_fill(upload.as_mut_ptr(), (at + 0x100) as *const u8, 0x200);
+        let mut written = Vec::new();
+        join_ranges(&mut written, declared_writes(&[&writer]).into_iter().flat_map(|(_, ranges)| ranges));
+        assert_eq!(blocked_by(&written, &[&reader], false), Some(WHY_READ), "a fill of title memory in place waits for the flight whose shaders write it");
+        let mut rig = crate::inplace::Rig::new(&host.device).expect("a queue of the test's own");
+        rig.store(&shadow.buffer, shadow.offset(at + 0x100), &[0x5a; 0x200]).expect("the card writes");
+        // SAFETY: the test's own committed memory.
+        let title = unsafe { std::slice::from_raw_parts((at + 0x100) as *const u8, 0x200) };
+        assert!(title.iter().all(|&v| v == 0x5a), "what the card wrote is in title memory: nothing is copied back");
+    }
 }
 
 /// The batches of clamped records in one scratch buffer
@@ -3868,7 +3915,7 @@ struct RelayBack {
 fn relay_hand_back(back: &[Declared]) -> RelayBack {
     let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
     for (shadow, declared) in back {
-        if shadow.carded() {
+        if shadow.carded() || shadow.in_place() {
             continue;
         }
         let mut spans: Vec<(usize, usize)> = Vec::new();
@@ -4293,7 +4340,7 @@ fn hand_back(back: &[Declared]) {
         // threads), then the merges, in order, as below.
         let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
         for (shadow, declared) in back {
-            if shadow.carded() {
+            if shadow.carded() || shadow.in_place() {
                 continue;
             }
             let mut sorted = declared.clone();
@@ -4324,8 +4371,8 @@ fn hand_back(back: &[Declared]) {
         return;
     }
     for (shadow, declared) in back {
-        if shadow.carded() {
-            // Done before (`Host::card_back`).
+        if shadow.carded() || shadow.in_place() {
+            // Done before (`Host::card_back`), or nothing to do (in place).
             shadow.copy_back_done(declared);
             continue;
         }
@@ -7809,6 +7856,9 @@ impl HostList {
         let (mut us, mut bytes) = (std::time::Duration::ZERO, 0u64);
         #[cfg(feature = "diagnostics")]
         let (mut copies, mut refreshes, mut refreshed) = (0u64, 0u64, 0u64);
+        // The refreshed bytes, by where the card reads them ([`READS`]).
+        #[cfg(feature = "diagnostics")]
+        let mut reads = [0u64; 3];
         for (i, step) in self.deferred().copies.iter().enumerate() {
             if matches!(step, Step::Copy(..) | Step::Fill(..)) && taken(i) {
                 continue;
@@ -7873,6 +7923,7 @@ impl HostList {
                     {
                         refreshes += 1;
                         refreshed += *len as u64;
+                        reads[shadow.read_class()] += *len as u64;
                     }
                     batch.add(shadow, *address, *len);
                     continue;
@@ -7939,6 +7990,9 @@ impl HostList {
             add(C::Refreshes, refreshes);
             add(C::RefreshBytes, refreshed);
             SPLIT[7].fetch_add(us.as_nanos() as u64, Ordering::Relaxed);
+            for (all, these) in READS.iter().zip(reads) {
+                all.fetch_add(these, Ordering::Relaxed);
+            }
         }
     }
 
@@ -7998,6 +8052,14 @@ impl std::hash::Hasher for AddressHash {
 /// end, the wait for the heaps' records.
 #[cfg(feature = "diagnostics")]
 static SPLIT: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
+
+/// Since the last frame-rate line: the bytes the lists' refreshes declare the
+/// card reads (shaders, vertex and index fetch), by where it reads them: title
+/// memory in place, copies in the card's memory (and windows the CPU maps
+/// there), copies in the PC's memory. Their sum is [`crate::copystat`]'s
+/// refreshed bytes. Whether memory belongs in place or on the card goes by it.
+#[cfg(feature = "diagnostics")]
+static READS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// Since the last frame-rate line: flushes of refreshes, their refreshes,
 /// those known to copy nothing, and those done on several threads.
@@ -8741,6 +8803,11 @@ impl Batch {
 
     /// Brings `[from, to)` of a copy up to date, timed.
     fn update(shadow: &crate::shadow::Shadow, from: usize, to: usize) {
+        // In place there is nothing to bring up, and no copy to count (what
+        // shaders write there is declared, `Step::GpuWrite`, which flushes).
+        if shadow.in_place() {
+            return;
+        }
         let started = std::time::Instant::now();
         let _one = crate::timeline::span("a copy's refresh");
         let copied = shadow.update(from, to - from);
@@ -9719,6 +9786,16 @@ impl Meter {
                 "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame; {refused:.2} indirect records a frame ran empty for want of their list's budget (2^27), the largest cost of one {biggest} (0: under 2^22)"
             );
             crate::shadow::exact_line(frames);
+            crate::shadow::owners_line();
+            #[cfg(feature = "diagnostics")]
+            {
+                let [placed, card, pc] = [0, 1, 2].map(|i| READS[i].swap(0, Ordering::Relaxed) as f64 / 1e6 / frames);
+                tracing::info!(
+                    "GPU reads declared per frame (the lists' refreshes, diagnostics): {:.1} MB; of them {placed:.1} MB of title memory \
+                     in place and {pc:.1} MB of copies in the PC's memory, both read across the bus, {card:.1} MB of copies in the card's memory",
+                    placed + card + pc
+                );
+            }
             crate::descriptor::sync_line(frames);
             late_line(frames);
             crate::queue::behind_line(frames);
