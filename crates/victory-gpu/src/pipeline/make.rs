@@ -55,6 +55,13 @@ pub(crate) struct Pending {
     scene_input: bool,
     /// Why this pipeline is intentionally skipped (e.g. RT resolve without BVH).
     left_out: Option<&'static str>,
+    /// A compute pipeline whose dispatches have a wait of their own
+    /// ([`compute_budget`]), whether a dropped dispatch of it was logged,
+    /// and whether a dispatch has had its one wait for it
+    /// ([`COMPUTE_CHANCE`]).
+    compute: bool,
+    compute_dropped: AtomicBool,
+    compute_waited: AtomicBool,
 }
 
 fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
@@ -127,6 +134,11 @@ impl Pending {
             || scene_input;
         let left_out = left_out(&shaders);
         Pending {
+            compute: graphics.is_none()
+                && shaders.first().is_some_and(|s| s.stage == "compute")
+                && !compute_budget().is_zero(),
+            compute_dropped: AtomicBool::new(false),
+            compute_waited: AtomicBool::new(false),
             screen,
             scene_input,
             left_out,
@@ -288,11 +300,102 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
             // Made here, or waited for while a worker makes it.
             p.make();
         } else {
-            wait(p, crate::frame::current());
+            let frame = crate::frame::current();
+            wait(p, frame);
+            // A dispatch still without its pipeline is dropped by the
+            // caller: said once a pipeline.
+            if p.compute && p.made.get().is_none() && !p.compute_dropped.swap(true, Ordering::Relaxed) {
+                tracing::info!(
+                    shaders = %hashes(p),
+                    frame,
+                    had_its_wait = p.compute_waited.load(Ordering::Relaxed),
+                    "a compute dispatch was dropped: its pipeline was not made within its wait (VICTORY_COMPUTE_WAIT_MS)"
+                );
+            }
         }
     }
     p.made.get()?.as_ref()
 }
+
+/// What compute dispatches may hold one frame, over all threads, from the
+/// frame's first such wait: `VICTORY_COMPUTE_WAIT_MS` milliseconds, 500 if
+/// unset, at most 1,000; 0: no wait of their own, a dispatch waits within
+/// the frame's budget as a draw does ([`wait_budget`]), as before.
+///
+/// A dropped draw loses one frame's picture; a dropped dispatch the title
+/// issues once loses its output for the session. With a cold driver cache
+/// the head blend-shape map (61e54e90adccaf6a) was made 1 to 21 s after its
+/// one dispatch, behind hundreds of graphics pipelines whose draws had
+/// spent the frame's budget, and every head of the session had no skin
+/// (avatarmanz PR #166, beba8da and ef32cab).
+///
+/// The wait is bounded three ways, so the title's watchdog (about 30 s
+/// without a frame) cannot come near:
+///
+/// - a frame: all compute waits of a frame end together, this budget after
+///   the first of them began ([`FrameWaits`]), however many threads wait
+///   and however many pipelines they wait for;
+/// - a dispatch: so no dispatch waits longer than that either;
+/// - a pipeline: one wait ([`COMPUTE_CHANCE`]); a pipeline that is never
+///   made holds one frame once, not every frame that dispatches it.
+///
+/// With the passes over the screen (10 s, once a pipeline) and the ordinary
+/// half second, a frame is held 11 s at the very most. The wait without a
+/// bound (fxceless PR #1312, `VICTORY_PIPELINE_COMPUTE_WAIT=1`, off) held
+/// the title's thread until the watchdog ended the run (5752ad3); upstream's
+/// first bound of 10 s a frame left gaps of 1 to 10 s between frames on a
+/// cold start. Waiting does not make a compile faster: what a one-off
+/// dispatch needs is its own pipeline made next ([`Queue::hurry`]) on a
+/// worker kept free for it ([`Queue::reserved`]); the head map is made 3 ms
+/// after a worker takes it.
+fn compute_budget() -> Duration {
+    static BUDGET: OnceLock<Duration> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let millis = compute_millis(std::env::var("VICTORY_COMPUTE_WAIT_MS").ok().and_then(|v| v.trim().parse().ok()));
+        if millis != 0 {
+            tracing::info!(millis, "compute dispatches wait for their pipelines, within this a frame and once a pipeline");
+        }
+        Duration::from_millis(millis)
+    })
+}
+
+/// [`compute_budget`] in milliseconds for what the switch says.
+fn compute_millis(asked: Option<u64>) -> u64 {
+    asked.unwrap_or(500).min(1000)
+}
+
+/// The end of the frame's compute waits ([`compute_budget`]).
+struct FrameWaits {
+    frame: u64,
+    until: Option<Instant>,
+}
+
+impl FrameWaits {
+    const fn new() -> Self {
+        FrameWaits { frame: u64::MAX, until: None }
+    }
+
+    /// A compute wait of frame `frame` begins at `now`: how long it may
+    /// wait. Threads that wait together end together (upstream, a second
+    /// thread that found the budget taken dropped its dispatch 18 ms before
+    /// its pipeline was made), and a frame is held at most the budget
+    /// however many wait. (A thread that read the frame before a newer one
+    /// began counts in the newer one: it must not give that frame a second
+    /// budget.)
+    fn begin(&mut self, now: Instant, frame: u64, budget: Duration) -> Duration {
+        if self.frame == u64::MAX || frame > self.frame {
+            *self = FrameWaits { frame, until: Some(now + budget) };
+        }
+        self.until.map_or(Duration::ZERO, |until| until.saturating_duration_since(now))
+    }
+}
+
+/// A wait at least this long without its pipeline made is the pipeline's
+/// one wait: one that is never made (the driver's compiler ended its worker
+/// or does not return) holds one frame once, not every frame that
+/// dispatches it. A shorter one (the frame's budget nearly spent) leaves it
+/// another.
+const COMPUTE_CHANCE: Duration = Duration::from_millis(100);
 
 /// Whether a dispatch waits for its compute pipeline until it is made,
 /// whatever the frame's budget ([`wait_budget`]); a draw still waits within
@@ -311,7 +414,8 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 /// thread until its render loop stopped at about 30 s of the world, and the
 /// title's watchdog ended it with a write to 0 another 35 s later (runs
 /// 20261127-005324 and -005721; with it off, -010017 played on).
-/// `VICTORY_PIPELINE_COMPUTE_WAIT=1` waits as upstream does.
+/// `VICTORY_PIPELINE_COMPUTE_WAIT=1` waits as upstream does. What is on by
+/// default is the bounded wait of [`compute_budget`].
 fn compute_waits() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_COMPUTE_WAIT").is_some_and(|v| v == "1"))
@@ -368,14 +472,37 @@ fn wait_once() -> bool {
 }
 
 /// Waits for `p` while frame `frame` has budget left.
-fn wait(p: &Pending, frame: u64) {
+fn wait(p: &Arc<Pending>, frame: u64) {
     let screen = p.screen && screens_first();
-    let budget = if screen { screen_budget() } else { wait_budget() };
+    // A compute dispatch of a pipeline that has not had its wait waits
+    // within the frame's compute budget ([`compute_budget`]); with that
+    // spent, or after its wait, as any other. The pipeline it waits for is
+    // made next.
+    let allowed = if p.compute && !screen && !p.compute_waited.load(Ordering::Relaxed) {
+        static WAITS: Mutex<FrameWaits> = Mutex::new(FrameWaits::new());
+        WAITS.lock().unwrap_or_else(|e| e.into_inner()).begin(Instant::now(), frame, compute_budget())
+    } else {
+        Duration::ZERO
+    };
+    let compute = !allowed.is_zero();
+    if compute {
+        QUEUE.lock().unwrap_or_else(|e| e.into_inner()).hurry(p);
+    }
+    let budget = if screen {
+        screen_budget()
+    } else if compute {
+        allowed
+    } else {
+        wait_budget()
+    };
     if budget.is_zero() {
         return;
     }
-    // What is left of this pipeline's own budget ([`wait_once`]).
-    let own = if wait_once() {
+    // What is left of this pipeline's own budget ([`wait_once`]); a compute
+    // wait has its own bound a pipeline.
+    let own = if compute {
+        Duration::MAX
+    } else if wait_once() {
         let own = budget.saturating_sub(Duration::from_micros(p.waited_us.load(Ordering::Relaxed)));
         if own.is_zero() {
             return;
@@ -389,7 +516,9 @@ fn wait(p: &Pending, frame: u64) {
     static SPENT: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
     let spent_of = &SPENT[usize::from(screen)];
     let shared = shared_budget();
-    let left = {
+    let left = if compute {
+        allowed
+    } else {
         let mut spent = spent_of.lock().unwrap_or_else(|e| e.into_inner());
         if spent.0 != frame {
             *spent = (frame, Duration::ZERO);
@@ -415,7 +544,11 @@ fn wait(p: &Pending, frame: u64) {
     }
     drop(held);
     let waited = started.elapsed().min(left);
-    if wait_once() && p.made.get().is_none() {
+    if compute {
+        if p.made.get().is_none() && waited >= COMPUTE_CHANCE.min(compute_budget() / 2) {
+            p.compute_waited.store(true, Ordering::Relaxed);
+        }
+    } else if wait_once() && p.made.get().is_none() {
         let before = p.waited_us.fetch_add(waited.as_micros() as u64, Ordering::Relaxed);
         if Duration::from_micros(before) + waited >= budget {
             tracing::info!(
@@ -433,7 +566,7 @@ fn wait(p: &Pending, frame: u64) {
             "a pass over the screen was waited for (VICTORY_SCREEN_WAIT_MS=0: dropped past half a second a frame)"
         );
     }
-    {
+    if !compute {
         let mut spent = spent_of.lock().unwrap_or_else(|e| e.into_inner());
         // A frame that began meanwhile has its own budget.
         if spent.0 == frame {
@@ -479,23 +612,71 @@ struct Queue {
     /// Requested passes over the screen: before all others, and the only ones
     /// [`SCREEN_WORKERS`] take.
     screen: VecDeque<Arc<Pending>>,
+    /// Compute pipelines a dispatch waits for now ([`Queue::hurry`]), and
+    /// the other requested ones whose dispatches have a wait of their own
+    /// ([`compute_budget`]): next, before the requested graphics, the newest
+    /// first.
+    hurried: VecDeque<Arc<Pending>>,
+    compute: VecDeque<Arc<Pending>>,
     early: VecDeque<Arc<Pending>>,
     /// Those of the early ones known to take long, and how many of them are
     /// being made ([`slow_limit`]).
     slow: VecDeque<Arc<Pending>>,
     slow_now: usize,
     requested: VecDeque<Arc<Pending>>,
+    /// What the workers other than the screen passes' have taken and not
+    /// made yet, and how many of those workers there are
+    /// ([`Queue::reserved`]; `None`: as many as were started, [`WORKERS`]).
+    taken: Vec<Arc<Pending>>,
+    workers: Option<usize>,
 }
+
+/// How many workers take any pipeline ([`workers`]; 0 until they start).
+static WORKERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 impl Queue {
     const fn new() -> Self {
         Self {
             screen: VecDeque::new(),
+            hurried: VecDeque::new(),
+            compute: VecDeque::new(),
             early: VecDeque::new(),
             slow: VecDeque::new(),
             slow_now: 0,
             requested: VecDeque::new(),
+            taken: Vec::new(),
+            workers: None,
         }
+    }
+
+    /// `p`, requested and not taken by a worker yet, goes before every
+    /// other compute pipeline: a dispatch waits for it now. Compute
+    /// pipelines are made newest first anyway: first in, first out, a short
+    /// wait would be spent on the hundreds dropped before it (a cold start's
+    /// first world frame dispatches some 670), and a pipeline the title
+    /// dispatches once would sit behind those it dispatches every frame.
+    fn hurry(&mut self, p: &Arc<Pending>) {
+        if p.queue_state.load(Ordering::Relaxed) == REQUESTED && !self.hurried.iter().any(|q| Arc::ptr_eq(q, p)) {
+            self.hurried.push_front(p.clone());
+            // (The worker kept for it may be asleep.)
+            AVAILABLE.notify_all();
+        }
+    }
+
+    /// Whether the last worker free is kept for pipelines a dispatch waits
+    /// for now ([`Queue::hurry`]) and passes over the screen. Upstream the
+    /// head map compiled in 1 to 3 ms, but on a cold start its dispatch
+    /// waited 280, 289, 444 and 1,132 ms for a worker to come free: the last
+    /// was past the budget, and the heads had no skin. Only with
+    /// [`compute_budget`] and four workers or more. A worker in a compile
+    /// that never returns counts as taken: the next one is kept.
+    fn reserved(&mut self) -> bool {
+        if compute_budget().is_zero() {
+            return false;
+        }
+        let workers = self.workers.unwrap_or_else(|| WORKERS.load(Ordering::Relaxed));
+        self.taken.retain(|p| p.made.get().is_none());
+        workers >= 4 && self.taken.len() + 1 >= workers
     }
 
     /// Queues an unrequested pipeline or promotes one queued at creation.
@@ -512,6 +693,14 @@ impl Queue {
         p.queue_state.store(priority, Ordering::Relaxed);
         if priority == REQUESTED && p.screen && screens_first() {
             self.screen.push_back(p.clone());
+        } else if priority == REQUESTED && p.compute {
+            // Before the requested graphics: a dropped draw is drawn again
+            // the next frame, a dispatch the title issues once is not
+            // (upstream the head map was made 21 s after its dispatch,
+            // behind a cold world's graphics). Not with the passes over the
+            // screen: a cold world frame asks for hundreds of compute
+            // pipelines, and those passes wait too.
+            self.compute.push_front(p.clone());
         } else if priority == REQUESTED {
             self.requested.push_back(p.clone());
         } else if slow {
@@ -527,15 +716,29 @@ impl Queue {
         let unclaimed = |list: &mut VecDeque<Arc<Pending>>| {
             std::iter::from_fn(|| list.pop_front()).find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
         };
+        // A compute pipeline can be in both of its lines.
+        let waiting = |list: &mut VecDeque<Arc<Pending>>| {
+            std::iter::from_fn(|| list.pop_front()).find(|p| p.queue_state.load(Ordering::Relaxed) == REQUESTED)
+        };
         let mut p = self.screen.pop_front();
-        if p.is_none() && !screens_only {
-            p = self.requested.pop_front().or_else(|| unclaimed(&mut self.early));
-            if p.is_none() && self.slow_now < slow_limit {
-                p = unclaimed(&mut self.slow);
-                if let Some(p) = &p {
-                    p.was_slow.store(true, Ordering::Relaxed);
-                    self.slow_now += 1;
+        if !screens_only {
+            p = p.or_else(|| waiting(&mut self.hurried));
+            if p.is_none() && !self.reserved() {
+                p = waiting(&mut self.compute)
+                    .or_else(|| self.requested.pop_front())
+                    .or_else(|| unclaimed(&mut self.early));
+                if p.is_none() && self.slow_now < slow_limit {
+                    p = unclaimed(&mut self.slow);
+                    if let Some(p) = &p {
+                        p.was_slow.store(true, Ordering::Relaxed);
+                        self.slow_now += 1;
+                    }
                 }
+            }
+            if let Some(p) = &p
+                && !compute_budget().is_zero()
+            {
+                self.taken.push(p.clone());
             }
         }
         let p = p?;
@@ -630,6 +833,7 @@ fn workers() -> bool {
         let stack = worker_stack(std::env::var("VICTORY_PIPELINE_STACK_MB").ok().and_then(|v| v.trim().parse().ok()));
         tracing::info!(workers, stack_mib = stack.map_or(0, |s| s >> 20), "pipeline workers");
         let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
+        WORKERS.store(workers, Ordering::Relaxed);
         for i in 0..workers + screens {
             let screens_only = i >= workers;
             let mut builder = std::thread::Builder::new().name(format!("victory-pipelines-{i}"));
@@ -733,6 +937,136 @@ mod tests {
         assert_eq!(made.ok(), Some(4096));
     }
 
+    #[test]
+    fn the_compute_wait_is_half_a_second_and_never_more_than_one() {
+        assert_eq!(compute_millis(None), 500);
+        assert_eq!(compute_millis(Some(0)), 0);
+        assert_eq!(compute_millis(Some(250)), 250);
+        assert_eq!(compute_millis(Some(30_000)), 1000);
+    }
+
+    /// Compute pipelines are made newest first, before requested graphics;
+    /// one a dispatch waits for now goes first, once, and not to the screen
+    /// passes' workers.
+    #[test]
+    fn a_pipeline_a_dispatch_waits_for_is_made_next() {
+        let of = || {
+            let mut p = Pending::new(Vec::new(), None);
+            p.compute = true;
+            Arc::new(p)
+        };
+        let (first, second, waited, later) = (of(), of(), of(), of());
+        let world = Arc::new(Pending::new(Vec::new(), None));
+        let mut queue = Queue::new();
+        queue.workers = Some(64);
+        for p in [&world, &first, &waited, &second, &later] {
+            assert_eq!(queue.push(p, REQUESTED), Some(true));
+        }
+        // A later dispatch of one already queued does not move it.
+        assert_eq!(queue.push(&first, REQUESTED), None);
+        queue.hurry(&waited);
+        queue.hurry(&waited);
+        assert!(queue.pop(true, 1).is_none());
+        for p in [&waited, &later, &second, &first, &world] {
+            assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), p));
+        }
+        queue.hurry(&first);
+        assert!(queue.pop(false, 1).is_none());
+    }
+
+    /// With all workers but one busy, the last takes only a pipeline a
+    /// dispatch waits for now (or a pass over the screen); a worker that
+    /// finishes gives its place back.
+    #[test]
+    fn the_last_worker_is_kept_for_a_waited_for_pipeline() {
+        if compute_budget().is_zero() {
+            return;
+        }
+        let of = |compute| {
+            let mut p = Pending::new(Vec::new(), None);
+            p.compute = compute;
+            Arc::new(p)
+        };
+        let mut queue = Queue::new();
+        queue.workers = Some(4);
+        let (a, b, c, d, waited) = (of(true), of(true), of(true), of(false), of(true));
+        for p in [&a, &b, &c, &d] {
+            queue.push(p, REQUESTED);
+        }
+        for p in [&c, &b, &a] {
+            assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), p));
+        }
+        assert!(queue.pop(false, 1).is_none());
+        queue.push(&waited, REQUESTED);
+        assert!(queue.pop(false, 1).is_none());
+        queue.hurry(&waited);
+        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &waited));
+        // One of the first three is made: its worker takes ordinary work again.
+        let _ = c.made.set(None);
+        let _ = waited.made.set(None);
+        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &d));
+    }
+
+    /// A frame's compute waits end together, the budget after its first
+    /// began; a newer frame has its own; a late thread of an older frame
+    /// does not open a new one.
+    #[test]
+    fn compute_waits_end_with_the_frames_budget() {
+        let ms = Duration::from_millis;
+        let budget = ms(500);
+        let t0 = Instant::now();
+        let mut w = FrameWaits::new();
+        assert_eq!(w.begin(t0, 7, budget), budget);
+        assert_eq!(w.begin(t0 + ms(100), 7, budget), budget - ms(100));
+        assert_eq!(w.begin(t0 + budget, 7, budget), Duration::ZERO);
+        assert_eq!(w.begin(t0 + budget, 8, budget), budget);
+        assert_eq!(w.begin(t0 + budget + ms(50), 7, budget), budget - ms(50));
+    }
+
+    /// A compute pipeline that is never made (a worker that does not come
+    /// back from its compile) is waited for once, within the frame's compute
+    /// budget; later dispatches wait no longer than for the others, and a
+    /// second such pipeline in the same frame has nothing left of the
+    /// frame's compute budget.
+    #[test]
+    fn a_compute_pipeline_not_made_has_one_wait() {
+        let budget = compute_budget();
+        if budget.is_zero() {
+            return;
+        }
+        let stuck = || {
+            let mut p = Pending::new(Vec::new(), None);
+            p.compute = true;
+            p.queue_state.store(MAKING, Ordering::Relaxed);
+            Arc::new(p)
+        };
+        let (p, other) = (stuck(), stuck());
+        // (A frame of its own, whatever the tests before waited in theirs.)
+        crate::frame::test_advance();
+        let started = Instant::now();
+        assert!(ready(&p).is_none());
+        let first = started.elapsed();
+        assert!(first >= COMPUTE_CHANCE && first < budget + Duration::from_millis(500), "{first:?}");
+        assert!(p.compute_waited.load(Ordering::Relaxed));
+        assert!(p.compute_dropped.load(Ordering::Relaxed));
+        assert_eq!(p.waited_us.load(Ordering::Relaxed), 0, "not counted against its ordinary wait");
+        // The frame's compute budget is spent: the other waits as a draw
+        // does, and keeps its one compute wait for a later frame.
+        let started = Instant::now();
+        assert!(ready(&other).is_none());
+        assert!(started.elapsed() <= wait_budget() + Duration::from_millis(500));
+        assert!(!other.compute_waited.load(Ordering::Relaxed));
+        // Its next dispatch, in a later frame, waits within the ordinary
+        // budget, at most that.
+        crate::frame::test_advance();
+        let started = Instant::now();
+        assert!(ready(&p).is_none());
+        assert!(started.elapsed() <= wait_budget() + Duration::from_millis(500));
+        // And in all, three dispatches held the title's thread far less
+        // than its watchdog allows.
+        assert!(first + started.elapsed() < Duration::from_secs(5));
+    }
+
     /// A worker that never returns from the host's compile (seen under
     /// Wine) is no longer waited for once it has held the pipeline past the
     /// bound; it is not given up on, and what it makes is used.
@@ -831,6 +1165,7 @@ mod tests {
         let new = || Arc::new(Pending::new(Vec::new(), None));
         let (long, longer, asked, quick) = (new(), new(), new(), new());
         let mut queue = Queue::new();
+        queue.workers = Some(64);
         for p in [&long, &longer, &asked] {
             assert_eq!(queue.push_as(p, EARLY, true), Some(true));
         }
