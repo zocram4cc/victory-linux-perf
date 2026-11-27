@@ -21,3 +21,6 @@ All of them run with GE-Proton11-14 and the view-tree wineserver (`~/Games/victo
 
 | name | commit | made | what this state is |
 |---|---|---|---|
+| `2026-11-27-translator-1105` | `70318d12` | 2026-11-27 04:51 | Current: translator at 1,105 of 2,680 0x218 programs (steps 1-13), huge pages, P.4 off by default. Played by the user 27 Nov ~04:30: like the best runs (15-21 fps). |
+| `2026-11-27-hugepages` | `3e80060d` | 2026-11-27 04:51 | kroeeee's huge pages for renderer port 1 merged, the watcher reading ANSI logs; translator at 715 (P.4 off). Played 27 Nov ~03:20: 15-19 fps with the original save. |
+| `2026-11-26-viewtree` | `81252bb6` | 2026-11-27 04:51 | First good state on this machine: kroeeee's tree + K.1 + the view-tree wineserver (outside the repo), no huge pages, no translator work. Measured 26 Nov ~19:45: 17.0-18.5 fps. |
