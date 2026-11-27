@@ -2834,6 +2834,30 @@ impl HostHeap {
         }
     }
 
+    /// For a UAV clear: makes slot `index` (a dynamic one) the host's view
+    /// of `view`, and gives the resource it views and the same view in this
+    /// thread's slot of the heap the card does not see
+    /// ([`staged`]). `ClearUnorderedAccessView*` takes the view from both,
+    /// and the one it reads on the CPU must not be in a shader-visible heap
+    /// (the driver reads it when the clear is recorded). `None` if the host
+    /// cannot make the view or has no such slot for this thread.
+    pub(crate) fn clear_view_at(
+        &self,
+        index: u32,
+        view: &View,
+    ) -> Option<(ID3D12Resource, D3D12_CPU_DESCRIPTOR_HANDLE)> {
+        if self.sampler {
+            return None;
+        }
+        let beside = staged(false, 0)?;
+        let resource = make(view, beside)??;
+        self.put(index);
+        self.clear_twin(index);
+        self.write_stride(index, 0);
+        self.keep(index, Some(resource.clone()));
+        Some((resource, beside))
+    }
+
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {

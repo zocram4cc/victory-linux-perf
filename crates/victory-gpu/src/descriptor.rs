@@ -1670,6 +1670,113 @@ mod tests {
         );
     }
 
+    /// The title's UAV clears are carried out on the host list
+    /// ([`crate::draw::State::clear_uav`]): a texture cleared whole with
+    /// `ClearUnorderedAccessViewUint`, then one rectangle of it with
+    /// `ClearUnorderedAccessViewFloat`, reads back as the title asked; a
+    /// view of a buffer is left out (its bytes are title memory, which a
+    /// host clear would not reach) and says so.
+    #[cfg(windows)]
+    #[test]
+    fn uav_clears_are_carried_out_on_the_host() {
+        use crate::list::UavValues;
+        use crate::resource::{create_committed, readback_test_descriptions};
+        use windows::Win32::Foundation::RECT;
+        let Some(device) = crate::host::host() else {
+            return; // no host GPU
+        };
+        let null: This = std::ptr::null();
+        // A 256x256 R32_FLOAT title texture with unordered access.
+        let (properties, texture_desc) = readback_test_descriptions();
+        let resource_iid = crate::object::guid(0x696442be, 0xa72e, 0x4059, [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad]);
+        let mut texture: This = null;
+        assert_eq!(
+            create_committed(null, &properties, 0, &texture_desc, 0, null.cast(), &resource_iid, &mut texture),
+            S_OK
+        );
+        let host_texture = crate::resource::host_resource(texture).expect("a host texture").clone();
+        let buffer = crate::resource::test_buffer(256);
+        // A view heap with the title's views of both.
+        let desc = HeapDesc { kind: VIEWS_KIND, count: 4, flags: SHADER_VISIBLE, nodes: 1 };
+        let mut h: This = null;
+        assert_eq!(create(desc, Placement { address: 0, size: 0 }, &mut h), S_OK);
+        let title = heap(h);
+        let (texture_view, buffer_view) = (title.handle(0).unwrap(), title.handle(1).unwrap());
+        create_uav(null, texture, null, std::ptr::null(), texture_view);
+        let buffer_desc: [u32; 10] = [41, 1, 0, 0, 0, 0, 64, 0, 0, 0];
+        create_uav(null, buffer, null, &buffer_desc, buffer_view);
+        let list = device.new_list().expect("a host list");
+        let mut state = crate::draw::State::default();
+        state.set_heaps(&[h]);
+        // 1.0 as bits, everywhere; then 0.5 in x 16..32, y 8..24.
+        state
+            .clear_uav(&list, texture_view, UavValues::Uint([0x3f80_0000; 4]), None)
+            .expect("the whole texture cleared");
+        let rect = RECT { left: 16, top: 8, right: 32, bottom: 24 };
+        state
+            .clear_uav(&list, texture_view, UavValues::Float([0.5; 4]), Some(&[rect]))
+            .expect("one rectangle cleared");
+        assert_eq!(
+            state.clear_uav(&list, buffer_view, UavValues::Uint([0; 4]), None),
+            Err("a buffer"),
+            "a buffer's bytes are title memory: left out"
+        );
+        const COPY_SOURCE: u32 = 0x800;
+        crate::list::ensure_state(&list, texture, COPY_SOURCE);
+        let (readback, footprint) = {
+            use windows::Win32::Graphics::Direct3D12::*;
+            let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+            let mut bytes = 0u64;
+            // SAFETY: a live texture; one subresource.
+            unsafe {
+                let desc = host_texture.GetDesc();
+                device.device.GetCopyableFootprints(&desc, 0, 1, 0, Some(&mut footprint), None, None, Some(&mut bytes));
+            }
+            let readback = device.read_back_buffer(bytes).expect("a read-back buffer");
+            // SAFETY: an open list; the texture is in the copy source state.
+            unsafe {
+                list.list.CopyTextureRegion(
+                    &D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: std::mem::ManuallyDrop::new(Some(readback.clone())),
+                        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
+                    },
+                    0,
+                    0,
+                    0,
+                    &D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: std::mem::ManuallyDrop::new(Some(host_texture.clone())),
+                        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                    },
+                    None,
+                );
+            }
+            (readback, footprint)
+        };
+        list.close();
+        device.execute(&[&list]);
+        // SAFETY: a mapped read-back buffer holding the footprint.
+        let texel = |x: usize, y: usize| unsafe {
+            let mut mapped = std::ptr::null_mut();
+            readback.Map(0, None, Some(&mut mapped)).expect("mapped");
+            let row = mapped.cast::<u8>().add(footprint.Offset as usize + y * footprint.Footprint.RowPitch as usize);
+            let value = row.cast::<f32>().add(x).read_unaligned();
+            readback.Unmap(0, None);
+            value
+        };
+        assert_eq!(texel(0, 0), 1.0, "outside the rectangle: the uint clear's bits");
+        assert_eq!(texel(255, 255), 1.0);
+        assert_eq!(texel(16, 8), 0.5, "inside the rectangle: the float clear");
+        assert_eq!(texel(31, 23), 0.5);
+        assert_eq!(texel(32, 23), 1.0, "the rectangle's right edge is exclusive");
+        drop(state);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        release(h);
+        release(texture);
+        release(buffer);
+    }
+
     #[test]
     fn heaps_hold_count_descriptors_from_their_start() {
         let null = std::ptr::null();

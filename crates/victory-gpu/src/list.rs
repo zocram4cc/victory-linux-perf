@@ -1437,14 +1437,51 @@ extern "system" fn clear_dsv(
     let _ = (this, handle, flags, depth, stencil, count, rects);
 }
 
+/// The values of a UAV clear, as the title passes them.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum UavValues {
+    Uint([u32; 4]),
+    Float([f32; 4]),
+}
+
+impl UavValues {
+    /// Whether every value is zero (all bits: `-0.0` is not).
+    pub(crate) fn zero(self) -> bool {
+        match self {
+            UavValues::Uint(v) => v == [0; 4],
+            UavValues::Float(v) => v.iter().all(|x| x.to_bits() == 0),
+        }
+    }
+
+    fn kind(self) -> &'static str {
+        match self {
+            UavValues::Uint(_) => "uint",
+            UavValues::Float(_) => "float",
+        }
+    }
+
+    fn as_f64(self) -> [f64; 4] {
+        match self {
+            UavValues::Uint(v) => v.map(f64::from),
+            UavValues::Float(v) => v.map(f64::from),
+        }
+    }
+}
+
+/// Whether the host carries out the title's UAV clears
+/// ([`State::clear_uav`](crate::draw::State::clear_uav)); on unless
+/// `VICTORY_UAV_CLEARS=0`, which leaves them all out as before (told about
+/// only). Left out, a clear keeps what the texture held: the shot before's
+/// content after a camera cut, a light list of the frame before.
+#[cfg(windows)]
+fn uav_clears_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UAV_CLEARS").is_none_or(|v| v != "0"))
+}
+
 /// `ClearUnorderedAccessViewUint(view in the heap, view, resource, values,
 /// count, rects)` by the slot after the two other clears (as on PC, where
 /// it follows ClearRenderTargetView; the title calls 0x1a8 from one place).
-/// Not carried out yet: the host clear needs the view in the list's bound
-/// heap and in a CPU heap both, made from the title's view. Told about,
-/// so that a run shows what it clears and when (a clear the host leaves
-/// out keeps what was there, e.g. the shot before's after a camera cut).
-/// shortcut: until a run shows the clears matter, they are only logged.
 extern "system" fn clear_uav_uint(
     this: This,
     gpu: u64,
@@ -1454,12 +1491,12 @@ extern "system" fn clear_uav_uint(
     count: u32,
     rects: *const Rect,
 ) {
-    let values = (!values.is_null()).then(|| {
-        // SAFETY: the title passes four values.
-        let v = unsafe { std::slice::from_raw_parts(values, 4) };
-        [v[0], v[1], v[2], v[3]]
-    });
-    uav_clear_seen("uint", this, gpu, cpu, resource, values.map(|v| v.map(|x| x as f64)), count, rects);
+    if values.is_null() {
+        return;
+    }
+    // SAFETY: the title passes four values.
+    let v = unsafe { std::slice::from_raw_parts(values, 4) };
+    clear_uav(this, gpu, cpu, resource, UavValues::Uint([v[0], v[1], v[2], v[3]]), count, rects);
 }
 
 /// `ClearUnorderedAccessViewFloat(...)`, 0x1b0: as [`clear_uav_uint`].
@@ -1472,30 +1509,64 @@ extern "system" fn clear_uav_float(
     count: u32,
     rects: *const Rect,
 ) {
-    let values = (!values.is_null()).then(|| {
-        // SAFETY: the title passes four values.
-        let v = unsafe { std::slice::from_raw_parts(values, 4) };
-        [v[0], v[1], v[2], v[3]]
-    });
-    uav_clear_seen("float", this, gpu, cpu, resource, values.map(|v| v.map(f64::from)), count, rects);
+    if values.is_null() {
+        return;
+    }
+    // SAFETY: the title passes four values.
+    let v = unsafe { std::slice::from_raw_parts(values, 4) };
+    clear_uav(this, gpu, cpu, resource, UavValues::Float([v[0], v[1], v[2], v[3]]), count, rects);
 }
 
-/// UAV clears seen, since the start.
-static UAV_CLEARS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Tells of a UAV clear the host leaves out: the first 48 each with what
-/// they clear and in which frame (to see whether they come at cuts), then
-/// a count every 1000.
+/// A UAV clear: carried out on the host list
+/// ([`crate::draw::State::clear_uav`]), or told about with the reason it
+/// is not. `cpu` is the title's view (the copy of its record, from a
+/// recording); the host makes its own view in the list's bound heap, so
+/// `gpu` is only reported.
 #[allow(clippy::too_many_arguments)]
-fn uav_clear_seen(
-    kind: &'static str,
-    _list: This,
+pub(crate) fn clear_uav(
+    this: This,
     gpu: u64,
     cpu: u64,
     resource: This,
-    values: Option<[f64; 4]>,
+    values: UavValues,
     count: u32,
-    _rects: *const Rect,
+    rects: *const Rect,
+) {
+    let mut why: Option<&'static str> = Some("VICTORY_UAV_CLEARS=0");
+    #[cfg(windows)]
+    if uav_clears_on() {
+        let rects = (count > 0 && !rects.is_null()).then(|| {
+            // SAFETY: the title passes `count` rectangles, laid out as the host's.
+            unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
+        });
+        why = Some("no host list");
+        with_state(this, |list, state| why = state.clear_uav(list, cpu, values, rects).err());
+    }
+    match why {
+        None => {
+            let n = UAV_CLEARS_DONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n == 1 || n.is_multiple_of(1000) {
+                tracing::info!(n, frame = crate::frame::current(), "UAV clears carried out on the host, since the start");
+            }
+        }
+        Some(why) => uav_clear_seen(values.kind(), why, gpu, cpu, resource, values.as_f64(), count),
+    }
+}
+
+/// UAV clears the host carried out, and those it left out, since the start.
+static UAV_CLEARS_DONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static UAV_CLEARS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Tells of a UAV clear the host leaves out: the first 48 each with what
+/// they clear, why, and in which frame, then a count every 1000.
+fn uav_clear_seen(
+    kind: &'static str,
+    why: &'static str,
+    gpu: u64,
+    cpu: u64,
+    resource: This,
+    values: [f64; 4],
+    count: u32,
 ) {
     let n = UAV_CLEARS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     if n <= 48 {
@@ -1509,6 +1580,7 @@ fn uav_clear_seen(
         let what: Option<String> = None;
         tracing::info!(
             kind,
+            why,
             n,
             frame = crate::frame::current(),
             gpu = format_args!("{gpu:#x}"),
@@ -1517,10 +1589,10 @@ fn uav_clear_seen(
             what = what.as_deref().unwrap_or("no host resource"),
             ?values,
             rects = count,
-            "a UAV clear the host does not carry out (yet)"
+            "a UAV clear the host leaves out"
         );
     } else if n.is_multiple_of(1000) {
-        tracing::info!(kind, n, frame = crate::frame::current(), "UAV clears not carried out, since the start");
+        tracing::info!(kind, n, frame = crate::frame::current(), "UAV clears left out, since the start");
     }
 }
 

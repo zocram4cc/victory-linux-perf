@@ -1544,6 +1544,127 @@ impl State {
         true
     }
 
+    /// Binds the host heaps behind the title heaps the list has set, if they
+    /// are not bound yet (a view heap and a sampler heap: the title's, or
+    /// the host's fallbacks).
+    pub(crate) fn set_host_heaps(&mut self, list: &HostList) {
+        if self.host_heaps_set && self.host_heaps == self.heaps {
+            return;
+        }
+        let l = &list.list;
+        let mut view_heap: Option<ID3D12DescriptorHeap> = None;
+        let mut sampler_heap: Option<ID3D12DescriptorHeap> = None;
+        for &h in &self.heaps {
+            if h == 0 {
+                continue;
+            }
+            let title_heap = crate::descriptor::heap(h as This);
+            if let Some(host_heap) = title_heap.host() {
+                if title_heap.samplers() {
+                    sampler_heap = Some(host_heap.heap.clone());
+                } else {
+                    view_heap = Some(host_heap.heap.clone());
+                }
+            }
+        }
+        if view_heap.is_none() {
+            view_heap = crate::host::host().and_then(|h| h.fallback_view_heap().cloned());
+        }
+        if sampler_heap.is_none() {
+            sampler_heap = crate::host::host().and_then(|h| h.fallback_sampler_heap().cloned());
+        }
+        let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = Vec::with_capacity(2);
+        if let Some(h) = view_heap {
+            list.keep(&h);
+            heaps.push(Some(h));
+        }
+        if let Some(h) = sampler_heap {
+            list.keep(&h);
+            heaps.push(Some(h));
+        }
+        if !heaps.is_empty() {
+            // SAFETY: an open list and shader-visible heaps.
+            unsafe { l.SetDescriptorHeaps(&heaps) };
+        }
+        self.host_heaps = self.heaps;
+        self.host_heaps_set = true;
+        self.host_roots = [0; 2];
+    }
+
+    /// Carries out a UAV clear (`ClearUnorderedAccessViewUint/Float`) of
+    /// the view recorded at `cpu`: the host's view of it is made in a
+    /// dynamic slot of the list's bound view heap (given back with the
+    /// list's others) and beside it in a heap the card does not see, the
+    /// texture is moved to the unordered access state, and the host clears
+    /// it with the title's values and rectangles. The reason it is not, for
+    /// the cases left out: buffers (their bytes are title memory, which a
+    /// host clear of the host copy would not reach), placed views, depth
+    /// textures (their unordered access is a colour twin's), and textures
+    /// in a stand-in format cleared to anything but zeros (the bits would
+    /// not be the title's).
+    pub(crate) fn clear_uav(
+        &mut self,
+        list: &HostList,
+        cpu: u64,
+        values: crate::list::UavValues,
+        rects: Option<&[windows::Win32::Foundation::RECT]>,
+    ) -> Result<(), &'static str> {
+        const BUFFER: u32 = 1;
+        const UNORDERED_ACCESS: u32 = 0x8;
+        let view = crate::descriptor::view(cpu).ok_or("not a view the host knows")?;
+        let resource = match &view {
+            View::Unordered(r, _, desc) => {
+                if crate::resource::buffer_bytes(*r as This).is_some() || desc.is_some_and(|d| d[1] == BUFFER) {
+                    return Err("a buffer");
+                }
+                *r as This
+            }
+            View::Placed(true, ..) => return Err("a placed view"),
+            _ => return Err("not an unordered access view"),
+        };
+        if crate::resource::twin_resource(resource).is_some()
+            || crate::resource::twin_plane_resource(resource).is_some()
+        {
+            return Err("a depth texture (its colour twin)");
+        }
+        if crate::resource::stands_in(resource) && !values.zero() {
+            return Err("a stand-in format, values other than zeros");
+        }
+        let heap = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())
+            .ok_or("no view heap bound")?;
+        let host = heap.host().ok_or("no host view heap")?;
+        let index = host
+            .dynamic(1)
+            .or_else(|| {
+                crate::host::settle_for_fence();
+                host.dynamic(1)
+            })
+            .ok_or("no free dynamic slot")?;
+        self.dynamic.push((std::ptr::from_ref(heap) as usize, index, 1));
+        let (texture, beside) = host.clear_view_at(index, &view).ok_or("the host cannot make the view")?;
+        self.set_host_heaps(list);
+        crate::list::ensure_state(list, resource, UNORDERED_ACCESS);
+        let gpu = host.gpu_handle(index);
+        // SAFETY: an open list with the view heap of `gpu` bound; the view
+        // at `beside` is of `texture`, which the list keeps.
+        unsafe {
+            match values {
+                crate::list::UavValues::Uint(v) => {
+                    list.list.ClearUnorderedAccessViewUint(gpu, beside, &texture, &v, rects.unwrap_or(&[]))
+                }
+                crate::list::UavValues::Float(v) => {
+                    list.list.ClearUnorderedAccessViewFloat(gpu, beside, &texture, &v, rects.unwrap_or(&[]))
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// A descriptor a shader reads through a table: its host slot made if
     /// it changed, constant data copied, textures made readable.
     /// What draws and dispatches share: heaps, our root signature, the
@@ -1569,45 +1690,7 @@ impl State {
         }
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them, with both a view heap and a sampler heap bound.
-        if !self.host_heaps_set || self.host_heaps != self.heaps {
-            let mut view_heap: Option<ID3D12DescriptorHeap> = None;
-            let mut sampler_heap: Option<ID3D12DescriptorHeap> = None;
-            for &h in &self.heaps {
-                if h == 0 {
-                    continue;
-                }
-                let title_heap = crate::descriptor::heap(h as This);
-                if let Some(host_heap) = title_heap.host() {
-                    if title_heap.samplers() {
-                        sampler_heap = Some(host_heap.heap.clone());
-                    } else {
-                        view_heap = Some(host_heap.heap.clone());
-                    }
-                }
-            }
-            if view_heap.is_none() {
-                view_heap = crate::host::host().and_then(|h| h.fallback_view_heap().cloned());
-            }
-            if sampler_heap.is_none() {
-                sampler_heap = crate::host::host().and_then(|h| h.fallback_sampler_heap().cloned());
-            }
-            let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = Vec::with_capacity(2);
-            if let Some(h) = view_heap {
-                list.keep(&h);
-                heaps.push(Some(h));
-            }
-            if let Some(h) = sampler_heap {
-                list.keep(&h);
-                heaps.push(Some(h));
-            }
-            if !heaps.is_empty() {
-                // SAFETY: an open list and shader-visible heaps.
-                unsafe { l.SetDescriptorHeaps(&heaps) };
-            }
-            self.host_heaps = self.heaps;
-            self.host_heaps_set = true;
-            self.host_roots = [0; 2];
-        }
+        self.set_host_heaps(list);
         // The depth target a draw only tests, for the views of it that the
         // draw's shaders read (`readable`).
         let tested = if !compute && self.depth_state == DEPTH_READ {

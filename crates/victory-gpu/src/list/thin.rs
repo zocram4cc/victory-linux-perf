@@ -469,6 +469,7 @@ const TARGETS: u64 = after(13);
 const CLEAR_RTV: u64 = after(14);
 const CLEAR_DSV: u64 = after(15);
 const COPY_TEXTURE: u64 = after(16);
+const CLEAR_UAV: u64 = after(17);
 
 /// The bytes of `count` things at `items` (none if null).
 fn bytes_of<'a, T>(items: *const T, count: usize) -> &'a [u8] {
@@ -645,6 +646,67 @@ extern "system" fn clear_dsv(
         &[bytes_of(view.as_ptr(), RECORD), bytes_of(rects, count as usize)],
     );
 }
+
+/// A shader view's record as it is now (its tag, index and generation; zeros
+/// for none): what [`crate::descriptor::view`] reads, copied so that the
+/// slot may be written again before the clear is played.
+fn view_record(handle: u64) -> [u64; 2] {
+    let mut words = [0u64; 2];
+    if handle != 0 {
+        // SAFETY: a descriptor slot the title passes (they are larger).
+        unsafe { std::ptr::copy_nonoverlapping(handle as *const u8, words.as_mut_ptr().cast(), 12) };
+    }
+    words
+}
+
+/// The UAV clears, written down: count, kind (0 uint, 1 float), the title's
+/// resource and GPU handle; then the view's record, the four values and the
+/// rectangles.
+#[allow(clippy::too_many_arguments)]
+fn clear_uav(this: This, gpu: u64, cpu: u64, resource: This, kind: u64, values: [u32; 4], count: u32, rects: *const Rect) {
+    if cpu == 0 {
+        return;
+    }
+    let count = if rects.is_null() { 0 } else { count };
+    let view = view_record(cpu);
+    front(this).put_with(
+        CLEAR_UAV,
+        &[u64::from(count), kind, resource as u64, gpu],
+        &[bytes_of(view.as_ptr(), 2), bytes_of(values.as_ptr(), 4), bytes_of(rects, count as usize)],
+    );
+}
+extern "system" fn clear_uav_uint(
+    this: This,
+    gpu: u64,
+    cpu: u64,
+    resource: This,
+    values: *const u32,
+    count: u32,
+    rects: *const Rect,
+) {
+    if values.is_null() {
+        return;
+    }
+    // SAFETY: the title passes four values.
+    let v = unsafe { values.cast::<[u32; 4]>().read_unaligned() };
+    clear_uav(this, gpu, cpu, resource, 0, v, count, rects);
+}
+extern "system" fn clear_uav_float(
+    this: This,
+    gpu: u64,
+    cpu: u64,
+    resource: This,
+    values: *const f32,
+    count: u32,
+    rects: *const Rect,
+) {
+    if values.is_null() {
+        return;
+    }
+    // SAFETY: the title passes four values; kept as their bits.
+    let v = unsafe { values.cast::<[u32; 4]>().read_unaligned() };
+    clear_uav(this, gpu, cpu, resource, 1, v, count, rects);
+}
 extern "system" fn copy_texture_region(
     this: This,
     dst: *const CopyLocation,
@@ -766,6 +828,18 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
                     at(w, 3 + RECORD, n),
                 );
             }
+            CLEAR_UAV => {
+                // count, kind, resource, gpu; the record (2 words), the
+                // values (2 words), the rectangles.
+                // SAFETY: four values were written after the record.
+                let v = unsafe { at_or::<[u32; 4]>(w, 6).read_unaligned() };
+                let values = if w[1] == 0 {
+                    super::UavValues::Uint(v)
+                } else {
+                    super::UavValues::Float(v.map(f32::from_bits))
+                };
+                super::clear_uav(list, w[3], w[4..].as_ptr() as u64, w[2] as This, values, n as u32, at(w, 8, n));
+            }
             COPY_TEXTURE => {
                 let step = size_of::<CopyLocation>().div_ceil(8);
                 let boxed = (w[1] >> 32) as usize;
@@ -802,7 +876,7 @@ pub(super) const fn table(newer: bool) -> [*const (); 160] {
     f
 }
 
-const MINE: [(usize, *const ()); 50] = [
+const MINE: [(usize, *const ()); 52] = [
     (9, list_close as *const ()),
     (10, list_reset as *const ()),
     (12, draw as *const ()),
@@ -838,6 +912,8 @@ const MINE: [(usize, *const ()); 50] = [
     (50, targets as *const ()),
     (51, clear_dsv as *const ()),
     (52, clear_rtv as *const ()),
+    (53, clear_uav_uint as *const ()),
+    (54, clear_uav_float as *const ()),
     (59, execute_indirect as *const ()),
     (60, copy_memory as *const ()),
     (68, depth_bounds as *const ()),
@@ -863,8 +939,7 @@ mod tests {
     /// left in both tables alike records nothing.
     #[test]
     fn every_recording_method_is_written_down() {
-        // (53 and 54, the UAV clears, are only told about for now.)
-        const NOTHING: [usize; 18] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 28, 29, 33, 34, 53, 54, 73, 99, 124];
+        const NOTHING: [usize; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 28, 29, 33, 34, 73, 99, 124];
         let mine: Vec<usize> = MINE.iter().map(|m| m.0).collect();
         for (slot, _) in METHODS.iter().chain(MORE_METHODS.iter()) {
             assert!(mine.contains(slot) != NOTHING.contains(slot), "slot {slot}");
