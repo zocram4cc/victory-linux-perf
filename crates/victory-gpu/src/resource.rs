@@ -1453,6 +1453,20 @@ pub(crate) fn want_level(this: This, first: u32) {
 pub(crate) static KINDS: [std::sync::atomic::AtomicU64; 7] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 7];
 
+/// Bytes already scheduled for eviction but still counted as live.
+#[cfg(windows)]
+static RETIRING_TEXTURE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(windows)]
+struct RetiringTextureBytes(u64);
+
+#[cfg(windows)]
+impl Drop for RetiringTextureBytes {
+    fn drop(&mut self) {
+        RETIRING_TEXTURE_BYTES.fetch_sub(self.0, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// Every title texture alive (not buffers), by address: for the sweep and
 /// the memory line. A texture leaves the table before it is freed.
 #[cfg(windows)]
@@ -1841,6 +1855,43 @@ fn texture_floor_bytes(vram_budget: Option<u64>) -> u64 {
     }
 }
 
+#[cfg(windows)]
+fn texture_budget_bytes() -> Option<u64> {
+    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
+        mb.trim().parse::<u64>().ok().map(|mb| mb << 20)
+    })
+}
+
+// (With the tiles of the copies made level by level, whose own bytes
+// count as none: `crate::tiles`.)
+#[cfg(windows)]
+fn filled_texture_bytes() -> u64 {
+    KINDS[1].load(std::sync::atomic::Ordering::Relaxed) + crate::tiles::given_total()
+}
+
+/// Aim for 5% headroom under the texture cap after queued retirements finish.
+/// Keep the DXGI target separate: freeing tiles can leave their heap resident.
+#[cfg(any(windows, test))]
+fn sweep_for_texture_budget(
+    (idle_ms, dxgi_bytes): (u64, u64),
+    filled: u64,
+    retiring: u64,
+    limit: u64,
+) -> (u64, u64, u64) {
+    if limit == 0 || filled < limit {
+        return (idle_ms, dxgi_bytes, 0);
+    }
+    let dxgi_bytes = if dxgi_bytes == u64::MAX { 0 } else { dxgi_bytes };
+    let remaining = filled.saturating_sub(retiring);
+    if remaining < limit {
+        return (idle_ms, dxgi_bytes, 0);
+    }
+    let target = limit - (limit / 20).max(1);
+    (idle_ms.min(5000), dxgi_bytes, remaining - target)
+}
+
 /// Whether more host copies of textures the title fills may be made for
 /// shaders that pick textures by index (`draw.rs` `heap_textures`): always
 /// up to [`texture_floor_bytes`] bytes of them, beyond that while the card's
@@ -1850,17 +1901,9 @@ fn texture_floor_bytes(vram_budget: Option<u64>) -> u64 {
 /// which ended runs 20 and 24.
 #[cfg(windows)]
 pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
-    use std::sync::atomic::Ordering::Relaxed;
     const WITHOUT_BUDGET: u64 = 4 << 30;
-    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    let limit = *LIMIT.get_or_init(|| {
-        let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
-        mb.trim().parse::<u64>().ok().map(|mb| mb << 20)
-    });
-    // (With the tiles of the copies made level by level, whose own bytes
-    // count as none: `crate::tiles`.)
-    let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
-    if let Some(limit) = limit {
+    let filled = filled_texture_bytes();
+    if let Some(limit) = texture_budget_bytes() {
         return filled < limit;
     }
     let floor = texture_floor_bytes(memory.map(|[budget, ..]| budget));
@@ -2187,7 +2230,7 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
 /// `VICTORY_TEXTURE_SWEEP=0` lets nothing go.
 #[cfg(windows)]
 pub(crate) fn let_go_idle() {
-    use std::sync::atomic::Ordering::Relaxed;
+    use std::sync::atomic::Ordering::{Acquire, Relaxed};
     const IDLE_FRAMES: u64 = 4;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
@@ -2208,7 +2251,7 @@ pub(crate) fn let_go_idle() {
     static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let keep = *KEEP
         .get_or_init(|| !matches!(std::env::var("VICTORY_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
-    let (idle_ms, most) = match memory {
+    let (mut idle_ms, mut most) = match memory {
         Some([budget, used, ..]) if keep => {
             let used = used.saturating_sub(crate::pool::texture_room())
                 + crate::shadow::card_room_kept()
@@ -2217,10 +2260,37 @@ pub(crate) fn let_go_idle() {
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
     };
+    // A texture budget (`VICTORY_TEXTURE_BUDGET_MB`) that is full: the
+    // copies idle for five seconds go, the longest idle first, down to 95 %
+    // of it. Before, a full budget only refused new copies ([`room`]) and
+    // nothing went until the whole card was short, so what the budget held
+    // was whatever had come first (Belobug PR #512).
+    // `VICTORY_TEXTURE_BUDGET_SWEEP=0`: as before. Without a budget set,
+    // nothing changes.
+    static BUDGET_SWEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let limit = if keep
+        && *BUDGET_SWEEP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_BUDGET_SWEEP").is_none_or(|v| v != "0"))
+    {
+        texture_budget_bytes().filter(|&bytes| bytes > 0)
+    } else {
+        None
+    };
+    let began = std::time::Instant::now();
+    let all = textures();
+    let mut texture_most = 0;
+    if let Some(limit) = limit {
+        // If a queued copy just dropped, read the live counters after its decrement.
+        let retiring = RETIRING_TEXTURE_BYTES.load(Acquire);
+        (idle_ms, most, texture_most) =
+            sweep_for_texture_budget((idle_ms, most), filled_texture_bytes(), retiring, limit);
+    }
+    if most == 0 && texture_most == 0 {
+        return;
+    }
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
-    let all = textures();
+    let mut dxgi_bytes = 0;
     // With a limit, the longest idle first.
     let mut by_age: Vec<(u64, usize)> = Vec::new();
     if most != u64::MAX {
@@ -2250,9 +2320,8 @@ pub(crate) fn let_go_idle() {
     };
     let from = if part == PART { FROM.load(Relaxed) } else { 0 };
     let mut looked = 0;
-    let began = std::time::Instant::now();
     for at in all.range(from..).take(part).copied().chain(by_age.iter().map(|&(_, at)| at)) {
-        if bytes >= most {
+        if dxgi_bytes >= most && bytes >= texture_most {
             break;
         }
         looked += 1;
@@ -2280,22 +2349,30 @@ pub(crate) fn let_go_idle() {
                 // state of the texture let go (it says "uploaded").
                 crate::texture::unstage(at as This);
                 r.host.wanted.store(u32::MAX, Relaxed);
+                r.host.used.store(0, Relaxed);
+                r.host.gone.store(true, Relaxed);
                 made.take()
             } else {
                 None
             }
         };
         if let Some((host, _)) = gone {
-            r.host.gone.store(true, Relaxed);
             KINDS[2].fetch_add(1, Relaxed);
             let freed = host.card_bytes();
             KINDS[3].fetch_add(freed, Relaxed);
             went += 1;
             bytes += freed;
+            dxgi_bytes += host.bytes;
             if first.is_none() {
                 first = Some(at);
             }
-            crate::host::retire(host);
+            if limit.is_some() {
+                RETIRING_TEXTURE_BYTES.fetch_add(freed, Relaxed);
+                // The host copy drops before its pending byte count.
+                crate::host::retire((host, RetiringTextureBytes(freed)));
+            } else {
+                crate::host::retire(host);
+            }
         }
     }
     SWEPT_US[0].fetch_add(1, Relaxed);
@@ -2452,7 +2529,7 @@ fn host_bytes(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) ->
 #[cfg(windows)]
 impl HostTexture {
     /// The bytes backed by card memory, counting only mapped tiles for reserved textures.
-    fn card_bytes(&self) -> u64 {
+    pub(crate) fn card_bytes(&self) -> u64 {
         self.tiled.as_ref().map_or(self.bytes, crate::tiles::Tiled::given_bytes)
     }
 
@@ -2489,7 +2566,7 @@ impl HostTexture {
 
     /// A texture made without memory of its own (`crate::tiles`): counted
     /// as a host texture of no bytes.
-    fn new_tiled(
+    pub(super) fn new_tiled(
         texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
         state: u32,
         tiled: crate::tiles::Tiled,
@@ -5141,6 +5218,44 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(texture_floor_bytes(Some(12 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(24 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(32 * GIB)), 2 * GIB);
+    }
+
+    #[test]
+    fn a_full_texture_budget_reclaims_space_before_global_vram_pressure() {
+        const MIB: u64 = 1 << 20;
+        let keep = (600_000, u64::MAX);
+        let limit = 1600 * MIB;
+        assert_eq!(sweep_for_texture_budget(keep, limit - 1, 0, limit), (keep.0, keep.1, 0));
+        assert_eq!(sweep_for_texture_budget(keep, limit, 0, limit), (5000, 0, 80 * MIB));
+        assert_eq!(sweep_for_texture_budget(keep, limit + 20 * MIB, 0, limit), (5000, 0, 100 * MIB));
+        assert_eq!(sweep_for_texture_budget(keep, limit, 0, 0), (keep.0, keep.1, 0));
+    }
+
+    #[test]
+    fn a_texture_budget_combines_with_global_vram_pressure() {
+        const MIB: u64 = 1 << 20;
+        let pressure = (3000, 100 * MIB);
+        let limit = 1600 * MIB;
+        assert_eq!(sweep_for_texture_budget(pressure, limit, 0, limit), (3000, 100 * MIB, 80 * MIB));
+        assert_eq!(
+            sweep_for_texture_budget(pressure, limit + 40 * MIB, 0, limit),
+            (3000, 100 * MIB, 120 * MIB)
+        );
+    }
+
+    #[test]
+    fn pending_evictions_are_credited_to_the_next_texture_sweep() {
+        const MIB: u64 = 1 << 20;
+        let keep = (600_000, u64::MAX);
+        let limit = 1600 * MIB;
+        let (_, _, first) = sweep_for_texture_budget(keep, limit, 0, limit);
+        assert_eq!(sweep_for_texture_budget(keep, limit, first, limit), (keep.0, 0, 0));
+        assert_eq!(sweep_for_texture_budget((5000, u64::MAX), limit, first, limit), (5000, 0, 0));
+        assert_eq!(sweep_for_texture_budget((3000, 100 * MIB), limit, first, limit), (3000, 100 * MIB, 0));
+        assert_eq!(
+            sweep_for_texture_budget(keep, limit + first + 20 * MIB, first, limit),
+            (5000, 0, 100 * MIB)
+        );
     }
 
     /// A placed texture viewed from a later level has a host copy of that
