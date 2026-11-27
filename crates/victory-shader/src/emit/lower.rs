@@ -2295,13 +2295,25 @@ impl<'a> Lower<'a> {
                     dword(self, at)?
                 }
                 Some((width, signed)) => {
-                    // shortcut: the field is taken not to cross a dword.
+                    // A half at byte 3 continues in the next dword.
                     let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
                     let at = self.s.m.bin(c, Bin::And, off, not3);
                     let w = dword(self, at)?;
                     let byte = self.s.m.bin(c, Bin::And, off, three);
                     let sh = self.s.m.bin(c, Bin::Shl, byte, three);
-                    let x = self.s.m.bin(c, Bin::LShr, w, sh);
+                    let mut x = self.s.m.bin(c, Bin::LShr, w, sh);
+                    if width == 16 {
+                        let straddles = self.s.m.cmp(c, pred::EQ, byte, three);
+                        let [four, eight, zero] = [4, 8, 0].map(|k| self.s.m.i32(k));
+                        let next = self.s.m.bin(c, Bin::Add, at, four);
+                        // Otherwise read the same dword again, without an
+                        // access past the end for an aligned final half.
+                        let next = self.s.m.select(c, straddles, next, at);
+                        let high = dword(self, next)?;
+                        let high = self.s.m.bin(c, Bin::Shl, high, eight);
+                        let high = self.s.m.select(c, straddles, high, zero);
+                        x = self.s.m.bin(c, Bin::Or, x, high);
+                    }
                     let left = self.s.m.i32(32 - width);
                     let x = self.s.m.bin(c, Bin::Shl, x, left);
                     self.s

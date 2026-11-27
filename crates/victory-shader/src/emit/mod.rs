@@ -103,6 +103,8 @@ pub mod validator;
 #[cfg(all(test, windows))]
 mod probe_tests;
 #[cfg(all(test, windows))]
+mod raw_load_tests;
+#[cfg(all(test, windows))]
 mod size_tests;
 #[cfg(all(test, windows))]
 mod valu_tests;
