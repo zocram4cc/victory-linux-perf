@@ -1128,10 +1128,27 @@ impl<'a> Tracer<'a> {
                             (None, None) => "phi".to_owned(),
                         })
                         .collect();
+                    let ops = |v: Value| -> String {
+                        match self.sop2(v, &["s_or_b32", "s_add_u32", "s_lshl_b32", "s_and_b32"]) {
+                            Some((i, [a, b])) => {
+                                let t = |t: Term| match t {
+                                    Term::Const(c) => format!("{c:#x}"),
+                                    Term::Value(x) => match (self.def(x), self.inputs[x.0 as usize]) {
+                                        (_, Some(r)) => format!("in{r:?}"),
+                                        (Some(d), None) => d.name().to_owned(),
+                                        (None, None) => "phi".to_owned(),
+                                    },
+                                };
+                                format!("{}({}, {})", i.name(), t(a), t(b))
+                            }
+                            None => String::new(),
+                        }
+                    };
                     eprintln!(
-                        "WHY-ADDRESS made by {} from leaves [{}]",
+                        "WHY-ADDRESS made by {} from leaves [{}] {}",
                         inst.map_or("?", |i| i.name()),
-                        leaves.join(", ")
+                        leaves.join(", "),
+                        ops(v)
                     );
                 }
                 "an address not from a root parameter"

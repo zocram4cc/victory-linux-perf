@@ -75,6 +75,9 @@ fn main() {
             continue;
         };
         let c = assemble(&packet, &hash, &code, &meta);
+        if std::env::var_os("VICTORY_WHY_ADDRESS").is_some() || std::env::var_os("VICTORY_WHY_DESCRIPTOR").is_some() {
+            eprintln!("PROGRAM {name}");
+        }
         let parsed = victory_shader::Container::parse(&c)
             .map_err(|e| e.to_string())
             .and_then(|c| victory_shader::native_programs(c.part(victory_shader::FourCC::ACCC).unwrap().data).map_err(|e| format!("fspx: {e}")));
