@@ -2593,9 +2593,10 @@ fn show(base: usize, len: usize, slice: &Slice, own: bool, quiet: bool) -> bool 
     if view.Value as usize != base {
         cost(cost::REFUSED, 1);
     }
-    // (Only with the runs of [`wine_switch`], which map runs over pages
-    // unmapped singly: with them off, a refusal fails as before.)
-    if view.Value as usize != base && len > PAGE && (join_views() || scatter_runs() || alias_runs()) {
+    // (With or without the runs of [`wine_switch`]: a call of the title's
+    // maps a run of slices as one view too, and failed here where its pages
+    // had been unmapped one at a time.)
+    if view.Value as usize != base && len > PAGE {
         // The range may be several placeholders (a run of pages mapped over
         // pages unmapped singly was refused).
         // SAFETY: reads and restores this thread's error.
