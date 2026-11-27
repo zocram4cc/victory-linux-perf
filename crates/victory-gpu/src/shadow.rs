@@ -3972,8 +3972,20 @@ impl Shadow {
     pub(crate) fn card_owns(&self, address: usize, len: usize) {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
+        if from >= to {
+            return;
+        }
         self.card_owned.lock().unwrap_or_else(|e| e.into_inner()).add(from, to);
         crate::census::note(from, to);
+        // Title memory there holds older bytes than the card: a refresh of a
+        // part the CPU wrote sends up only the dwords it changed, not the
+        // part whole over what shaders wrote beside them ([`send_changed`]:
+        // the CPU's side holds what title memory held, as nothing comes back).
+        if self.card.is_some() {
+            self.keep_stores();
+        } else {
+            crate::wc::uncarded((to - from) as u64);
+        }
     }
 
     /// At submission: copies what changed of `[address, address + len)`
@@ -4004,7 +4016,12 @@ impl Shadow {
         if !matches!(self.watched.load(Ordering::Relaxed), 1 | GUARDED) {
             let owned = self.card_owned.lock().unwrap_or_else(|e| e.into_inner());
             if !owned.is_empty() {
+                let before = busy.len();
                 busy.extend(owned.overlapping(from, to));
+                let left: usize = busy[before..].iter().map(|&(a, e)| e.min(to) - a.max(from)).sum();
+                if left != 0 {
+                    crate::wc::unwatched(left as u64);
+                }
             }
         }
         if !busy.is_empty() {
