@@ -106,10 +106,22 @@ struct Last {
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
+    /// The last read of a partly mapped texture found nothing but zeros: it
+    /// is the one a streaming arrival changes next, so it is looked at again
+    /// in a frame or two rather than after thirty ([`partial_every`];
+    /// DoubleGhosty c34104617: character skins stayed black for seconds on
+    /// an 8 GB card).
+    zero: bool,
     /// Until this frame a guarded texture is hashed at every check: its
     /// first checks, and after the hash found a change the guard had not
     /// seen ([`hot_textures`]). 0: not checked under the guard yet.
     hot_until: u64,
+}
+
+/// Frames between reads of a partly mapped texture: 2 while its last read
+/// found nothing but zeros (the pages a stream fills next), 30 otherwise.
+fn partial_every(last: &Last) -> u64 {
+    if last.zero { 2 } else { 30 }
 }
 
 /// Frames a guarded texture is hashed at every check from its first check,
@@ -1354,7 +1366,8 @@ impl Staging {
             // unmapped pages is slow, and nothing tells us when pages
             // arrive): a mip that streams in shows up to 30 frames late.
             let frame = crate::frame::current();
-            if !exact && last.partial.is_some_and(|at| frame < at + 30) {
+            let every = partial_every(last);
+            if !exact && last.partial.is_some_and(|at| frame < at + every) {
                 return 0;
             }
             last.partial = Some(frame);
@@ -1368,8 +1381,10 @@ impl Staging {
                 }
                 last.hash = Some(hash);
                 if read.iter().all(|&b| b == 0) {
+                    last.zero = true;
                     return false;
                 }
+                last.zero = false;
                 self.detile(read);
                 true
             });
@@ -1942,6 +1957,21 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod partial_tests {
+    use super::{Last, partial_every};
+
+    /// A partly mapped texture whose last read found only zeros is read
+    /// again in 2 frames, one with something in it after 30.
+    #[test]
+    fn a_texture_read_as_zeros_is_looked_at_again_soon() {
+        let mut last = Last::default();
+        assert_eq!(partial_every(&last), 30);
+        last.zero = true;
+        assert_eq!(partial_every(&last), 2);
+    }
 }
 
 #[cfg(test)]
