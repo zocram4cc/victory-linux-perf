@@ -1096,6 +1096,27 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
     if (0..n).any(|r| reads[r] && writes[r]) && !LDS_LOOSE.get() {
         return None;
     }
+    // `VICTORY_WAVE_WHY`: where the shortcut above is taken, a region that writes LDS from two
+    // or more instructions that are not atomics (whose order among lanes the console leaves
+    // open anyway), and no read: those two halves' writes are ordered by nothing.
+    if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+        let mut plain: std::collections::HashMap<usize, Vec<u32>> = Default::default();
+        for (b, block) in p.blocks.iter().enumerate().take(n) {
+            if all[b] {
+                continue;
+            }
+            let r = find(&mut region, b);
+            for i in &block.insts {
+                let name = i.name();
+                if matches!(i.fields, Fields::Ds { .. }) && name.starts_with("ds_write") {
+                    plain.entry(r).or_default().push(i.machine.offset as u32);
+                }
+            }
+        }
+        for (r, at) in plain.iter().filter(|(r, at)| at.len() > 1 && !reads[**r]) {
+            eprintln!("LDS-WRITES-UNORDERED region of B{r}: {} plain writes at {:x?}", at.len(), at);
+        }
+    }
     let mut meet = vec![(false, false); n];
     for b in 0..n {
         for t in succ(b) {
