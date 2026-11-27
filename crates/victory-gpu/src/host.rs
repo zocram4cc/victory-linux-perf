@@ -4290,6 +4290,7 @@ pub(crate) mod aside;
 pub(crate) mod awake;
 pub(crate) mod framecsv;
 mod card_steps;
+mod compare;
 #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) mod indirects;
 #[cfg(feature = "diagnostics")]
@@ -5068,9 +5069,9 @@ impl Host {
             up,
             ringed: false,
         };
-        // Each byte once, as the copy-back joins the declared ranges. The
-        // results go behind those of plans still in the air.
-        let mut at = work.taken;
+        // The copy-back uses byte ranges, but the GPU compares whole pieces.
+        // Put the new results behind those of plans still in the air.
+        let mut compares = compare::Plan::new(work.taken, (work.differs.2 / 4) as u32, compare::sharing());
         for (shadow, ranges) in &declared {
             let mut sorted = ranges.clone();
             sorted.sort_unstable();
@@ -5086,25 +5087,22 @@ impl Host {
                 let Some(span) = shadow.card_span(from, to) else {
                     continue;
                 };
-                let compared = twin && u64::from(at + span.pieces) * 4 <= work.differs.2;
+                let result = twin.then(|| compares.add(shadow, span, false)).flatten();
                 plan.ranges.push(CardRange {
                     shadow: shadow.clone(),
                     declared: (from, to),
                     span,
-                    at,
-                    compared,
+                    at: result.unwrap_or(0),
+                    compared: result.is_some(),
                     picked: false,
                 });
-                if compared {
-                    at += span.pieces;
-                }
             }
         }
         for (shadow, from, len) in looked {
             let twin = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
             if let Some(span) = shadow.card_span(*from, from + len)
                 && twin
-                && u64::from(at + span.pieces) * 4 <= work.differs.2
+                && let Some(at) = compares.add(shadow, span, true)
             {
                 plan.ranges.push(CardRange {
                     shadow: shadow.clone(),
@@ -5114,11 +5112,10 @@ impl Host {
                     compared: true,
                     picked: true,
                 });
-                at += span.pieces;
             }
         }
-        work.taken = at;
-        if plan.ranges.iter().any(|r| r.compared) {
+        work.taken = compares.taken;
+        if !compares.passes.is_empty() {
             let Some(check) = work.check.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list for the compare of host copies in the card's memory"));
             };
@@ -5149,19 +5146,20 @@ impl Host {
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
                     work.bind_ring(list);
-                    for r in plan.ranges.iter().filter(|r| r.compared) {
-                        let (Some((_, Some(before), _)), size) = (r.shadow.card_sides(), r.shadow.card_hash_size()) else {
+                    for pass in &compares.passes {
+                        let (Some((_, Some(before), _)), size) = (pass.shadow.card_sides(), pass.shadow.card_hash_size()) else {
                             continue;
                         };
-                        list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
+                        list.SetComputeRootShaderResourceView(1, pass.shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
                         // (What is only looked at keeps its hashes: what
                         // changed there is the next declared range's to land.
                         // Only what lands comes down by the ring.)
-                        let mode = if flown && !r.picked { 2 } else { 1 };
-                        let mode = if ringed && !r.picked { mode | 4 } else { mode };
-                        card_pass(list, &r.span, size as u32, r.at, mode, work.ring_size());
+                        let mode = if flown && !pass.picked { 2 } else { 1 };
+                        let mode = if ringed && !pass.picked { mode | 4 } else { mode };
+                        card_pass(list, &pass.span, size as u32, pass.at, mode, work.ring_size());
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
+                        crate::shadow::CARD_STATS[2].fetch_add(u64::from(pass.span.pieces), Ordering::Relaxed);
                     }
                     list.Close()?;
                     list.cast()
@@ -5372,7 +5370,6 @@ impl Host {
                             total += (hi - lo) as u64;
                         }
                     }
-                    crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
                 }
             }
         }
@@ -5774,7 +5771,6 @@ impl Host {
                     total += (hi - lo) as u64;
                 }
             }
-            crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
         }
         let mut written = vec![0usize; plan.ranges.len()];
         if !pieces.is_empty() {
