@@ -9,9 +9,6 @@
 //! CPU to a buffer the card writes, words the card has written since the
 //! start of the frame (which are not what was last put there) stay.
 
-use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-use windows::Win32::Graphics::Direct3D::ID3DBlob;
-
 use super::*;
 
 const SOURCE: &str = r#"
@@ -152,29 +149,14 @@ impl Player {
         if !on || self.merger.is_some() {
             return Ok(());
         }
-        let mut code: Option<ID3DBlob> = None;
-        // SAFETY: the source and names live through the call; the blob's own
-        // bytes.
+        // Through `host::compile`: Wine's d3dcompiler_47 drops the
+        // [RootSignature] the source declares, and the root signature and
+        // pipeline made from its blob were refused under vkd3d-proton
+        // ("Invalid shader", 0x80004005), so no replay ran on Linux.
+        let bytes = crate::host::compile(SOURCE, windows::core::s!("main"), windows::core::s!("cs_5_1"))?;
+        // SAFETY: the bytes live through the calls.
         let (root, pso) = unsafe {
-            D3DCompile(
-                SOURCE.as_ptr().cast(),
-                SOURCE.len(),
-                None,
-                None,
-                None,
-                windows::core::s!("main"),
-                windows::core::s!("cs_5_1"),
-                0,
-                0,
-                &mut code,
-                None,
-            )?;
-            let code = code.context("no merge shader")?;
-            let bytes = std::slice::from_raw_parts(
-                code.GetBufferPointer().cast::<u8>(),
-                code.GetBufferSize(),
-            );
-            let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;
+            let root: ID3D12RootSignature = self.device.CreateRootSignature(0, &bytes)?;
             let pso =
                 self.device
                     .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
