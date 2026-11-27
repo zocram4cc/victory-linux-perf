@@ -4121,7 +4121,38 @@ fn buffer_view_ok(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw:
 /// Raw twins ([`raw_twins`]) made since the last frame line, and those of them that
 /// do not begin on 16 bytes, as a raw view must ([`move_raw`]), and those of
 /// these that could not be moved there (null).
-pub(crate) static TWINS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+pub(crate) static TWINS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Whether raw twins of buffer views that do not begin on 16 bytes begin at
+/// the view's own dword (on by default; `VICTORY_TWIN_EXACT=0`: a null view,
+/// as before, unless [`move_raw`] can move a staged one). Read once.
+///
+/// D3D12 asks raw views to begin on 16 bytes; AMD's hardware and RADV read a
+/// raw buffer from any dword. Null, such a twin read zeros: the tree culling
+/// (`InstanceCulling:CS_Tree_BatchCull`) runs in two dispatches a frame, and
+/// the second one's batch list begins right after the first one's 4-byte
+/// entries, so in every frame whose split left it off 16 bytes the second
+/// dispatch read a list of zeros and its trees were not drawn: whole trees
+/// and palms dropped out for single frames while the camera moved (up to
+/// 1,000 such twins a frame in play; avatarmanz PR #437, where the exact
+/// twins ended the flicker). Seen working on AMD (RADV) only there: whether
+/// NVIDIA under vkd3d-proton reads such a view is not yet known here, hence
+/// the switch.
+fn twin_exact() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TWIN_EXACT").is_none_or(|v| v != "0"))
+}
+
+/// The window ([`twin_window`]: first dword, dwords, bytes past it) begun at
+/// the view's own dword: first dword and dwords. None where it begins on 16
+/// bytes already, or between two dwords (a view of 16 bit values at an odd
+/// one: no raw view begins there; [`move_raw`] or null, as before).
+fn exact_window(first: u64, count: u32, by: u32) -> Option<(u64, u32)> {
+    if by == 0 || by % 4 != 0 {
+        return None;
+    }
+    Some((first + u64::from(by / 4), count.checked_sub(by / 4).filter(|&n| n > 0)?))
+}
 
 /// Moves the raw view at `at`, a slot of our heaps the card does not see,
 /// which shows `bytes` from `start` on (GPU address), `by` bytes on: for a
@@ -4273,7 +4304,15 @@ fn buffer_srv(
                     .CreateShaderResourceView(&shadow.buffer, Some(&desc), twin);
                 shadow.buffer.GetGPUVirtualAddress() + first * 4
             };
-            if by > 0 && !(staged(false, 1).is_some_and(|s| s.ptr == twin.ptr) && move_raw(twin, start, count.saturating_mul(4), by)) {
+            if let Some((first, count)) = exact_window(first, count, by).filter(|_| twin_exact()) {
+                // The raw twin from the view's own first dword (on 4 bytes, not
+                // 16), not a null view ([`twin_exact`]).
+                TWINS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                desc.Anonymous.Buffer.FirstElement = first;
+                desc.Anonymous.Buffer.NumElements = count;
+                // SAFETY: a live buffer and a slot of our heap.
+                unsafe { host.device.CreateShaderResourceView(&shadow.buffer, Some(&desc), twin) };
+            } else if by > 0 && !(staged(false, 1).is_some_and(|s| s.ptr == twin.ptr) && move_raw(twin, start, count.saturating_mul(4), by)) {
                 TWINS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 null_buffer_view(twin);
             }
@@ -4397,7 +4436,15 @@ fn buffer_uav(
                     .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), twin);
                 shadow.buffer.GetGPUVirtualAddress() + first * 4
             };
-            if by > 0 && !(staged(false, 1).is_some_and(|s| s.ptr == twin.ptr) && move_raw(twin, start, count.saturating_mul(4), by)) {
+            if let Some((first, count)) = exact_window(first, count, by).filter(|_| twin_exact()) {
+                // The raw twin from the view's own first dword (on 4 bytes, not
+                // 16), not a null view ([`twin_exact`]).
+                TWINS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                desc.Anonymous.Buffer.FirstElement = first;
+                desc.Anonymous.Buffer.NumElements = count;
+                // SAFETY: a live buffer and a slot of our heap.
+                unsafe { host.device.CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), twin) };
+            } else if by > 0 && !(staged(false, 1).is_some_and(|s| s.ptr == twin.ptr) && move_raw(twin, start, count.saturating_mul(4), by)) {
                 TWINS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 null_buffer_view(twin);
             }
@@ -6189,6 +6236,30 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert_eq!(twin_window(none, 1, 3, 24, false, 4096), Some((4, 20, 8)));
         assert_eq!(twin_window(u32s, 1, 10, 0, false, 4096), Some((0, 11, 4)));
         assert_eq!(twin_window(u32s, 1, 10, 0, false, 4), None);
+    }
+
+    /// A twin that does not begin on 16 bytes begins at the view's own dword
+    /// (`VICTORY_TWIN_EXACT`) and shows the dwords from there; one between
+    /// two dwords, or on 16 bytes already, is left to the older ways.
+    #[test]
+    fn exact_twins_begin_at_the_views_own_dword() {
+        let (u16s, u32s, none) = (DXGI_FORMAT(57), DXGI_FORMAT(42), DXGI_FORMAT_UNKNOWN);
+        // 10 dwords from dword 1: the window began 4 bytes early.
+        let (first, count, by) = twin_window(u32s, 1, 10, 0, false, 4096).unwrap();
+        assert_eq!(exact_window(first, count, by), Some((1, 10)));
+        // 24 byte elements from the second: dwords 6 to 24.
+        let (first, count, by) = twin_window(none, 1, 3, 24, false, 4096).unwrap();
+        assert_eq!(exact_window(first, count, by), Some((6, 18)));
+        // On 16 bytes: nothing to do.
+        let (first, count, by) = twin_window(u32s, 4, 10, 0, false, 4096).unwrap();
+        assert_eq!(exact_window(first, count, by), None);
+        // 16 bit values from an odd one: between two dwords.
+        let (first, count, by) = twin_window(u16s, 9, 7, 0, false, 4096).unwrap();
+        assert_eq!(by, 2);
+        assert_eq!(exact_window(first, count, by), None);
+        // Never an empty or wrapped window.
+        assert_eq!(exact_window(0, 1, 4), None);
+        assert_eq!(exact_window(0, 1, 8), None);
     }
 
     /// What a slot is made as is made beside the heap and copied in whole: the
