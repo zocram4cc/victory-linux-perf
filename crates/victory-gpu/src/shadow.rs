@@ -5528,8 +5528,12 @@ fn lookup_with(address: u64, len: u64, any: bool, quick: bool, buckets: bool) ->
         // are read too often to stay in the PC's.
         let big = cards() && (size >= card_limits().0 || card_all());
         // Renderer port 1 (`crate::port`, `VICTORY_PORT_CONSTANTS=1`): the
-        // title's 32-bit graphics heap in place, big or not.
-        if let Some(placed) = crate::port::place_for(key.0, len, false) {
+        // title's 32-bit graphics heap in place, big or not. Above 4 GiB
+        // (`VICTORY_PORT_BUFFERS=1`), keep `big` buffers in local GDDR6 VRAM
+        // so GPU-heavy buffers do not stall over PCIe.
+        if (!big || key.0 + len <= (1u64 << 32))
+            && let Some(placed) = crate::port::place_for(key.0, len, false)
+        {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
