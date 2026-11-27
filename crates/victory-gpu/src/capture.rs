@@ -21,13 +21,9 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
 pub(crate) fn listed(n: u64) -> bool {
     static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
     let named = LIST
-        .get_or_init(|| {
-            let list = std::env::var("VICTORY_CAPTURE_FRAMES").unwrap_or_default();
-            list.split(',')
-                .filter_map(|f| f.trim().parse().ok())
-                .collect()
-        })
-        .contains(&n);
+        .get_or_init(|| frame_list("VICTORY_CAPTURE_FRAMES"))
+        .binary_search(&n)
+        .is_ok();
     // `VICTORY_CAPTURE_WORLD`: also the 2nd and the 6th frame after the first
     // one that ran 500 draws or more (a title's first 3D frames: their
     // numbers depend on how long the menus were shown), and the 30th and
@@ -39,15 +35,26 @@ pub(crate) fn listed(n: u64) -> bool {
     // about the 118th frame on, when the window's model has arrived and
     // the reflections hold values: none of the four above has them).
     static ALSO: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
-    let also = ALSO.get_or_init(|| {
-        let list = std::env::var("VICTORY_CAPTURE_WORLD_ALSO").unwrap_or_default();
-        list.split(',')
-            .filter_map(|f| f.trim().parse().ok())
-            .collect()
-    });
+    let also = ALSO.get_or_init(|| frame_list("VICTORY_CAPTURE_WORLD_ALSO"));
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let after = n.wrapping_sub(first);
-    named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+    named
+        || first != u64::MAX
+            && ([2, 6, 30, 80].contains(&after) || also.binary_search(&after).is_ok())
+}
+
+/// The frame numbers variable `name` lists (comma-separated), sorted: looked
+/// up for every operation of a frame, so a list of hundreds is not searched
+/// from its start each time.
+fn frame_list(name: &str) -> Vec<u64> {
+    let mut list: Vec<u64> = std::env::var(name)
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|f| f.trim().parse().ok())
+        .collect();
+    list.sort_unstable();
+    list.dedup();
+    list
 }
 
 /// With a capture folder, for the frames [`listed`]: `what` is added to
@@ -92,20 +99,26 @@ pub(crate) fn op(list: usize, what: impl FnOnce() -> String) {
     let Some(folder) = folder() else {
         return;
     };
-    static FILE: std::sync::Mutex<Option<(u64, u64, std::fs::File)>> = std::sync::Mutex::new(None);
     let what = what();
-    let mut file = FILE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut file = OPS.lock().unwrap_or_else(|e| e.into_inner());
     if file.as_ref().is_none_or(|f| f.0 != frame) {
         let Ok(made) = std::fs::File::create(folder.join(format!("frame-{frame}-ops.txt"))) else {
             return;
         };
-        *file = Some((frame, 0, made));
+        *file = Some((frame, 0, std::io::BufWriter::with_capacity(1 << 20, made)));
     }
     if let Some((_, n, f)) = file.as_mut() {
         *n += 1;
         let _ = writeln!(f, "{n} list {list:#x} {what}");
     }
 }
+
+/// The open `frame-<n>-ops.txt` of [`op`]: buffered (a line per operation
+/// of a frame, thousands, were as many writes), and flushed at every present
+/// ([`frame_drew`]) and as the next frame's replaces it.
+#[cfg(feature = "diagnostics")]
+static OPS: std::sync::Mutex<Option<(u64, u64, std::io::BufWriter<std::fs::File>)>> =
+    std::sync::Mutex::new(None);
 
 /// The last lines of [`op`] before the world.
 #[cfg(feature = "diagnostics")]
@@ -128,6 +141,11 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let before = LAST.swap(drawn, Relaxed);
+    #[cfg(feature = "diagnostics")]
+    if let Some((_, _, f)) = OPS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        use std::io::Write;
+        let _ = f.flush();
+    }
     if world_on()
         && drawn.saturating_sub(before) >= 500
         && WORLD.compare_exchange(u64::MAX, frame, Relaxed, Relaxed).is_ok()
@@ -144,15 +162,26 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
 
 /// Whether frame `n` is saved.
 pub(crate) fn wanted(n: u64) -> bool {
+    let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     // Before the world, with `VICTORY_CAPTURE_WORLD`: every 16th frame too
     // (small pictures of menus, loading screens and title cards).
-    let before_world = world_on() && n.is_multiple_of(16) && WORLD.load(std::sync::atomic::Ordering::Relaxed) == u64::MAX;
+    let before_world = world_on() && n.is_multiple_of(16) && first == u64::MAX;
     // In the world: every 8th frame's picture, a timeline of the opening
     // cutscene (its shots do not fall on the same frame numbers from run to
     // run, so single frames cannot be compared between runs).
-    let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(8);
-    folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
+    // `VICTORY_CAPTURE_WORLD_PICTURES` (comma-separated, counted from the
+    // world's first frame as `VICTORY_CAPTURE_WORLD_ALSO`): pictures only, for
+    // dense timelines. A frame [`listed`] costs far more (a line per
+    // operation, a wait for the queues, target dumps): with every frame
+    // listed a frame took 300-470 ms instead of ~85.
+    static PICTURES: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    let picture = first != u64::MAX
+        && PICTURES
+            .get_or_init(|| frame_list("VICTORY_CAPTURE_WORLD_PICTURES"))
+            .binary_search(&n.wrapping_sub(first))
+            .is_ok();
+    folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world || picture)
 }
 
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
@@ -160,7 +189,8 @@ pub(crate) fn save(n: u64, width: u32, height: u32, pitch: usize, bgra: bool, ro
     save_as(&format!("frame-{n}"), width, height, pitch, bgra, rows);
 }
 
-/// Saves 8-bit RGBA or BGRA rows as `<name>.png`, at half size.
+/// Saves 8-bit RGBA or BGRA rows as `<name>.png`, at half size: halved here,
+/// encoded and written on [`write_later`]'s threads.
 fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
     let Some(folder) = folder() else { return };
     let (w, h) = ((width / 2).max(1), (height / 2).max(1));
@@ -178,9 +208,53 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
             }
         }
     }
-    let png = encode(w, h, &raw);
-    let path = folder.join(format!("{name}.png"));
-    match std::fs::write(&path, png) {
+    write_later(folder.join(format!("{name}.png")), w, h, raw);
+}
+
+/// Encodes and writes a picture on threads of their own, so that saving a
+/// frame costs the frame's thread only the halving. Three threads; a frame
+/// waits while six pictures are queued (none is dropped). Pictures still
+/// queued when the process is ended are lost.
+fn write_later(path: PathBuf, w: u32, h: u32, raw: Vec<u8>) {
+    type Job = (PathBuf, u32, u32, Vec<u8>);
+    static QUEUE: std::sync::OnceLock<Option<std::sync::mpsc::SyncSender<Job>>> =
+        std::sync::OnceLock::new();
+    let queue = QUEUE.get_or_init(|| {
+        let (send, receive) = std::sync::mpsc::sync_channel::<Job>(6);
+        let receive = std::sync::Arc::new(std::sync::Mutex::new(receive));
+        let mut started = false;
+        for i in 0..3 {
+            let receive = receive.clone();
+            started |= std::thread::Builder::new()
+                .name(format!("capture-{i}"))
+                .spawn(move || {
+                    loop {
+                        // The lock is let go at the end of the statement:
+                        // one thread waits for the next picture, the others
+                        // encode theirs.
+                        let job = receive.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                        let Ok((path, w, h, raw)) = job else { return };
+                        write_png(&path, w, h, &raw);
+                    }
+                })
+                .is_ok();
+        }
+        started.then_some(send)
+    });
+    match queue {
+        Some(send) => {
+            if let Err(std::sync::mpsc::SendError((path, w, h, raw))) = send.send((path, w, h, raw))
+            {
+                write_png(&path, w, h, &raw);
+            }
+        }
+        None => write_png(&path, w, h, &raw),
+    }
+}
+
+/// Encodes RGB rows (each behind its filter byte) and writes them to `path`.
+fn write_png(path: &std::path::Path, w: u32, h: u32, raw: &[u8]) {
+    match std::fs::write(path, encode(w, h, raw)) {
         Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
         Err(e) => tracing::warn!(error = %e, path = %path.display(), "frame not saved"),
     }
@@ -222,13 +296,27 @@ fn chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
     png.extend(crc.to_be_bytes());
 }
 
+/// The PNG CRC (ISO-HDLC), a byte at a time from a table (bit by bit it took
+/// a picture's 2.5 MB 20 million steps).
 fn crc32(bytes: &[u8]) -> u32 {
+    const TABLE: [u32; 256] = {
+        let mut table = [0u32; 256];
+        let mut i = 0;
+        while i < 256 {
+            let mut c = i as u32;
+            let mut k = 0;
+            while k < 8 {
+                c = (c >> 1) ^ (0xedb8_8320 & (c & 1).wrapping_neg());
+                k += 1;
+            }
+            table[i] = c;
+            i += 1;
+        }
+        table
+    };
     let mut crc = !0u32;
     for &b in bytes {
-        crc ^= u32::from(b);
-        for _ in 0..8 {
-            crc = (crc >> 1) ^ (0xedb8_8320 & (crc & 1).wrapping_neg());
-        }
+        crc = TABLE[((crc ^ u32::from(b)) & 0xff) as usize] ^ (crc >> 8);
     }
     !crc
 }
@@ -240,16 +328,18 @@ pub(crate) fn read_back(
     list: &ID3D12GraphicsCommandList,
     texture: &ID3D12Resource,
 ) -> Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)> {
-    read_back_of(device, list, texture, 0)
+    read_back_of(device, list, texture, 0, true)
 }
 
 /// As [`read_back`], of subresource `sub` (the stencil plane of a
-/// one-level, one-slice depth-stencil texture is subresource 1).
+/// one-level, one-slice depth-stencil texture is subresource 1). `kept`:
+/// into the buffer [`KEPT`] holds, made once (the presented frame's).
 fn read_back_of(
     device: &ID3D12Device,
     list: &ID3D12GraphicsCommandList,
     texture: &ID3D12Resource,
     sub: u32,
+    kept: bool,
 ) -> Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)> {
     let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
     let mut total = 0;
@@ -284,20 +374,41 @@ fn read_back_of(
         Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
         ..Default::default()
     };
-    let mut buffer: Option<ID3D12Resource> = None;
-    // SAFETY: plain creation; an open list; locations naming live resources.
+    let reused = kept
+        .then(|| {
+            KEPT.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .filter(|k| k.0 == total)
+                .map(|k| k.1.clone())
+        })
+        .flatten();
+    let buffer = match reused {
+        Some(buffer) => buffer,
+        None => {
+            let mut buffer: Option<ID3D12Resource> = None;
+            // SAFETY: plain creation.
+            unsafe {
+                device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        None,
+                        &mut buffer,
+                    )
+                    .ok()?;
+            }
+            let buffer = buffer?;
+            if kept {
+                *KEPT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Kept(total, buffer.clone()));
+            }
+            buffer
+        }
+    };
+    // SAFETY: an open list; locations naming live resources.
     unsafe {
-        device
-            .CreateCommittedResource(
-                &heap,
-                D3D12_HEAP_FLAG_NONE,
-                &desc,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                None,
-                &mut buffer,
-            )
-            .ok()?;
-        let buffer = buffer?;
         let to = D3D12_TEXTURE_COPY_LOCATION {
             pResource: std::mem::transmute_copy(&buffer),
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
@@ -316,6 +427,15 @@ fn read_back_of(
         Some((buffer, footprint))
     }
 }
+
+/// The readback buffer of the presented frame ([`read_back`]) and its size,
+/// made once and used again: 33 MB at 4K, made for every saved frame it cost
+/// an allocation and the kernel's zeroing of it each time. The present waits
+/// for its copy, and the picture is read out of it before the next present.
+struct Kept(u64, ID3D12Resource);
+// SAFETY: D3D12 objects are free-threaded.
+unsafe impl Send for Kept {}
+static KEPT: std::sync::Mutex<Option<Kept>> = std::sync::Mutex::new(None);
 
 /// Saves a frame read back by [`read_back`] (8-bit color only).
 pub(crate) fn save_read_back(
@@ -418,7 +538,7 @@ fn dump_one(
         let stencil = (matches!(d.Format.0, 19..=22 | 44..=47)
             && d.MipLevels == 1
             && d.DepthOrArraySize == 1)
-            .then(|| read_back_of(&host.device, &list.list, texture, 1))
+            .then(|| read_back_of(&host.device, &list.list, texture, 1, false))
             .flatten();
         if state != copy {
             list.list
