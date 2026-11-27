@@ -518,30 +518,74 @@ impl Module {
         }
         let succs = |m: &Self, b: usize| successors(m.blocks[b].term);
         // Reverse postorder from the entry, as `write` lays blocks out.
-        let mut seen = vec![false; n];
-        let mut post = Vec::new();
-        let mut stack = vec![(0usize, 0usize)];
-        seen[0] = true;
-        while let Some(top) = stack.last_mut() {
-            let (b, k) = *top;
-            top.1 += 1;
-            match succs(self, b).get(k) {
-                Some(&s) if !seen[s] => {
-                    seen[s] = true;
-                    stack.push((s, 0));
+        let order = |m: &Self| {
+            let n = m.blocks.len();
+            let mut seen = vec![false; n];
+            let mut post = Vec::new();
+            let mut stack = vec![(0usize, 0usize)];
+            seen[0] = true;
+            while let Some(top) = stack.last_mut() {
+                let (b, k) = *top;
+                top.1 += 1;
+                match succs(m, b).get(k) {
+                    Some(&s) if !seen[s] => {
+                        seen[s] = true;
+                        stack.push((s, 0));
+                    }
+                    Some(_) => {}
+                    None => {
+                        post.push(b);
+                        stack.pop();
+                    }
                 }
-                Some(_) => {}
-                None => {
-                    post.push(b);
-                    stack.pop();
+            }
+            post.reverse();
+            let mut pos = vec![usize::MAX; n];
+            for (i, &b) in post.iter().enumerate() {
+                pos[b] = i;
+            }
+            (post, pos)
+        };
+        // A block that continues two loops (an inner and an outer header):
+        // dxil-spirv allows one back edge out of a block too
+        // (`cfg_structurizer.cpp`: "entry.succ_back_edge == succ"); on such
+        // a block it recursed until the stack ran out (LoopMergeTracer),
+        // which under Proton ended the pipeline worker with no log line:
+        // InstanceCulling:CS_Prop_BatchNoCull fdd56d97a806bcca and
+        // deferred_tiled:CS_LaserLightShadowRaytracing 32ed072b9f845048 were
+        // never made. The inner header's edge stays (the block stays its
+        // exiting latch, as DXC makes them); each outer one goes through a
+        // block of its own that only branches back. (Marvisak PR #2309
+        // 91e3bdf, Vice-Tay PR #198.)
+        let (post, pos) = order(self);
+        for &b in &post {
+            let mut heads: Vec<usize> = succs(self, b).iter().copied().filter(|&s| pos[s] <= pos[b]).collect();
+            heads.dedup();
+            let Some(&inner) = heads.iter().max_by_key(|&&h| pos[h]) else {
+                continue;
+            };
+            for header in heads {
+                if header == inner {
+                    continue;
+                }
+                let via = self.new_block();
+                self.blocks[via].term = Some(Term::Br(header));
+                let swap = |t: usize| if t == header { via } else { t };
+                self.blocks[b].term = match self.blocks[b].term {
+                    Some(Term::Br(t)) => Some(Term::Br(swap(t))),
+                    Some(Term::CondBr(c, t, f)) => Some(Term::CondBr(c, swap(t), swap(f))),
+                    other => other,
+                };
+                for phi in self.blocks[header].phis.clone() {
+                    let Op::Phi(incoming) = self.insts[phi as usize].op.clone() else {
+                        continue;
+                    };
+                    let incoming = incoming.into_iter().map(|(v, p)| (v, if p == b { via } else { p })).collect();
+                    self.insts[phi as usize].op = Op::Phi(incoming);
                 }
             }
         }
-        post.reverse();
-        let mut pos = vec![usize::MAX; n];
-        for (i, &b) in post.iter().enumerate() {
-            pos[b] = i;
-        }
+        let (post, pos) = order(self);
         // Each header's back-edge sources, in layout order.
         let mut back: std::collections::BTreeMap<usize, Vec<usize>> = Default::default();
         for &b in &post {
@@ -814,6 +858,10 @@ impl Module {
                 &preds[b][..],
             ) && pos[h] < pos[b]
                 && !succs(*p).contains(&h)
+                // Not into a block that already branches back (to an outer
+                // loop's header, `single_latches`): one block with two back
+                // edges sends dxil-spirv into recursion without end.
+                                && !succs(*p).iter().any(|&s| s != b && pos[s] <= pos[*p])
             {
                 fold[b] = Some((*p, h));
             }
@@ -1393,6 +1441,67 @@ mod tests {
             let bytes = synthetic(regs, stages, read).write();
             assert_eq!((bytes.len(), fnv(&bytes)), (len, hash), "{regs}x{stages}");
         }
+    }
+
+    /// A block that continues two loops (an inner and an outer header)
+    /// keeps the inner back edge; the outer one goes through a block of its
+    /// own, the outer header's phis name that block, and `write` does not
+    /// fold it back into the block it came from. (Vice-Tay PR #198.)
+    #[test]
+    fn a_block_continuing_two_loops_keeps_one_back_edge() {
+        let build = || {
+            let mut m = Module::default();
+            let i32t = m.int(32);
+            let (entry, outer, inner, both, exit) =
+                (m.new_block(), m.new_block(), m.new_block(), m.new_block(), m.new_block());
+            let (zero, one) = (m.i32(0), m.i32(1));
+            let ten = m.i32(10);
+            m.terminate(entry, Term::Br(outer));
+            let po = m.phi(outer, i32t);
+            m.terminate(outer, Term::Br(inner));
+            let pi = m.phi(inner, i32t);
+            let go = m.cmp(inner, pred::IULT, pi, ten);
+            m.terminate(inner, Term::CondBr(go, both, exit));
+            let v = m.bin(both, Bin::Add, pi, one);
+            let again = m.cmp(both, pred::IULT, v, ten);
+            m.terminate(both, Term::CondBr(again, inner, outer));
+            m.terminate(exit, Term::Ret);
+            m.set_phi(po, vec![(zero, entry), (v, both)]);
+            m.set_phi(pi, vec![(po, outer), (v, both)]);
+            (m, [entry, outer, inner, both, exit], po, pi, v)
+        };
+        let (unsplit, ..) = build();
+        let (mut m, [_, outer, inner, both, exit], po, pi, v) = build();
+        m.single_latches();
+
+        // One new block, which only branches back to the outer header.
+        let via = exit + 1;
+        assert_eq!(m.blocks.len(), via + 1);
+        assert!(matches!(m.blocks[via].term, Some(Term::Br(h)) if h == outer));
+        assert!(m.blocks[via].body.is_empty() && m.blocks[via].phis.is_empty());
+        let Some(Term::CondBr(_, t, f)) = m.blocks[both].term else {
+            panic!("still a conditional branch")
+        };
+        assert_eq!((t, f), (inner, via), "the inner back edge stays, the outer one goes through the new block");
+        // The outer header takes its value from the new block; the inner
+        // header's phi is as it was.
+        let incoming = |m: &Module, phi: V| {
+            let V::Inst(p) = phi else { panic!() };
+            let Op::Phi(inc) = &m.insts[p as usize].op else { panic!("a phi") };
+            inc.clone()
+        };
+        assert!(incoming(&m, po).contains(&(v, via)));
+        assert!(!incoming(&m, po).iter().any(|&(_, b)| b == both));
+        assert_eq!(incoming(&m, pi), vec![(po, outer), (v, both)]);
+        // Done again: nothing to do.
+        m.single_latches();
+        assert_eq!(m.blocks.len(), via + 1);
+        // The written module keeps the new block (an empty latch with one
+        // predecessor is otherwise folded into it, which would put both back
+        // edges on one block again): it is not the unsplit module's bytes.
+        let written = m.write();
+        assert!(!written.is_empty());
+        assert!(written != unsplit.write(), "the new block is not folded back");
     }
 
     #[test]
