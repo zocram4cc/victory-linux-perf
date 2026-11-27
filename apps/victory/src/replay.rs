@@ -493,7 +493,9 @@ fn retranslate(folder: &std::path::Path, into: &std::path::Path, view_limit: u32
             s.spawn(|| {
                 while let Some((stage, hash)) = all.get(next.fetch_add(1, Ordering::Relaxed)) {
                     let Ok(bytes) = std::fs::read(kept.join(format!("{hash}.cdxil"))) else { continue };
-                    match victory_shader::emit::translate(&bytes) {
+                    // (`VICTORY_WAVE_WIDE_ONLY`, as a run has it)
+                    let wide = victory_shader::emit::wave_wide_only(hash);
+                    match victory_shader::emit::with_wave_wide(wide, || victory_shader::emit::translate(&bytes)) {
                         Ok(t) => {
                             if std::fs::write(into.join(format!("{hash}.dxil")), &t.dxil).is_ok() {
                                 done.fetch_add(1, Ordering::Relaxed);

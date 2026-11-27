@@ -119,7 +119,12 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    // `VICTORY_WAVE_WIDE_ONLY`: the wave-wide form for the containers it names, by the hash
+    // the log names them with (the cache key holds the switch: `switch_values`).
+    let translate = |c: &[u8]| {
+        let wide = victory_shader::emit::wave_wide_only(&blake3::hash(c).to_hex()[..16]);
+        victory_shader::emit::with_wave_wide(wide, || victory_shader::emit::translate(c)).map_err(|e| e.to_string())
+    };
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),
         None => translate(container),

@@ -305,6 +305,93 @@ thread_local! {
     pub(crate) static TEST_WIDE_LAST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// The water's volumetric light programs, which no form but the wave-wide one takes off
+/// 64-lane waves (groups of 8 x 8, one console wave, whose thread (0, 0) seeds two LDS
+/// accumulators that every lane then folds into and reads back, all behind per-lane
+/// early-outs: the two host waves must meet there, and only the wave-wide form gives them
+/// barriers every thread reaches). Refused on a 32-lane host without it, their dispatches
+/// dropped every frame (runs of 2026-11-27 on an RTX 5080: the first two in every run).
+/// `water_shading:` `CS_TransmissionVolumetrics_Tiled`, `_Tiled_LocalLights`,
+/// `CS_TransmissionVolumetrics`, `_VolumePortalsOnly`.
+const WIDE_REFUSED_WATER: [&str; 4] = ["5dc3b25986622949", "6f225b641c5b0708", "6871d6e4b3ac9a10", "a10179ab7eda0dc3"];
+
+/// The other water programs of DoubleGhosty issue #94's list, which this translator takes
+/// today with a branch on a mask's SCC split per lane ([`emit`], inexact): `sr_tracing:`
+/// `CS_RayPrePass_Water_SSR`, `water_micro_geom_renderer:`
+/// `CS_GenerateWaterPatchWritingJobs_WithLODStitching` and `CS_CullWaterPatchesUsingCalmingInfo`,
+/// `water_shading:CS_TransmissionVolumetricsSubmerged`, `water_compressed_simulation_rendertarget:`
+/// `CS_MinMax_Float_DualPlane_Parallel`, `_Float_SinglePlane_Parallel`, `_Int_SinglePlane_Parallel`.
+const WIDE_INEXACT_WATER: [&str; 7] = [
+    "11276d0c8bbe180a",
+    "73ac67482f6b6a5d",
+    "926c46bab3b86bd6",
+    "9809b8d965b04935",
+    "a2f1004f8d6d7aad",
+    "bdf438d5731d36cc",
+    "cbf9b65f2249ba96",
+];
+
+/// The containers (by the hash a run's log names them with: the first 16 hex digits of the
+/// container's BLAKE3) whose wave64 compute programs are translated as with
+/// `VICTORY_WAVE_WIDE=1`, the others as before. `VICTORY_WAVE_WIDE_ONLY`: unset, the water's
+/// volumetric light programs, which are refused without it ([`WIDE_REFUSED_WATER`]); `0`,
+/// none; otherwise a comma list of hashes and the words `refused` (those) and `water` (those
+/// and the water programs translated inexactly today, [`WIDE_INEXACT_WATER`]).
+/// `VICTORY_WAVE_WIDE` set to anything wins over it. (After DoubleGhosty 0da18ad.)
+fn wave_wide_list(value: Option<&str>) -> Vec<String> {
+    let Some(value) = value else {
+        return WIDE_REFUSED_WATER.iter().map(|h| (*h).to_owned()).collect();
+    };
+    let mut out = Vec::new();
+    for word in value.split(',').map(str::trim).filter(|w| !w.is_empty()) {
+        match word {
+            "0" => return Vec::new(),
+            "refused" => out.extend(WIDE_REFUSED_WATER.iter().map(|h| (*h).to_owned())),
+            "water" => out.extend(WIDE_REFUSED_WATER.iter().chain(&WIDE_INEXACT_WATER).map(|h| (*h).to_owned())),
+            h if h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()) => out.push(h.to_ascii_lowercase()),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Whether the container named by `hash` (see [`wave_wide_list`]) is translated wave-wide.
+pub fn wave_wide_only(hash: &str) -> bool {
+    static ONLY: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let only = ONLY.get_or_init(|| {
+        let value = std::env::var("VICTORY_WAVE_WIDE_ONLY").ok();
+        wave_wide_list(value.as_deref())
+    });
+    only.iter().any(|h| h.eq_ignore_ascii_case(hash))
+}
+
+thread_local! {
+    /// [`with_wave_wide`]'s choice for the translation running on this thread.
+    static WIDE_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `translate` (one container's translation) on this thread as with
+/// `VICTORY_WAVE_WIDE=1` when `on`, unless `VICTORY_WAVE_WIDE` is set: the callers that know
+/// the container's hash pass [`wave_wide_only`] of it.
+pub fn with_wave_wide<T>(on: bool, translate: impl FnOnce() -> T) -> T {
+    struct Restore(bool, bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WIDE_HERE.set(self.0);
+            lower::THREAD_WAVE_WIDE.set(self.1);
+        }
+    }
+    let on = on && std::env::var_os("VICTORY_WAVE_WIDE").is_none();
+    let _restore = Restore(WIDE_HERE.replace(on), lower::THREAD_WAVE_WIDE.replace(lower::THREAD_WAVE_WIDE.get() || on));
+    translate()
+}
+
+/// `VICTORY_WAVE_WIDE` as the translation on this thread sees it: `1` for a program
+/// [`with_wave_wide`] names when the switch is unset.
+fn wave_wide_option() -> Option<std::ffi::OsString> {
+    std::env::var_os("VICTORY_WAVE_WIDE").or_else(|| WIDE_HERE.get().then(|| "1".into()))
+}
+
 /// Which of a translated program's group barriers wait for the whole
 /// group (`GroupMemoryBarrierWithGroupSync`); the others keep their memory
 /// fence and lose the wait. A wait that some thread of the group never
@@ -777,7 +864,8 @@ fn emit_forms(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_option = std::env::var_os("VICTORY_WAVE_WIDE");
+        // (or the program `VICTORY_WAVE_WIDE_ONLY` names, `with_wave_wide`)
+        let wide_option = wave_wide_option();
         // Both archived kernels use one logical wave per group and have
         // validated wave32 PSOs on RTX. Explicit policy wins.
         let scene_kernel = matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64)

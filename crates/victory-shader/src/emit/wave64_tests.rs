@@ -1605,3 +1605,167 @@ fn a_select_on_a_mask_held_as_a_number_keeps_the_consoles_lanes() {
     lower::TEST_HOST_WAVE.set(was);
     assert_eq!(lowered.expect("lower").wave_size, Some(32));
 }
+
+/// `VICTORY_WAVE_WIDE_ONLY`: unset, the water's volumetric light programs that are refused
+/// without it; `0`, none; hashes (any case) and the words `refused` and `water` otherwise;
+/// anything else is left out. (The lists are this translator's own: a regression guard.)
+#[test]
+fn the_wave_wide_list_is_read_as_documented() {
+    let refused: Vec<String> = super::WIDE_REFUSED_WATER.iter().map(|h| (*h).to_owned()).collect();
+    assert_eq!(super::wave_wide_list(None), refused);
+    assert!(super::wave_wide_list(Some("0")).is_empty());
+    assert!(super::wave_wide_list(Some("")).is_empty());
+    assert_eq!(super::wave_wide_list(Some("refused")), refused);
+    let water = super::wave_wide_list(Some("water"));
+    assert_eq!(water.len(), 11);
+    assert!(refused.iter().chain(&super::WIDE_INEXACT_WATER.map(str::to_owned)).all(|h| water.contains(h)));
+    assert_eq!(
+        super::wave_wide_list(Some(" 11276D0C8BBE180A ,nonsense,123")),
+        vec!["11276d0c8bbe180a".to_owned()]
+    );
+    // the issue's names, one per hash (CS_TransmissionVolumetrics_Tiled is the first)
+    assert!(refused.contains(&"5dc3b25986622949".to_owned()));
+}
+
+/// The shape of the water's tiled volumetric light (`CS_TransmissionVolumetrics_Tiled`,
+/// 0x94-0x4c4): one console wave of 64 threads; the threads below s0 go on (a per-lane
+/// early-out, kept: the region sets s20, which the code after it stores); among them thread 0
+/// seeds an LDS accumulator with 7 (`v_cmpx_eq_u32 exec, 0, v0`, `ds_write_b32`), every
+/// thread folds `t ^ s1` into it (`ds_max_u32`) and reads it back (`ds_read_b32`), and stores
+/// what it read to dword t; after the region every thread stores s20 to dword 64 + t. The
+/// console code has no barrier: one wave runs its LDS instructions in order.
+fn lds_seed_fold_read() -> NativeProgram {
+    let mut native = native(&[
+        0xBF8C_0000, // s_waitcnt 0: the descriptor
+        0xBE94_0380, // s_mov_b32 s20, 0
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0x3A04_0001, // v_xor_b32 v2, s1, v0
+        0x7E08_0280, // v_mov_b32 v4, 0 (the accumulator's address)
+        0x7E0A_0287, // v_mov_b32 v5, 7 (its seed)
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_000E, // s_cbranch_execz to the restore
+        0xBE94_0387, // s_mov_b32 s20, 7
+        0xBE8E_047E, // s_mov_b64 s[14:15], exec
+        0x7DA4_0080, // v_cmpx_eq_u32 exec, 0, v0
+        0xD834_0000,
+        0x0000_0504, // ds_write_b32 v4, v5
+        0xBEFE_040E, // s_mov_b64 exec, s[14:15]
+        0xD820_0000,
+        0x0000_0204, // ds_max_u32 v4, v2
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xD8D8_0000,
+        0x0300_0004, // ds_read_b32 v3, v4
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xE070_1000,
+        0x8002_0301, // buffer_store_dword v3, v1, s[8:11], 0 offen
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0x7E06_0214, // v_mov_b32 v3, s20
+        0xE070_1100,
+        0x8002_0301, // buffer_store_dword v3, v1, s[8:11], 256 offen
+    ]);
+    // one 512-byte block of LDS
+    if let StageIo::Cs(cs) = &mut native.io {
+        cs.rsrc2 |= 1 << 15;
+    }
+    native
+}
+
+/// [`lds_seed_fold_read`] as `emit_forms` gives it to a host of 32-lane waves, with
+/// [`super::with_wave_wide`] `on` or not.
+fn emit_seed_fold_read(native: &NativeProgram, p: &ir::Program, on: bool) -> Result<HostShader, ShaderError> {
+    let st = structure::structure(p).expect("structure");
+    let res = resource::track(p, &native.layout, native.stage, Some(&st)).expect("resources");
+    let io = io::raise(p, native).expect("io");
+    let c = crate::Container { digest: [0; 16], version: (1, 0), parts: Vec::new() };
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let shader = super::with_wave_wide(on, || super::emit_forms(&c, native, p, &st, &io, &res));
+    lower::TEST_HOST_WAVE.set(was);
+    shader
+}
+
+/// What the console gives [`lds_seed_fold_read`], from the definitions of the instructions
+/// (`ds_max_u32` an unsigned maximum; one wave's LDS instructions in program order): dword
+/// t < s0 the maximum of the seed 7 and every `u ^ s1` for u < s0; dwords 64.. s20, 7 once
+/// some thread went on; the rest 0.
+fn seed_fold_read_expected(below: u32, xor: u32) -> Vec<u32> {
+    let folded = (0..below).map(|u| u ^ xor).fold(7, u32::max);
+    (0..128u32)
+        .map(|i| match i {
+            0..64 if i < below => folded,
+            0..64 => 0,
+            _ => 7 * u32::from(below > 0),
+        })
+        .collect()
+}
+
+/// The program `VICTORY_WAVE_WIDE_ONLY` names (`with_wave_wide`) is taken wave-wide, with the
+/// group barriers that order the LDS seed, the folds and the read between the two host waves;
+/// one it does not name keeps the form it had. On a card of 32-lane waves: the console's
+/// words in every case, including those whose maximum lies in the upper host wave (a fold or
+/// the read before the other wave's seed or folds would lose it).
+#[test]
+fn a_named_program_is_taken_wave_wide_and_its_lds_seed_folds_and_read_stay_in_order() {
+    if std::env::var_os("VICTORY_WAVE_WIDE").is_some() {
+        eprintln!("VICTORY_WAVE_WIDE set; skipped");
+        return;
+    }
+    let native = lds_seed_fold_read();
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("IR");
+    let wide = emit_seed_fold_read(&native, &p, true).expect("wave-wide");
+    let before = emit_seed_fold_read(&native, &p, false);
+    match &before {
+        Ok(shader) => assert_ne!(shader.dxil, wide.dxil, "the named program's form changed"),
+        Err(e) => eprintln!("not named: {e}"),
+    }
+    // (the choice is the translation's alone)
+    assert!(!super::WIDE_HERE.get() && !lower::THREAD_WAVE_WIDE.get());
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut wide.dxil.clone()).expect("DXIL validation");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let run = |shader: &HostShader, below: u32, xor: u32| -> Option<Vec<u32>> {
+        let (root, pso) = match host.compute_pipeline(shader) {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("the hardware device does not take this program: {e}; not run");
+                return None;
+            }
+        };
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            if let (RootType::Constants, 0, d @ 0..=1) = (u.root, u.slot, u.dword) {
+                ud[u.index as usize] = [below, xor][d as usize];
+            }
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(128)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        Some(out[0][..128].to_vec())
+    };
+    let mut old_wrong = 0;
+    for (below, xor) in [(64, 0), (40, 0), (33, 0), (32, 0), (5, 0), (1, 0), (0, 0), (64, 0x30), (40, 0x20), (40, 0x27)] {
+        let Some(got) = run(&wide, below, xor) else { return };
+        let expected = seed_fold_read_expected(below, xor);
+        assert_eq!(got, expected, "{below} threads on, xor {xor:#x}");
+        if let Ok(shader) = &before
+            && let Some(old) = run(shader, below, xor)
+        {
+            old_wrong += old.iter().zip(&expected).filter(|(a, b)| a != b).count();
+        }
+    }
+    eprintln!("ran on the hardware device: the console's words in every case; not named, {old_wrong} words differ");
+}
