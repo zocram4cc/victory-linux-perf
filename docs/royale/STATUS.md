@@ -1,6 +1,6 @@
 # Where things stand (branch `k7900`), and how every piece works
 
-Written 26 Nov 2026, evening. Read this first; [PLAN.md](PLAN.md) has the plan, [k-journal.md](k-journal.md) the dated log of each step.
+Written 26 Nov 2026, evening (updated 27 Nov, section 10). **Next steps, in order: [NEXT.md](NEXT.md); saved states to play and compare: [CHECKPOINTS.md](CHECKPOINTS.md).** Read this first; [PLAN.md](PLAN.md) has the plan, [k-journal.md](k-journal.md) the dated log of each step.
 
 ## 1. In one paragraph
 

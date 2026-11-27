@@ -1,4 +1,4 @@
-> **victory-royale (private), branch `k7900`:** this tree plus our pieces. The plan, what carries over and in what order: [docs/royale/PLAN.md](docs/royale/PLAN.md); where things stand and how every piece works: [docs/royale/STATUS.md](docs/royale/STATUS.md).
+> **victory-royale (private), branch `k7900`:** this tree plus our pieces. The plan, what carries over and in what order: [docs/royale/PLAN.md](docs/royale/PLAN.md); where things stand and how every piece works: [docs/royale/STATUS.md](docs/royale/STATUS.md); next steps: [docs/royale/NEXT.md](docs/royale/NEXT.md); checkpoints to play and compare: [docs/royale/CHECKPOINTS.md](docs/royale/CHECKPOINTS.md).
 
 ## victory-royale: what the tests of 26 Nov 2026 found
 
