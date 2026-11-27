@@ -4449,6 +4449,16 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         format.0 = linear as i32;
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
+    // A typed unordered view in a format the host cannot store to
+    // (B5G5R5A1_UNORM on NVIDIA) removes the device when it is made, in the
+    // texture's own format too: the slot stays null, its writes dropped
+    // (DoubleGhosty 32aceeb). The format asked about is the one the view is
+    // made in: a typed texture's own (below).
+    let typed = if view == 0 || !typeless { own } else { view };
+    if unordered && !(view == 0 && typeless) && !typed_store(typed) {
+        once!(view = typed, own, "an unordered view in a format the host cannot store");
+        return false;
+    }
     if view == 0 {
         return !typeless;
     }
@@ -4470,6 +4480,34 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         *format = d.Format;
     }
     true
+}
+
+/// Whether the host stores to typed unordered views of `format` (asked
+/// once for each).
+fn typed_store(format: u32) -> bool {
+    static KNOWN: Mutex<Vec<(u32, bool)>> = Mutex::new(Vec::new());
+    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, ok)) = known.iter().find(|(f, _)| *f == format) {
+        return ok;
+    }
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: DXGI_FORMAT(format as i32),
+        ..Default::default()
+    };
+    let ok = host().is_some_and(|h| {
+        // SAFETY: a plain query into a struct of its size.
+        unsafe {
+            h.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut support).cast(),
+                size_of_val(&support) as u32,
+            )
+        }
+        .is_ok()
+            && support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0
+    });
+    known.push((format, ok));
+    ok
 }
 
 /// The title's unordered access view of a depth texture, as a view of the
@@ -6081,6 +6119,26 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert_eq!(constant_bytes(480), 512);
         assert_eq!(constant_bytes(64 << 10), 64 << 10);
         assert_eq!(constant_bytes(u32::MAX), 64 << 10);
+    }
+
+    /// The host is asked which formats it stores to through typed unordered
+    /// views: the ones every card takes pass (their views are made as
+    /// before), one that is no format does not, and the answer for one a
+    /// card may refuse (B5G5R5A1_UNORM, 86: NVIDIA) stays the same.
+    #[test]
+    fn the_host_says_which_typed_unordered_views_it_stores_to() {
+        if host().is_none() {
+            return; // no host GPU
+        }
+        // R8G8B8A8_UNORM, R32_FLOAT, R32_UINT.
+        for format in [28, 41, 42] {
+            assert!(typed_store(format), "{format}");
+            assert!(typed_store(format), "{format} asked again");
+        }
+        assert!(!typed_store(0xffff));
+        let b5g5r5a1 = typed_store(86);
+        eprintln!("typed unordered views of B5G5R5A1_UNORM on this host: {b5g5r5a1}");
+        assert_eq!(typed_store(86), b5g5r5a1);
     }
 
     /// A null 3D UAV made on the real device leaves it alive.
