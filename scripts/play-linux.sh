@@ -234,6 +234,10 @@ d VICTORY_LEVELS_ON_DEMAND 0
 # drawn (trustno1's notes: "skipping them left rainbow glitter"); with it the
 # same plants were green and brown (test run 20261127-000808).
 d VICTORY_ACTIVATE_RAYS 1
+# Depth bias on float depth times 8: an overlay drawn one step in front of
+# the mesh under it z-fought where the two pipelines' vertex code rounded
+# differently (a bunk-bed sheet; steady with 8, run 20261127-003552).
+d VICTORY_DEPTH_BIAS_SCALE 8
 # The title's own short waits for textures in the first frames and the first
 # cutscene: with the willy build's longer ones (--texture-waits) the first
 # 20 s of the world were slow and the first car scene dark; without them the
@@ -292,6 +296,8 @@ if [[ "${VICTORY_PREBUILD:-1}" != 0 ]]; then
   if [[ "$(cat "$stamp_file" 2>/dev/null)" != "$stamp" ]]; then
     log="$cache/prebuild.log"
     echo "New build or switches: translating the title's shaders first (about 70 s the first time; log: $log)..." >&2
+    # Ctrl-C here stops the launch, not just the translating.
+    trap 'echo "stopped during the prebuild; nothing launched" >&2; exit 130' INT
     if umu-run "$win_exe" shaders "$(winpath "$game/shaders.rpf")" > "$log" 2>&1; then
       sed 's/\x1b\[[0-9;]*m//g' "$log" | grep -E 'shaders in the cache, .*translate' >&2 || true
       if [[ -s "$cache/pipelines/early-pipelines.txt" ]]; then
@@ -303,6 +309,7 @@ if [[ "${VICTORY_PREBUILD:-1}" != 0 ]]; then
     else
       echo "warning: translating the shaders failed (see $log); the run translates them as it goes" >&2
     fi
+    trap - INT
   fi
 fi
 
