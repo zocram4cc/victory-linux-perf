@@ -1329,6 +1329,8 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         return Some(gpu);
     }
     if let Some((_, gpu)) = list.place_constant(address as usize, len as usize) {
+        #[cfg(feature = "diagnostics")]
+        crate::constwatch::placed(std::ptr::from_ref(list) as usize, address as usize, len as usize);
         return Some(gpu);
     }
     list.fill_scratch(address as *const u8, len)
@@ -5380,6 +5382,8 @@ impl State {
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
                         if let Some((buffer, gpu)) = list.place_constant(address as usize, size as usize) {
+                            #[cfg(feature = "diagnostics")]
+                            crate::constwatch::placed(std::ptr::from_ref(list) as usize, address as usize, size as usize);
                             host.constant_at(index, &buffer, gpu, size);
                             continue;
                         }
@@ -5389,8 +5393,6 @@ impl State {
                         };
                         let slot = (std::ptr::from_ref(heap) as usize, index);
                         list.defer_constants(to, address as *const u8, size as usize, slot);
-                        #[cfg(feature = "diagnostics")]
-                        crate::constwatch::fill(address, size, std::ptr::from_ref(list) as usize);
                         host.constant_at(index, &buffer, gpu, size);
                     }
                     Some(view) => {

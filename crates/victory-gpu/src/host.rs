@@ -6045,8 +6045,6 @@ impl Host {
         }
         stage.next("submit: the lists' steps");
         for list in runs {
-            #[cfg(feature = "diagnostics")]
-            crate::constwatch::filling(std::ptr::from_ref(*list) as usize);
             list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
             firsts.push(lists.len());
             if let Some(prelude) = list.prelude() {
@@ -7824,6 +7822,11 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         let (mut copies, mut refreshes, mut refreshed) = (0u64, 0u64, 0u64);
         for (i, step) in self.deferred().copies.iter().enumerate() {
+            // Every fill, those the card does too (`taken`).
+            #[cfg(feature = "diagnostics")]
+            if let &Step::Fill(_, src, len, _) = step {
+                crate::constwatch::fill(std::ptr::from_ref(self) as usize, src, len);
+            }
             if matches!(step, Step::Copy(..) | Step::Fill(..)) && taken(i) {
                 continue;
             }
