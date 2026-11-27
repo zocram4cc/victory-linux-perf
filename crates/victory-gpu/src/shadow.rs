@@ -4693,6 +4693,7 @@ impl Shadow {
             // Title memory is not mapped there: the copy keeps what the
             // card wrote, as before.
             old.copy_from_slice(gpu);
+            self.resent_missed(n.div_ceil(KERNEL_PAGE) as u64);
         }
         // The card's side and its "before" take the result.
         self.card_changed(at, at + n);
@@ -4754,6 +4755,10 @@ impl Shadow {
             // Title memory that is not mapped: the CPU's side keeps what
             // the card wrote, as before; `title` is scratch then.
             changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
+        }
+        if !mapped && changed {
+            // The CPU's side took the card's bytes; title memory did not.
+            self.resent_missed(n.div_ceil(KERNEL_PAGE) as u64);
         }
         if !mapped || !changed {
             return 0;
