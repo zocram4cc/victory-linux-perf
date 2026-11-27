@@ -49,3 +49,9 @@ Seen: the intro flickers before the loading screen (the author lists it as known
   1. Find a 0x218 program whose GFX10 code also appears in a regular container (`create_compute`, FSSM record) in the shader cache, and compare the two sets of bindings field by field.
   2. Otherwise, disassemble a small one (`0f00220000`: 8×8 groups, 1 sampler, 1 SRV, 1 UAV, 1 CBV) and check each binding the code reads (user SGPRs 4.., table offsets) against what `fspx_program` produced.
 - `VICTORY_NATIVE_COMPUTE` stays off (default). Normal play is unaffected.
+
+**P.4, checked by hand on the smallest bad program (`0f00220000`, 384 B)**
+- Disassembled (`llvm-mc -arch=amdgcn -mcpu=gfx1030`): table address in user SGPR s4 (`s_mov_b32 s8, s4; s_mov_b32 s9, 0`), `s_load_dwordx16 s[24:39]` at table+0 (SRV, 8 dwords, then UAV, 8 dwords), `s_load_dwordx4 s[12:15]` at table+0x40 (CBV); an immediate sampler built in code (`0x92`, `s_bfm_b32`, `0x14500000`); group ids in s5/s6/s7 (RSRC2 0xb8a: 5 user SGPRs, TGID x/y/z, TG size); `image_sample_l` from a 2D array with the CBV's scale, `image_store` of the result at (x, y, slice): a per-layer copy/downsample.
+- **The metadata matches the code exactly:** SRV table offset 0 (8 dwords), UAV 8 (8 dwords), CBV 16 (4 dwords), all user data 4, root slot 0; sampler root type 4 (immediate). So the FSPX record mapping is not the fault, at least here.
+- **Lost UAV writes ruled out:** `placed unordered texture view not mirrored (null: writes … lost)` is asked as often without native programs (`times` 2,048, 12 textures) as with them (512, 10).
+- **Next (needs the game):** trace one native pipeline's dispatch: which root signature and root parameter values the list holds at that moment, and what user data the translated shader gets. Suspect: the title binds these pipelines' resources through a console path the layer does not carry over, so they read empty or wrong tables.
