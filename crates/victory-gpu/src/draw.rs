@@ -3791,10 +3791,12 @@ impl State {
                 unsafe { list.list.SetComputeRoot32BitConstant(param, threads[0], word) };
             }
         }
+        self.named_program(list, p, false);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         self.buffers_written();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        self.named_program(list, p, true);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
             && crate::ambient::on()
             && self.ambient(list, p, role)
@@ -3802,6 +3804,59 @@ impl State {
             self.host_pipeline = 0;
             self.host_roots[1] = 0;
         }
+    }
+
+    /// For a compute program named by `VICTORY_VIEWS_OF`,
+    /// `VICTORY_CLEAR_BEFORE` or `VICTORY_CLEAR_AFTER`
+    /// (`crate::pipeline::named`), bound in `list` for a dispatch: before it
+    /// (`after` false), its outputs cleared; after it, its views said once
+    /// and its outputs cleared. Leaves the list's bindings as they were.
+    fn named_program(&mut self, list: &HostList, p: &HostPipeline, after: bool) {
+        use crate::pipeline::named;
+        let Some(stage) = p.stages.first() else { return };
+        let Some(wanted) = named::of(&stage.shader) else { return };
+        let t = stage.translated();
+        let view_at = |state: &Self, (slot, dwords): (u8, u32)| match state.roots_ref(true).get(usize::from(slot)) {
+            Some(&Root::Table(table)) => Some(table + u64::from(dwords) * 4),
+            _ => None,
+        };
+        if after && wanted.views && named::first_views(&stage.shader) {
+            for u in t.used.iter().filter(|u| u.root == RootType::Table && matches!(u.kind, ResourceType::Srv | ResourceType::Uav)) {
+                let resource = view_at(self, (u.slot, u.table_offset_dwords))
+                    .and_then(crate::descriptor::view)
+                    .and_then(|view| match view {
+                        View::Shader(r, _) | View::Unordered(r, ..) => crate::resource::host_resource(r as This),
+                        _ => None,
+                    })
+                    // SAFETY: a live resource.
+                    .map(|r| unsafe { r.GetDesc() })
+                    .map(|d| [d.Dimension.0 as u64, d.Format.0 as u64, d.Width, u64::from(d.Height), u64::from(d.DepthOrArraySize), u64::from(d.MipLevels)]);
+                named::say_view(&stage.shader, u, resource);
+            }
+        }
+        let places = named::places(&stage.shader, if after { &wanted.after } else { &wanted.before }, &t.used, after);
+        if places.is_empty() {
+            return;
+        }
+        named::uav_barrier(&list.list);
+        for (at, corner) in places {
+            let result = match view_at(self, at) {
+                Some(cpu) => {
+                    let format = match crate::descriptor::view(cpu) {
+                        Some(View::Unordered(_, _, Some(desc))) if desc[0] != 0 => desc[0],
+                        Some(View::Unordered(r, ..)) => crate::resource::host_resource(r as This)
+                            // SAFETY: a live resource.
+                            .map_or(0, |r| unsafe { r.GetDesc() }.Format.0 as u32),
+                        _ => 0,
+                    };
+                    let rect = corner.map(|(w, h)| RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 });
+                    self.clear_uav(list, cpu, named::zeros(format), rect.as_ref().map(std::slice::from_ref))
+                }
+                None => Err("no table bound at that root parameter"),
+            };
+            named::cleared(&stage.shader, at, after, result);
+        }
+        named::uav_barrier(&list.list);
     }
 
     /// The stand-in for the indirect light after a dispatch of `p`
@@ -5333,6 +5388,9 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
+        if kind == DISPATCH {
+            self.named_program(list, p, false);
+        }
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
         unsafe {
@@ -5350,6 +5408,7 @@ impl State {
         }
         if kind == DISPATCH {
             self.buffers_written();
+            self.named_program(list, p, true);
         } else {
             self.drew(Some(p));
         }
