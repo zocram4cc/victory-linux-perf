@@ -668,7 +668,53 @@ impl<'a> Tracer<'a> {
         })
     }
 
+    /// The one term a chain of phis comes to, if every path brings the
+    /// same one: through phis and XOR swaps that cancel out (the console
+    /// compiler keeps a table address in registers it swaps with
+    /// `s_xor_b32` across branches; copy propagation does not see through
+    /// those). P.4: most "addresses from a phi" were the table SGPR s4
+    /// joined with itself.
+    fn one_leaf(&self, v: Value) -> Option<Term> {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut todo = vec![v];
+        let mut leaf: Option<Term> = None;
+        while let Some(x) = todo.pop() {
+            if !seen.insert(x) {
+                continue;
+            }
+            if seen.len() > 256 {
+                return None;
+            }
+            if let Some((b, i)) = self.phis[x.0 as usize] {
+                for &a in &self.p.blocks[b].phis[i].args {
+                    match self.xor_cancelled(self.origin(a)) {
+                        Term::Value(y) => todo.push(y),
+                        c => match leaf {
+                            None => leaf = Some(c),
+                            Some(l) if l == c => {}
+                            Some(_) => return None,
+                        },
+                    }
+                }
+                continue;
+            }
+            let t = Term::Value(x);
+            match leaf {
+                None => leaf = Some(t),
+                Some(l) if l == t => {}
+                Some(_) => return None,
+            }
+        }
+        leaf
+    }
+
     fn sum(&self, t: Term) -> Sum {
+        if let Term::Value(v) = t
+            && self.phis[v.0 as usize].is_some()
+            && let Some(one) = self.one_leaf(v)
+        {
+            return self.sum(one);
+        }
         let v = match t {
             Term::Const(c) => {
                 return Sum {
@@ -1033,6 +1079,41 @@ impl<'a> Tracer<'a> {
         if !self.high_half(hi, high)
             && !(dynamic.is_some() && high.is_some_and(|h| self.carried(hi, h)))
         {
+            if std::env::var_os("VICTORY_WHY_HIGH").is_some() {
+                let d = |t: Term| match t {
+                    Term::Const(c) => format!("{c:#x}"),
+                    Term::Value(x) => match (self.def(x), self.inputs[x.0 as usize], self.phis[x.0 as usize]) {
+                        (Some(i), _, _) => i.name().to_string(),
+                        (_, Some(r), _) => format!("in{r:?}"),
+                        (_, _, Some(_)) => {
+                            // The leaves the phi chain brings.
+                            let mut seen = std::collections::BTreeSet::new();
+                            let mut todo = vec![x];
+                            let mut leaves = std::collections::BTreeSet::new();
+                            while let Some(y) = todo.pop() {
+                                if !seen.insert(y) || seen.len() > 64 { continue; }
+                                if let Some((b, i)) = self.phis[y.0 as usize] {
+                                    for &a in &self.p.blocks[b].phis[i].args {
+                                        match self.xor_cancelled(self.origin(a)) {
+                                            Term::Value(z) => todo.push(z),
+                                            Term::Const(c) => { leaves.insert(format!("{c:#x}")); }
+                                        }
+                                    }
+                                } else {
+                                    leaves.insert(match (self.def(y), self.inputs[y.0 as usize]) {
+                                        (Some(i), _) => i.name().to_string(),
+                                        (_, Some(r)) => format!("in{r:?}"),
+                                        _ => "?".into(),
+                                    });
+                                }
+                            }
+                            format!("phi{leaves:?}")
+                        }
+                        _ => "?".into(),
+                    },
+                };
+                eprintln!("WHY-HIGH hi {} want {:?} root {:?}", d(hi), high.map(|h| d(Term::Value(h))), self.layout[param].root);
+            }
             return Err("an address with an untracked high half");
         }
         Ok(Address {
@@ -1045,12 +1126,62 @@ impl<'a> Tracer<'a> {
 
     /// `hi` is `high` (0 for a table), possibly plus a carry.
     fn high_half(&self, hi: Term, high: Option<Value>) -> bool {
+        // A high half joined from paths that all bring one value: that value.
+        let hi = match hi {
+            Term::Value(v) if self.phis[v.0 as usize].is_some() => self.one_leaf(v).unwrap_or(hi),
+            _ => hi,
+        };
         let want = high.map_or(Term::Const(0), Term::Value);
+        // A table's high half that is 0 on every path, through phis and XOR
+        // swaps of zeros (P.4: 461 programs).
+        if want == Term::Const(0) && self.is_zero(hi) {
+            return true;
+        }
         hi == want
             || matches!(hi, Term::Value(v) if self.sop2(v, &["s_addc_u32"]).is_some_and(
                 |(_, [a, b])| a == want && b == Term::Const(0) || b == want && a == Term::Const(0)
             ))
             || matches!(hi, Term::Value(v) if self.plus_scc(v).is_some_and(|t| t == want))
+    }
+
+    /// Whether `t` is 0 whatever path the code took: a constant 0, or phis
+    /// and XORs (and copies) of such, a cycle among them counting as 0 (the
+    /// greatest fixed point: no path brings anything else in).
+    fn is_zero(&self, t: Term) -> bool {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut todo = vec![t];
+        while let Some(t) = todo.pop() {
+            let v = match self.xor_cancelled(t) {
+                Term::Const(c) => {
+                    if c != 0 {
+                        return false;
+                    }
+                    continue;
+                }
+                Term::Value(v) => v,
+            };
+            if !seen.insert(v) {
+                continue;
+            }
+            if seen.len() > 256 {
+                return false;
+            }
+            if let Some((b, i)) = self.phis[v.0 as usize] {
+                todo.extend(self.p.blocks[b].phis[i].args.iter().map(|&a| self.origin(a)));
+            } else if let Some(ops) = self.xor_operands(v) {
+                todo.extend(ops);
+            } else {
+                if std::env::var_os("VICTORY_WHY_HIGH").is_some() {
+                    eprintln!("WHY-ZERO stops at {}", match (self.def(v), self.inputs[v.0 as usize]) {
+                        (Some(i), _) => i.name().to_string(),
+                        (_, Some(r)) => format!("in{r:?}"),
+                        _ => "?".into(),
+                    });
+                }
+                return false;
+            }
+        }
+        true
     }
 
     /// `x` where `v` is `s_add_u32 v, x, src_scc` (either way round): the
@@ -1143,7 +1274,30 @@ impl<'a> Tracer<'a> {
         }
         match self.def(v).map(|i| i.name()) {
             Some(n) if n.starts_with("s_load_") => "an address loaded from memory",
-            None => "an address from a phi",
+            None => {
+                if std::env::var_os("VICTORY_WHY_PHI_ADDRESS").is_some()
+                    && let Some((b, i)) = self.phis[v.0 as usize]
+                {
+                    let ph = &self.p.blocks[b].phis[i];
+                    let args: Vec<String> = ph
+                        .args
+                        .iter()
+                        .map(|&a| match self.origin(a) {
+                            Term::Const(c) => format!("{c:#x}"),
+                            Term::Value(x) if x == v => "self".into(),
+                            Term::Value(x) => match (self.def(x), self.inputs[x.0 as usize], self.phis[x.0 as usize]) {
+                                (Some(d), _, _) => d.name().to_string(),
+                                (_, Some(r), _) => format!("in{r:?}"),
+                                (_, _, Some(_)) => "phi".into(),
+                                _ => "?".into(),
+                            },
+                        })
+                        .collect();
+                    let back = self.p.blocks[b].preds.iter().any(|&q| self.rpo[q] >= self.rpo[b]);
+                    eprintln!("WHY-PHI-ADDRESS {} [{}]", if back { "loop" } else { "join" }, args.join(", "));
+                }
+                "an address from a phi"
+            }
             _ => {
                 if std::env::var_os("VICTORY_WHY_ADDRESS").is_some() {
                     let inst = self.def(v);
