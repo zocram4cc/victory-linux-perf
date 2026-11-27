@@ -9947,6 +9947,15 @@ impl Meter {
                         per_frame(6) / 1e3
                     );
                 }
+                {
+                    let [srv, uav] = crate::descriptor::host::raw_view_counts();
+                    if srv != [0; 4] || uav != [0; 4] {
+                        tracing::info!(
+                            "raw views of root buffers kept inside their buffer (VICTORY_RAW_VIEW_CLAMP=0: as asked), since the \
+                             start, as [past the end: null, shortened, under a dword, not on 16 bytes: null]: SRV {srv:?}, UAV {uav:?}"
+                        );
+                    }
+                }
                 tracing::info!(
                     "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                      {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
