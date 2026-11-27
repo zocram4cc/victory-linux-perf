@@ -1538,6 +1538,12 @@ pub(crate) fn record_at(handle: u64) -> Option<[u32; 3]> {
 
 /// The view recorded at `handle`, if one is (and its resource is alive).
 pub(crate) fn view(handle: u64) -> Option<View> {
+    view_and_key(handle).map(|(view, _)| view)
+}
+
+/// The view recorded at `handle`, and what says which record that is
+/// (`host::HostHeap::publish`).
+pub(crate) fn view_and_key(handle: u64) -> Option<(View, u64)> {
     if handle == 0 {
         return None;
     }
@@ -1546,7 +1552,7 @@ pub(crate) fn view(handle: u64) -> Option<View> {
     if tag != VIEW_TAG {
         return None;
     }
-    view_at(i, generation)
+    Some((view_at(i, generation)?, u64::from(generation) << 32 | u64::from(i)))
 }
 
 /// A description of `N` words, if the title passes one.

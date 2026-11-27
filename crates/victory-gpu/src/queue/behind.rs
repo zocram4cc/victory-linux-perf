@@ -822,6 +822,18 @@ pub(super) fn drain() {
     STATS[DRAINS].fetch_add(1, Relaxed);
 }
 
+/// Lists of ours that go before the next submission to queue `this`
+/// (`crate::heap_worker`): in the line as a submission of its own.
+pub(super) fn run_before(this: This, taken: Vec<crate::list::Detached>, order: Vec<usize>) {
+    let queue = this as usize;
+    let before = QUEUED.fetch_add(1, Relaxed);
+    STATS[RUNS].fetch_add(1, Relaxed);
+    STATS[DEPTH].fetch_add(before, Relaxed);
+    STATS[DEEPEST].fetch_max(before + 1, Relaxed);
+    LANE.push(queue, [Job::Run(queue, taken, order)]);
+    room(before + 1);
+}
+
 /// A submission of `lists` to queue `this`.
 pub(super) fn submit(this: This, lists: &[This]) {
     let queue = this as usize;

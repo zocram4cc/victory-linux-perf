@@ -8131,6 +8131,24 @@ impl HostList {
         self.deferred().copies.push(Step::Texture(staging));
     }
 
+    /// Detiles the textures the list uploads now, ahead of its submission
+    /// ([`crate::texture::Staging::refresh`]); how many there were.
+    pub(crate) fn refresh_textures_ahead(&self) -> u64 {
+        let textures: Vec<_> = self
+            .deferred()
+            .copies
+            .iter()
+            .filter_map(|step| match step {
+                Step::Texture(staging) => Some(staging.clone()),
+                _ => None,
+            })
+            .collect();
+        for staging in &textures {
+            staging.refresh();
+        }
+        textures.len() as u64
+    }
+
     /// Runs the list's submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges). Copies and fills that
@@ -10264,6 +10282,19 @@ impl Meter {
             let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;
             let picked_ms =
                 crate::draw::HEAP_BUFFER_MICROS.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
+            {
+                let [busy, detiling, lists, textures] = std::array::from_fn::<f64, 4, _>(|i| {
+                    crate::heap_worker::STATS[i].swap(0, Ordering::Relaxed) as f64 / frames
+                });
+                if busy > 0.0 {
+                    tracing::info!(
+                        "textures picked by index, their own thread (VICTORY_HEAP_WORKER), per frame: {:.1} ms at work, of them {:.1} detiling; \
+                         {lists:.1} lists, {textures:.0} textures detiled ahead",
+                        busy / 1e6,
+                        detiling / 1e6
+                    );
+                }
+            }
             // Copies between depth textures and their colour twins, each way.
             let [twin_to_depth, twin_to_colour] =
                 [2, 3].map(|i| crate::resource::TWINS[i].swap(0, Ordering::Relaxed) as f64 / frames);

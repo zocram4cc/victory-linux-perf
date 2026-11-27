@@ -303,6 +303,20 @@ fn hold(this: This, what: impl FnOnce() -> Held) -> bool {
     true
 }
 
+/// `taken` and `order` run as a submission does: behind what the queue
+/// holds, or now.
+#[cfg(windows)]
+fn run_behind_held(this: This, host: &crate::host::Host, taken: Vec<crate::list::Detached>, order: Vec<usize>) {
+    let mut run = Some((taken, order));
+    if !hold(this, || {
+        let (taken, order) = run.take().unwrap_or_default();
+        Held::Run(taken, order)
+    }) && let Some((taken, order)) = run
+    {
+        host.execute_late(taken, order);
+    }
+}
+
 /// One caller of [`release_held`] at a time, so a queue's submissions keep
 /// their order; also serializes queue teardown in [`release`] so a queue
 /// present in `WAITING` cannot be freed while [`release_held`] iterates it.
@@ -582,6 +596,14 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        // Textures uploaded ahead (`crate::heap_worker`): their lists run before the title's.
+        if let Some((taken, order)) = crate::heap_worker::ahead() {
+            if behind::on() && !this.is_null() {
+                behind::run_before(this, taken, order);
+            } else {
+                run_behind_held(this, host, taken, order);
+            }
+        }
         if behind::on() && !this.is_null() {
             behind::submit(this, lists);
             return;
