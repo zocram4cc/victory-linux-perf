@@ -1561,7 +1561,7 @@ impl Drop for Held {
 #[cfg(windows)]
 pub(crate) fn hold(this: This) -> Option<Held> {
     let all = textures();
-    (all.contains(&(this as usize)) && object::add_ref_alive(this)).then_some(Held(this))
+    (all.contains(&(this as usize)) && object::add_ref_alive(this)).then(|| Held(this))
 }
 
 /// The lookup behind [`alias_of`]: `found` runs on the texture while the
