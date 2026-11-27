@@ -1873,7 +1873,7 @@ pub(crate) fn copy_state(this: This) -> Option<(u8, u64, u64)> {
     let memory = r.data() as u64;
     let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
     Some(match made.as_ref() {
-        Some((host, _)) => (2, host.bytes, memory),
+        Some((host, _)) => (2, host.card_bytes(), memory),
         None => (u8::from(r.host.gone.load(Relaxed)), footprint(&r.desc).map_or(0, |f| f.size), memory),
     })
 }
@@ -1928,10 +1928,7 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
             }
             let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             match made.as_ref() {
-                Some((host, _)) => copies.push(match &host.tiled {
-                    Some(tiled) => (r.data() as usize, r.desc, tiled.given_bytes(), true),
-                    None => (r.data() as usize, r.desc, host.bytes, false),
-                }),
+                Some((host, _)) => copies.push((r.data() as usize, r.desc, host.card_bytes(), host.tiled.is_some())),
                 None => without[usize::from(r.host.gone.load(Relaxed))] += 1,
             }
         }
@@ -2168,6 +2165,7 @@ pub(crate) fn let_go_idle() {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             let idle = made.as_ref().is_some_and(|(host, _)| {
                 crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
+                    && (most == u64::MAX || host.card_bytes() != 0)
                     && std::sync::Arc::strong_count(host) == 1
                     && crate::host::references(&host.texture) == 1
             });
@@ -2184,9 +2182,10 @@ pub(crate) fn let_go_idle() {
         if let Some((host, _)) = gone {
             r.host.gone.store(true, Relaxed);
             KINDS[2].fetch_add(1, Relaxed);
-            KINDS[3].fetch_add(host.bytes, Relaxed);
+            let freed = host.card_bytes();
+            KINDS[3].fetch_add(freed, Relaxed);
             went += 1;
-            bytes += host.bytes;
+            bytes += freed;
             if first.is_none() {
                 first = Some(at);
             }
@@ -2240,7 +2239,7 @@ pub(crate) fn targets_census() -> [u64; 12] {
         if host.filled && !copied_into {
             continue;
         }
-        let bytes = host.bytes + twin.as_ref().map_or(0, |t| t.colour.bytes);
+        let bytes = host.card_bytes() + twin.as_ref().map_or(0, |t| t.colour.bytes);
         let mut add = |i: usize| {
             c[i] += 1;
             c[i + 1] += bytes;
@@ -2298,7 +2297,7 @@ pub(crate) fn census() -> [u64; 10] {
             Some((host, twin)) => {
                 let kind = if host.filled { 4 } else { 0 };
                 count[kind] += 1;
-                count[kind + 1] += host.bytes + twin.as_ref().map_or(0, |t| t.colour.bytes);
+                count[kind + 1] += host.card_bytes() + twin.as_ref().map_or(0, |t| t.colour.bytes);
                 count[7] += twin.as_ref().map_or(0, |t| t.colour.bytes);
                 let placed = r.host.placed.load(std::sync::atomic::Ordering::Relaxed);
                 if placed {
@@ -2309,9 +2308,9 @@ pub(crate) fn census() -> [u64; 10] {
                     // Its first page: a texture's smallest mips lie there,
                     // and are mapped first and unmapped last.
                     if placed_filled.is_multiple_of(EVERY) && !crate::texture::committed(r.data().cast_const(), 1) {
-                        count[8] += host.bytes * EVERY;
+                        count[8] += host.card_bytes() * EVERY;
                         if crate::host::references(&host.texture) > 1 {
-                            count[9] += host.bytes * EVERY;
+                            count[9] += host.card_bytes() * EVERY;
                         }
                     }
                 }
@@ -2346,6 +2345,11 @@ fn host_bytes(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) ->
 
 #[cfg(windows)]
 impl HostTexture {
+    /// The bytes backed by card memory, counting only mapped tiles for reserved textures.
+    fn card_bytes(&self) -> u64 {
+        self.tiled.as_ref().map_or(self.bytes, crate::tiles::Tiled::given_bytes)
+    }
+
     pub(crate) fn flags(&self) -> u32 {
         self.flags
     }
@@ -3723,6 +3727,67 @@ mod tests {
             assert_eq!(total, 24_072, "format {format}");
             assert!(subresource(&desc, 8).is_none(), "format {format}");
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reserved_texture_copy_state_counts_mapped_tiles() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+
+        let Some(host) = crate::host::host() else { return; };
+        let desc = texture(512, 512, 28, 10);
+        let mut texture = None;
+        let gpu_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: desc.width,
+            Height: desc.height,
+            DepthOrArraySize: 1,
+            MipLevels: desc.mip_levels,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE,
+            ..Default::default()
+        };
+        // SAFETY: a reserved texture description and its output pointer are live.
+        let made = unsafe {
+            host.device.CreateReservedResource(
+                &gpu_desc, D3D12_RESOURCE_STATE_COMMON, None, &mut texture,
+            )
+        };
+        if let Err(error) = made {
+            eprintln!("reserved textures are unavailable on this adapter: {error}");
+            return;
+        }
+        let tex: ID3D12Resource = texture.unwrap();
+        let tiled = crate::tiles::Tiled::make(&host.device, &tex, 10).unwrap();
+        let source = vec![0u8; footprint(&desc).unwrap().size as usize];
+        let mut title: This = std::ptr::null();
+        assert_eq!(
+            create_at_address(
+                std::ptr::null(),
+                source.as_ptr() as u64,
+                &desc,
+                0,
+                std::ptr::null(),
+                &RESOURCE_IIDS[0],
+                &mut title,
+            ),
+            S_OK
+        );
+        let copy = std::sync::Arc::new(HostTexture::new_tiled(tex, 0, tiled));
+        *resource(title).host.made.lock().unwrap() = Some((copy.clone(), None));
+        assert_eq!(copy_state(title).unwrap().1, 0);
+        let tiled = copy.tiled.as_ref().unwrap();
+        let (_, waiting) = tiled.uploaded_on(host.queue(), &host.device, &copy.texture, 1, true);
+        assert!(!waiting);
+        let bytes = tiled.given_bytes();
+        assert_ne!(bytes, 0);
+        assert_eq!(copy_state(title).unwrap().1, bytes);
+        let list = host.new_list().unwrap();
+        list.close();
+        host.execute(&[&list]);
+        slot::<extern "system" fn(This) -> u32>(title, 0x10)(title);
     }
 
     /// A 4x4 texture filled from a title buffer through our list and queue,
