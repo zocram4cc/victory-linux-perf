@@ -4343,8 +4343,10 @@ fn buffer_view_ok(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw:
 pub(crate) static TWINS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// Whether raw twins of buffer views that do not begin on 16 bytes begin at
-/// the view's own dword (on by default; `VICTORY_TWIN_EXACT=0`: a null view,
-/// as before, unless [`move_raw`] can move a staged one). Read once.
+/// the view's own dword (on by default under Wine, off on native D3D12, which
+/// refuses such a view and removes the device; `VICTORY_TWIN_EXACT=1` on,
+/// `=0`: a null view, as before, unless [`move_raw`] can move a staged one).
+/// Read once.
 ///
 /// D3D12 asks raw views to begin on 16 bytes; AMD's hardware and RADV read a
 /// raw buffer from any dword. Null, such a twin read zeros: the tree culling
@@ -4359,7 +4361,11 @@ pub(crate) static TWINS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync:
 /// the switch.
 fn twin_exact() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TWIN_EXACT").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| twin_exact_for(std::env::var("VICTORY_TWIN_EXACT").ok().as_deref(), crate::wine::on_wine()))
+}
+
+fn twin_exact_for(asked: Option<&str>, wine: bool) -> bool {
+    asked.map_or(wine, |v| v != "0")
 }
 
 /// The window ([`twin_window`]: first dword, dwords, bytes past it) begun at
@@ -6593,6 +6599,18 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         // Never an empty or wrapped window.
         assert_eq!(exact_window(0, 1, 4), None);
         assert_eq!(exact_window(0, 1, 8), None);
+    }
+
+    /// Native D3D12 refuses a raw view that does not begin on 16 bytes (the
+    /// RX 9070 XT removed the device at the first such twin): exact twins only
+    /// under Wine, or when asked for.
+    #[test]
+    fn exact_twins_stay_off_on_native_d3d12_unless_asked() {
+        use super::twin_exact_for;
+        assert!(!twin_exact_for(None, false), "native D3D12: no raw twin off 16 bytes by default");
+        assert!(twin_exact_for(None, true));
+        assert!(twin_exact_for(Some("1"), false));
+        assert!(!twin_exact_for(Some("0"), true));
     }
 
     /// What a slot is made as is made beside the heap and copied in whole: the
