@@ -19,13 +19,14 @@ use super::Host;
 /// The columns. Times in milliseconds, sizes in megabytes (10^6 bytes).
 const HEADER: &str = "frame,t_ms,frame_ms,submit_busy_ms,gpu_idle_ms,gpu_idle_behind_us_ms,\
 waits_for_gpu_ms,title_copy_ms,title_copy_mb,texture_refresh_ms,texture_mb,copy_back_ms,\
-copy_back_mb,card_up_mb,draws,draws_dropped,pipelines_queued,pipelines_made,vram_used_mb";
+copy_back_mb,card_up_mb,draws,draws_dropped,pipelines_queued,pipelines_made,vram_used_mb,\
+pipeline_late_drops";
 
 /// VRAM is asked of DXGI only every this many frames (the column is empty
 /// between).
 const VRAM_EVERY: u64 = 30;
 
-const COUNTERS: usize = 14;
+const COUNTERS: usize = 15;
 
 /// The counters as of now, in [`HEADER`]'s order from `submit_busy_ms`.
 fn counters() -> [u64; COUNTERS] {
@@ -45,6 +46,11 @@ fn counters() -> [u64; COUNTERS] {
         crate::draw::drawn(),
         crate::draw::dropped_now(),
         crate::pipeline::made(),
+        // (Last column: added after the others. `draws_dropped` counts the
+        // ray-tracing structure builder's dispatches and pipelines left out
+        // on purpose too; this, only asks that found their pipeline still
+        // being made.)
+        crate::pipeline::late_drops(),
     ]
 }
 
@@ -127,7 +133,7 @@ pub(super) fn frame(host: &Host) {
         String::new()
     };
     let row = format!(
-        "{},{:.1},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{},{},{},{},{}",
+        "{},{:.1},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{},{},{},{},{},{}",
         state.frame,
         (now - state.start).as_secs_f64() * 1e3,
         frame_ms,
@@ -147,6 +153,7 @@ pub(super) fn frame(host: &Host) {
         crate::pipeline::making(),
         moved[13],
         vram,
+        moved[14],
     );
     state.frame += 1;
     let _ = state.rows.send(row);

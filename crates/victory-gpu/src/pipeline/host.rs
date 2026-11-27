@@ -506,9 +506,11 @@ impl HostPipeline {
         if mesh.is_some() && !host()?.mesh_shaders() {
             return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
         }
+        let translating = std::time::Instant::now();
         for (s, _) in &stages {
             s.translated()?;
         }
+        super::account::TRANSLATING.add(translating.elapsed());
         let host = host()?;
 
         let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();

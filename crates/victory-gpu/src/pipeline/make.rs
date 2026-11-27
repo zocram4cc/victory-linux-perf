@@ -74,6 +74,12 @@ pub(crate) struct Pending {
     compute_said: AtomicU8,
     compute_waited: AtomicBool,
     compute_asked: OnceLock<Instant>,
+    /// When a draw or dispatch first asked for it, how many were dropped
+    /// while it was being made, and whether one has been drawn with it
+    /// since it was made after such drops (the account, [`account_line`]).
+    asked: OnceLock<Instant>,
+    dropped: AtomicU64,
+    drawn_after: AtomicBool,
 }
 
 fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
@@ -168,6 +174,9 @@ impl Pending {
             claimed: OnceLock::new(),
             stall_noted: AtomicBool::new(false),
             waited_us: AtomicU64::new(0),
+            asked: OnceLock::new(),
+            dropped: AtomicU64::new(0),
+            drawn_after: AtomicBool::new(false),
         }
     }
 
@@ -314,11 +323,27 @@ impl Pending {
 }
 
 /// Why a pipeline has no host pipeline (diagnostics): its shaders that do
-/// not translate, else "refused" or "being made"; `None` if it has one.
+/// not translate, else "refused", "left out" (and why), "given up",
+/// "stalled" or "being made"; `None` if it has one.
+///
+/// "Being made" is said only of one queued or on a worker. Pipelines left
+/// out on purpose are never queued and never made, and were said to be
+/// "being made" with the rest: some 590 indirect executions a frame of the
+/// ray-tracing resolve, the whole run, while no pipeline was queued at all
+/// (runs 20261127-210643 and -200336, the frame line's "(0 being made)").
 #[cfg(feature = "diagnostics")]
 pub(crate) fn missing(p: &Pending) -> Option<String> {
+    if let Some(why) = p.left_out {
+        return Some(format!("left out: {why}"));
+    }
     match p.made.get() {
         Some(Some(_)) => None,
+        None if p.failed.load(Ordering::Relaxed) => {
+            Some("given up: making it ended its thread, and again on the larger stack".into())
+        }
+        None if p.stalled(Instant::now(), stall_bound()) => {
+            Some("stalled: its worker has not returned (VICTORY_PIPELINE_STALL_S)".into())
+        }
         None => Some("being made".into()),
         Some(None) => {
             let failed: Vec<String> = p
@@ -409,6 +434,7 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     // A still-pending pipeline was requested by the title too. Prewarm it
     // on the next launch, even if this run never got to use it.
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
+        let _ = p.asked.set(Instant::now());
         super::library::note_used(&p.key);
     }
     // A compute dispatch's own wait, if it had one ([`compute_budget`]).
@@ -451,7 +477,20 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
             compute_line(Instant::now());
         }
     }
-    p.made.get()?.as_ref()
+    let made = p.made.get();
+    match made {
+        // Dropped by the caller for want of it while it is being made.
+        None if !p.failed.load(Ordering::Relaxed) => {
+            p.dropped.fetch_add(1, Ordering::Relaxed);
+            super::account::LATE_DROPS.fetch_add(1, Ordering::Relaxed);
+            account_now_and_then();
+        }
+        Some(Some(_)) if p.dropped.load(Ordering::Relaxed) > 0 && !p.drawn_after.load(Ordering::Relaxed) => {
+            p.drawn_after.store(true, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+    made?.as_ref()
 }
 
 /// Why a dispatch of a compute pipeline was dropped, its pipeline not made
@@ -823,19 +862,20 @@ fn wait(p: &Arc<Pending>, frame: u64) -> Option<Duration> {
         let _ = p.compute_asked.set(Instant::now());
         QUEUE.lock().unwrap_or_else(|e| e.into_inner()).hurry(p);
     }
+    let (draw_budget, starting) = draw_wait_at(crate::host::now_ms(), start_window(), wait_budget());
     let budget = if screen {
         screen_budget()
     } else if compute {
         allowed
     } else {
-        wait_budget()
+        draw_budget
     };
     if budget.is_zero() {
         return None;
     }
     // What is left of this pipeline's own budget ([`wait_once`]); a compute
     // wait has its own bounds ([`Facts::hopeless`], the frame's).
-    let own = if compute {
+    let own = if compute || starting {
         Duration::MAX
     } else if wait_once() {
         let own = budget.saturating_sub(Duration::from_micros(p.waited_us.load(Ordering::Relaxed)));
@@ -887,7 +927,7 @@ fn wait(p: &Arc<Pending>, frame: u64) -> Option<Duration> {
         if p.made.get().is_none() && waited >= COMPUTE_CHANCE.min(compute_budget() / 2) {
             p.compute_waited.store(true, Ordering::Relaxed);
         }
-    } else if wait_once() && p.made.get().is_none() {
+    } else if wait_once() && !starting && p.made.get().is_none() {
         let before = p.waited_us.fetch_add(waited.as_micros() as u64, Ordering::Relaxed);
         if Duration::from_micros(before) + waited >= budget {
             tracing::info!(
@@ -924,6 +964,57 @@ fn wait(p: &Arc<Pending>, frame: u64) -> Option<Duration> {
     compute.then_some(waited)
 }
 
+/// The opening's wait for draws: until `VICTORY_PIPELINE_WAIT_START_S`
+/// seconds into the run (`crate::host::now_ms`), a frame's draws wait for
+/// their pipelines up to `VICTORY_PIPELINE_WAIT_START_MS` (1,000 if unset,
+/// at most 5,000) together, and a pipeline is waited for in every frame
+/// that draws with it ([`wait_once`] does not hold in that time). After
+/// it, as before. Off (unset or 0): today's half second a frame, once a
+/// pipeline.
+///
+/// A dropped draw is a piece missing from one frame; a wait is a frame
+/// held. On a warm driver cache nothing is being made in the opening and
+/// this waits for nothing (runs 20261127-210643, -200336: no pipeline
+/// queued from 30 s on). On a cold one, some 1,700 pipelines were queued
+/// as the cutscene began and the workers made about 15 a second (run
+/// 20261127-210258): with this the cutscene's frames come complete, but
+/// as slowly as the pipelines they need come, up to this many ms each,
+/// for as long as they keep coming. Every wait is bounded: a frame is held
+/// at most this budget (and the passes over the screen' own), far below
+/// the title's 30 s watchdog.
+fn start_window() -> Option<(u64, Duration)> {
+    static WINDOW: OnceLock<Option<(u64, Duration)>> = OnceLock::new();
+    *WINDOW.get_or_init(|| {
+        let number = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
+        let window = start_window_of(number("VICTORY_PIPELINE_WAIT_START_S"), number("VICTORY_PIPELINE_WAIT_START_MS"));
+        if let Some((until_ms, budget)) = window {
+            tracing::info!(
+                until_s = until_ms / 1000,
+                millis = budget.as_millis() as u64,
+                "draws wait for their pipelines up to this a frame, in every frame, until this far into the run \
+                 (VICTORY_PIPELINE_WAIT_START_S, _MS); then as VICTORY_PIPELINE_WAIT_MS says"
+            );
+        }
+        window
+    })
+}
+
+/// [`start_window`] for what the switches say: seconds, milliseconds.
+fn start_window_of(seconds: Option<u64>, millis: Option<u64>) -> Option<(u64, Duration)> {
+    let seconds = seconds.filter(|&s| s > 0)?;
+    let millis = millis.unwrap_or(1000).min(5000);
+    (millis > 0).then(|| (seconds.saturating_mul(1000), Duration::from_millis(millis)))
+}
+
+/// The budget a frame's draws wait within at `now_ms`, and whether that is
+/// the opening's ([`start_window`]): `normal` otherwise.
+fn draw_wait_at(now_ms: u64, window: Option<(u64, Duration)>, normal: Duration) -> (Duration, bool) {
+    match window {
+        Some((until_ms, budget)) if now_ms < until_ms => (budget, true),
+        _ => (normal, false),
+    }
+}
+
 const NOT_QUEUED: u8 = 0;
 const EARLY: u8 = 1;
 const REQUESTED: u8 = 2;
@@ -958,7 +1049,11 @@ struct Queue {
     /// first.
     hurried: VecDeque<Arc<Pending>>,
     compute: VecDeque<Arc<Pending>>,
-    early: VecDeque<Arc<Pending>>,
+    /// Started at creation ([`early`]), by when an earlier run first asked
+    /// for each ([`super::library::first_use`]; unknown last), then in the
+    /// order they came.
+    early: std::collections::BTreeMap<(u32, u64), Arc<Pending>>,
+    early_seq: u64,
     /// Those of the early ones known to take long, and how many of them are
     /// being made ([`slow_limit`]).
     slow: VecDeque<Arc<Pending>>,
@@ -980,7 +1075,8 @@ impl Queue {
             screen: VecDeque::new(),
             hurried: VecDeque::new(),
             compute: VecDeque::new(),
-            early: VecDeque::new(),
+            early: std::collections::BTreeMap::new(),
+            early_seq: 0,
             slow: VecDeque::new(),
             slow_now: 0,
             requested: VecDeque::new(),
@@ -1022,10 +1118,13 @@ impl Queue {
     /// Queues an unrequested pipeline or promotes one queued at creation.
     /// Returns whether it is new to the queue, or `None` if nothing changed.
     fn push(&mut self, p: &Arc<Pending>, priority: u8) -> Option<bool> {
-        self.push_as(p, priority, slow_limit() != usize::MAX && super::library::slow(&p.key))
+        let slow = slow_limit() != usize::MAX && super::library::slow(&p.key);
+        let order = if priority == EARLY { super::library::first_use(&p.key) } else { None };
+        self.push_as(p, priority, slow, order.unwrap_or(u32::MAX))
     }
 
-    fn push_as(&mut self, p: &Arc<Pending>, priority: u8, slow: bool) -> Option<bool> {
+    /// As [`Queue::push`]; `order` places an early one ([`Queue::early`]).
+    fn push_as(&mut self, p: &Arc<Pending>, priority: u8, slow: bool, order: u32) -> Option<bool> {
         let prev = p.queue_state.load(Ordering::Relaxed);
         if prev >= priority {
             return None;
@@ -1046,7 +1145,8 @@ impl Queue {
         } else if slow {
             self.slow.push_back(p.clone());
         } else {
-            self.early.push_back(p.clone());
+            self.early.insert((order, self.early_seq), p.clone());
+            self.early_seq += 1;
         }
         Some(prev == NOT_QUEUED)
     }
@@ -1066,7 +1166,10 @@ impl Queue {
             if p.is_none() && !self.reserved() {
                 p = waiting(&mut self.compute)
                     .or_else(|| self.requested.pop_front())
-                    .or_else(|| unclaimed(&mut self.early));
+                    .or_else(|| {
+                        std::iter::from_fn(|| self.early.pop_first().map(|(_, p)| p))
+                            .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
+                    });
                 if p.is_none() && self.slow_now < slow_limit {
                     p = unclaimed(&mut self.slow);
                     if let Some(p) = &p {
@@ -1214,10 +1317,12 @@ fn spawn_worker(i: usize) -> bool {
                     let thread = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
                     loop {
                         let p = next(screens_only);
+                        let began = Instant::now();
                         *slot.lock().unwrap_or_else(|e| e.into_inner()) =
-                            Some(Making { pipeline: p.clone(), thread, since: Instant::now() });
+                            Some(Making { pipeline: p.clone(), thread, since: began });
                         p.make();
                         *slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                        note_made(&p, began);
                         if p.was_slow.load(Ordering::Relaxed) {
                             let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
                             queue.slow_now = queue.slow_now.saturating_sub(1);
@@ -1427,8 +1532,104 @@ fn drained() {
             started_early = EARLY.load(Ordering::Relaxed),
             "host pipelines all made"
         );
+        // The burst's last word, whenever the line last came.
+        account_line();
     }
     super::library::save(false);
+}
+
+/// Pipelines made after draws or dispatches of them were dropped, for the
+/// account's "not drawn with since" (at most [`AFTER_MAX`]).
+static AFTER: Mutex<Vec<Arc<Pending>>> = Mutex::new(Vec::new());
+const AFTER_MAX: usize = 4096;
+
+/// A worker made `p`, begun at `began`: its time, and its lateness if a
+/// draw or dispatch had asked for it before.
+fn note_made(p: &Arc<Pending>, began: Instant) {
+    let done = Instant::now();
+    super::account::WHOLE.add(done - began);
+    if let Some(&asked) = p.asked.get()
+        && asked < done
+    {
+        super::account::LATE.add(done - asked);
+    }
+    if p.dropped.load(Ordering::Relaxed) > 0 && matches!(p.made.get(), Some(Some(_))) {
+        let mut after = AFTER.lock().unwrap_or_else(|e| e.into_inner());
+        if after.len() < AFTER_MAX {
+            after.push(p.clone());
+        }
+    }
+    account_now_and_then();
+}
+
+/// [`account_line`] if its time has come (cheap otherwise: one load).
+fn account_now_and_then() {
+    if super::account::due(crate::host::now_ms()) {
+        account_line();
+    }
+}
+
+/// The account of the pipelines made since the last such line (at most
+/// every five seconds, when something was made or dropped), and since the
+/// start: how long they took and where, the queue, the workers, and what the
+/// picture lost. Always on; also at the end of a burst ([`drained`]).
+fn account_line() {
+    use super::account::{self as a, text};
+    let whole = a::WHOLE.take();
+    let (loaded, missed, created, translating, late) =
+        (a::LOADED.take(), a::LOAD_MISSED.take(), a::CREATED.take(), a::TRANSLATING.take(), a::LATE.take());
+    let drops_all = a::LATE_DROPS.load(Ordering::Relaxed);
+    let drops = drops_all.saturating_sub(a::LATE_DROPS_SAID.swap(drops_all, Ordering::Relaxed));
+    if whole[0] == 0 && loaded[0] == 0 && created[0] == 0 && drops == 0 {
+        return;
+    }
+    // (Not waited for: the queue is the title's to fill and the workers'.)
+    let queue = QUEUE.try_lock().ok().map(|q| {
+        format!(
+            "screen {}, compute waited for {}, compute {}, asked for {}, early {}, early known to be slow {} ({} of them on workers)",
+            q.screen.len(),
+            q.hurried.len(),
+            q.compute.len(),
+            q.requested.len(),
+            q.early.len(),
+            q.slow.len(),
+            q.slow_now
+        )
+    });
+    let busy = NOW_MAKING.iter().filter(|s| s.try_lock().map_or(true, |s| s.is_some())).count();
+    let (after, lost) = {
+        let mut after = AFTER.lock().unwrap_or_else(|e| e.into_inner());
+        after.retain(|p| !p.drawn_after.load(Ordering::Relaxed));
+        let names: Vec<String> = after.iter().take(8).map(|p| format!("{} ({} dropped)", hashes(p), p.dropped.load(Ordering::Relaxed))).collect();
+        (after.len(), names)
+    };
+    tracing::info!(
+        "host pipelines in about {} s: {} made by the workers, {}; library loads that gave one {}; loads that found none {}; \
+         made anew {}; waiting for the shaders' translations {}. Queued now {} ({}), workers making {busy} of {}. \
+         Asks of draws and dispatches that found their pipeline still being made (dropped; a rectangle draw asks twice): \
+         {drops} ({drops_all} since the start). Made after a draw or dispatch had asked: {}",
+        a::EVERY_MS / 1000,
+        whole[0],
+        text(whole),
+        text(loaded),
+        text(missed),
+        text(created),
+        text(translating),
+        WAITING.load(Ordering::Relaxed),
+        queue.as_deref().unwrap_or("busy"),
+        WORKERS.load(Ordering::Relaxed) + if screens_first() { SCREEN_WORKERS } else { 0 },
+        text(late),
+    );
+    tracing::info!(
+        "host pipelines since the start: made by the workers {}; library loads that gave one {}; made anew {}; \
+         made after a draw or dispatch had asked {}; made after some of their draws were dropped and not drawn with \
+         since (a once-only pass lost, or only out of view): {after}{}",
+        text(a::WHOLE.total()),
+        text(a::LOADED.total()),
+        text(a::CREATED.total()),
+        text(a::LATE.total()),
+        if lost.is_empty() { String::new() } else { format!(", first {}", lost.join(", ")) },
+    );
 }
 
 #[cfg(test)]
@@ -1924,21 +2125,70 @@ mod tests {
         let mut queue = Queue::new();
         queue.workers = Some(64);
         for p in [&long, &longer, &asked] {
-            assert_eq!(queue.push_as(p, EARLY, true), Some(true));
+            assert_eq!(queue.push_as(p, EARLY, true, u32::MAX), Some(true));
         }
-        assert_eq!(queue.push_as(&quick, EARLY, false), Some(true));
+        assert_eq!(queue.push_as(&quick, EARLY, false, u32::MAX), Some(true));
         // The quick one first, then one long one at a time; one a draw asks
         // for waits for nobody.
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &quick));
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &long));
         assert!(queue.pop(false, 1).is_none());
-        assert_eq!(queue.push_as(&asked, REQUESTED, true), Some(false));
+        assert_eq!(queue.push_as(&asked, REQUESTED, true, u32::MAX), Some(false));
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &asked));
         assert!(!asked.was_slow.load(Ordering::Relaxed));
         assert!(queue.pop(false, 1).is_none());
         queue.slow_now -= 1;
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &longer));
         assert!(queue.pop(false, 1).is_none());
+    }
+
+    /// Early ones go by when an earlier run first asked for them, those no
+    /// run asked for last, and in the order they came among equals; one a
+    /// draw asks for meanwhile is taken from the asked-for line, once.
+    #[test]
+    fn early_pipelines_go_in_the_order_earlier_runs_asked_for_them() {
+        let new = || Arc::new(Pending::new(Vec::new(), None));
+        let (never, late, first, also_first, unknown, asked) = (new(), new(), new(), new(), new(), new());
+        let mut queue = Queue::new();
+        queue.workers = Some(64);
+        for (p, order) in [(&never, u32::MAX), (&late, 90), (&first, 3), (&asked, 40), (&also_first, 3), (&unknown, u32::MAX)] {
+            assert_eq!(queue.push_as(p, EARLY, false, order), Some(true));
+        }
+        assert_eq!(queue.push_as(&asked, REQUESTED, false, u32::MAX), Some(false));
+        for p in [&asked, &first, &also_first, &late, &never, &unknown] {
+            assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), p));
+        }
+        assert!(queue.pop(false, 1).is_none(), "the asked-for one is not made twice");
+    }
+
+    #[test]
+    fn the_openings_wait_holds_until_its_time_and_is_bounded() {
+        assert_eq!(start_window_of(None, Some(2000)), None);
+        assert_eq!(start_window_of(Some(0), None), None);
+        assert_eq!(start_window_of(Some(150), None), Some((150_000, Duration::from_millis(1000))));
+        assert_eq!(start_window_of(Some(150), Some(60_000)), Some((150_000, Duration::from_millis(5000))));
+        assert_eq!(start_window_of(Some(150), Some(0)), None);
+        let normal = Duration::from_millis(500);
+        let window = start_window_of(Some(150), Some(2000));
+        assert_eq!(draw_wait_at(149_999, window, normal), (Duration::from_millis(2000), true));
+        assert_eq!(draw_wait_at(150_000, window, normal), (normal, false));
+        assert_eq!(draw_wait_at(0, None, normal), (normal, false));
+    }
+
+    /// Only a pipeline queued or on a worker is said to be being made.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn a_pipeline_left_out_or_given_up_is_not_said_to_be_being_made() {
+        let mut left = Pending::new(Vec::new(), None);
+        left.left_out = Some("shades ray-tracing hits without BVH, left out");
+        assert_eq!(missing(&left).as_deref(), Some("left out: shades ray-tracing hits without BVH, left out"));
+        let gone = Pending::new(Vec::new(), None);
+        gone.failed.store(true, Ordering::Relaxed);
+        assert!(missing(&gone).is_some_and(|w| w.starts_with("given up")));
+        let making = Pending::new(Vec::new(), None);
+        assert_eq!(missing(&making).as_deref(), Some("being made"));
+        let _ = making.made.set(None);
+        assert!(missing(&making).is_some_and(|w| w.starts_with("refused")));
     }
 
     /// Passes over the screen go before all others, and workers of their own

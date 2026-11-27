@@ -548,7 +548,10 @@ pub(crate) fn pipeline(
     let wide = HSTRING::from(name);
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
-        return create();
+        let began = std::time::Instant::now();
+        let made = create();
+        super::account::CREATED.add(began.elapsed());
+        return made;
     };
     let began = std::time::Instant::now();
     let loaded = {
@@ -557,6 +560,11 @@ pub(crate) fn pipeline(
         let _call = call("load", name);
         load(&library.library, PCWSTR(wide.as_ptr()))
     };
+    if loaded.is_ok() {
+        super::account::LOADED.add(began.elapsed());
+    } else {
+        super::account::LOAD_MISSED.add(began.elapsed());
+    }
     // The load read the library's file (see `trim`).
     LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
     TRIMMED.store(false, Ordering::Relaxed);
@@ -574,7 +582,10 @@ pub(crate) fn pipeline(
     // Compiled outside any lock: compiles take up to seconds.
     let pso = {
         let _call = call("make", name);
-        create()?
+        let creating = std::time::Instant::now();
+        let made = create();
+        super::account::CREATED.add(creating.elapsed());
+        made?
     };
     MADE.fetch_add(1, Ordering::Relaxed);
     crate::host::trail(|| {
@@ -660,8 +671,10 @@ pub(crate) fn save(now: bool) {
         });
     }
     let slow: Vec<String> = slow_ones().iter().flatten().map(|(key, ms)| format!("{key} {ms}")).collect();
+    let order = order_text(order_now().as_ref());
     let written = library_written
         .and_then(|()| write_atomically(&dir.join(SLOW_FILE), slow.join("\n").as_bytes()))
+        .and_then(|()| write_atomically(&dir.join(ORDER_FILE), order.as_bytes()))
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
     match written {
         Ok(()) => tracing::info!(
@@ -799,16 +812,101 @@ pub(crate) fn wanted_early(key: &str) -> bool {
 
 /// A draw or dispatch requested the title pipeline with `key`.
 pub(crate) fn note_used(key: &str) {
-    let mut used = used();
-    let set = used.get_or_insert_with(HashSet::new);
-    if set.len() < EARLY_MAX && set.insert(key.to_owned()) {
+    {
+        let mut used = used();
+        let set = used.get_or_insert_with(HashSet::new);
+        if set.len() < EARLY_MAX && set.insert(key.to_owned()) {
+            USED_CHANGED.store(true, Ordering::Relaxed);
+        }
+    }
+    let at = FIRST_ASK.get_or_init(std::time::Instant::now).elapsed().as_secs().min(u64::from(u32::MAX - 1)) as u32;
+    if note_order(order_now().get_or_insert_default(), key, at) {
         USED_CHANGED.store(true, Ordering::Relaxed);
     }
+}
+
+/// When each title pipeline was first asked for, in seconds from the first
+/// ask of the run, as the last run that asked for it had it (beside the
+/// early list; "key seconds" a line). The early pipelines are started in
+/// that order ([`first_use`]): the opening scene's before those it needs
+/// a minute later. The title creates its pipelines in an order of its own
+/// while it loads, and on a cold driver cache the workers make some 15 a
+/// second: 1,700 queued at the opening cutscene took two minutes to make
+/// (run 20261127-210258).
+const ORDER_FILE: &str = "early-order.txt";
+static ORDER: Mutex<Option<std::collections::HashMap<String, u32>>> = Mutex::new(None);
+/// The run's first ask ([`note_used`]).
+static FIRST_ASK: OnceLock<std::time::Instant> = OnceLock::new();
+
+fn order_now() -> MutexGuard<'static, Option<std::collections::HashMap<String, u32>>> {
+    let mut order = ORDER.lock().unwrap_or_else(|e| e.into_inner());
+    if order.is_none() {
+        let listed = DIR.get().and_then(|d| std::fs::read_to_string(d.join(ORDER_FILE)).ok()).unwrap_or_default();
+        *order = Some(order_parse(&listed));
+    }
+    order
+}
+
+fn order_parse(listed: &str) -> std::collections::HashMap<String, u32> {
+    listed
+        .lines()
+        .filter_map(|l| l.split_once(' '))
+        .filter_map(|(key, at)| Some((key.to_owned(), at.trim().parse().ok()?)))
+        .collect()
+}
+
+/// The file's text, earliest first.
+fn order_text(order: Option<&std::collections::HashMap<String, u32>>) -> String {
+    let mut all: Vec<(&String, &u32)> = order.into_iter().flatten().collect();
+    all.sort_unstable_by(|a, b| a.1.cmp(b.1).then_with(|| a.0.cmp(b.0)));
+    all.iter().map(|(key, at)| format!("{key} {at}")).collect::<Vec<_>>().join("\n")
+}
+
+/// This run asked first for `key` `at` seconds in; whether that changes
+/// what is kept. This run's time replaces an earlier run's (the opening
+/// scene moves when the save does); at most [`EARLY_MAX`] keys.
+fn note_order(order: &mut std::collections::HashMap<String, u32>, key: &str, at: u32) -> bool {
+    match order.get_mut(key) {
+        Some(was) if *was == at => false,
+        Some(was) => {
+            *was = at;
+            true
+        }
+        None if order.len() >= EARLY_MAX => false,
+        None => {
+            order.insert(key.to_owned(), at);
+            true
+        }
+    }
+}
+
+/// When an earlier run first asked for the title pipeline with `key`, in
+/// seconds from its first ask ([`ORDER_FILE`]); `None` if no run did, or
+/// with `VICTORY_EARLY_ORDER=0` (the early ones in the title's order of
+/// creation, as before).
+pub(crate) fn first_use(key: &str) -> Option<u32> {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_EARLY_ORDER").is_none_or(|v| v != "0")) {
+        return None;
+    }
+    order_now().as_ref().and_then(|o| o.get(key).copied())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_first_asks_are_kept_earliest_first_and_this_runs_replace_earlier_ones() {
+        let mut order = order_parse("bbb 40\naaa 3\nnot-a-line\nccc x\n");
+        assert_eq!(order.len(), 2);
+        assert!(!note_order(&mut order, "aaa", 3), "the same: nothing to write");
+        assert!(note_order(&mut order, "bbb", 7), "this run's time replaces the last one's");
+        assert!(note_order(&mut order, "ddd", 0));
+        assert_eq!(order_text(Some(&order)), "ddd 0\naaa 3\nbbb 7");
+        assert_eq!(order_parse(&order_text(Some(&order))), order);
+        assert_eq!(order_text(None), "");
+    }
 
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {

@@ -476,6 +476,14 @@ pub(crate) fn made() -> u64 {
     library::MADE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Asks of draws and dispatches that found their pipeline still being made
+/// (queued or on a worker; not those left out, refused or given up), since
+/// the start: the drops that waiting for pipelines could have saved.
+#[cfg(windows)]
+pub(crate) fn late_drops() -> u64 {
+    account::late_drops()
+}
+
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
 /// (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -768,6 +776,8 @@ static FUNCTIONS: Table<24> = {
     Table(f)
 };
 
+#[cfg(windows)]
+mod account;
 #[cfg(windows)]
 pub(crate) mod host;
 #[cfg(windows)]
