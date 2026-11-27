@@ -1209,20 +1209,25 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
     // per region: LDS reads, LDS writes
     let mut reads = vec![false; n];
     let mut writes = vec![false; n];
+    let lds_op = |i: &Inst| {
+        let name = i.name();
+        (matches!(i.fields, Fields::Ds { .. }) && !name.starts_with("ds_swizzle") && !name.contains("permute"))
+            .then_some(name)
+    };
     for (b, block) in p.blocks.iter().enumerate().take(n) {
         if all[b] {
             continue;
         }
         let r = find(&mut region, b);
-        for i in &block.insts {
-            let name = i.name();
-            if !matches!(i.fields, Fields::Ds { .. }) || name.starts_with("ds_swizzle") || name.contains("permute") {
-                continue;
-            }
+        for name in block.insts.iter().filter_map(lds_op) {
             if name.starts_with("ds_read") {
                 reads[r] = true;
             } else {
                 writes[r] = true;
+                // An atomic reads the word it changes (avatarmanz/VIctory-7900XTX #204): an
+                // atomic minimum and an add in one region, split in two host waves, could
+                // run the other half's minimum after this half's add.
+                reads[r] |= !(name.starts_with("ds_write_b") || name.starts_with("ds_write2"));
             }
         }
     }
@@ -1232,6 +1237,26 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
     let flags_on = std::env::var_os("VICTORY_LDS_FLAGS").is_none_or(|v| v != "0");
     for r in (0..n).filter(|&r| reads[r] && writes[r]).collect::<Vec<_>>() {
         let blocks: Vec<usize> = (0..n).filter(|&b| !all[b] && find(&mut region, b) == r).collect();
+        // One kind of commuting reduction that returns nothing, alone in the region: any
+        // order of the two halves leaves the same word.
+        let mut ops = blocks.iter().flat_map(|&b| p.blocks[b].insts.iter().filter_map(lds_op));
+        if let Some(op) = ops.next()
+            && matches!(
+                op,
+                "ds_add_u32"
+                    | "ds_sub_u32"
+                    | "ds_and_b32"
+                    | "ds_or_b32"
+                    | "ds_xor_b32"
+                    | "ds_min_i32"
+                    | "ds_max_i32"
+                    | "ds_min_u32"
+                    | "ds_max_u32"
+            )
+            && ops.all(|next| next == op)
+        {
+            continue;
+        }
         if !(flags_on && lds_flag_region(p, st, &blocks)) {
             return None;
         }
