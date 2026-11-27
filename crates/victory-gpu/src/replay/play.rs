@@ -333,6 +333,32 @@ pub fn find(folder: &Path) -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("no capture (frame.bin) in {}", folder.display()))
 }
 
+/// The host facts the translator takes from the card (`host.rs` sets the
+/// same at a run's start): its widest and narrowest waves decide the form
+/// of wave64 compute programs (on a card of 32 lanes they run in waves of
+/// 32) and whether it is an RDNA card. The widest wave and whether it is
+/// RDNA, or none where the card cannot be asked.
+pub fn card_wave_facts() -> Option<(u32, bool)> {
+    // SAFETY: a device made and asked about its features, nothing more.
+    unsafe {
+        let mut device: Option<ID3D12Device> = None;
+        D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
+        let device = device?;
+        let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        device
+            .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, (&raw mut o1).cast(), size_of_val(&o1) as u32)
+            .ok()?;
+        let amd = crate::indirect::amd(&device);
+        Some((o1.WaveLaneCountMax, wave_facts_rdna(amd, o1.WaveLaneCountMin, o1.WaveLaneCountMax)))
+    }
+}
+
+/// Whether a card is RDNA, as `host.rs` decides it: the vendor's, with waves
+/// of 32 and 64 (its older cards have 64 alone).
+fn wave_facts_rdna(amd: bool, min: u32, max: u32) -> bool {
+    amd && min == 32 && max == 64
+}
+
 /// The stage and hash by which the runtime names each of the title's shaders
 /// in a capture.
 pub fn title_shaders(folder: &Path) -> Result<std::collections::BTreeSet<(String, String)>> {
@@ -3542,5 +3568,17 @@ mod tests {
             ..Default::default()
         };
         assert!(o.edited() && !o.plain().edited() && o.plain().buffers == Buffers::Card);
+    }
+}
+
+#[cfg(test)]
+mod card_tests {
+    /// A card is RDNA where it is the vendor's and has waves of 32 and 64.
+    #[test]
+    fn rdna_is_told_as_the_runtime_tells_it() {
+        assert!(super::wave_facts_rdna(true, 32, 64));
+        assert!(!super::wave_facts_rdna(true, 64, 64));
+        assert!(!super::wave_facts_rdna(false, 32, 32));
+        assert!(!super::wave_facts_rdna(false, 32, 64));
     }
 }

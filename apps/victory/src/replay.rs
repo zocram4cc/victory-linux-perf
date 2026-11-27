@@ -465,8 +465,18 @@ fn retranslate(folder: &std::path::Path, into: &std::path::Path, view_limit: u32
         }
     }
     println!("{} containers not found", missing.len());
-    victory_shader::emit::set_host_max_wave(64);
-    victory_shader::emit::set_host_rdna(true);
+    // As a run on this card translates (`VICTORY_RETRANSLATE_CARD=0`: as for
+    // an RDNA card of 64 lanes, as before: on a card of 32 lanes every wave64
+    // compute program then asked for waves of 64, and its pipeline was
+    // refused and made with the recorded shader).
+    let (wave, rdna) = if std::env::var_os("VICTORY_RETRANSLATE_CARD").is_some_and(|v| v == "0") {
+        (64, true)
+    } else {
+        play::card_wave_facts().unwrap_or((64, true))
+    };
+    println!("translated as for a card of {wave}-lane waves{}", if rdna { ", RDNA" } else { "" });
+    victory_shader::emit::set_host_max_wave(wave);
+    victory_shader::emit::set_host_rdna(rdna);
     victory_shader::emit::set_view_heap_limit(view_limit);
     victory_shader::emit::set_raw_views(raw_views);
     let all: Vec<_> = wanted.iter().collect();
