@@ -85,8 +85,11 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
         unsafe { crate::tls::redirect(loaded.base(), &loaded.info) }?;
     }
     let size = loaded.info.size_of_image as usize;
-    // SAFETY: just mapped, and no title code has run.
-    unsafe { crate::hooks::apply_asked(loaded.base(), size, &prepared.original_hash) };
+    // The title hooks are made for its executable, not the DLLs beside it.
+    if !loaded.info.is_dll() {
+        // SAFETY: just mapped, and no title code has run.
+        unsafe { crate::hooks::apply_asked(loaded.base(), size, &prepared.original_hash) };
+    }
     tracing::info!(
         base = format_args!("{:#x}", loaded.base()),
         preferred = format_args!("{:#x}", loaded.info.image_base),
