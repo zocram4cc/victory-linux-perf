@@ -53,8 +53,3 @@ Cursor) can follow it: *"port the memory stack from victory-memory-stack into my
 | [MEMORY_STACK.md](MEMORY_STACK.md) | What each switch does, the cherry-pick order, the hook points |
 | [AGENTS.md](AGENTS.md) | How to port: path A (apply directly) and path B (port feature by feature), invariants, verification |
 | [patches/](patches) | `0001`-`0027`, `git format-patch` of `e94251a..memory-portable` |
-
-## License
-
-The patches change VIctory, which is GPL-3.0-or-later, and are under the same terms:
-[LICENSE](LICENSE) (GNU GPL v3).
