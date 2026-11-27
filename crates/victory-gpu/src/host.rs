@@ -2411,6 +2411,9 @@ struct Deferred {
     filled: std::collections::HashMap<(usize, usize), u64, std::hash::BuildHasherDefault<AddressHash>>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
+    /// The host texture last copied into each placed view's texture by
+    /// this list ([`crate::texture::alias`]), by the view's host texture.
+    texture_aliases: std::collections::HashMap<usize, usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -7443,6 +7446,17 @@ impl HostList {
     /// about `key` (a texture to bring up to date).
     pub(crate) fn first_use(&self, key: usize) -> bool {
         self.deferred().textures.insert(key)
+    }
+
+    /// Marks `key` used ([`HostList::first_use`]) and says whether the list
+    /// has yet to copy `source` into `view` ([`crate::texture::alias`]): no
+    /// copy was recorded since the reset, or the last was from another
+    /// texture.
+    pub(crate) fn alias_source_changed(&self, key: usize, view: &ID3D12Resource, source: &ID3D12Resource) -> bool {
+        let source = source.as_raw() as usize;
+        let mut deferred = self.deferred();
+        deferred.textures.insert(key);
+        deferred.texture_aliases.insert(view.as_raw() as usize, source) != Some(source)
     }
 
     /// Whether `key` was asked about ([`HostList::first_use`]) since the
