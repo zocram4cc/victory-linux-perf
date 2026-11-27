@@ -102,6 +102,16 @@ pub(crate) fn on() -> bool {
     set() != Set::Off && !crate::pipeline::builder_runs()
 }
 
+/// Whether the stand-in drops probe light the title left magenta
+/// (`VICTORY_AMBIENT_MAGENTA=1`, off by default): green below half the
+/// lesser of red and blue, and not black, is taken for uninitialized or
+/// corrupted memory, not light (Belobug e9428969: "magenta garbage probes
+/// left by uninitialized/corrupted memory on AMD"), and counts as none.
+fn magenta_filter() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_AMBIENT_MAGENTA").is_some_and(|v| v == "1"))
+}
+
 /// The most the air scatters, as a multiple of the light around
 /// (`VICTORY_AMBIENT_AIR=<multiple>`; unset or 0: what the title has).
 fn air() -> f32 {
@@ -403,6 +413,9 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
     float3 was = unpack(light[p]);
+#ifdef MAGENTA_FILTER
+    if (was.g < 0.5 * min(was.r, was.b) && max(was.r, was.b) > 0.02) was = 0.0;
+#endif
     float left = dot(was, LUMA);
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.
@@ -453,7 +466,8 @@ unsafe impl Sync for Pass {}
 fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -> windows::core::Result<Pass> {
     let mut root: Option<ID3D12RootSignature> = None;
     let mut pipeline = |part: &str, entry| -> windows::core::Result<ID3D12PipelineState> {
-        let code = crate::host::compile(&format!("#define {part}\n{SOURCE}"), entry, s!("cs_5_1"))?;
+        let filter = if magenta_filter() { "#define MAGENTA_FILTER\n" } else { "" };
+        let code = crate::host::compile(&format!("#define {part}\n{filter}{SOURCE}"), entry, s!("cs_5_1"))?;
         // SAFETY: the root signature is inside the shader; plain creations.
         unsafe {
             if root.is_none() {
