@@ -9432,6 +9432,8 @@ impl Meter {
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                 objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
             );
+            // Always: what refreshes send up again over what shaders wrote.
+            crate::shadow::resent::log(frames);
             #[cfg(feature = "diagnostics")]
             {
                 let put = [0, 1, 2, 3].map(|i| crate::shadow::PUT[i].swap(0, Ordering::Relaxed) as f64 / frames);

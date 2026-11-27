@@ -2038,6 +2038,161 @@ fn land_echo() -> bool {
 /// bytes a landing was noted in that were the title's too.
 pub(crate) static ECHO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// What refreshes of copies in the card's memory that shaders wrote send up
+/// again, by kind ([`Resent`]). Always counted, whatever the switches: the
+/// pages of such a copy that a refresh sends up are where the CPU's side goes
+/// over what the card holds.
+pub(crate) mod resent {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    /// Pages (4 KiB) and bytes, per copy.
+    #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) struct Resent {
+        /// Sent up, no landing noted in them: written by the title, as far
+        /// as the watch says.
+        pub(crate) title: u64,
+        /// A landing was noted in them, and they hold what the CPU's side
+        /// holds: left (`VICTORY_LAND_ECHO`).
+        pub(crate) echo: u64,
+        /// A landing was noted in them, and title memory holds other bytes
+        /// than the CPU's side: sent up.
+        pub(crate) landed: u64,
+        /// Of the pages sent up, the bytes that differ from the CPU's side
+        /// (what the card holds): what the send changes on the card.
+        pub(crate) bytes: u64,
+        /// Of the pages sent up: whole, and as runs of changed dwords.
+        pub(crate) whole: u64,
+        pub(crate) runs: u64,
+        /// Pages a landing could not put into title memory, whose CPU side
+        /// took the card's bytes all the same (`take`): from then on title
+        /// memory and the CPU's side differ there.
+        pub(crate) missed: u64,
+    }
+
+    impl Resent {
+        pub(crate) fn add(&mut self, o: &Resent) {
+            self.title += o.title;
+            self.echo += o.echo;
+            self.landed += o.landed;
+            self.bytes += o.bytes;
+            self.whole += o.whole;
+            self.runs += o.runs;
+            self.missed += o.missed;
+        }
+
+        pub(crate) fn is_empty(&self) -> bool {
+            *self == Resent::default()
+        }
+
+        /// For the log, `per` frames.
+        pub(crate) fn said(&self, per: f64) -> String {
+            let f = |n: u64| n as f64 / per.max(1.0);
+            format!(
+                "pages sent up {:.1} (title-written {:.1}, landing noted and differing {:.1}; whole {:.1}, as runs {:.1}), \
+                 {:.1} KB differing from the card, echo pages left {:.1}, landing pages title memory missed {:.1}",
+                f(self.title + self.landed),
+                f(self.title),
+                f(self.landed),
+                f(self.whole),
+                f(self.runs),
+                f(self.bytes) / 1024.0,
+                f(self.echo),
+                f(self.missed)
+            )
+        }
+    }
+
+    /// Since the last frame-rate line, and since the last lines per copy.
+    struct All {
+        line: Resent,
+        by_copy: HashMap<u64, (u64, Resent)>,
+    }
+
+    static ALL: Mutex<Option<All>> = Mutex::new(None);
+
+    /// Counts `r` for the copy of title memory `[start, start + len)`.
+    pub(crate) fn note(start: u64, len: u64, r: Resent) {
+        if r.is_empty() {
+            return;
+        }
+        let mut all = ALL.lock().unwrap_or_else(|e| e.into_inner());
+        let all = all.get_or_insert_with(|| All { line: Resent::default(), by_copy: HashMap::new() });
+        all.line.add(&r);
+        let e = all.by_copy.entry(start).or_insert((len, Resent::default()));
+        e.1.add(&r);
+    }
+
+    /// The totals since the last call, then empty.
+    pub(crate) fn take_line() -> Resent {
+        let mut all = ALL.lock().unwrap_or_else(|e| e.into_inner());
+        all.as_mut().map(|a| std::mem::take(&mut a.line)).unwrap_or_default()
+    }
+
+    /// The copies with anything counted since the last call, the most bytes
+    /// first, at most `most`; all are emptied.
+    pub(crate) fn take_copies(most: usize) -> Vec<(u64, u64, Resent)> {
+        let mut all = ALL.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(all) = all.as_mut() else {
+            return Vec::new();
+        };
+        let mut v: Vec<(u64, u64, Resent)> = all.by_copy.drain().map(|(s, (l, r))| (s, l, r)).collect();
+        v.sort_by_key(|(s, _, r)| (std::cmp::Reverse(r.bytes), std::cmp::Reverse(r.title + r.landed), *s));
+        v.truncate(most);
+        v
+    }
+
+    /// Bytes in which `a` and `b` differ.
+    pub(crate) fn differing(a: &[u8], b: &[u8]) -> u64 {
+        a.iter().zip(b).filter(|(x, y)| x != y).count() as u64
+    }
+
+    /// For the frame-rate line, over `frames` frames: the totals, and every
+    /// five seconds a line per copy (the most bytes first).
+    pub(crate) fn log(frames: f64) {
+        static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+        let line = take_line();
+        if !line.is_empty() {
+            tracing::info!("copies in the card's memory sent up again per frame: {}", line.said(frames));
+        }
+        {
+            let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+            let now = std::time::Instant::now();
+            match *last {
+                Some(at) if now.duration_since(at) < std::time::Duration::from_secs(5) => return,
+                _ => *last = Some(now),
+            }
+        }
+        let copies = take_copies(12);
+        for (start, len, r) in copies {
+            tracing::info!("  sent up again, five seconds, copy {start:#x}+{len:#x}: {}", r.said(1.0));
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn counts_go_by_copy_and_the_most_bytes_come_first() {
+            let _ = take_copies(usize::MAX);
+            let _ = take_line();
+            note(0x1000, 0x100, Resent { title: 1, bytes: 10, whole: 1, ..Default::default() });
+            note(0x2000, 0x100, Resent { landed: 2, bytes: 500, whole: 2, ..Default::default() });
+            note(0x1000, 0x100, Resent { echo: 3, ..Default::default() });
+            note(0x3000, 0x100, Resent::default());
+            let line = take_line();
+            assert_eq!((line.title, line.landed, line.echo, line.bytes), (1, 2, 3, 510));
+            assert!(take_line().is_empty(), "the line's totals start again");
+            let copies = take_copies(8);
+            assert_eq!(copies.iter().map(|c| c.0).collect::<Vec<_>>(), [0x2000, 0x1000], "nothing counted, no line");
+            assert_eq!(copies[1].2.echo, 3);
+            assert!(take_copies(8).is_empty());
+            assert_eq!(differing(&[1, 2, 3, 4], &[1, 0, 3, 0]), 2);
+        }
+    }
+}
+
 /// Whether a refresh of a copy in the card's memory takes, and sends up,
 /// the dwords that title memory changed and no others
 /// (`VICTORY_SEND_CHANGED=1`; off: the 64 KiB pages written since it last
@@ -4112,9 +4267,11 @@ impl Shadow {
                 at = next;
             }
         }
+        let mut resent = resent::Resent::default();
         TITLE.with_borrow_mut(|title| {
             for (from, to, noted) in runs {
                 if !noted {
+                    resent.add(&self.resent_whole(from, to, |_| false));
                     self.copy(from, to);
                     continue;
                 }
@@ -4131,8 +4288,12 @@ impl Shadow {
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at - start), next - at) };
                     if title == held {
                         ECHO[0].fetch_add((next - at) as u64, Ordering::Relaxed);
+                        resent.echo += 1;
                     } else {
                         ECHO[1].fetch_add((next - at) as u64, Ordering::Relaxed);
+                        resent.landed += 1;
+                        resent.whole += 1;
+                        resent.bytes += resent::differing(title, held);
                         held.copy_from_slice(title);
                         self.changed(at - start, next - start);
                         self.card_changed(at - start, next - start);
@@ -4141,7 +4302,51 @@ impl Shadow {
                 }
             }
         });
+        resent::note(self.start, self.len, resent);
         to - from
+    }
+
+    /// For [`resent`]: `pages` of a landing were not put into title memory,
+    /// and the CPU's side took the card's bytes there.
+    pub(crate) fn resent_missed(&self, pages: u64) {
+        resent::note(self.start, self.len, resent::Resent { missed: pages, ..Default::default() });
+    }
+
+    /// Whether a landing is noted in the 4 KiB page that holds title address
+    /// `at`, left noted.
+    fn landing_noted(&self, at: usize) -> bool {
+        let page = at / KERNEL_PAGE - self.start as usize / KERNEL_PAGE;
+        let bits = self.landings.lock().unwrap_or_else(|e| e.into_inner());
+        bits.get(page / 64).is_some_and(|word| word >> (page % 64) & 1 != 0)
+    }
+
+    /// For [`resent`]: title memory `[from, to)` goes up whole; by 4 KiB
+    /// page, whether a landing is noted in it (`noted`, by its address) and
+    /// the bytes in which it differs from the CPU's side. Read before the
+    /// copy takes it (title memory is read twice).
+    fn resent_whole(&self, from: usize, to: usize, noted: impl Fn(usize) -> bool) -> resent::Resent {
+        let mut r = resent::Resent::default();
+        let start = self.start as usize;
+        let (from, to) = (from.max(start), to.min(start + self.len as usize));
+        let mut title = [0u8; KERNEL_PAGE];
+        let mut at = from;
+        while at < to {
+            let next = ((at / KERNEL_PAGE + 1) * KERNEL_PAGE).min(to);
+            let title = &mut title[..next - at];
+            crate::host::copy_mapped(title.as_mut_ptr(), at as *const u8, next - at, false);
+            // SAFETY: inside the mapping of the copy's CPU side; read only,
+            // by the refresh that is about to write it.
+            let held = unsafe { std::slice::from_raw_parts(self.data.add(at - start).cast_const(), next - at) };
+            if noted(at) {
+                r.landed += 1;
+            } else {
+                r.title += 1;
+            }
+            r.whole += 1;
+            r.bytes += resent::differing(title, held);
+            at = next;
+        }
+        r
     }
 
     /// Copies title memory `[from, to)` (inside the buffer) into the copy;
@@ -4152,8 +4357,13 @@ impl Shadow {
             static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
         let Some(card) = self.card.as_ref().filter(|_| self.changes_only.load(Ordering::Relaxed) || send_changed()) else {
-            if known && self.card.is_some() && self.landing.load(Ordering::Acquire) && land_echo() && !crate::host::upcheck::on() {
+            let landed = self.card.is_some() && self.landing.load(Ordering::Acquire);
+            if known && landed && land_echo() && !crate::host::upcheck::on() {
                 return self.take_landed(from, to);
+            }
+            if landed {
+                // Counted as `take_landed` would, whatever the switches.
+                resent::note(self.start, self.len, self.resent_whole(from, to, |at| self.landing_noted(at)));
             }
             return self.copy(from, to);
         };
@@ -4179,6 +4389,21 @@ impl Shadow {
                     self.changed(at - start + a, at - start + a + len);
                 }
                 self.card_changed_runs(runs.iter().map(|&(a, len)| (at - start + a, at - start + a + len)));
+                if !runs.is_empty() && self.landing.load(Ordering::Acquire) {
+                    let noted = self.landing_noted(at);
+                    resent::note(
+                        self.start,
+                        self.len,
+                        resent::Resent {
+                            title: u64::from(!noted),
+                            landed: u64::from(noted),
+                            whole: u64::from(whole),
+                            runs: u64::from(!whole),
+                            bytes: runs.iter().map(|r| r.1 as u64).sum(),
+                            ..Default::default()
+                        },
+                    );
+                }
                 if let Some(was) = was {
                     crate::host::upcheck::note(self.id, at - start, &was, held);
                 }

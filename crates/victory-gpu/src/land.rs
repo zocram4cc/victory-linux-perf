@@ -616,6 +616,7 @@ unsafe fn piece_at(
     let into = beside.unwrap_or(title);
     let since = crate::watch::changes();
     let (mut pages, mut new_pages, mut blocks, mut dwords, mut missing) = (0, 0u64, 0, 0, 0);
+    let mut missed_taken = 0u64;
     let mut span: Option<(usize, usize)> = None;
     for_pages(title, parts, |from, n| {
         pages += 1;
@@ -647,6 +648,7 @@ unsafe fn piece_at(
         blocks += done.new;
         dwords += done.dwords;
         missing += u64::from(!done.there);
+        missed_taken += u64::from(!done.there && take);
         if done.new > 0 {
             new_pages += 1;
             if beside.is_some() {
@@ -666,6 +668,10 @@ unsafe fn piece_at(
         // block then has two.
         let through = if missing == 0 { copy } else { std::ptr::null() };
         notes.landed.push((title / BLOCK, through));
+    }
+    if missed_taken > 0 && !copy.is_null() {
+        // SAFETY: the caller's copy, live through the call.
+        unsafe { &*copy }.resent_missed(missed_taken);
     }
     count(stat::NEW_PIECES, u64::from(new_pages > 0));
     count(stat::PAGES, pages);
