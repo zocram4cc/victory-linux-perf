@@ -95,9 +95,6 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
     shader
 }
 
-/// Runs `shader` with `views` at heap indices 0.. (the UAV last) on the
-/// hardware GPU and on WARP (each skipped without a device) and returns,
-/// per one that ran, the UAV's 32 dwords.
 thread_local! {
     /// The record counts the title's views at heap slots 0.. hold, where
     /// they differ from the host view's (a structured view the runtime makes
@@ -129,6 +126,9 @@ fn slot_table(views: &[View]) -> Vec<u32> {
     table
 }
 
+/// Runs `shader` with `views` at heap indices 0.. (the UAV last) on the
+/// hardware GPU and on WARP (each skipped without a device) and returns,
+/// per one that ran, the UAV's 32 dwords.
 pub(super) fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
     let samplers = [D3D12_SAMPLER_DESC {
         Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,

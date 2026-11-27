@@ -74,7 +74,7 @@ fn totals() -> Totals {
         back_us: b[0].load(Relaxed),
         back_bytes: b[1].load(Relaxed),
         lock_wait_ns,
-        draws: crate::draw::drawn() as u64,
+        draws: crate::draw::drawn(),
     }
 }
 
