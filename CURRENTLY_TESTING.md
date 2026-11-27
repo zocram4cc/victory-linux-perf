@@ -12,11 +12,22 @@ bimodal; differences under ~5 ms need ≥4 runs an arm).
   world (`draws > 100`). Figure = median `ms_per_frame` of those rows; "prep" = median `cpu_prepare_ms`.
 - Release build (`--features scripted`), caches warm (prebuild + full `warm`, 93,821 pipelines).
 
-## Latest (2026-11-28 night): `main` = 506a3bc75
+## Latest (2026-11-28 night): `main` = 6092804c5
 
 Same method; old save; play set + `VICTORY_SHADER_OPT=63 VICTORY_WINDOWS_BAR_MB=4096` (both new in
-play). Two identical baselines in one batch differed by 3.9 ms (ab25: 47.4 vs 43.5), so single
-150-row runs only resolve effects of ~4 ms and more.
+play). Single 150-row runs moved by up to 3.9 ms between identical setups (ab25: 47.4 vs 43.5). Two
+causes: the title's idle camera swings in after ~90 world seconds (draws ~2x, +~10 ms a frame) at a
+slightly different time each run, and the time of day follows the wall clock (night at 04:08, day at
+04:50 from the same save). From ab26 on: medians over world rows 15–89 (the steady phase), pairs
+interleaved in one batch, plus ms per 1,000 draws; identical runs then agree within 1–2 ms.
+
+| Change | Frame | Prep | Heap | Notes |
+|---|---|---|---|---|
+| **`VICTORY_STORE_BESIDE=1 VICTORY_COPY_BESIDE=1`** (on `main`, off by default; kroeeee sets STORE) | **39.8 / 39.1 vs 42.5 / 42.9** | 33.0 / 31.9 vs 36.2 | 10.2 / 9.6 | ab29, rows 15–89, 2 pairs: −3.2 ms (−7.5 %); STORE alone 41.1 / 40.5; picture checked; now in play (`play-fast8.sh`) |
+| `VICTORY_WIDE_SPIN=50` | 42.4 / 42.3 vs 41.5 / 42.5 | | | ab26; no effect; off |
+| nice −10 on the submitting, relay and wide threads | 42.3 / 42.8 vs 42.6 / 43.0 | | | ab27; no effect |
+| `VICTORY_REFRESH_PREFETCH=1` (branch `perf/refresh-prefetch`, not merged) | 64.5 / 64.2 vs 45.0 / 45.9 | | | ab28; +19 ms: the prefetch ran on the list threads before a list was handed over |
+| upstream fixes: `..` stops at a mounted drive's root (cwWwWwW), TLS callback lists over the limit rejected (pwu2775-dev) | | | | correctness; ported tests red without the fixes |
 
 | Change | Frame | Prep | Heap | Notes |
 |---|---|---|---|---|
