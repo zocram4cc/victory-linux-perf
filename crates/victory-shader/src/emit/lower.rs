@@ -7437,6 +7437,13 @@ impl<'a> Lower<'a> {
                 let stride = used.map_or(0, |u| u.stride);
                 if stride > 1 && stride < 1 << 14 {
                     words.push((1, self.s.m.i32(stride << 16)));
+                } else if let Some(st) = self.slot_stride(&src)? {
+                    // Not in the metadata: the view's own stride from the
+                    // host's table by heap slot (`SLOT_STRIDES`), real data
+                    // (P.4: 47,000 reads of `s_bfe_u32 x, d1, 0xe0010`).
+                    let (k3fff, k16) = (self.s.m.i32(0x3FFF), self.s.m.i32(16));
+                    let st = self.s.m.bin(c, Bin::And, st, k3fff);
+                    words.push((1, self.s.m.bin(c, Bin::Shl, st, k16)));
                 }
                 // Its address too, where the code computes with it and the
                 // host can tell it.
@@ -7456,12 +7463,31 @@ impl<'a> Lower<'a> {
                 words
             }
         };
+        // The view's identity for dwords 0-1 (its address on the console)
+        // where they are only compared for equality with other descriptors'
+        // dwords 0-1 (waterfall loops, "did the texture change?") or used
+        // as a descriptor: the heap slot in dword 0, 0 in dword 1. Same view,
+        // same number; different views, different numbers (two slots naming
+        // one texture compare unequal: a waterfall loop then takes one more
+        // pass, a change test reloads; both still right). Proven per use
+        // ([`Self::compare_only`]), never assumed.
+        // `VICTORY_VIEW_IDENTITY=0` leaves them without value, as before.
+        let identity_on = !std::env::var_os("VICTORY_VIEW_IDENTITY").is_some_and(|v| v == "0");
+        let mut identity: Option<Option<V>> = None;
         for k in 0..count {
             let rel = k.wrapping_sub(u32::from(first));
             match words.iter().find(|w| w.0 == rel) {
                 Some(&(_, x)) => self.write(inst, Reg::S(code + k as u8), x, None),
                 None => {
                     if let Some(v) = inst.write(Reg::S(code + k as u8)) {
+                        if identity_on && rel < 2 && self.compare_only(v) {
+                            let id = *identity.get_or_insert_with(|| self.heap_index(site, first, false).ok());
+                            if let Some(id) = id {
+                                let x = if rel == 0 { id } else { self.s.m.i32(0) };
+                                self.write(inst, Reg::S(code + k as u8), x, None);
+                                continue;
+                            }
+                        }
                         self.vals.insert(v, Val::Missing(OTHER));
                         self.stale.insert(v);
                     }
@@ -7469,6 +7495,129 @@ impl<'a> Lower<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Whether `v`, a descriptor's dword 0 or 1, is only used as a
+    /// descriptor or compared for equality with another descriptor's dword
+    /// 0 or 1 ([`Self::ident_dword`]): followed through copies, joins and
+    /// `v_readfirstlane_b32`.
+    fn compare_only(&self, v: Value) -> bool {
+        let p = self.x.p;
+        let mut todo = vec![v];
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(x) = todo.pop() {
+            if !seen.insert(x) {
+                continue;
+            }
+            if seen.len() > 512 {
+                return false;
+            }
+            for block in &p.blocks {
+                for ph in &block.phis {
+                    if ph.args.contains(&x) {
+                        todo.push(ph.value);
+                    }
+                }
+                for i in &block.insts {
+                    let Some(&(reg, _)) = i.reads.iter().find(|r| r.1 == x) else { continue };
+                    let name = i.name();
+                    match name {
+                        "s_mov_b32" | "s_mov_b64" | "v_mov_b32" | "v_readfirstlane_b32" => {
+                            let k = match (&i.fields, reg) {
+                                (Fields::Sop { src, .. }, Reg::S(c)) => match src.first() {
+                                    Some(Operand::Scalar { code, .. }) if c >= *code => usize::from(c - code),
+                                    _ => return false,
+                                },
+                                _ => 0,
+                            };
+                            match i.writes.get(k) {
+                                Some(&(_, w)) => todo.push(w),
+                                None => return false,
+                            }
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    let equality = (name.starts_with("s_cmp_eq_") || name.starts_with("s_cmp_lg_")
+                        || name.starts_with("v_cmp_eq_") || name.starts_with("v_cmp_ne_")
+                        || name.starts_with("v_cmpx_eq_") || name.starts_with("v_cmpx_ne_"))
+                        && (name.contains("_u32") || name.contains("_i32"));
+                    if equality {
+                        // Both sides descriptors' dwords 0-1.
+                        let ok = i.reads.iter().filter(|r| !matches!(r.0, Reg::S(c) if c == EXEC || c == EXEC + 1))
+                            .all(|r| r.1 == x || self.ident_dword(r.1, &mut Vec::new()));
+                        if ok && i.reads.iter().filter(|r| !matches!(r.0, Reg::S(c) if c == EXEC || c == EXEC + 1)).count() == 2 {
+                            continue;
+                        }
+                        if std::env::var_os("VICTORY_WHY_IDENTITY").is_some() {
+                            eprintln!("WHY-IDENTITY compared at {:#x} {name} with a non-descriptor", i.machine.offset);
+                        }
+                        return false;
+                    }
+                    let within = |op: &Operand| match (*op, reg) {
+                        (Operand::Scalar { code, dwords }, Reg::S(c)) => c >= code && c < code + dwords,
+                        _ => false,
+                    };
+                    let descriptor = match &i.fields {
+                        Fields::Smem { base, .. } if name.starts_with("s_buffer_") => within(base),
+                        Fields::Buffer { rsrc, .. } => within(rsrc),
+                        Fields::Image { rsrc, sampler, .. } => within(rsrc) || sampler.as_ref().is_some_and(within),
+                        _ => false,
+                    };
+                    if !descriptor {
+                        if std::env::var_os("VICTORY_WHY_IDENTITY").is_some() {
+                            let k = match &i.fields {
+                                Fields::Sop { src, .. } => src.iter().find_map(|o| match *o {
+                                    Operand::Literal(x) => Some(format!("{x:#x}")),
+                                    Operand::Const(c) => crate::resource::inline(c).map(|x| format!("{x:#x}")),
+                                    _ => None,
+                                }).unwrap_or_default(),
+                                _ => String::new(),
+                            };
+                            eprintln!("WHY-IDENTITY used by {:#x} {name} {k}", i.machine.offset);
+                        }
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Whether `v` comes, through copies, joins and `v_readfirstlane_b32`,
+    /// only from dwords 0-1 of scalar descriptor loads the program traces
+    /// (`scalar`).
+    fn ident_dword(&self, v: Value, seen: &mut Vec<Value>) -> bool {
+        if seen.contains(&v) {
+            return true;
+        }
+        if seen.len() > 256 {
+            return false;
+        }
+        seen.push(v);
+        if let Some(&(b, i)) = self.phi_at.get(&v) {
+            return self.x.p.blocks[b].phis[i].args.iter().all(|&a| self.ident_dword(a, seen));
+        }
+        let Some(&b) = self.def_block.get(&v) else { return false };
+        let p = self.x.p;
+        let Some((n, inst)) = p.blocks[b].insts.iter().enumerate().find(|(_, i)| i.writes.iter().any(|w| w.1 == v)) else {
+            return false;
+        };
+        let k = inst.writes.iter().position(|w| w.1 == v).unwrap_or(0);
+        match inst.name() {
+            "s_mov_b32" | "s_mov_b64" | "v_mov_b32" | "v_readfirstlane_b32" => {
+                let src = match &inst.fields {
+                    Fields::Sop { src, .. } => match src.first() {
+                        Some(Operand::Scalar { code, .. }) => inst.read(Reg::S(code + k as u8)),
+                        _ => None,
+                    },
+                    _ => inst.reads.first().map(|r| r.1),
+                };
+                src.is_some_and(|s| self.ident_dword(s, seen))
+            }
+            name if name.starts_with("s_load_dwordx") => k < 2 && self.scalar.contains_key(&(b, n)),
+            _ => false,
+        }
     }
 
     /// What [`Self::descriptor_data`] makes of a descriptor load that nothing uses as a
