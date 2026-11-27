@@ -75,7 +75,7 @@ fn main() {
             continue;
         };
         let c = assemble(&packet, &hash, &code, &meta);
-        if std::env::var_os("VICTORY_WHY_ADDRESS").is_some() || std::env::var_os("VICTORY_WHY_DESCRIPTOR").is_some() {
+        if std::env::var_os("VICTORY_WHY_ADDRESS").is_some() || std::env::var_os("VICTORY_WHY_DESCRIPTOR").is_some() || std::env::var_os("VICTORY_WHY_DEAD").is_some() {
             eprintln!("PROGRAM {name}");
         }
         let parsed = victory_shader::Container::parse(&c)

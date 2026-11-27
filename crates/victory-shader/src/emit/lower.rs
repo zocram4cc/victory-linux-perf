@@ -6081,6 +6081,9 @@ impl<'a> Lower<'a> {
     /// run, and the assumption is safe there (`p4-shortcuts.md` #2).
     fn dead_marker(&mut self, qb: usize, b: usize, at: u32) {
         use super::shader::{MEMORY_FAULTS, SLOT_FAULTS, SLOT_MEMORY};
+        if std::env::var_os("VICTORY_WHY_DEAD").is_some() {
+            eprintln!("WHY-DEAD assumed edge into join at {at:#x} (host block {qb}, IR block {b})");
+        }
         if !std::env::var_os("VICTORY_DEAD_MARKERS").is_some_and(|v| v == "1") {
             return;
         }
