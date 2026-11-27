@@ -424,6 +424,83 @@ pub(crate) fn bound_ahead(
     clamp_into(list, c, &dst, budget, src, None, spec, true).then_some(dst)
 }
 
+/// Whether a clamp's two waits are asked for by what they wait for, under
+/// Wine (`VICTORY_CLAMP_SYNC`, read here and only under Wine: on there,
+/// `=0` as on Windows; A/B-able). On Windows nothing changes.
+///
+/// A clamp stands between two waits for every earlier shader write
+/// ([`record_clamp_as`]) and moves its scratch buffer twice. vkd3d-proton
+/// makes of each of the four a barrier whose source is every shader stage of
+/// the queue (its `command.c`: a UAV barrier of no resource, and a buffer
+/// that leaves unordered access), and RADV of such a barrier a wait for the
+/// pixel shaders of every draw before it, at the front of its command
+/// processor where what follows reads indirect arguments
+/// (`radv_stage_flush` and `radv_dst_stage_to_acquire_point` of Mesa
+/// 26.3.1): the card stands still twice a clamp.
+///
+/// With this the clamp asks, by barriers of the newer kind
+/// (`ID3D12GraphicsCommandList7::Barrier`, which vkd3d-proton turns into the
+/// stages they name), for what it needs: the compute passes before it done
+/// (the title's argument and count passes, and the clamp before it, which
+/// wrote the budget), the execution that read the scratch buffer last
+/// started, and its own dispatch done before the execution reads.
+///
+/// Measured on an RX 7900 GRE (docs/linux-wine.md, run 43: on and off by
+/// turns in one run, renderer port 1's order making 1,360 clamps alone a
+/// frame): 34.0 ms a frame with it, 56.4 without. With the 170 clamps a
+/// frame there are without that order, no difference (run 41).
+///
+/// shortcut: arguments a pixel shader has written are not waited for (the
+/// title writes them with compute passes, and its own barrier before its
+/// execution is recorded as it asks for it).
+fn narrow() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_CLAMP_SYNC") {
+        return on && crate::wine::on_wine();
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::wine::on_wine() && std::env::var_os("VICTORY_CLAMP_SYNC").is_none_or(|v| v != "0"))
+}
+
+/// What a wait of the newer kind names on one side: the work, and what it
+/// does to memory.
+type Scope = (D3D12_BARRIER_SYNC, D3D12_BARRIER_ACCESS);
+
+/// Compute passes that store to buffers: the title's argument and count
+/// passes, and our clamps.
+const COMPUTE: Scope = (D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_ACCESS_UNORDERED_ACCESS);
+/// Indirect executions reading their arguments.
+const READ: Scope = (D3D12_BARRIER_SYNC_EXECUTE_INDIRECT, D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT);
+/// `l`'s newer interface if the clamps' waits are to be narrow ([`narrow`]).
+fn narrow_list(l: &ID3D12GraphicsCommandList) -> Option<ID3D12GraphicsCommandList7> {
+    if narrow() {
+        windows::core::Interface::cast::<ID3D12GraphicsCommandList7>(l).ok()
+    } else {
+        None
+    }
+}
+
+/// Records in `l7`: what `from` names is done before what `to` names begins.
+///
+/// # Safety
+/// An open list.
+unsafe fn wait(l7: &ID3D12GraphicsCommandList7, from: Scope, to: Scope) {
+    let one = [D3D12_GLOBAL_BARRIER {
+        SyncBefore: from.0,
+        SyncAfter: to.0,
+        AccessBefore: from.1,
+        AccessAfter: to.1,
+    }];
+    // SAFETY: the caller's; the barrier names no resource.
+    unsafe {
+        l7.Barrier(&[D3D12_BARRIER_GROUP {
+            Type: D3D12_BARRIER_TYPE_GLOBAL,
+            NumBarriers: 1,
+            Anonymous: D3D12_BARRIER_GROUP_0 { pGlobalBarriers: one.as_ptr() },
+        }]);
+    }
+}
+
 /// [`record_clamp_as`] into `list`'s scratch buffer `dst`, from the state
 /// the list left it in; afterwards the list knows it is readable as
 /// indirect arguments.
@@ -533,9 +610,24 @@ fn record_clamp_as(
         ),
     ];
     let skip = usize::from(!waits);
+    // Under Wine ([`narrow`]): the same two waits, each for what it waits
+    // for and no more.
+    let narrow = narrow_list(l);
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
-        l.ResourceBarrier(&first[skip..]);
+        match &narrow {
+            // The compute passes before it; and, where an execution of this
+            // recording has read the scratch buffer, that one too.
+            Some(l7) if before == D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT => {
+                let both = (
+                    D3D12_BARRIER_SYNC(COMPUTE.0.0 | READ.0.0),
+                    D3D12_BARRIER_ACCESS(COMPUTE.1.0 | READ.1.0),
+                );
+                wait(l7, both, COMPUTE);
+            }
+            Some(l7) => wait(l7, COMPUTE, COMPUTE),
+            None => l.ResourceBarrier(&first[skip..]),
+        }
         if records > 0 {
             l.SetComputeRootSignature(&c.root);
             l.SetPipelineState(&c.pso);
@@ -546,7 +638,11 @@ fn record_clamp_as(
             l.SetComputeRootUnorderedAccessView(4, budget);
             l.Dispatch(records.div_ceil(64), 1, 1);
         }
-        l.ResourceBarrier(&second[skip..]);
+        match &narrow {
+            // Our dispatch, before the execution reads what it stored.
+            Some(l7) => wait(l7, COMPUTE, READ),
+            None => l.ResourceBarrier(&second[skip..]),
+        }
     }
     true
 }
