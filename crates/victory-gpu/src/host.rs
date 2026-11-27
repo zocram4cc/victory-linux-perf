@@ -1433,6 +1433,19 @@ mod tests {
         }
     }
 
+    /// Only what lies between, before and after the runs is zeroed.
+    #[test]
+    fn only_bytes_outside_the_runs_are_zeroed() {
+        let mut dst = [7u8; 16];
+        super::zero_between(&mut dst, 100, &[(102, 3), (104, 2), (110, 4)]);
+        assert_eq!(dst, [0, 0, 7, 7, 7, 7, 0, 0, 0, 0, 7, 7, 7, 7, 0, 0]);
+        let mut dst = [7u8; 4];
+        super::zero_between(&mut dst, 100, &[(100, 4)]);
+        assert_eq!(dst, [7; 4]);
+        super::zero_between(&mut dst, 100, &[]);
+        assert_eq!(dst, [0; 4]);
+    }
+
     /// Zeros for a title destination that went meanwhile are no fault.
     #[test]
     fn zeros_where_nothing_is_are_lost() {
@@ -9627,13 +9640,15 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 /// reads). What the runtime's record says is mapped is read in one go each,
 /// and by pieces where that fails; memory it has no record of by pieces.
 pub(crate) fn read_there(src: *const u8, dst: &mut [u8]) -> usize {
-    dst.fill(0);
     let (start, len) = (src as usize, dst.len());
     let mut got = 0;
     let mut runs = crate::inplace::shown_runs(start, len);
     if runs.is_empty() {
         runs.push((start, len));
     }
+    // Every byte of a run is read or zeroed below: only the rest is zeroed
+    // here, not the whole buffer first (one write over all of it less).
+    zero_between(dst, start, &runs);
     for (at, n) in runs {
         let piece = &mut dst[at - start..at - start + n];
         if read_into(at as *const u8, piece) {
@@ -9660,6 +9675,20 @@ pub(crate) fn read_there(src: *const u8, dst: &mut [u8]) -> usize {
         });
     }
     got
+}
+
+/// Zeros what of `dst` (title memory from `start`) `runs` (in order,
+/// within `dst`: address, bytes) leave out.
+fn zero_between(dst: &mut [u8], start: usize, runs: &[(usize, usize)]) {
+    let mut done = 0;
+    for &(at, n) in runs {
+        let from = at - start;
+        if from > done {
+            dst[done..from].fill(0);
+        }
+        done = done.max(from + n);
+    }
+    dst[done..].fill(0);
 }
 
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
