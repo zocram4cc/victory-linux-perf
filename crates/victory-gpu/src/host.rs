@@ -5930,7 +5930,18 @@ impl Host {
         }
         // What shaders may write through views they pick: last, so that no
         // refresh of this submission leaves it alone.
-        let picked = crate::picked::declare(runs);
+        let mut picked = crate::picked::declare(runs);
+        // Into write-combined title memory: the card keeps it
+        // (`VICTORY_WC_NO_BACK`), as with `HostList::defer_gpu_write`.
+        if crate::wc::no_back() {
+            picked.written.retain(|(shadow, at, len)| {
+                let keep = !crate::wc::skip_back(*at, *len);
+                if !keep {
+                    shadow.card_owns(*at, *len);
+                }
+                keep
+            });
+        }
         for (shadow, at, len) in &picked.written {
             shadow.writing(*at, *len);
         }
@@ -7252,6 +7263,12 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
+        // Into write-combined title memory: the card keeps it, nothing is
+        // declared (`VICTORY_WC_NO_BACK`).
+        if crate::wc::skip_back(address, len) {
+            shadow.card_owns(address, len);
+            return;
+        }
         let mut deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.gpu_written.insert(key) || !declare_once() {

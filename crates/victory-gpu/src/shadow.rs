@@ -53,6 +53,11 @@ pub(crate) struct Shadow {
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
+    /// With `VICTORY_WC_NO_BACK=1`: ranges shaders wrote and that were not
+    /// copied back ([`crate::wc::no_back`]): title memory there is older
+    /// than the copy for good, so a refresh that cannot tell what the CPU
+    /// wrote (not watched) leaves them out.
+    card_owned: Mutex<crate::wc::Ranges>,
     /// With [`relay`]: how many submissions not yet copied back declared
     /// each range of `pending` ([`Flights`]). Locked inside `pending`'s
     /// lock.
@@ -3203,6 +3208,7 @@ impl Shadow {
             ranged: Mutex::default(),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
+            card_owned: Mutex::default(),
             flights: Mutex::default(),
             before: Mutex::default(),
             merging: RwLock::default(),
@@ -3954,6 +3960,15 @@ impl Shadow {
         })
     }
 
+    /// Shaders write `[address, address + len)` and it is not copied back
+    /// (`VICTORY_WC_NO_BACK`, [`crate::wc::skip_back`]): the copy holds the
+    /// newest bytes there from now on (see [`Shadow::update`]).
+    pub(crate) fn card_owns(&self, address: usize, len: usize) {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), (address + len).min(end));
+        self.card_owned.lock().unwrap_or_else(|e| e.into_inner()).add(from, to);
+    }
+
     /// At submission: copies what changed of `[address, address + len)`
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
@@ -3975,6 +3990,15 @@ impl Shadow {
             .copied()
             .filter(|&(a, e)| a < to && e > from)
             .collect();
+        // Ranges the card keeps (`VICTORY_WC_NO_BACK`): left out where the
+        // write watch cannot say which pages the CPU wrote, so a whole copy
+        // would put the title's old bytes over what shaders wrote.
+        if !matches!(self.watched.load(Ordering::Relaxed), 1 | GUARDED) {
+            let owned = self.card_owned.lock().unwrap_or_else(|e| e.into_inner());
+            if !owned.is_empty() {
+                busy.extend(owned.overlapping(from, to));
+            }
+        }
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the

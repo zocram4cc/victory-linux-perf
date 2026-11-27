@@ -35,9 +35,101 @@ const NAMES: [&str; KINDS] = ["unknown", "cached", "write-combined", "uncached"]
 const UNCACHED: u32 = 0x200;
 const WRITE_COMBINED: u32 = 0x400;
 
+/// Whether title memory is sorted by kind: for the stats, or for
+/// [`no_back`], which needs to know it.
 pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WC_STATS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WC_STATS").is_some_and(|v| v == "1") || no_back())
+}
+
+/// `VICTORY_WC_NO_BACK=1` (off by default): what shaders write into title
+/// memory the title asked for as write-combined is not copied back into it.
+/// The card's side keeps it, as a PC title keeps what its GPU writes: the
+/// console's CPU does not read such memory back (belorx_8: all 46 MB a frame
+/// of the copy-back went there). Such a range is not declared as written at
+/// all (no snapshot, no compare, no copy back); it is noted as the card's
+/// ([`crate::shadow::Shadow::card_owns`]) so that a refresh of a copy whose
+/// writes are not watched does not put the title's old bytes over it.
+/// Where the copy is watched, pages the CPU writes are still sent up: its
+/// newer bytes win, as they do today.
+///
+/// Ranges under `VICTORY_WC_NO_BACK_MIN_KB` (64 by default) are copied back
+/// as before: the few results the title's CPU does read (the walls'
+/// culling, small read-outs) are small.
+pub(crate) fn no_back() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WC_NO_BACK").is_some_and(|v| v == "1"))
+}
+
+fn no_back_min() -> usize {
+    static MIN: OnceLock<usize> = OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("VICTORY_WC_NO_BACK_MIN_KB").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(64) << 10
+    })
+}
+
+/// Declared writes left to the card ([`skip_back`]) and small ones kept,
+/// in declared bytes (not bytes shaders changed), since the last line.
+static SKIPPED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Whether shaders' writes to `[address, address + len)` stay on the card
+/// ([`no_back`]): the whole range lies in write-combined title memory and
+/// is not small.
+pub(crate) fn skip_back(address: usize, len: usize) -> bool {
+    if !no_back() || len == 0 {
+        return false;
+    }
+    let wc = kind(address) == Kind::WriteCombined && kind(address + len - 1) == Kind::WriteCombined;
+    if !wc {
+        return false;
+    }
+    if len < no_back_min() {
+        SKIPPED[2].fetch_add(1, Ordering::Relaxed);
+        SKIPPED[3].fetch_add(len as u64, Ordering::Relaxed);
+        return false;
+    }
+    SKIPPED[0].fetch_add(1, Ordering::Relaxed);
+    SKIPPED[1].fetch_add(len as u64, Ordering::Relaxed);
+    true
+}
+
+/// A set of disjoint `[start, end)` ranges, joined where they touch.
+#[derive(Default)]
+pub(crate) struct Ranges(BTreeMap<usize, usize>);
+
+impl Ranges {
+    pub(crate) fn add(&mut self, from: usize, to: usize) {
+        if from >= to {
+            return;
+        }
+        let (mut from, mut to) = (from, to);
+        // One that starts before and reaches `from` is joined.
+        if let Some((&s, &e)) = self.0.range(..=from).next_back()
+            && e >= from
+        {
+            if e >= to {
+                return;
+            }
+            from = s;
+        }
+        let inside: Vec<usize> = self.0.range(from..=to).map(|(&s, _)| s).collect();
+        for s in inside {
+            if let Some(e) = self.0.remove(&s) {
+                to = to.max(e);
+            }
+        }
+        self.0.insert(from, to);
+    }
+
+    /// The ranges that overlap `[from, to)`.
+    pub(crate) fn overlapping(&self, from: usize, to: usize) -> impl Iterator<Item = (usize, usize)> + '_ {
+        let first = self.0.range(..from).next_back().filter(|(_, e)| **e > from).map(|(&s, &e)| (s, e));
+        first.into_iter().chain(self.0.range(from..to).map(|(&s, &e)| (s, e)))
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 /// Start of a range -> (end, kind); ranges never overlap.
@@ -152,6 +244,16 @@ pub(crate) fn log(sample: Sample) {
         part(&back),
         (0..KINDS).skip(1).map(|i| format!("{} {} MB", NAMES[i], noted[i] >> 20)).collect::<Vec<_>>().join(", ")
     );
+    if no_back() {
+        let [n, bytes, small, small_bytes] = std::array::from_fn(|i| SKIPPED[i].swap(0, Ordering::Relaxed));
+        tracing::info!(
+            "shaders' writes into write-combined title memory left on the card (VICTORY_WC_NO_BACK, under {} KiB kept), \
+             since the last line: {n} ranges declared, {} MB; kept and copied back as before: {small} ranges, {:.1} MB",
+            no_back_min() >> 10,
+            bytes >> 20,
+            small_bytes as f64 / 1e6
+        );
+    }
 }
 
 #[cfg(test)]
@@ -171,6 +273,21 @@ mod tests {
         insert(&mut map, 0x2000, 0x6000, Kind::Uncached);
         let got: Vec<_> = map.iter().map(|(&s, &(e, k))| (s, e, k)).collect();
         assert_eq!(got, [(0x1000, 0x2000, Kind::Cached), (0x2000, 0x6000, Kind::Uncached), (0x6000, 0x9000, Kind::Cached)]);
+    }
+
+    #[test]
+    fn ranges_join_and_answer_overlaps() {
+        let mut r = Ranges::default();
+        r.add(10, 20);
+        r.add(30, 40);
+        r.add(20, 25);
+        r.add(12, 15);
+        assert_eq!(r.0.iter().map(|(&s, &e)| (s, e)).collect::<Vec<_>>(), [(10, 25), (30, 40)]);
+        assert_eq!(r.overlapping(0, 11).collect::<Vec<_>>(), [(10, 25)]);
+        assert_eq!(r.overlapping(25, 30).collect::<Vec<_>>(), Vec::<(usize, usize)>::new());
+        assert_eq!(r.overlapping(24, 31).collect::<Vec<_>>(), [(10, 25), (30, 40)]);
+        r.add(5, 50);
+        assert_eq!(r.0.iter().map(|(&s, &e)| (s, e)).collect::<Vec<_>>(), [(5, 50)]);
     }
 
     #[test]
