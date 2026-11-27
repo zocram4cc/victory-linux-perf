@@ -1631,13 +1631,21 @@ impl Player {
                 if loaded { &mut into } else { &mut early },
             );
         }
+        let blank = blank_resources()?;
         let textures: Vec<(Content, u64, u64)> = self
             .frame
             .contents
             .iter()
             .filter(|c| self.objects.contains_key(&c.res))
-            .map(|c| (c.clone(), c.len, c.file))
+            .map(|c| (c.clone(), c.len, if blank.contains(&c.res) { ZERO } else { c.file }))
             .collect();
+        if !blank.is_empty() {
+            let n = self.frame.contents.iter().filter(|c| blank.contains(&c.res)).count();
+            self.note(format!(
+                "VICTORY_REPLAY_BLANK: {n} parts of {} resources start as zeros",
+                blank.len()
+            ));
+        }
         let missing = self.frame.contents.len() - textures.len();
         self.worker.run(|list| {
             // SAFETY: an open list; live resources.
@@ -3680,6 +3688,45 @@ fn debug_messages(q: &ID3D12InfoQueue) -> Vec<String> {
         .collect()
 }
 
+/// Resources whose recorded contents the replay leaves out, starting them
+/// as zeros instead (`VICTORY_REPLAY_BLANK=<file>`: resource ids, one per
+/// line, or `a..b` both included; `#` starts a comment). A zeroed block of
+/// a compressed texture decodes black: what a draw samples is found by
+/// halving a list of candidates until a pixel changes.
+fn blank_resources() -> Result<HashSet<u32>> {
+    let Some(path) = std::env::var_os("VICTORY_REPLAY_BLANK") else {
+        return Ok(HashSet::new());
+    };
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("VICTORY_REPLAY_BLANK: {}", path.to_string_lossy()))?;
+    parse_blank(&text)
+}
+
+fn parse_blank(text: &str) -> Result<HashSet<u32>> {
+    let mut all = HashSet::new();
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let bad = || anyhow!("VICTORY_REPLAY_BLANK: not an id or a range: {line}");
+        match line.split_once("..") {
+            Some((a, b)) => {
+                let a: u32 = a.trim().parse().map_err(|_| bad())?;
+                let b: u32 = b.trim().parse().map_err(|_| bad())?;
+                if b < a {
+                    return Err(bad());
+                }
+                all.extend(a..=b);
+            }
+            None => {
+                all.insert(line.parse().map_err(|_| bad())?);
+            }
+        }
+    }
+    Ok(all)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3715,6 +3762,17 @@ mod tests {
         assert_eq!(Poke::apply(&pokes, 1, 10, &mut buf), 0);
         assert_eq!(Poke::apply(&pokes, 3, 0, &mut buf), 0);
         assert_eq!(buf, [0; 4]);
+    }
+
+    #[test]
+    fn blank_lists_take_ids_ranges_and_comments() {
+        let all = parse_blank("12\n# a comment\n 20..22 # three\n\n7").unwrap();
+        let mut v: Vec<u32> = all.into_iter().collect();
+        v.sort_unstable();
+        assert_eq!(v, [7, 12, 20, 21, 22]);
+        assert!(parse_blank("x").is_err());
+        assert!(parse_blank("5..3").is_err());
+        assert!(parse_blank("").unwrap().is_empty());
     }
 
     #[test]
