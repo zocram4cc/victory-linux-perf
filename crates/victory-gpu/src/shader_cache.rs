@@ -131,7 +131,7 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
         })
         .map_err(|e| e.to_string())
     };
-    let key = if sheets {
+    let key = if sheets != 0 {
         *blake3::hash(&[&build()[..], b"sheet watch"].concat()).as_bytes()
     } else {
         build()

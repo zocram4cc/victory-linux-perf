@@ -626,7 +626,7 @@ pub(super) fn wave_wide_on() -> bool {
 thread_local! {
     pub(super) static THREAD_WAVE_WIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// [`super::with_sheet_watch`].
-    pub(super) static SHEET_WATCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(super) static SHEET_WATCH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// Whether a refusal is of code that needs every lane of the wave where it stands (two host
@@ -12927,8 +12927,8 @@ impl<'a> Lower<'a> {
         } else {
             None
         };
-        if mesh && e.target == Target::Position(0) && SHEET_WATCH.get() {
-            self.watch_sheet(&e)?;
+        if mesh && e.target == Target::Position(0) && SHEET_WATCH.get() != 0 {
+            self.watch_sheet(&e, SHEET_WATCH.get())?;
         }
         let (name, opcode) = match (mesh, primitive) {
             (false, _) => ("storeOutput", 5),
@@ -12990,15 +12990,23 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// Mesh, with [`SHEET_WATCH`]: in the lanes that write a vertex, the
-    /// span of this host wave's vertices on the screen (x/w and y/w of those
-    /// in front, finite); over `SHEET_SPANS[0]`, the first lane stores 1 into
-    /// the row of the largest span passed, at a slot of its group and wave
-    /// (`shader::SLOT_SHEETS`). Plain stores, as the memory faults' are:
-    /// nothing the program outputs changes.
-    fn watch_sheet(&mut self, e: &Export) -> Result<(), Why> {
-        use super::shader::{SHEET_SLOTS, SHEET_SPANS, SLOT_SHEETS};
-        let [Some(x), Some(y), _, Some(w)] = e.values else {
+    /// Mesh, with [`SHEET_WATCH`] (its value: the program's id): in the
+    /// lanes that write a vertex, two notes into the region the host binds
+    /// as the root UAV `u<SLOT_SHEETS>` for this draw (`shader::SLOT_SHEETS`):
+    /// - the row of the widest span passed (`SHEET_SPANS`) of this host
+    ///   wave's vertices on the screen (x/w, y/w of those in front, finite),
+    ///   set to 1 by the first lane;
+    /// - a jump: a vertex whose clip position is far from both its
+    ///   neighbours' (lanes one down and one up, where they write a vertex),
+    ///   by the largest of |dx|, |dy|, |dw|. Over `SHEET_JUMP_NOTED`, the lane
+    ///   of the wave's largest jump writes an event: the program id, group,
+    ///   thread, the jump, and the clip positions of the vertex and its two
+    ///   neighbours.
+    /// Plain stores, as the memory faults' are: nothing the program outputs
+    /// changes.
+    fn watch_sheet(&mut self, e: &Export, id: u32) -> Result<(), Why> {
+        use super::shader::{SHEET_EVENT_DWORDS, SHEET_EVENTS, SHEET_EVENTS_AT, SHEET_JUMP_NOTED, SHEET_SPANS, SLOT_SHEETS};
+        let [Some(x), Some(y), Some(z), Some(w)] = e.values else {
             return Ok(());
         };
         let float = |l: &mut Self, v: Value| -> Result<V, Why> {
@@ -13008,88 +13016,194 @@ impl<'a> Lower<'a> {
                 None => l.as_float(i),
             })
         };
-        let (x, y, w) = (float(self, x)?, float(self, y)?, float(self, w)?);
+        let (x, y, z, w) = (float(self, x)?, float(self, y)?, float(self, z)?, float(self, w)?);
         self.s.flags |= flags::WAVE_OPS;
         let c = self.cur;
+        let f32t = self.s.t.f32;
+        let i32t = self.s.t.i32;
+        let i1t = self.s.t.i1;
         let f = |l: &mut Self, v: f32| l.s.m.f32(v.to_bits());
         let near = f(self, 0.05);
         let (big, small) = (f(self, 1.0e6), f(self, -1.0e6));
+        let gt = |l: &mut Self, a: V, b: V| l.s.m.cmp(c, pred::OGT, a, b);
+        let lt = |l: &mut Self, a: V, b: V| l.s.m.cmp(c, pred::OLT, a, b);
+        let and = |l: &mut Self, a: V, b: V| l.s.m.bin(c, Bin::And, a, b);
+        // The span: x/w, y/w of the lanes in front, finite.
         let nx = self.s.m.bin(c, Bin::SDiv, x, w);
         let ny = self.s.m.bin(c, Bin::SDiv, y, w);
-        // In front, and finite (a NaN fails every ordered compare).
-        let mut ok = self.s.m.cmp(c, pred::OGT, w, near);
+        let mut ok = gt(self, w, near);
         for v in [nx, ny] {
-            let below = self.s.m.cmp(c, pred::OLT, v, big);
-            let above = self.s.m.cmp(c, pred::OGT, v, small);
-            ok = self.s.m.bin(c, Bin::And, ok, below);
-            ok = self.s.m.bin(c, Bin::And, ok, above);
+            let below = lt(self, v, big);
+            let above = gt(self, v, small);
+            ok = and(self, ok, below);
+            ok = and(self, ok, above);
         }
-        let f32t = self.s.t.f32;
+        let wave_f = |l: &mut Self, v: V, op: u8| {
+            let (k, u) = (l.s.m.i8(op), l.s.m.i8(0));
+            l.s.op(c, "waveActiveOp.f32", Attr::NoUnwind, f32t, 119, &[v, k, u])
+        };
         let mut span = None;
         for v in [nx, ny] {
             let lo = self.s.m.select(c, ok, v, big);
             let hi = self.s.m.select(c, ok, v, small);
-            let wave = |l: &mut Self, v: V, op: u8| {
-                let (k, u) = (l.s.m.i8(op), l.s.m.i8(0));
-                l.s.op(c, "waveActiveOp.f32", Attr::NoUnwind, f32t, 119, &[v, k, u])
-            };
-            let (lo, hi) = (wave(self, lo, 2), wave(self, hi, 3));
+            let (lo, hi) = (wave_f(self, lo, 2), wave_f(self, hi, 3));
             let d = self.s.m.bin(c, Bin::Sub, hi, lo);
             span = Some(match span {
                 None => d,
                 Some(s) => {
-                    let wider = self.s.m.cmp(c, pred::OGT, d, s);
+                    let wider = gt(self, d, s);
                     self.s.m.select(c, wider, d, s)
                 }
             });
         }
         let span = span.ok_or("no span")?;
-        // The row: how many spans it passes, less one.
-        let i32t = self.s.t.i32;
         let mut row = self.s.m.i32(0);
         for &s in &SHEET_SPANS {
             let s = f(self, s);
-            let over = self.s.m.cmp(c, pred::OGT, span, s);
+            let over = gt(self, span, s);
             let one = self.s.m.cast(c, Cast::ZExt, over, i32t);
             row = self.s.m.bin(c, Bin::Add, row, one);
         }
-        let i1t = self.s.t.i1;
-        let first = self.s.op(c, "waveIsFirstLane", Attr::NoUnwind, i1t, 110, &[]);
-        let zero = self.s.m.i32(0);
-        let some = self.s.m.cmp(c, pred::IUGT, row, zero);
-        let noting = self.s.m.bin(c, Bin::And, first, some);
-        let at = self.begin_guarded(Some(noting));
-        let c = self.cur;
-        let one = self.s.m.i32(1);
-        let row = self.s.m.bin(c, Bin::Sub, row, one);
-        let k0 = self.s.m.i32(0);
-        let group = self.s.op(c, "groupId.i32", Attr::ReadNone, i32t, 94, &[k0]);
-        let thread = self.mesh_thread();
-        let c = self.cur;
-        let k5 = self.s.m.i32(5);
-        let wave = self.s.m.bin(c, Bin::LShr, thread, k5);
-        let k2 = self.s.m.i32(2);
-        let g = self.s.m.bin(c, Bin::Shl, group, k2);
-        let slot = self.s.m.bin(c, Bin::Add, g, wave);
-        let mask = self.s.m.i32(SHEET_SLOTS - 1);
-        let slot = self.s.m.bin(c, Bin::And, slot, mask);
-        let width = self.s.m.i32(SHEET_SLOTS);
-        let base = self.s.m.bin(c, Bin::Mul, row, width);
-        let dword = self.s.m.bin(c, Bin::Add, base, slot);
-        let byte = self.s.m.bin(c, Bin::Shl, dword, k2);
+        // The jump: against the neighbours that write a vertex, in front.
+        let lane = self.s.op(c, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let yes = self.s.m.bool(true);
+        let here = self.s.op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[yes]);
+        let (here_lo, here_hi) = (self.s.m.extract(c, here, 0), self.s.m.extract(c, here, 1));
+        let (k0, k1, k31, k32, k64) = (self.s.m.i32(0), self.s.m.i32(1), self.s.m.i32(31), self.s.m.i32(32), self.s.m.i32(64));
+        let bits = [x, y, z, w].map(|v| self.as_int(v));
+        let inf = f(self, f32::INFINITY);
+        let mut jump = inf;
+        let mut any = self.s.m.bool(false);
+        let mut sides = Vec::new();
+        for down in [true, false] {
+            let other = if down {
+                self.s.m.bin(c, Bin::Sub, lane, k1)
+            } else {
+                self.s.m.bin(c, Bin::Add, lane, k1)
+            };
+            // In the wave (lane - 1 of lane 0 wraps past 64) and writing a vertex.
+            let inside = self.s.m.cmp(c, pred::IULT, other, k64);
+            let high = self.s.m.cmp(c, pred::IUGE, other, k32);
+            let word = self.s.m.select(c, high, here_hi, here_lo);
+            let shift = self.s.m.bin(c, Bin::And, other, k31);
+            let bit = self.s.m.bin(c, Bin::LShr, word, shift);
+            let bit = self.s.m.bin(c, Bin::And, bit, k1);
+            let set = self.s.m.cmp(c, pred::NE, bit, k0);
+            let valid = and(self, inside, set);
+            let at = self.s.m.select(c, valid, other, lane);
+            let theirs: Vec<V> = bits
+                .iter()
+                .map(|&b| {
+                    let r = self.read_lane(b, at);
+                    self.as_float(r)
+                })
+                .collect();
+            let front = gt(self, theirs[3], near);
+            let valid = and(self, valid, front);
+            let mut d = None;
+            for k in [0usize, 1, 3] {
+                let v = [x, y, z, w][k];
+                let diff = self.s.m.bin(c, Bin::Sub, v, theirs[k]);
+                let size = self.unary(6, diff);
+                d = Some(match d {
+                    None => size,
+                    Some(m) => {
+                        let more = gt(self, size, m);
+                        self.s.m.select(c, more, size, m)
+                    }
+                });
+            }
+            let d = d.ok_or("no difference")?;
+            let d = self.s.m.select(c, valid, d, inf);
+            let nearer = lt(self, d, jump);
+            jump = self.s.m.select(c, nearer, d, jump);
+            any = self.s.m.bin(c, Bin::Or, any, valid);
+            sides.push(theirs);
+        }
+        let in_front = gt(self, w, near);
+        let counted = and(self, any, in_front);
+        let zero = f(self, 0.0);
+        let jump = self.s.m.select(c, counted, jump, zero);
+        let noted = f(self, SHEET_JUMP_NOTED);
+        let flagged = gt(self, jump, noted);
+        let minus = f(self, -1.0);
+        let mine = self.s.m.select(c, flagged, jump, minus);
+        let best = wave_f(self, mine, 3);
+        let top = self.s.m.cmp(c, pred::OEQ, mine, best);
+        let cand = and(self, flagged, top);
+        let chosen = self.s.op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[cand]);
+        let (lo, hi) = (self.s.m.extract(c, chosen, 0), self.s.m.extract(c, chosen, 1));
+        let flo = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[lo]);
+        let fhi = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[hi]);
+        let fhi = self.s.m.bin(c, Bin::Add, fhi, k32);
+        let in_lo = self.s.m.cmp(c, pred::NE, lo, k0);
+        let first_cand = self.s.m.select(c, in_lo, flo, fhi);
+        let is_me = self.s.m.cmp(c, pred::EQ, lane, first_cand);
+        let leader = and(self, cand, is_me);
         let h = self.s.root_uav_handle(SLOT_SHEETS);
         let iu = self.s.m.undef(i32t);
         let void = self.s.t.void;
-        let mask = self.s.m.i8(1);
         let align = self.s.m.i32(4);
-        self.s.op(
-            c,
-            "rawBufferStore.i32",
-            Attr::NoUnwind,
-            void,
-            140,
-            &[h, byte, iu, one, iu, iu, iu, mask, align],
-        );
+        let k2 = self.s.m.i32(2);
+        let store = |l: &mut Self, dword: V, words: [V; 4], n: u8| {
+            let c = l.cur;
+            let byte = l.s.m.bin(c, Bin::Shl, dword, k2);
+            let mask = l.s.m.i8((1u8 << n) - 1);
+            l.s.op(
+                c,
+                "rawBufferStore.i32",
+                Attr::NoUnwind,
+                void,
+                140,
+                &[h, byte, iu, words[0], words[1], words[2], words[3], mask, align],
+            );
+        };
+        // The row, by the first lane.
+        let first = self.s.op(c, "waveIsFirstLane", Attr::NoUnwind, i1t, 110, &[]);
+        let some = self.s.m.cmp(c, pred::IUGT, row, k0);
+        let noting = and(self, first, some);
+        let at = self.begin_guarded(Some(noting));
+        {
+            let c = self.cur;
+            let dword = self.s.m.bin(c, Bin::Sub, row, k1);
+            store(self, dword, [k1, iu, iu, iu], 1);
+        }
+        self.end_guarded(at, &[]);
+        // The event, by the lane of the largest jump.
+        let at = self.begin_guarded(Some(leader));
+        {
+            let k0g = self.s.m.i32(0);
+            let group = self.s.op(self.cur, "groupId.i32", Attr::ReadNone, i32t, 94, &[k0g]);
+            let thread = self.mesh_thread();
+            let c = self.cur;
+            let k5 = self.s.m.i32(5);
+            let wave = self.s.m.bin(c, Bin::LShr, thread, k5);
+            let g4 = self.s.m.bin(c, Bin::Shl, group, k2);
+            let slot = self.s.m.bin(c, Bin::Add, g4, wave);
+            let events = self.s.m.i32(SHEET_EVENTS);
+            let slot = self.s.m.bin(c, Bin::URem, slot, events);
+            let width = self.s.m.i32(SHEET_EVENT_DWORDS);
+            let base = self.s.m.bin(c, Bin::Mul, slot, width);
+            let first = self.s.m.i32(SHEET_EVENTS_AT);
+            let base = self.s.m.bin(c, Bin::Add, base, first);
+            let id = self.s.m.i32(id);
+            let jump_bits = self.as_int(jump);
+            let down: Vec<V> = sides[0].iter().map(|&v| self.as_int(v)).collect();
+            let up: Vec<V> = sides[1].iter().map(|&v| self.as_int(v)).collect();
+            let groups = [
+                [id, group, thread, jump_bits],
+                bits,
+                [down[0], down[1], down[2], down[3]],
+                [up[0], up[1], up[2], up[3]],
+            ];
+            for (n, words) in groups.into_iter().enumerate() {
+                let c = self.cur;
+                let off = self.s.m.i32(4 * n as u32);
+                let dword = self.s.m.bin(c, Bin::Add, base, off);
+                store(self, dword, words, 4);
+            }
+        }
         self.end_guarded(at, &[]);
         Ok(())
     }

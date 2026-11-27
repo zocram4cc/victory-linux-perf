@@ -2401,8 +2401,23 @@ impl State {
             for &(slot, param) in &stage.root_uavs {
                 if slot == victory_shader::emit::SLOT_SHEETS {
                     // Ours: the frame recorder's notes of stretched geometry
-                    // (`sheets`); only programs translated with it on have it.
-                    if let Some(at) = crate::sheets::address() {
+                    // (`sheets`), a region for each draw; only programs
+                    // translated with it on have it.
+                    let what = || {
+                        let roots: Vec<String> = self
+                            .roots_ref(compute)
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(i, r)| match r {
+                                Root::View(a) => Some(format!("root{i}={a:#x}")),
+                                Root::Table(t) => Some(format!("table{i}={t:#x}")),
+                                Root::Constants(c) => Some(format!("constants{i}={c:x?}")),
+                                Root::None => None,
+                            })
+                            .collect();
+                        format!("{} {}", p.name, roots.join(" "))
+                    };
+                    if let Some(at) = crate::sheets::region_for(what) {
                         // SAFETY: an open list; the buffer lives as long as
                         // the process.
                         unsafe {

@@ -3,15 +3,19 @@
 //! retranslated with the watch (`--retranslate`, then `--shaders`), whose
 //! pre-skinned mesh programs note what they see through the root UAV
 //! `u<SLOT_SHEETS>`. The recorded root signatures do not have it: each one
-//! gets it added as its last parameter, which every command that sets a root
-//! signature then binds to a buffer of ours. Each run says what was noted.
+//! gets it added as its last parameter. Each draw is bound a region of our
+//! buffer of its own (the game's host does the same), named by its list and
+//! command; each run says what the draws noted.
 
+use std::cell::Cell;
 use std::collections::HashMap;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::Interface;
 
-use victory_shader::emit::{ROOT_CBV_SPACE, SHEET_BUCKETS, SHEET_SLOTS, SLOT_SHEETS};
+use victory_shader::emit::{ROOT_CBV_SPACE, SHEET_REGION_DWORDS, SHEET_REGIONS, SLOT_SHEETS};
 
 /// The watch in a replay: our buffer, and per root signature the parameter
 /// it is bound to.
@@ -22,7 +26,16 @@ pub(super) struct Watch {
     params: HashMap<u32, u32>,
     /// Root signatures that could not take the parameter.
     refused: u32,
+    /// The parameter of the graphics root signature set last.
+    current: Cell<Option<u32>>,
+    /// The next region, and what each was given to.
+    next: AtomicU32,
+    labels: Mutex<Vec<String>>,
 }
+
+/// The last region is bound when a root signature is set, for draws that
+/// are not given one of their own; what lands there is not reported.
+const SPARE: u32 = SHEET_REGIONS - 1;
 
 impl Watch {
     /// The watch if `VICTORY_RECORD_SHEETS=1`.
@@ -30,7 +43,7 @@ impl Watch {
         if !std::env::var_os("VICTORY_RECORD_SHEETS").is_some_and(|v| v == "1") {
             return Ok(None);
         }
-        let bytes = u64::from(SHEET_BUCKETS * SHEET_SLOTS) * 4;
+        let bytes = u64::from(SHEET_REGIONS * SHEET_REGION_DWORDS) * 4;
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_CUSTOM,
             CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
@@ -73,6 +86,9 @@ impl Watch {
             va,
             params: HashMap::new(),
             refused: 0,
+            current: Cell::new(None),
+            next: AtomicU32::new(0),
+            labels: Mutex::new(vec![String::new(); SHEET_REGIONS as usize]),
         }))
     }
 
@@ -91,34 +107,78 @@ impl Watch {
         unsafe { device.CreateRootSignature(0, blob) }
     }
 
-    /// After root signature `id` was set on `l`: our parameter bound.
+    fn region(&self, r: u32) -> u64 {
+        self.va + u64::from(r) * u64::from(SHEET_REGION_DWORDS) * 4
+    }
+
+    /// After root signature `id` was set on `l`: our parameter bound (to
+    /// the spare region until a draw is given its own).
     pub(super) fn bind(&self, l: &ID3D12GraphicsCommandList, graphics: bool, id: u32) {
-        if let Some(&param) = self.params.get(&id) {
+        let param = self.params.get(&id).copied();
+        if graphics {
+            self.current.set(param);
+        }
+        if let Some(param) = param {
             // SAFETY: an open list; the buffer lives as long as the player.
             unsafe {
                 if graphics {
-                    l.SetGraphicsRootUnorderedAccessView(param, self.va);
+                    l.SetGraphicsRootUnorderedAccessView(param, self.region(SPARE));
                 } else {
-                    l.SetComputeRootUnorderedAccessView(param, self.va);
+                    l.SetComputeRootUnorderedAccessView(param, self.region(SPARE));
                 }
             }
         }
     }
 
-    /// What a run noted (the card has finished it), cleared for the next.
-    pub(super) fn take(&self) -> String {
-        let n = (SHEET_BUCKETS * SHEET_SLOTS) as usize;
+    /// Before a draw: a region of its own, named by `label`.
+    pub(super) fn draw(&self, l: &ID3D12GraphicsCommandList, label: impl FnOnce() -> String) {
+        let Some(param) = self.current.get() else {
+            return;
+        };
+        let r = self.next.fetch_add(1, Ordering::Relaxed) % SPARE;
+        if let Ok(mut labels) = self.labels.lock() {
+            labels[r as usize] = label();
+        }
+        // SAFETY: an open list; the buffer lives as long as the player.
+        unsafe { l.SetGraphicsRootUnorderedAccessView(param, self.region(r)) };
+    }
+
+    /// What a run's draws noted (the card has finished it), cleared for the
+    /// next: a summary and a line per draw.
+    pub(super) fn take(&self) -> Vec<String> {
+        let n = (SHEET_REGIONS * SHEET_REGION_DWORDS) as usize;
         // SAFETY: the mapping, of that many dwords; the card is idle.
         let all = unsafe { std::slice::from_raw_parts_mut(self.data, n) };
-        let rows = crate::sheets::counts(all);
+        let labels = self.labels.lock().map(|l| l.clone()).unwrap_or_default();
+        let mut lines = Vec::new();
+        let (mut rows, mut jumps) = ([0u32; 4], Vec::new());
+        for (r, region) in all.chunks_mut(SHEET_REGION_DWORDS as usize).enumerate().take(SPARE as usize) {
+            if let Some(d) = crate::sheets::read_region(region) {
+                for (k, &on) in d.rows.iter().enumerate() {
+                    rows[k] += u32::from(on);
+                }
+                if !d.events.is_empty() {
+                    jumps.push(d.jump());
+                }
+                lines.push(format!("sheet draw {}", crate::sheets::line(0, &labels[r], &d)));
+            }
+        }
+        // (The lists are built once and run every loop: the regions keep
+        // their draws.)
         all.fill(0);
         let _ = &self.buffer;
-        format!(
-            "sheets (VICTORY_RECORD_SHEETS): waves noted per span over {:?} of the screen: {rows:?}; {} root signatures with the watch, {} without",
+        jumps.sort_by(|a, b| b.total_cmp(a));
+        let mut out = vec![format!(
+            "sheets (VICTORY_RECORD_SHEETS): {} draws given a region; draws per widest span over {:?} of the screen: {rows:?}; {} draws with a jump, largest {:?}; {} root signatures with the watch, {} without",
+            labels.iter().filter(|l| !l.is_empty()).count(),
             victory_shader::emit::SHEET_SPANS.map(|s| s / 2.0),
+            jumps.len(),
+            jumps.iter().take(12).map(|j| (j * 100.0).round() / 100.0).collect::<Vec<_>>(),
             self.params.len(),
             self.refused
-        )
+        )];
+        out.extend(lines);
+        out
     }
 }
 

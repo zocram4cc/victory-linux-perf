@@ -2667,6 +2667,12 @@ impl Player {
                     }
                 }
             } else {
+                if let Some(w) = &self.sheets
+                    && mesh.contains(&bound)
+                    && matches!(c, Cmd::DispatchMesh { .. } | Cmd::Indirect { .. })
+                {
+                    w.draw(list, || self.sheet_label(cmds, c, bound));
+                }
                 // SAFETY: an open list; the objects are the frame's, alive
                 // with the player; commands the host recorded the same way.
                 unsafe { self.command(list, c, version) };
@@ -3268,6 +3274,17 @@ impl Player {
         self.finish(o, made, &stamps)
     }
 
+    /// A draw's name for the sheet watch: `<list>:<command> <pipeline>`.
+    fn sheet_label(&self, cmds: &[Cmd], c: &Cmd, pso: u32) -> String {
+        let list = self.commands.iter().position(|l| std::ptr::eq(l.as_ptr(), cmds.as_ptr()));
+        let at = (c as *const Cmd as usize).wrapping_sub(cmds.as_ptr() as usize) / std::mem::size_of::<Cmd>();
+        let name = self.frame.pipelines.iter().find(|p| p.id == pso).map_or("", |p| p.name.as_str());
+        match list {
+            Some(l) => format!("{l}:{at} {name}"),
+            None => format!("?:{at} {name}"),
+        }
+    }
+
     /// The lists for a run as the options say.
     fn prepare(&mut self, o: &Options) -> Result<(Sends, Report)> {
         let mut report = Report {
@@ -3290,7 +3307,7 @@ impl Player {
         self.fresh = false;
         let stamps = self.send(built, o)?;
         if let Some(w) = &self.sheets {
-            report.notes.push(w.take());
+            report.notes.extend(w.take());
         }
         if let Some((db, _, hash, _)) = self.picture_now()? {
             report.pictures.push((db, hash));

@@ -69,18 +69,31 @@ pub const MEMORY_READ_ONLY: u32 = 1 << 31;
 /// Dwords of the [`SLOT_FAULTS`] buffer.
 pub const MEMORY_FAULTS: u32 = 4096;
 /// The root UAV `u<SLOT_SHEETS>` of a mesh program translated with
-/// [`super::with_sheet_watch`] (the frame recorder's trigger for stretched
-/// geometry): [`SHEET_BUCKETS`] rows of [`SHEET_SLOTS`] dwords. A host wave
-/// whose vertices span more of the screen than `SHEET_SPANS[k]` stores 1 into
-/// row `k` (the largest such `k`), at a slot of its group and wave; the host
-/// reads and clears them.
+/// [`super::with_sheet_watch`] (the frame recorder's watch for stretched
+/// geometry): one region of [`SHEET_REGION_DWORDS`] per draw (the host binds
+/// each draw's own). Dwords `0..SHEET_BUCKETS`: a host wave whose vertices
+/// span more of the screen than `SHEET_SPANS[k]` sets dword `k` (the largest
+/// such `k`) to 1. From [`SHEET_EVENTS_AT`]: [`SHEET_EVENTS`] events of
+/// [`SHEET_EVENT_DWORDS`], a wave's largest jump over [`SHEET_JUMP_NOTED`]
+/// (program id, group, thread, jump; clip xyzw of the vertex, of the one
+/// below and of the one above), at a slot of its group and wave.
 pub const SLOT_SHEETS: u8 = 251;
 /// See [`SLOT_SHEETS`]: spans in clip units (2 is the screen's width).
 pub const SHEET_SPANS: [f32; 4] = [0.25, 0.5, 1.0, 2.0];
 /// See [`SLOT_SHEETS`].
 pub const SHEET_BUCKETS: u32 = 4;
+/// See [`SLOT_SHEETS`]: in clip units (x, y and w differences).
+pub const SHEET_JUMP_NOTED: f32 = 0.25;
 /// See [`SLOT_SHEETS`].
-pub const SHEET_SLOTS: u32 = 64;
+pub const SHEET_EVENTS_AT: u32 = 16;
+/// See [`SLOT_SHEETS`].
+pub const SHEET_EVENTS: u32 = 7;
+/// See [`SLOT_SHEETS`].
+pub const SHEET_EVENT_DWORDS: u32 = 16;
+/// See [`SLOT_SHEETS`].
+pub const SHEET_REGION_DWORDS: u32 = SHEET_EVENTS_AT + SHEET_EVENTS * SHEET_EVENT_DWORDS;
+/// Regions of the host's buffer: draws noted before they are read.
+pub const SHEET_REGIONS: u32 = 1024;
 /// `RootType::Other` code of a user-data dword the host computes: the view
 /// heap slot of the memory copies' views ([`SLOT_MEMORY`]).
 pub const USER_MEMORY_BASE: u32 = 0x100;

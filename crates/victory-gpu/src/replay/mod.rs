@@ -16,6 +16,6 @@ mod snap;
 pub mod trigger;
 
 /// For `victory replay --retranslate` (`VICTORY_RECORD_SHEETS=1`).
-pub use crate::sheets::pre_skinned;
+pub use crate::sheets::{pre_skinned, program_id};
 mod states;
 mod wire;

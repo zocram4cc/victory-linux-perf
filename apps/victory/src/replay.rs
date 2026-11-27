@@ -533,8 +533,13 @@ fn retranslate(folder: &std::path::Path, into: &std::path::Path, view_limit: u32
                     let wide = victory_shader::emit::wave_wide_only(hash);
                     // (`VICTORY_RECORD_SHEETS=1`: the pre-skinned programs with the
                     // frame recorder's watch, as a run has them.)
-                    let sheets = std::env::var_os("VICTORY_RECORD_SHEETS").is_some_and(|v| v == "1")
-                        && victory_hle::replay::pre_skinned(&bytes);
+                    let sheets = if std::env::var_os("VICTORY_RECORD_SHEETS").is_some_and(|v| v == "1")
+                        && victory_hle::replay::pre_skinned(&bytes)
+                    {
+                        victory_hle::replay::program_id(&bytes)
+                    } else {
+                        0
+                    };
                     let translated = victory_shader::emit::with_sheet_watch(sheets, || {
                         victory_shader::emit::with_wave_wide(wide, || victory_shader::emit::translate(&bytes))
                     });
