@@ -6071,6 +6071,37 @@ impl<'a> Lower<'a> {
             .all(|&a| self.dead(a, seen))
     }
 
+    /// `VICTORY_DEAD_MARKERS=1` (with `VICTORY_DEAD_DESCRIPTOR_JOINS=assume`):
+    /// where a join takes an assumed-dead descriptor dword as 0 on the edge
+    /// from host block `qb` into the IR block `b`, lanes that run that edge
+    /// note `DEAD_MARK | at` (`at`: the console code offset of the join)
+    /// in the faults buffer (`SLOT_FAULTS`), which the layer logs. Only
+    /// where `qb` branches to the join alone (else the edge cannot be told
+    /// in `qb`: counted as unwatched). No hit in game: those edges never
+    /// run, and the assumption is safe there (`p4-shortcuts.md` #2).
+    fn dead_marker(&mut self, qb: usize, b: usize, at: u32) {
+        use super::shader::{MEMORY_FAULTS, SLOT_FAULTS, SLOT_MEMORY};
+        if !std::env::var_os("VICTORY_DEAD_MARKERS").is_some_and(|v| v == "1") {
+            return;
+        }
+        let Some(to) = self.s.m.only_successor(qb) else {
+            DEAD_MARKS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        };
+        let _ = (to, b);
+        DEAD_MARKS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // The layer binds the faults buffer to programs that read title
+        // memory by address: this one now declares that too.
+        let _ = self.s.root_srv_handle(SLOT_MEMORY);
+        let faults = self.s.root_uav_handle(SLOT_FAULTS);
+        let id = at >> 2 & 0x00FF_FFFF;
+        let place = self.s.m.i32((id % (MEMORY_FAULTS - 1) + 1) * 4);
+        let mark = self.s.m.i32(DEAD_MARK | id);
+        let (iu, void) = (self.s.m.undef(self.s.t.i32), self.s.t.void);
+        let (mask, align) = (self.s.m.i8(1), self.s.m.i32(4));
+        self.s.op(qb, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &[faults, place, iu, mark, iu, iu, iu, mask, align]);
+    }
+
     /// Whether no lane that reads `v` (a join in block `b`) can have come into
     /// `b` from its predecessor `q`: what that edge brings is never read, so
     /// any value is right there. False where that is not proven (a read
@@ -13633,6 +13664,11 @@ impl<'a> Lower<'a> {
                             && (assume_dead_joins() || self.edge_unread(phi.value, b, q))
                             && !std::env::var_os("VICTORY_DEAD_DESCRIPTOR_JOINS").is_some_and(|v| v == "0") =>
                     {
+                        // Assumed, not proven: the runtime marker, where asked.
+                        if !self.edge_unread(phi.value, b, q) {
+                            let at = p.blocks[b].insts.first().map_or(b as u32, |i| i.machine.offset as u32);
+                            self.dead_marker(qb, b, at);
+                        }
                         self.s.m.i32(0)
                     }
                     (Some(Val::Missing(why)), _) if self.read_phis.contains(&phi.value) => {
@@ -13659,6 +13695,14 @@ impl<'a> Lower<'a> {
 /// dword, dead where a join or a lane-mask merge reads the register (the
 /// console compiler reuses it), is 0 / no lanes there (`p4-shortcuts.md`
 /// #2, `VICTORY_DEAD_DESCRIPTOR_JOINS=0` refuses).
+/// A runtime marker of an assumed-dead edge in the faults buffer
+/// ([`Lower::dead_marker`]): above any page number (2^21 pages).
+pub const DEAD_MARK: u32 = 0x4000_0000;
+
+/// Assumed-dead join edges given a runtime marker, and those that could not
+/// be (their tail branches elsewhere too), since the start.
+pub static DEAD_MARKS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// `VICTORY_DEAD_DESCRIPTOR_JOINS=assume`: the dead-dword rule as an
 /// assumption (any join or lane-mask leaf that brings such a dword), for
 /// tests in game against the default, which takes it only where it is

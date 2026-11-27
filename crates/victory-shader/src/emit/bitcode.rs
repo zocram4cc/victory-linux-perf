@@ -496,6 +496,14 @@ impl Module {
         let V::Inst(i) = phi else { panic!() };
         self.insts[i as usize].op = Op::Phi(incoming);
     }
+    /// The one block `block` branches to, if it branches to one only.
+    pub fn only_successor(&self, block: usize) -> Option<usize> {
+        match self.blocks.get(block)?.term {
+            Some(Term::Br(t)) => Some(t),
+            _ => None,
+        }
+    }
+
     pub fn terminate(&mut self, block: usize, t: Term) {
         self.blocks[block].term = Some(t);
     }

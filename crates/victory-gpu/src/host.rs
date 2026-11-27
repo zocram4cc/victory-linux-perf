@@ -9444,6 +9444,13 @@ impl Meter {
                             "P.4: 0x218 compute pipelines from their pieces so far (VICTORY_NATIVE_COMPUTE): {} made, {} refused, {} left without (not understood or not translating)",
                             native[0], native[1], native[2]
                         );
+                        let marks = victory_shader::emit::DEAD_MARKS.each_ref().map(|m| m.load(Ordering::Relaxed));
+                        if marks.iter().any(|&m| m > 0) {
+                            tracing::info!(
+                                "P.4: assumed-dead join edges with a runtime marker so far (VICTORY_DEAD_MARKERS): {} watched, {} not (their block branches elsewhere too)",
+                                marks[0], marks[1]
+                            );
+                        }
                     }
                     if unset + unmade > 0.0 {
                         tracing::info!(

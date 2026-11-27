@@ -664,6 +664,22 @@ impl Memory {
             let at = unsafe { self.faults.1.add(i) };
             // SAFETY: as above.
             let page = unsafe { at.read_volatile() };
+            // A runtime marker of the translator (`emit::DEAD_MARK`): an
+            // edge where a join took an assumed-dead descriptor dword ran
+            // (docs/royale/p4-shortcuts.md #2). Logged once per place.
+            if page & victory_shader::emit::DEAD_MARK != 0 {
+                static SEEN: std::sync::Mutex<std::collections::BTreeSet<u32>> = std::sync::Mutex::new(std::collections::BTreeSet::new());
+                let code = (page & 0x00FF_FFFF) << 2;
+                if SEEN.lock().unwrap_or_else(|e| e.into_inner()).insert(code) {
+                    tracing::warn!(
+                        code = format_args!("{code:#x}"),
+                        "P.4 dead-dword marker: an edge where a join took an assumed-dead descriptor dword ran (the assumption may be wrong there)"
+                    );
+                }
+                // SAFETY: inside the faults' mapping (as below).
+                unsafe { at.write_volatile(0) };
+                continue;
+            }
             if page != 0 {
                 pages.push(u64::from(page));
                 // SAFETY: as above.
