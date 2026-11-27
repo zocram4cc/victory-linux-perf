@@ -59,6 +59,56 @@ The title asks for ~12,900 pipelines through two console device methods the laye
 - **fxceless**: `VICTORY_NATIVE_PSO_DUMP` (dump only).
 - **victory-scarlett**: `SHOW_AFTER` (a slot shows a new texture only after its upload ran) in place of a wait for running submissions.
 
+### 6. P.4 translator work, in detail (27 Nov 2026)
+
+**Goal.** Make device method 0x218's compute programs (2,680 in one dump) translate, family by family, so that whole chains of the title's GPU work can be switched on (`VICTORY_NATIVE_COMPUTE=1`). A family made in part breaks the picture (section 3), so coverage has to reach whole families before anything is turned on by default.
+
+**How it is measured (no game needed).**
+
+```sh
+# every dumped 0x218 program rebuilt as FSPX and translated, errors grouped; writes the list of those that translate
+cargo run --release -p victory-shader --example p4_fspx -- ~/Games/victory-data/pso-dump --ok bench/p4-translate-ok.txt
+# the unit tests, after every change
+cargo test --release -p victory-shader
+# what blocks the next step (printed per attempt, grouped with sort | uniq -c)
+VICTORY_WHY_DESCRIPTOR=1 cargo run --release -p victory-shader --example p4_fspx -- ~/Games/victory-data/pso-dump 2>&1 | grep WHY-DESCRIPTOR
+VICTORY_WHY_ADDRESS=1    cargo run --release -p victory-shader --example p4_fspx -- ~/Games/victory-data/pso-dump 2>&1 | grep WHY-ADDRESS
+```
+
+The dump comes from one game run with `VICTORY_NATIVE_PSO_DUMP=Z:\…\pso-dump` (598 MB; `218_<code address>/` directories with the description's pieces). A whole run of the harness takes well under a minute on Linux.
+
+**Method.** Census the most frequent blocker → read real programs that hit it (`llvm-mc --disassemble -arch=amdgcn -mcpu=gfx1030` on `w5_*.bin`, the metadata records in `w7_*.bin`) → implement exactly that shape, refusing variations → tests green → harness count up → commit. A program translates only when every blocker on its path is gone, so the count rises slowly while blockers move.
+
+**Steps done** (all in `crates/victory-shader`, each its own commit on `k7900`):
+
+| step | what the console code does | what the translator does now | where | effect |
+|---|---|---|---|---|
+| 0 | declares a constant buffer as root constants (root type 0) | as many user SGPRs as the record's descriptor dwords | `native::fspx_program` | 1,469 programs were refused as malformed before |
+| 1 | adds an offset register to an address that already had a computed term | `resource::Address::dynamic2`, a second computed term, added where the address is used (global loads, built buffer offsets); single-term interpretations skip it; scalar loads from code tables refuse it | `resource.rs`, `emit/lower.rs` | the 1,366 programs blocked there pass it |
+| 2 | turns a loaded structured-buffer descriptor into a raw view: `[d0, d1 & 0xc000ffff, d2 * n, (d3 & m) \| 0x30000000]` | that is the loaded descriptor; accesses without an index are raw already | `resource::raw_view_of_loaded` | 664 of 979 pass "a descriptor changed after loading" |
+| 3 | swaps registers with three `s_xor_b32` | XOR chains that cancel are the word they come back to | `resource::xor_cancelled` | "changed after loading" 315 → 114 |
+| 4 | fetches descriptors from the heap by index: `s_add_u32 addr, s[n-2], readfirstlane(index << 5)` (a waterfall over bindless descriptors); the heap bases are in the last two user SGPRs and the metadata does not list them | `ResourceHeap` at user SGPR n-2 and `SamplerHeap` at n-1 where nothing listed covers them (the host binds heap bases as 0) | `native::fspx_program` | "a descriptor outside the heaps" (362) gone; 544 → 574 |
+| 5 | writes an address's high half as `s_add_u32 hi, 0, src_scc` (the low add's carry) | accepted as the high half plus carry | `resource::plus_scc`, `high_half` | 574 → 587 |
+
+**Where it stands: 587 of 2,680 translate** (542 before the steps). 209 `victory-shader` tests pass. In game nothing changes by default.
+
+**Next blockers** (programs whose first remaining error it is):
+
+| programs | blocker | what is known |
+|---|---|---|
+| 618 | an address not from a root parameter | addresses made by `s_or_b32`, `v_or_b32`, `v_cndmask_b32`, a pair of `s_lshl_b64`, `v_add_co_u32`, `s_bfm_b64` (`VICTORY_WHY_ADDRESS`) |
+| 376 | an image store of some channels | stores with a partial `dmask` |
+| 298 | a descriptor neither loaded nor built | to census |
+| 114 | a descriptor changed after loading | other shapes (`VICTORY_WHY_DESCRIPTOR`) |
+| 96 + 69 | `s_pack_hh_b32_b16`, `s_pack_ll_b32_b16` | scalar 16-bit packing, not implemented |
+| 95 | a structured buffer of unknown stride | FSPX records carry no stride |
+| 69 | a typed buffer store of some channels or at an offset | |
+| 49 | `v_mad_u32_u16` | not implemented |
+
+**Families** (programs sharing the root signature of the description's word 0): 30. Recompute which are whole with the `--ok` list against the dump (`bench/p4-full-families.txt` was made so). When one becomes whole, test it in game alone: `VICTORY_NATIVE_COMPUTE=1 VICTORY_NATIVE_COMPUTE_ONLY=Z:\…\family.txt`, judged by screenshot contrast, the world-entry window region (the house's interior must show; mean luminance ~55-60 in plain runs) and fps against plain runs, plus the user's eyes.
+
+**Known bad in game:** `0f01a73b00` turns the picture grey even alone with the others; keep it out until understood.
+
 ---
 
 > **Linux / Proton fork.** This is avatarmanz/VIctory-7900XTX with the changes it
