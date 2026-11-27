@@ -127,6 +127,9 @@ struct Region {
     start: u64,
     end: u64,
     heap: ID3D12Heap,
+    /// Bytes from the heap's first to `start`'s (a heap opened by handle holds
+    /// all of the home, [`home_heap`]).
+    offset: u64,
 }
 
 // SAFETY: D3D12 heaps are free-threaded.
@@ -205,7 +208,7 @@ pub(crate) fn place_in(device: &ID3D12Device, start: u64, len: u64) -> Result<Pl
         }
     };
     let region = &regions[i];
-    let buffer = crate::inplace::place(device, &region.heap, at - region.start, end - at).map_err(|e| (6, format!("no buffer placed in the region: {e}")))?;
+    let buffer = crate::inplace::place(device, &region.heap, region.offset + at - region.start, end - at).map_err(|e| (6, format!("no buffer placed in the region: {e}")))?;
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
     Ok(Placed { buffer, heap: region.heap.clone(), gpu, bias: start - at })
@@ -297,7 +300,7 @@ fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usiz
             );
             // shortcut: the view stays mapped for good (the heap holds its
             // pages while anything names it).
-            Ok(Region { start: first, end: first + bytes, heap })
+            Ok(Region { start: first, end: first + bytes, heap, offset: 0 })
         }
         Err(e) => {
             unmap();
@@ -327,8 +330,8 @@ fn open_at_home(device: &ID3D12Device, first: u64, bytes: u64) -> Result<Region,
         return Err((4, "pages of the stretch are not committed".to_owned()));
     }
     for attempt in 1..=TRIES {
-        let heap = crate::inplace::open(device, crate::inplace::From::Part(first as usize, bytes as usize)).map_err(|e| (5, format!("refused by the host: {e}")))?;
-        let shows = crate::inplace::heap_shows(device, &heap, first as usize, bytes as usize);
+        let (heap, offset) = home_heap(device, first, bytes)?;
+        let shows = crate::inplace::heap_shows(device, &heap, offset, first as usize, bytes as usize);
         // Diagnostics (`VICTORY_PORT_HOME_FAIL=1`, read here): as if the card
         // had read zeros every time, to see what a stretch given up costs.
         #[cfg(feature = "diagnostics")]
@@ -341,7 +344,7 @@ fn open_at_home(device: &ID3D12Device, first: u64, bytes: u64) -> Result<Region,
                 attempt,
                 "renderer port 1: a stretch of the title's graphics memory opened as a host heap where the title has it (pages shown as memory of their own, under Wine)"
             );
-            return Ok(Region { start: first, end: first + bytes, heap });
+            return Ok(Region { start: first, end: first + bytes, heap, offset });
         }
         tracing::warn!(
             start = format_args!("{first:#x}"),
@@ -354,6 +357,27 @@ fn open_at_home(device: &ID3D12Device, first: u64, bytes: u64) -> Result<Region,
     }
     crate::inplace::home_given_up(first as usize, bytes as usize);
     Err((5, "the card reads zeros in the heap the host opened on the title's pages".to_owned()))
+}
+
+/// [`open_at_home`]'s heap on `[first, first + bytes)`, and the bytes from its
+/// first to `first`: by the handle the runtime gave for those pages
+/// (`VICTORY_HOME_BO=1`, `crate::inplace::title_memory_home_handle`; the heap is
+/// then all of their memory); else, or if the host refuses the handle, on their
+/// address as before.
+fn home_heap(device: &ID3D12Device, first: u64, bytes: u64) -> Result<(ID3D12Heap, u64), (usize, String)> {
+    if let Some((handle, offset)) = crate::inplace::home_handle(first as usize, bytes as usize) {
+        match crate::inplace::open(device, crate::inplace::From::Shared(handle)) {
+            Ok(heap) => return Ok((heap, offset)),
+            Err(e) => {
+                static SAID: std::sync::Once = std::sync::Once::new();
+                SAID.call_once(|| {
+                    tracing::warn!(error = %e, "renderer port 1 under Wine: the host opens no heap by the handle to the pages at home (VICTORY_HOME_BO=1): opened on their address as before");
+                });
+            }
+        }
+    }
+    let heap = crate::inplace::open(device, crate::inplace::From::Part(first as usize, bytes as usize)).map_err(|e| (5, format!("refused by the host: {e}")))?;
+    Ok((heap, 0))
 }
 
 /// Whether every page of `[at, at + len)` is committed.
@@ -440,6 +464,16 @@ pub(crate) fn log(frames: f64) {
         s[6],
         s[7],
     );
+}
+
+/// For `victory-hle`'s tests: what the card reads of title memory `[at, at +
+/// len)` through the buffer [`place_in`] places there on the host device.
+#[doc(hidden)]
+pub fn card_reads(at: usize, len: usize) -> Result<Vec<u8>, String> {
+    let host = crate::host::host().ok_or("no host device")?;
+    let placed = place_in(&host.device, at as u64, len as u64).map_err(|(_, why)| why)?;
+    let mut rig = crate::inplace::Rig::new(&host.device).map_err(|e| e.to_string())?;
+    rig.fetch(&placed.buffer, placed.bias, len).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -545,6 +579,56 @@ mod tests {
             mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ });
             crate::inplace::title_memory_section_gone(section);
             windows_sys::Win32::Foundation::CloseHandle(section as _);
+        }
+    }
+
+    /// Under Wine, on the card (nothing is tried elsewhere): a stretch at home
+    /// with a handle the host opens no heap by (here an event's; to a host
+    /// without `VICTORY_HOME_BO=1`'s vkd3d-proton and Wine every handle is
+    /// one) is opened where it is, as without a handle, and the card reads
+    /// the bytes at the title's address.
+    #[test]
+    fn under_wine_a_stretch_at_home_whose_handle_opens_no_heap_is_opened_where_it_is() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        if !on_wine() {
+            return;
+        }
+        let mut device: Option<ID3D12Device> = None;
+        // SAFETY: plain device creation on the default adapter.
+        let made = unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device) };
+        let Some(device) = device.filter(|_| made.is_ok()) else {
+            eprintln!("not tried: no device");
+            return;
+        };
+        let k64 = K64 as usize;
+        let bytes = 4 * k64;
+        // SAFETY: memory, a section and an event of the test's own.
+        unsafe {
+            let home = mem::VirtualAlloc(std::ptr::null(), bytes, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE) as usize;
+            let invalid = windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+            let section = mem::CreateFileMappingW(invalid, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_COMMIT, 0, bytes as u32, std::ptr::null()) as usize;
+            let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None).unwrap().0 as usize;
+            assert!(home != 0 && section != 0);
+            crate::inplace::title_memory_section(section, bytes as u64, true);
+            crate::inplace::title_memory_view(home, bytes, section, 0);
+            crate::inplace::title_memory_home(home, bytes, true);
+            crate::inplace::title_memory_home_handle(home, bytes, Some(event));
+            for (i, b) in std::slice::from_raw_parts_mut(home as *mut u8, bytes).iter_mut().enumerate() {
+                *b = (i as u8).wrapping_mul(13).wrapping_add(1);
+            }
+            let region = open_region(&device, home as u64 + K64, home as u64 + 2 * K64).unwrap_or_else(|e| panic!("not opened: {e:?}"));
+            assert_eq!((region.start, region.end, region.offset), (home as u64, (home + bytes) as u64, 0), "the whole stretch, on its address");
+            let buffer = crate::inplace::place(&device, &region.heap, K64, K64).unwrap();
+            let got = crate::inplace::Rig::new(&device).unwrap().fetch(&buffer, 0, k64).unwrap();
+            assert!(got == std::slice::from_raw_parts((home + k64) as *const u8, k64), "the card reads the bytes at the title's address");
+            drop((buffer, region));
+            crate::inplace::title_memory_home_handle(home, bytes, None);
+            crate::inplace::title_memory_home(home, bytes, false);
+            crate::inplace::views_gone(home, bytes);
+            crate::inplace::title_memory_section_gone(section);
+            windows_sys::Win32::Foundation::CloseHandle(section as _);
+            windows_sys::Win32::Foundation::CloseHandle(event as _);
+            mem::VirtualFree(home as _, 0, mem::MEM_RELEASE);
         }
     }
 

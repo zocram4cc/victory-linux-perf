@@ -40,7 +40,7 @@ use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::sync::{LazyLock, Mutex};
 
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_ALL, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
 use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, FILE_MAP_WRITE, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE,
@@ -53,6 +53,14 @@ type Mmap = unsafe extern "sysv64" fn(*mut c_void, usize, i32, i32, i32, i64) ->
 type Close = unsafe extern "sysv64" fn(i32) -> i32;
 type Madvise = unsafe extern "sysv64" fn(*mut c_void, usize, i32) -> i32;
 type HandleToFd = unsafe extern "C" fn(HANDLE, u32, *mut i32, *mut u32) -> i32;
+type MemfdCreate = unsafe extern "sysv64" fn(*const u8, u32) -> i32;
+type Ftruncate = unsafe extern "sysv64" fn(i32, i64) -> i32;
+// (`fcntl`, `open` and `ioctl` take more arguments in C, after these fixed
+// ones, in the registers the convention gives fixed ones: only these are passed.)
+type Fcntl = unsafe extern "sysv64" fn(i32, i32, i32) -> i32;
+type Open = unsafe extern "sysv64" fn(*const u8, i32) -> i32;
+type Ioctl = unsafe extern "sysv64" fn(i32, u64, *mut UdmabufCreate) -> i32;
+type FdToHandle = unsafe extern "C" fn(i32, u32, u32, *mut HANDLE) -> i32;
 
 const PROT_READ: i32 = 1;
 const PROT_WRITE: i32 = 2;
@@ -62,6 +70,15 @@ const MAP_FIXED: i32 = 0x10;
 const MAP_ANONYMOUS: i32 = 0x20;
 const MAP_NORESERVE: i32 = 0x4000;
 const MADV_NOHUGEPAGE: i32 = 15;
+const MFD_CLOEXEC: u32 = 1;
+const MFD_ALLOW_SEALING: u32 = 2;
+const F_ADD_SEALS: i32 = 1033;
+const F_SEAL_SHRINK: i32 = 2;
+const O_RDWR: i32 = 2;
+const O_CLOEXEC: i32 = 0o200_0000;
+/// `_IOW('u', 0x42, struct udmabuf_create)`.
+const UDMABUF_CREATE: u64 = 0x4018_7542;
+const UDMABUF_FLAGS_CLOEXEC: u32 = 1;
 
 struct Direct {
     mmap: Mmap,
@@ -69,6 +86,29 @@ struct Direct {
     /// The C library's `madvise`, if found ([`Direct::no_huge`] only).
     madvise: Option<Madvise>,
     handle_to_fd: HandleToFd,
+    /// With `VICTORY_HOME_BO=1` ([`home_bo`]), if all of it is found.
+    bo: Option<Bo>,
+}
+
+/// `struct udmabuf_create` (`linux/udmabuf.h`).
+#[repr(C)]
+struct UdmabufCreate {
+    memfd: u32,
+    flags: u32,
+    offset: u64,
+    size: u64,
+}
+
+/// What makes memory at home a memfd the card opens as a heap by handle
+/// ([`home_bo`]): the C library's calls and Wine's way from a descriptor to a
+/// handle.
+struct Bo {
+    memfd_create: MemfdCreate,
+    ftruncate: Ftruncate,
+    fcntl: Fcntl,
+    open: Open,
+    ioctl: Ioctl,
+    fd_to_handle: FdToHandle,
 }
 
 /// What is needed, if all of it is there and a page shown this way reads and
@@ -248,6 +288,28 @@ pub(crate) fn one_own_mapping(at: usize, len: usize) -> Option<bool> {
     )
 }
 
+/// For tests: whether the host maps `at` from a memfd [`own`] made
+/// (`VICTORY_HOME_BO=1`), by its list of this process's mappings (`None`: the
+/// list could not be read).
+#[cfg(test)]
+pub(crate) fn memfd_at(at: usize) -> Option<bool> {
+    let maps = own_maps().ok()?;
+    Some(
+        maps.lines()
+            .filter_map(mapping)
+            .any(|(start, end, _, _, path)| start <= at && at < end && path.starts_with("/memfd:victory-home")),
+    )
+}
+
+/// For tests: whether the host's device opens a heap by a handle to a dma-buf
+/// of a memfd, [`own`]'s question with `VICTORY_HOME_BO=1`, asked on one of
+/// the test's own (`None`: pages are not shown by mmap, or the switch is off).
+#[cfg(test)]
+pub(crate) fn opens_by_handle() -> Option<bool> {
+    let direct = DIRECT.as_ref()?;
+    Some(direct.bo.as_ref()?.made(direct, 64 << 10).map(|(memfd, handle)| direct.let_go(memfd, handle)).is_ok())
+}
+
 /// The values of the functions `names` in the dynamic symbols of `elf` (a
 /// 64-bit little-endian shared object), in order.
 fn symbols(elf: &[u8], names: &[&str]) -> Option<Vec<usize>> {
@@ -336,6 +398,30 @@ fn find() -> Result<Direct, &'static str> {
         .ok_or("the C library's functions are not where its file says")?;
     // (Looked up alone: without it pages are shown all the same.)
     let madvise = symbols(&file, &["madvise"]).and_then(|values| at(values[0]));
+    // (Looked up only with `VICTORY_HOME_BO=1`.)
+    let bo = home_bo()
+        .then(|| {
+            // SAFETY: a plain lookup in ntdll, always loaded.
+            let fd_to_handle = unsafe {
+                let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+                GetProcAddress(ntdll, c"wine_server_fd_to_handle".as_ptr().cast())
+            }?;
+            let values = symbols(&file, &["memfd_create", "ftruncate", "fcntl", "open", "ioctl"])?;
+            let calls = values.into_iter().map(&at).collect::<Option<Vec<usize>>>()?;
+            // SAFETY: as below: the C library's functions in its executable mappings, called
+            // as the host's calling convention has them, and ntdll's export, of this signature.
+            Some(unsafe {
+                Bo {
+                    memfd_create: std::mem::transmute::<usize, MemfdCreate>(calls[0]),
+                    ftruncate: std::mem::transmute::<usize, Ftruncate>(calls[1]),
+                    fcntl: std::mem::transmute::<usize, Fcntl>(calls[2]),
+                    open: std::mem::transmute::<usize, Open>(calls[3]),
+                    ioctl: std::mem::transmute::<usize, Ioctl>(calls[4]),
+                    fd_to_handle: std::mem::transmute::<unsafe extern "system" fn() -> isize, FdToHandle>(fd_to_handle),
+                }
+            })
+        })
+        .flatten();
     // SAFETY: the addresses of the C library's `mmap`, `close` and `madvise`, in its executable
     // mappings, called as the host's calling convention has them; and ntdll's export, of this
     // signature.
@@ -347,6 +433,7 @@ fn find() -> Result<Direct, &'static str> {
             handle_to_fd: std::mem::transmute::<unsafe extern "system" fn() -> isize, HandleToFd>(
                 handle_to_fd,
             ),
+            bo,
         })
     }
 }
@@ -466,6 +553,70 @@ impl Direct {
             unsafe { madvise(base as *mut c_void, len, MADV_NOHUGEPAGE) == 0 }
         })
     }
+
+    /// Fresh memory of the process's own over `[base, base + len)`, in one
+    /// mapping of the host's, then the host's books ([`own`]).
+    fn fresh(&self, base: usize, len: usize) -> bool {
+        // SAFETY: over a range of a reservation of the title's that shows nothing
+        // (the caller looked): fresh memory first, then the host's books; nothing
+        // but that range is touched.
+        unsafe {
+            let at = (self.mmap)(
+                base as *mut c_void,
+                len,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE,
+                -1,
+                0,
+            );
+            if at as usize != base {
+                return false;
+            }
+            if VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE).is_null() {
+                VirtualFree(base as *mut c_void, len, MEM_DECOMMIT);
+                return false;
+            }
+        }
+        true
+    }
+
+    /// [`own`] with `VICTORY_HOME_BO=1` made `[base, base + len)` anew
+    /// (`shown`), from the memfd and handle in `shared` if it is theirs: what
+    /// was made there before goes ([`SHARED`]), and `victory_gpu` is told the
+    /// handle the heap there is opened by, if any.
+    fn made_home(&self, base: usize, len: usize, shared: Option<(i32, usize)>, shown: bool) {
+        let mut made = SHARED.lock().unwrap_or_else(|e| e.into_inner());
+        made.retain(|s| {
+            let apart = s.0 + s.1 <= base || base + len <= s.0;
+            if !apart {
+                self.let_go(s.2, s.3);
+            }
+            apart
+        });
+        match shared {
+            Some((memfd, handle)) if shown => {
+                made.push((base, len, memfd, handle));
+                tracing::info!(
+                    at = format_args!("{base:#x}"),
+                    len,
+                    "memory at home is a memfd the card opens as a heap by handle (VICTORY_HOME_BO=1)"
+                );
+            }
+            Some((memfd, handle)) => self.let_go(memfd, handle),
+            None => {}
+        }
+        victory_gpu::title_memory_home_handle(base, len, shared.filter(|_| shown).map(|s| s.1));
+    }
+
+    /// Lets go of a memfd and a handle [`Bo::memfd`] gave (a mapping made with
+    /// the memfd keeps it on its own, and a heap opened by the handle its memory).
+    fn let_go(&self, memfd: i32, handle: usize) {
+        // SAFETY: a descriptor and a handle of ours that no call uses any more.
+        unsafe {
+            (self.close)(memfd);
+            CloseHandle(handle as HANDLE);
+        }
+    }
 }
 
 /// Makes `[base, base + len)`, a stretch of a reservation of [`Spaces`] that
@@ -474,29 +625,29 @@ impl Direct {
 /// (Committed piece by piece, with pages written in between, the host kernel
 /// keeps a mapping for each piece: memory of the process's own all the same,
 /// but not what its graphics driver takes by address, `xmem`'s `show_home`.)
+///
+/// With `VICTORY_HOME_BO=1` ([`home_bo`]) the memory is a sealed memfd shown
+/// there ([`Direct::show`]) if the host's device opens a heap by a handle to a
+/// dma-buf of its pages (asked first), and `victory_gpu` opens the heap by that
+/// handle; else, or if a step fails, fresh memory as without the switch.
 pub(crate) fn own(base: usize, len: usize) -> bool {
     let Some(direct) = DIRECT.as_ref() else {
         return false;
     };
-    // SAFETY: over a range of a reservation of the title's that shows nothing
-    // (the caller looked): fresh memory first, then the host's books; nothing
-    // but that range is touched.
-    unsafe {
-        let at = (direct.mmap)(
-            base as *mut c_void,
-            len,
-            PROT_READ | PROT_WRITE,
-            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE,
-            -1,
-            0,
-        );
-        if at as usize != base {
-            return false;
-        }
-        if VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE).is_null() {
-            VirtualFree(base as *mut c_void, len, MEM_DECOMMIT);
-            return false;
-        }
+    let shared = direct.bo.as_ref().and_then(|bo| {
+        bo.made(direct, len)
+            .inspect_err(|why| tracing::warn!(why = %why, "memory at home is the process's own, as without VICTORY_HOME_BO=1"))
+            .ok()
+    });
+    let shown = match shared {
+        Some((memfd, _)) => direct.show(base, len, memfd, 0),
+        None => direct.fresh(base, len),
+    };
+    if direct.bo.is_some() {
+        direct.made_home(base, len, shared, shown);
+    }
+    if !shown {
+        return false;
     }
     if home_no_huge() {
         let kept = direct.no_huge(base, len);
@@ -519,6 +670,84 @@ fn home_no_huge() -> bool {
     static ON: LazyLock<bool> =
         LazyLock::new(|| std::env::var_os("VICTORY_HOME_NOHUGE").is_some_and(|v| v == "1"));
     *ON
+}
+
+/// `VICTORY_HOME_BO=1` (off unless set; read here; it takes effect where
+/// renderer port 1's pages are at home, `VICTORY_PORT_HOME=1`): memory [`own`]
+/// makes is a sealed memfd, and the card's heap on it is opened by a handle to
+/// a dma-buf of its pages (`/dev/udmabuf`), not by its address. By address
+/// (`VK_EXT_external_memory_host`) amdgpu holds a user pointer and walks its
+/// pages at every submission (~90 a frame, 64-512 us each for the 185 MB
+/// home); a dma-buf's pages are pinned once. Needs a vkd3d-proton that opens a
+/// heap by such a handle (`OpenSharedHandle(ID3D12Heap)`) and a Wine whose
+/// win32u imports a handle that is no D3DKMT object; without them the device
+/// refuses the handle and the memory is the process's own, as without the
+/// switch (opened by address: a user pointer takes no memfd, its pages have a
+/// file behind them).
+fn home_bo() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_HOME_BO").is_some_and(|v| v == "1"));
+    *ON
+}
+
+/// The stretches [`own`] made a memfd ([`home_bo`]): start, bytes, the memfd
+/// (kept, to show its pages there again, [`shared`]) and the handle the card's
+/// heap there is opened by.
+static SHARED: Mutex<Vec<(usize, usize, i32, usize)>> = Mutex::new(Vec::new());
+
+/// The memfd [`own`] made the stretch at home that starts at `first`, if it did.
+pub(crate) fn shared(first: usize) -> Option<i32> {
+    SHARED.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|s| s.0 == first).map(|s| s.2)
+}
+
+impl Bo {
+    /// A sealed memfd of `len` bytes, and a handle to a dma-buf of its pages
+    /// that the host's device opens a heap by: [`own`]'s memory with the
+    /// switch. `Err` says why not; what was made on the way is let go.
+    fn made(&self, direct: &Direct, len: usize) -> Result<(i32, usize), String> {
+        let (memfd, handle) = self.memfd(direct.close, len)?;
+        victory_gpu::opens_heap_by_handle(handle).inspect_err(|_| direct.let_go(memfd, handle))?;
+        Ok((memfd, handle))
+    }
+
+    /// A sealed memfd of `len` bytes and a handle (Wine's) to a dma-buf of its
+    /// pages (`/dev/udmabuf`, which pins them).
+    fn memfd(&self, close: Close, len: usize) -> Result<(i32, usize), &'static str> {
+        // SAFETY: the C library's calls and Wine's on descriptors made here, with
+        // the arguments they take; each is kept or closed.
+        unsafe {
+            let memfd = (self.memfd_create)(c"victory-home".as_ptr().cast(), MFD_CLOEXEC | MFD_ALLOW_SEALING);
+            if memfd < 0 {
+                return Err("no memfd was made");
+            }
+            let handle = (|| {
+                if (self.ftruncate)(memfd, len as i64) != 0 || (self.fcntl)(memfd, F_ADD_SEALS, F_SEAL_SHRINK) != 0 {
+                    return Err("the memfd was not sized and sealed");
+                }
+                let device = (self.open)(c"/dev/udmabuf".as_ptr().cast(), O_RDWR | O_CLOEXEC);
+                if device < 0 {
+                    return Err("/dev/udmabuf was not opened");
+                }
+                let mut create = UdmabufCreate { memfd: memfd as u32, flags: UDMABUF_FLAGS_CLOEXEC, offset: 0, size: len as u64 };
+                let dmabuf = (self.ioctl)(device, UDMABUF_CREATE, &mut create);
+                close(device);
+                if dmabuf < 0 {
+                    return Err("/dev/udmabuf made no dma-buf of the memfd");
+                }
+                let mut handle: HANDLE = std::ptr::null_mut();
+                // (Wine's server keeps a descriptor of its own.)
+                let status = (self.fd_to_handle)(dmabuf, GENERIC_ALL, 0, &mut handle);
+                close(dmabuf);
+                if status < 0 || handle.is_null() {
+                    return Err("Wine gave no handle to the dma-buf");
+                }
+                Ok(handle as usize)
+            })();
+            if handle.is_err() {
+                close(memfd);
+            }
+            handle.map(|handle| (memfd, handle))
+        }
+    }
 }
 
 /// The file descriptor behind `section`, to show its pages with; `None` if
@@ -752,5 +981,105 @@ mod tests {
         assert!(flags.split_whitespace().any(|f| f == "nh"), "kept off huge pages: {flags}");
         // SAFETY: ours, from above.
         unsafe { VirtualFree(base as *mut c_void, 0, MEM_RELEASE) };
+    }
+
+    /// `VICTORY_HOME_BO=1`'s memory at home (a memfd whose pages a dma-buf
+    /// pins) against [`own`]'s fresh memory, each over a write-watched
+    /// reservation, and against memory Wine commits there itself: Wine's write
+    /// watch answers alike for the memfd and [`own`]'s memory after a write, a
+    /// reset and another write (and finds the second write in Wine's own,
+    /// which shows that the asking works), and a write to a page made
+    /// read-only faults into a handler for all three (the guards' way, for
+    /// pages at home given up). Needs pages shown by the host's mmap and the
+    /// switch (`VICTORY_WINE_MAP=1 VICTORY_HOME_BO=1`, under Wine).
+    #[test]
+    fn a_memfd_at_home_is_watched_and_guarded_as_memory_of_its_own() {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        use windows_sys::Win32::Foundation::EXCEPTION_ACCESS_VIOLATION;
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            AddVectoredExceptionHandler, EXCEPTION_POINTERS, RemoveVectoredExceptionHandler,
+        };
+        use windows_sys::Win32::System::Memory::GetWriteWatch;
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const WRITE_WATCH_FLAG_RESET: u32 = 1;
+        const PAGE: usize = 4 << 10;
+        const LEN: usize = 64 << 10;
+        static GUARDED: AtomicUsize = AtomicUsize::new(0);
+        static FAULTS: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "system" fn guard(info: *mut EXCEPTION_POINTERS) -> i32 {
+            const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
+            const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
+            // SAFETY: the record of the exception being dispatched.
+            let record = unsafe { &*(*info).ExceptionRecord };
+            let page = GUARDED.load(Relaxed);
+            if record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION
+                || page == 0
+                || !(page..page + PAGE).contains(&record.ExceptionInformation[1])
+            {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+            let mut old = 0;
+            // SAFETY: the test's page, read-write again.
+            unsafe { VirtualProtect(page as *const c_void, PAGE, PAGE_READWRITE, &mut old) };
+            FAULTS.fetch_add(1, Relaxed);
+            EXCEPTION_CONTINUE_EXECUTION
+        }
+        let Some(direct) = DIRECT.as_ref() else {
+            eprintln!("not tried: not under Wine with pages shown by mmap (VICTORY_WINE_MAP=1)");
+            return;
+        };
+        let Some(bo) = direct.bo.as_ref() else {
+            eprintln!("not tried: without VICTORY_HOME_BO=1");
+            return;
+        };
+        let mut answers = Vec::new();
+        for kind in ["Wine's own", "memory of its own", "a memfd"] {
+            // SAFETY: a reservation of the test's own, released below.
+            let base = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_WRITE_WATCH, PAGE_NOACCESS) } as usize;
+            assert_ne!(base, 0, "no reservation for the test");
+            let made = (kind == "a memfd").then(|| bo.memfd(direct.close, LEN).expect("a memfd and a handle to a dma-buf of it"));
+            let shown = match made {
+                Some((memfd, _)) => direct.show(base, LEN, memfd, 0),
+                // SAFETY: the reservation above, committed by Wine.
+                None if kind == "Wine's own" => !unsafe { VirtualAlloc(base as *const c_void, LEN, MEM_COMMIT, PAGE_READWRITE) }.is_null(),
+                None => direct.fresh(base, LEN),
+            };
+            assert!(shown, "memory over the reservation");
+            let page = |k: usize| (base + k * PAGE) as *mut u8;
+            let (mut found, mut granularity) = ([0usize; 16], 0u32);
+            // SAFETY: committed read-write pages of the test's; room for `count` answers.
+            let written: Vec<usize> = unsafe {
+                page(0).write_volatile(1);
+                let mut count = found.len();
+                GetWriteWatch(WRITE_WATCH_FLAG_RESET, base as *const c_void, LEN, found.as_mut_ptr().cast(), &mut count, &mut granularity);
+                page(2).write_volatile(1);
+                let mut count = found.len();
+                let status = GetWriteWatch(0, base as *const c_void, LEN, found.as_mut_ptr().cast(), &mut count, &mut granularity);
+                assert_eq!(status, 0, "write-watched");
+                found[..count].iter().map(|&at| (at - base) / PAGE).collect()
+            };
+            GUARDED.store(page(1) as usize, Relaxed);
+            FAULTS.store(0, Relaxed);
+            // SAFETY: the handler above, taken away below; the test's page.
+            let faulted = unsafe {
+                let handler = AddVectoredExceptionHandler(1, Some(guard));
+                let mut old = 0;
+                assert_ne!(VirtualProtect(page(1).cast(), PAGE, PAGE_READONLY, &mut old), 0);
+                page(1).write_volatile(5);
+                RemoveVectoredExceptionHandler(handler);
+                (FAULTS.load(Relaxed), page(1).read_volatile())
+            };
+            GUARDED.store(0, Relaxed);
+            eprintln!("{kind}: pages written after the reset {written:?}; a write to a read-only page (faults, byte) {faulted:?}");
+            answers.push((written, faulted));
+            if let Some((memfd, handle)) = made {
+                direct.let_go(memfd, handle);
+            }
+            // SAFETY: ours, from above.
+            unsafe { VirtualFree(base as *mut c_void, 0, MEM_RELEASE) };
+        }
+        assert_eq!(answers[0].0, [2], "Wine's own write watch finds the page written after the reset");
+        assert_eq!(answers[1], answers[2], "a memfd is watched and guarded as memory of its own");
+        assert_eq!(answers.iter().map(|a| a.1).collect::<Vec<_>>(), [(1, 5); 3], "the write faulted once, then landed");
     }
 }

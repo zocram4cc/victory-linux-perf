@@ -163,4 +163,7 @@ pub use watch::{
 #[cfg(windows)]
 pub use watch::title_view_space;
 #[cfg(windows)]
-pub use inplace::title_memory_home;
+pub use inplace::{opens_heap_by_handle, title_memory_home, title_memory_home_handle};
+#[cfg(windows)]
+#[doc(hidden)]
+pub use port::card_reads as port_card_reads;

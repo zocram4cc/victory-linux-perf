@@ -6222,7 +6222,7 @@ mod one_owner_tests {
         let window = lookup_with(a + 0x1000, 16, true, false, false).expect("a window");
         assert!(window.in_place(), "a window over private memory committed whole is placed");
         let (heap, _) = window.place.as_ref().expect("in place");
-        let shows = crate::inplace::heap_shows(device(), heap, a as usize, WINDOW as usize);
+        let shows = crate::inplace::heap_shows(device(), heap, 0, a as usize, WINDOW as usize);
         assert_eq!(shows, Some(true), "the card reads the title's bytes in place: the host imported the memory");
         let mut rig = crate::inplace::Rig::new(device()).expect("a queue of the test's own");
         rig.store(&window.buffer, window.offset(a + 0x2000), &[0xc3; 256]).expect("the card writes");

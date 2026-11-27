@@ -689,6 +689,15 @@ fn show_home(base: usize, len: usize, slice: &Slice, first: usize) -> bool {
             "renderer port 1 under Wine: the stretch the title's 32-bit graphics pages go home to shows something already: committed piece by piece, which the host may not open as a heap"
         );
     }
+    // With `VICTORY_HOME_BO=1` the stretch may be a memfd the card opens by
+    // handle (`wine_map::own`): the piece shows its pages, also when it is
+    // shown again after it was taken away (a decommit leaves other memory).
+    if let Some(memfd) = wine_map::shared(first)
+        && !wine_map::show(base, len, memfd, (base - first) as u64)
+    {
+        tracing::warn!(address = format_args!("{base:#x}"), len, "physical pages at home: their memfd was not shown there (VICTORY_HOME_BO=1)");
+        return false;
+    }
     // SAFETY: a range of a plain reservation of the title's that shows nothing
     // (the caller unmapped it): committed, it is fresh memory of the process's.
     if unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
@@ -3101,7 +3110,7 @@ mod tests {
         // SAFETY: mapped read-write.
         unsafe { base.cast::<u32>().write(1) };
         match wine_map::one_own_mapping(base as usize, 4 * PAGE) {
-            Some(one) => assert!(one, "one mapping of the process's own holds the stretch"),
+            Some(one) => assert!(one || wine_map::shared(base as usize).is_some(), "one mapping of the process's own (or VICTORY_HOME_BO's memfd) holds the stretch"),
             None => eprintln!("not looked at: the host's list of this process's mappings could not be read"),
         }
         let section = page_table().pages.get(&pages[0]).map(|s| s.section.clone()).unwrap();
@@ -3136,6 +3145,67 @@ mod tests {
         }
         assert_eq!(page_window(&pages[2..3], 0, 4).unwrap().bytes(), 13u32.to_le_bytes());
         assert_eq!(XMemMapPhysicalPages(other, 1, std::ptr::null()), other);
+        assert_eq!(XMemMapPhysicalPages(base, 4, std::ptr::null()), base);
+        assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
+    }
+
+    /// With `VICTORY_HOME_BO=1` as well (the tests run with `VICTORY_WINE_MAP=1
+    /// VICTORY_PORT_CONSTANTS=1 VICTORY_PORT_HOME=1 VICTORY_HOME_BO=1`; nothing
+    /// is tried otherwise): where the host's device opens a heap by a handle to
+    /// a dma-buf (vkd3d-proton and Wine patched for it) the 32-bit heap's pages
+    /// at home are a memfd, and the card reads the bytes the title writes there
+    /// through the heap renderer port 1 opens by that handle: on a stretch that
+    /// starts inside the home, on all of it, and after a piece was unmapped and
+    /// mapped again. Elsewhere they are memory of their own, as without the
+    /// switch (opened by address, `victory_gpu`'s port tests).
+    #[test]
+    fn under_wine_with_home_bo_the_card_reads_the_32_bit_heap_where_the_title_writes_it() {
+        let Some(opens) = wine_map::opens_by_handle() else {
+            eprintln!("not tried: not under Wine with pages shown by mmap and VICTORY_HOME_BO=1");
+            return;
+        };
+        if !home_on() {
+            eprintln!("not tried: without VICTORY_PORT_CONSTANTS=1 and VICTORY_PORT_HOME=1");
+            return;
+        }
+        eprintln!("the host's device opens a heap by a handle to a dma-buf: {opens}");
+        let base = XMemVirtualAlloc(std::ptr::null_mut(), 4 * PAGE, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, GRAPHICS | ADDRESS_32BIT, PAGE_NOACCESS);
+        assert!(!base.is_null() && (base as usize) < 1 << 32);
+        let pages = allocate(4);
+        let at = |page: usize| base.wrapping_byte_add(page * PAGE);
+        let write = |page: usize, n: usize, seed: u8| {
+            // SAFETY: mapped read-write.
+            let bytes = unsafe { std::slice::from_raw_parts_mut(at(page).cast::<u8>(), n * PAGE) };
+            for (i, b) in bytes.iter_mut().enumerate() {
+                *b = (i as u8).wrapping_mul(seed).wrapping_add(page as u8 + 1);
+            }
+        };
+        let card_reads = |page: usize, n: usize| {
+            let card = victory_gpu::port_card_reads(at(page) as usize, n * PAGE).unwrap_or_else(|e| panic!("nothing placed: {e}"));
+            // SAFETY: mapped.
+            card == unsafe { std::slice::from_raw_parts(at(page).cast::<u8>(), n * PAGE) }
+        };
+        // The last two pages' place first, as the title does: a stretch that
+        // starts inside the home.
+        assert_eq!(XMemMapPhysicalPages(at(2), 2, pages.as_ptr()), at(2));
+        write(2, 2, 3);
+        if !opens {
+            assert_eq!(wine_map::one_own_mapping(base as usize, 4 * PAGE), Some(true), "memory of its own, as without the switch");
+            assert_eq!(XMemMapPhysicalPages(at(2), 2, std::ptr::null()), at(2));
+            assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
+            return;
+        }
+        assert_eq!(wine_map::memfd_at(at(2) as usize), Some(true), "the home is the memfd");
+        assert!(card_reads(2, 2), "the card reads a stretch that starts inside the home");
+        assert_eq!(XMemMapPhysicalPages(base, 2, pages[2..].as_ptr()), base);
+        write(0, 2, 5);
+        assert!(card_reads(0, 4), "the card reads all of it");
+        assert_eq!(wine_map::memfd_at(at(0) as usize), Some(true), "the home is the memfd");
+        // Unmapped and mapped again.
+        assert_eq!(XMemMapPhysicalPages(at(2), 2, std::ptr::null()), at(2));
+        assert_eq!(XMemMapPhysicalPages(at(2), 2, pages.as_ptr()), at(2));
+        write(3, 1, 7);
+        assert!(card_reads(0, 4), "the card reads a piece mapped again");
         assert_eq!(XMemMapPhysicalPages(base, 4, std::ptr::null()), base);
         assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
     }
