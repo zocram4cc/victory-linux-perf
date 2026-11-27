@@ -66,12 +66,14 @@ pub(crate) struct Pending {
     /// Why this pipeline is intentionally skipped (e.g. RT resolve without BVH).
     left_out: Option<&'static str>,
     /// A compute pipeline whose dispatches have a wait of their own
-    /// ([`compute_budget`]), whether a dropped dispatch of it was logged,
-    /// and whether a dispatch has had its one wait for it
-    /// ([`COMPUTE_CHANCE`]).
+    /// ([`compute_budget`]), the reasons ([`Lost`], bits) a dropped dispatch
+    /// of it was logged for, whether a dispatch has had a full wait for it
+    /// ([`COMPUTE_CHANCE`]; its only one with [`compute_wait_once`]), and
+    /// when a dispatch first waited for it ([`Facts::unclaimed`]).
     compute: bool,
-    compute_dropped: AtomicBool,
+    compute_said: AtomicU8,
     compute_waited: AtomicBool,
+    compute_asked: OnceLock<Instant>,
 }
 
 fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
@@ -147,8 +149,9 @@ impl Pending {
             compute: graphics.is_none()
                 && shaders.first().is_some_and(|s| s.stage == "compute")
                 && !compute_budget().is_zero(),
-            compute_dropped: AtomicBool::new(false),
+            compute_said: AtomicU8::new(0),
             compute_waited: AtomicBool::new(false),
+            compute_asked: OnceLock::new(),
             screen,
             scene_input,
             left_out,
@@ -408,6 +411,8 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
         super::library::note_used(&p.key);
     }
+    // A compute dispatch's own wait, if it had one ([`compute_budget`]).
+    let mut waited = None;
     if p.made.get().is_none() && !p.failed.load(Ordering::Relaxed) {
         start(p, REQUESTED);
         // (A worker that ended is found even when nobody waits to the end
@@ -419,21 +424,218 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
             // Made here, or waited for while a worker makes it.
             p.make();
         } else {
-            let frame = crate::frame::current();
-            wait(p, frame);
-            // A dispatch still without its pipeline is dropped by the
-            // caller: said once a pipeline.
-            if p.compute && p.made.get().is_none() && !p.compute_dropped.swap(true, Ordering::Relaxed) {
-                tracing::info!(
-                    shaders = %hashes(p),
-                    frame,
-                    had_its_wait = p.compute_waited.load(Ordering::Relaxed),
-                    "a compute dispatch was dropped: its pipeline was not made within its wait (VICTORY_COMPUTE_WAIT_MS)"
-                );
-            }
+            waited = wait(p, crate::frame::current());
+        }
+    }
+    if p.compute {
+        // A dispatch still without its pipeline is dropped by the caller:
+        // why, counted, and said once a pipeline and reason.
+        if let Some(waited) = waited {
+            compute_note_wait(waited, p.made.get().is_some());
+        }
+        let lost = match p.made.get() {
+            Some(Some(_)) => None,
+            Some(None) if Facts::of(p, Instant::now()).untranslated => Some(Lost::Untranslated),
+            Some(None) => Some(Lost::Refused),
+            None => Some(Facts::of(p, Instant::now()).hopeless().unwrap_or(if waited.is_some() {
+                Lost::NotYet
+            } else {
+                Lost::FrameSpent
+            })),
+        };
+        if let Some(lost) = lost {
+            compute_dropped(p, lost, crate::frame::current());
+        }
+        // (Not for a dispatch whose pipeline was there: nothing to count.)
+        if lost.is_some() || waited.is_some() {
+            compute_line(Instant::now());
         }
     }
     p.made.get()?.as_ref()
+}
+
+/// Why a dispatch of a compute pipeline was dropped, its pipeline not made
+/// ([`ready`]). The first two leave it its waits in later frames; the
+/// others end them, for the pipeline can no longer come in time (waiting
+/// half a second a frame for one that never comes would be a picture at 2
+/// frames a second for good).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum Lost {
+    /// Waited to the frame's deadline, still being made: waits again.
+    NotYet,
+    /// The frame's compute wait was spent by other dispatches: waits again.
+    FrameSpent,
+    /// Its worker has held it past `VICTORY_PIPELINE_STALL_S`.
+    Stalled,
+    /// Making it ended its worker, and the rescue too (or there was none).
+    Failed,
+    /// One of its shaders does not translate.
+    Untranslated,
+    /// Made, and the host gave no pipeline for it.
+    Refused,
+    /// No worker took it within `VICTORY_PIPELINE_STALL_S` of its first wait.
+    NoWorker,
+    /// It had its one wait (`VICTORY_COMPUTE_WAIT_ONCE=1`).
+    HadItsWait,
+}
+
+impl Lost {
+    const ALL: [Lost; 8] = [
+        Lost::NotYet,
+        Lost::FrameSpent,
+        Lost::Stalled,
+        Lost::Failed,
+        Lost::Untranslated,
+        Lost::Refused,
+        Lost::NoWorker,
+        Lost::HadItsWait,
+    ];
+
+    fn says(self) -> &'static str {
+        match self {
+            Lost::NotYet => "still being made at the frame's deadline: waits again in the next frame",
+            Lost::FrameSpent => "the frame's compute wait was spent by other dispatches: waits again in the next frame",
+            Lost::Stalled => {
+                "its worker has not returned from the host's compile (VICTORY_PIPELINE_STALL_S): not waited for again"
+            }
+            Lost::Failed => "making it ended its worker, and the rescue's too: not waited for again",
+            Lost::Untranslated => "one of its shaders does not translate: not waited for again",
+            Lost::Refused => "the host gave no pipeline for it: not waited for again",
+            Lost::NoWorker => {
+                "no worker took it within VICTORY_PIPELINE_STALL_S of its first wait: not waited for again until one does"
+            }
+            Lost::HadItsWait => "it had its one wait (VICTORY_COMPUTE_WAIT_ONCE=1): not waited for again",
+        }
+    }
+
+    /// Whether it ends the pipeline's waits (said once a pipeline).
+    fn ends(self) -> bool {
+        !matches!(self, Lost::NotYet | Lost::FrameSpent)
+    }
+}
+
+/// What decides whether a dispatch waits for a compute pipeline not made.
+#[derive(Clone, Copy, Debug, Default)]
+struct Facts {
+    failed: bool,
+    stalled: bool,
+    untranslated: bool,
+    /// Waited for since [`stall_bound`] or longer, and no worker has taken
+    /// it (all of them in compiles that do not return).
+    unclaimed: bool,
+    /// A full wait ended without it ([`COMPUTE_CHANCE`]).
+    had_its_wait: bool,
+    /// `VICTORY_COMPUTE_WAIT_ONCE=1`.
+    once: bool,
+}
+
+impl Facts {
+    fn of(p: &Pending, now: Instant) -> Facts {
+        let bound = stall_bound();
+        let past = |since: Option<&Instant>| {
+            since.zip(bound).is_some_and(|(&since, bound)| now.saturating_duration_since(since) >= bound)
+        };
+        Facts {
+            failed: p.failed.load(Ordering::Relaxed),
+            stalled: p.made.get().is_none() && past(p.claimed.get()),
+            untranslated: p.shaders.iter().any(|s| matches!(s.translated.get(), Some(None))),
+            unclaimed: p.claimed.get().is_none() && past(p.compute_asked.get()),
+            had_its_wait: p.compute_waited.load(Ordering::Relaxed),
+            once: compute_wait_once(),
+        }
+    }
+
+    /// Why no dispatch waits for the pipeline any more, if none does: it
+    /// cannot come (or, with the switch, it had its wait). Otherwise a
+    /// dispatch waits again in every frame, within the frame's deadline,
+    /// for as long as the pipeline is being made.
+    fn hopeless(self) -> Option<Lost> {
+        if self.failed {
+            Some(Lost::Failed)
+        } else if self.untranslated {
+            Some(Lost::Untranslated)
+        } else if self.stalled {
+            Some(Lost::Stalled)
+        } else if self.unclaimed {
+            Some(Lost::NoWorker)
+        } else if self.once && self.had_its_wait {
+            Some(Lost::HadItsWait)
+        } else {
+            None
+        }
+    }
+}
+
+/// `VICTORY_COMPUTE_WAIT_ONCE=1`: a compute pipeline has one wait in all,
+/// as before (cebe78e): its later dispatches wait as draws do and are
+/// dropped. Unset: a dispatch waits again in later frames while its
+/// pipeline is being made ([`Facts::hopeless`]).
+fn compute_wait_once() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COMPUTE_WAIT_ONCE").is_some_and(|v| v == "1"))
+}
+
+/// Since the last [`compute_line`]: dispatches that had a wait of their
+/// own, its microseconds, how many got their pipeline in it; and the
+/// dispatches dropped, by [`Lost`].
+static COMPUTE_WAITS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+static COMPUTE_LOST: [AtomicU64; Lost::ALL.len()] = [const { AtomicU64::new(0) }; Lost::ALL.len()];
+
+fn compute_note_wait(waited: Duration, made: bool) {
+    COMPUTE_WAITS[0].fetch_add(1, Ordering::Relaxed);
+    COMPUTE_WAITS[1].fetch_add(waited.as_micros() as u64, Ordering::Relaxed);
+    COMPUTE_WAITS[2].fetch_add(u64::from(made), Ordering::Relaxed);
+}
+
+/// A dispatch of `p` is dropped for `lost`: counted, and said once a
+/// pipeline and reason where that ends its waits.
+fn compute_dropped(p: &Pending, lost: Lost, frame: u64) {
+    COMPUTE_LOST[lost as usize].fetch_add(1, Ordering::Relaxed);
+    let bit = 1u8 << (lost as u8);
+    if lost.ends() && p.compute_said.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+        tracing::info!(
+            shaders = %hashes(p),
+            key = %p.key,
+            frame,
+            why = lost.says(),
+            "a compute dispatch is dropped, its pipeline not made (VICTORY_COMPUTE_WAIT_MS)"
+        );
+    }
+}
+
+/// Every five seconds at most, when there is something to say: how many
+/// dispatches waited for their compute pipeline, how long in all, and how
+/// many were dropped and why.
+fn compute_line(now: Instant) {
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    {
+        let Ok(mut last) = LAST.try_lock() else { return };
+        match *last {
+            Some(t) if now.saturating_duration_since(t) < Duration::from_secs(5) => return,
+            _ => *last = Some(now),
+        }
+    }
+    let [waits, us, made] = [0, 1, 2].map(|i| COMPUTE_WAITS[i].swap(0, Ordering::Relaxed));
+    let lost = Lost::ALL.map(|l| COMPUTE_LOST[l as usize].swap(0, Ordering::Relaxed));
+    if waits == 0 && lost.iter().all(|&n| n == 0) {
+        return;
+    }
+    tracing::info!(
+        waits,
+        waited_ms = us / 1000,
+        made_in_wait = made,
+        dropped = %dropped_text(&lost),
+        "compute dispatches whose pipeline was not made, in about five seconds (VICTORY_COMPUTE_WAIT_MS a frame; \
+         NotYet and FrameSpent wait again in later frames, the others no more; VICTORY_COMPUTE_WAIT_ONCE=1: one wait a pipeline)"
+    );
+}
+
+/// The dropped dispatches by reason, for [`compute_line`].
+fn dropped_text(lost: &[u64; Lost::ALL.len()]) -> String {
+    let parts: Vec<String> =
+        Lost::ALL.iter().zip(lost).filter(|(_, n)| **n > 0).map(|(l, n)| format!("{n} {l:?}")).collect();
+    if parts.is_empty() { "none".to_owned() } else { parts.join(", ") }
 }
 
 /// What compute dispatches may hold one frame, over all threads, from the
@@ -455,8 +657,15 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 ///   the first of them began ([`FrameWaits`]), however many threads wait
 ///   and however many pipelines they wait for;
 /// - a dispatch: so no dispatch waits longer than that either;
-/// - a pipeline: one wait ([`COMPUTE_CHANCE`]); a pipeline that is never
-///   made holds one frame once, not every frame that dispatches it.
+/// - a pipeline: its dispatches wait again in later frames only while it
+///   can still come ([`Facts::hopeless`]): not once its worker stalled
+///   (`VICTORY_PIPELINE_STALL_S`), its making failed for good, a shader of
+///   it does not translate, or no worker took it within the stall bound.
+///   Waiting half a second in every frame for one that never comes would
+///   be a picture at two frames a second for good. With
+///   `VICTORY_COMPUTE_WAIT_ONCE=1`, one wait a pipeline ([`COMPUTE_CHANCE`])
+///   as before: in runs on a loaded machine that dropped 68 to 153
+///   dispatches at world load, each a one-off's output lost.
 ///
 /// With the passes over the screen (10 s, once a pipeline) and the ordinary
 /// half second, a frame is held 11 s at the very most. The wait without a
@@ -472,7 +681,12 @@ fn compute_budget() -> Duration {
     *BUDGET.get_or_init(|| {
         let millis = compute_millis(std::env::var("VICTORY_COMPUTE_WAIT_MS").ok().and_then(|v| v.trim().parse().ok()));
         if millis != 0 {
-            tracing::info!(millis, "compute dispatches wait for their pipelines, within this a frame and once a pipeline");
+            tracing::info!(
+                millis,
+                once = compute_wait_once(),
+                "compute dispatches wait for their pipelines, within this a frame (VICTORY_COMPUTE_WAIT_MS), in every frame \
+                 while a pipeline is being made (VICTORY_COMPUTE_WAIT_ONCE=1: once a pipeline)"
+            );
         }
         Duration::from_millis(millis)
     })
@@ -509,11 +723,10 @@ impl FrameWaits {
     }
 }
 
-/// A wait at least this long without its pipeline made is the pipeline's
-/// one wait: one that is never made (the driver's compiler ended its worker
-/// or does not return) holds one frame once, not every frame that
-/// dispatches it. A shorter one (the frame's budget nearly spent) leaves it
-/// another.
+/// A wait at least this long without its pipeline made is a full one; with
+/// `VICTORY_COMPUTE_WAIT_ONCE=1` the pipeline's only one: one that is never
+/// made holds one frame once, not every frame that dispatches it. A
+/// shorter one (the frame's budget nearly spent) leaves it another.
 const COMPUTE_CHANCE: Duration = Duration::from_millis(100);
 
 /// Whether a dispatch waits for its compute pipeline until it is made,
@@ -590,14 +803,16 @@ fn wait_once() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_ONCE").is_none_or(|v| v != "0"))
 }
 
-/// Waits for `p` while frame `frame` has budget left.
-fn wait(p: &Arc<Pending>, frame: u64) {
+/// Waits for `p` while frame `frame` has budget left; how long, if it was
+/// a compute dispatch's wait of its own ([`compute_budget`]).
+fn wait(p: &Arc<Pending>, frame: u64) -> Option<Duration> {
     let screen = p.screen && screens_first();
-    // A compute dispatch of a pipeline that has not had its wait waits
-    // within the frame's compute budget ([`compute_budget`]); with that
-    // spent, or after its wait, as any other. The pipeline it waits for is
-    // made next.
-    let allowed = if p.compute && !screen && !p.compute_waited.load(Ordering::Relaxed) {
+    // A compute dispatch of a pipeline that can still come ([`Facts`])
+    // waits within the frame's compute budget ([`compute_budget`]), again
+    // in every frame until the pipeline is made; with that budget spent, or
+    // once the pipeline cannot come, as any other. The pipeline it waits
+    // for is made next.
+    let allowed = if p.compute && !screen && Facts::of(p, Instant::now()).hopeless().is_none() {
         static WAITS: Mutex<FrameWaits> = Mutex::new(FrameWaits::new());
         WAITS.lock().unwrap_or_else(|e| e.into_inner()).begin(Instant::now(), frame, compute_budget())
     } else {
@@ -605,6 +820,7 @@ fn wait(p: &Arc<Pending>, frame: u64) {
     };
     let compute = !allowed.is_zero();
     if compute {
+        let _ = p.compute_asked.set(Instant::now());
         QUEUE.lock().unwrap_or_else(|e| e.into_inner()).hurry(p);
     }
     let budget = if screen {
@@ -615,16 +831,16 @@ fn wait(p: &Arc<Pending>, frame: u64) {
         wait_budget()
     };
     if budget.is_zero() {
-        return;
+        return None;
     }
     // What is left of this pipeline's own budget ([`wait_once`]); a compute
-    // wait has its own bound a pipeline.
+    // wait has its own bounds ([`Facts::hopeless`], the frame's).
     let own = if compute {
         Duration::MAX
     } else if wait_once() {
         let own = budget.saturating_sub(Duration::from_micros(p.waited_us.load(Ordering::Relaxed)));
         if own.is_zero() {
-            return;
+            return None;
         }
         own
     } else {
@@ -649,7 +865,7 @@ fn wait(p: &Arc<Pending>, frame: u64) {
         left
     };
     if left.is_zero() {
-        return;
+        return None;
     }
     let started = Instant::now();
     let (lock, done) = &DONE;
@@ -705,6 +921,7 @@ fn wait(p: &Arc<Pending>, frame: u64) {
         crate::copystat::C::PipelineWaitUs,
         started.elapsed().as_micros() as u64,
     );
+    compute.then_some(waited)
 }
 
 const NOT_QUEUED: u8 = 0;
@@ -1499,15 +1716,15 @@ mod tests {
         assert_eq!(w.begin(t0 + budget + ms(50), 7, budget), budget - ms(50));
     }
 
-    /// A compute pipeline that is never made (a worker that does not come
-    /// back from its compile) is waited for once, within the frame's compute
-    /// budget; later dispatches wait no longer than for the others, and a
-    /// second such pipeline in the same frame has nothing left of the
-    /// frame's compute budget.
+    /// A compute pipeline still being made is waited for again in later
+    /// frames, each time within the frame's compute budget; a second such
+    /// pipeline in the same frame has nothing left of that budget; once the
+    /// pipeline cannot come (here: its making failed for good) no dispatch
+    /// waits for it, and that is said once.
     #[test]
-    fn a_compute_pipeline_not_made_has_one_wait() {
+    fn a_compute_pipeline_being_made_is_waited_for_in_every_frame() {
         let budget = compute_budget();
-        if budget.is_zero() {
+        if budget.is_zero() || compute_wait_once() {
             return;
         }
         let stuck = || {
@@ -1517,30 +1734,94 @@ mod tests {
             Arc::new(p)
         };
         let (p, other) = (stuck(), stuck());
+        let late = Duration::from_millis(500);
         // (A frame of its own, whatever the tests before waited in theirs.)
         crate::frame::test_advance();
         let started = Instant::now();
         assert!(ready(&p).is_none());
         let first = started.elapsed();
-        assert!(first >= COMPUTE_CHANCE && first < budget + Duration::from_millis(500), "{first:?}");
+        assert!(first >= COMPUTE_CHANCE && first < budget + late, "{first:?}");
         assert!(p.compute_waited.load(Ordering::Relaxed));
-        assert!(p.compute_dropped.load(Ordering::Relaxed));
+        assert_eq!(p.compute_said.load(Ordering::Relaxed), 0, "still being made: nothing said");
         assert_eq!(p.waited_us.load(Ordering::Relaxed), 0, "not counted against its ordinary wait");
         // The frame's compute budget is spent: the other waits as a draw
-        // does, and keeps its one compute wait for a later frame.
+        // does, and has its compute waits in later frames.
         let started = Instant::now();
         assert!(ready(&other).is_none());
-        assert!(started.elapsed() <= wait_budget() + Duration::from_millis(500));
-        assert!(!other.compute_waited.load(Ordering::Relaxed));
-        // Its next dispatch, in a later frame, waits within the ordinary
-        // budget, at most that.
+        assert!(started.elapsed() <= wait_budget() + late);
+        assert!(other.compute_asked.get().is_none());
+        // Its next dispatch, in a later frame, waits again, as long.
         crate::frame::test_advance();
         let started = Instant::now();
         assert!(ready(&p).is_none());
-        assert!(started.elapsed() <= wait_budget() + Duration::from_millis(500));
-        // And in all, three dispatches held the title's thread far less
-        // than its watchdog allows.
-        assert!(first + started.elapsed() < Duration::from_secs(5));
+        let second = started.elapsed();
+        assert!(second >= COMPUTE_CHANCE && second < budget + late, "{second:?}");
+        // Its making ended for good: no wait, and it is said.
+        give_up(&p);
+        crate::frame::test_advance();
+        let started = Instant::now();
+        assert!(ready(&p).is_none());
+        assert!(started.elapsed() < Duration::from_millis(50), "{:?}", started.elapsed());
+        assert_eq!(p.compute_said.load(Ordering::Relaxed), 1 << Lost::Failed as u8);
+        assert!(ready(&p).is_none());
+        assert_eq!(p.compute_said.load(Ordering::Relaxed), 1 << Lost::Failed as u8);
+    }
+
+    /// What ends a compute pipeline's waits: what keeps it from coming, or,
+    /// with `VICTORY_COMPUTE_WAIT_ONCE=1`, the one wait it had. A pipeline
+    /// still being made that had full waits is waited for again.
+    #[test]
+    fn what_ends_a_compute_pipelines_waits() {
+        let made = Facts::default();
+        assert_eq!(made.hopeless(), None);
+        assert_eq!(Facts { had_its_wait: true, ..made }.hopeless(), None, "waits again");
+        assert_eq!(Facts { once: true, ..made }.hopeless(), None, "its first wait");
+        assert_eq!(Facts { once: true, had_its_wait: true, ..made }.hopeless(), Some(Lost::HadItsWait));
+        assert_eq!(Facts { stalled: true, ..made }.hopeless(), Some(Lost::Stalled));
+        assert_eq!(Facts { failed: true, ..made }.hopeless(), Some(Lost::Failed));
+        assert_eq!(Facts { untranslated: true, ..made }.hopeless(), Some(Lost::Untranslated));
+        assert_eq!(Facts { unclaimed: true, ..made }.hopeless(), Some(Lost::NoWorker));
+        let all = Facts { failed: true, stalled: true, untranslated: true, unclaimed: true, had_its_wait: true, once: true };
+        assert_eq!(all.hopeless(), Some(Lost::Failed));
+        for lost in Lost::ALL {
+            assert_eq!(lost.ends(), !matches!(lost, Lost::NotYet | Lost::FrameSpent), "{lost:?}");
+            assert_eq!(Lost::ALL[lost as usize], lost);
+        }
+        let mut counts = [0; Lost::ALL.len()];
+        assert_eq!(dropped_text(&counts), "none");
+        counts[Lost::NotYet as usize] = 12;
+        counts[Lost::Stalled as usize] = 1;
+        assert_eq!(dropped_text(&counts), "12 NotYet, 1 Stalled");
+    }
+
+    /// The facts of a pipeline: a worker held past the stall bound, no
+    /// worker taking it within the bound of its first wait, a shader that
+    /// does not translate.
+    #[test]
+    fn a_compute_pipelines_facts() {
+        let Some(bound) = stall_bound() else { return };
+        let now = Instant::now();
+        let Some(long_ago) = now.checked_sub(bound * 2) else { return };
+        let p = Pending::new(Vec::new(), None);
+        assert_eq!(Facts::of(&p, now).hopeless(), None);
+        p.compute_asked.set(long_ago).unwrap();
+        assert!(Facts::of(&p, now).unclaimed);
+        assert!(!Facts::of(&p, long_ago).unclaimed, "not yet past the bound");
+        p.claimed.set(long_ago).unwrap();
+        let f = Facts::of(&p, now);
+        assert!(!f.unclaimed && f.stalled);
+        let _ = p.made.set(None);
+        assert!(!Facts::of(&p, now).stalled, "its worker came back");
+
+        let untranslatable = Arc::new(Shader {
+            stage: "compute",
+            hash: "0000000000000000".to_owned(),
+            container: Vec::new(),
+            ambient: None,
+            translated: OnceLock::from(None),
+        });
+        let p = Pending::new(vec![untranslatable], None);
+        assert_eq!(Facts::of(&p, now).hopeless(), Some(Lost::Untranslated));
     }
 
     /// A worker that never returns from the host's compile (seen under
