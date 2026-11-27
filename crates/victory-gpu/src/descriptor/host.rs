@@ -2773,6 +2773,25 @@ impl HostHeap {
         stale
     }
 
+    /// Enters the stride, kind and address of `view` (`None`: no buffer view,
+    /// 0) at slot `index` of the table of strides, as [`note_buffer`] does for
+    /// the title's slots. For the dynamic slots tables are made in for a draw:
+    /// shaders look those up there too, and the face network's 16-bit loads
+    /// through integer views read 0 where the word says nothing.
+    ///
+    /// [`note_buffer`]: HostHeap::note_buffer
+    fn write_slot_word(&self, index: u32, view: Option<&View>) {
+        let Some((_, _, data)) = &self.strides else { return };
+        if index >= victory_shader::emit::SLOT_STRIDES_COUNT {
+            return;
+        }
+        let word = view.and_then(view_stride).unwrap_or(0) | view.map_or(0, view_kind);
+        // SAFETY: inside the mapping; a dynamic slot is not in use on the card
+        // while it is made ([`HostHeap::release`] gives it back after).
+        unsafe { (*data as *mut u32).add(index as usize).write_volatile(word) };
+        write_view_address(*data, index, view);
+    }
+
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
     /// returned).
     ///
@@ -2801,6 +2820,7 @@ impl HostHeap {
         self.put(index);
         self.twin_made(index, kept.is_some() && twinned(view));
         self.keep(index, kept.flatten());
+        self.write_slot_word(index, Some(view));
     }
 
     /// Makes slot `index` (a dynamic one) the view the record `words` names,
@@ -2842,6 +2862,7 @@ impl HostHeap {
             }
             let made = &views.made[&words];
             self.copy_from(index, views.slot(made.at));
+            self.write_slot_word(index, Some(&made.view));
             if made.twin && twins {
                 self.copy_from(self.raw + index, views.slot(made.at + 1));
                 self.twins[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
@@ -2872,6 +2893,7 @@ impl HostHeap {
         } else {
             null_view(self.at(index));
             self.put(index);
+            self.write_slot_word(index, None);
         }
         self.clear_twin(index);
         self.keep(index, None);
@@ -3065,11 +3087,21 @@ impl HostHeap {
                 .CreateConstantBufferView(Some(&desc), self.at(index))
         };
         self.put(index);
+        self.write_slot_word(index, None);
         // A program that reads it as raw bytes reads its twin.
         let twin = self.twin(index).filter(|_| desc.SizeInBytes > 0);
         if let Some(twin) = twin {
             // SAFETY: a live buffer that holds the range.
-            let first = (gpu - unsafe { buffer.GetGPUVirtualAddress() }) / 4;
+            let base = unsafe { buffer.GetGPUVirtualAddress() };
+            let first = (gpu - base) / 4;
+            // All of a buffer over 64 KiB ([`twin_bytes`]), inside the buffer.
+            let bytes = if size > 64 << 10 {
+                // SAFETY: a live buffer.
+                let width = unsafe { buffer.GetDesc().Width };
+                (u64::from(twin_bytes(size)).min(width.saturating_sub(gpu - base)) & !3) as u32
+            } else {
+                desc.SizeInBytes
+            };
             let raw = D3D12_SHADER_RESOURCE_VIEW_DESC {
                 Format: DXGI_FORMAT_R32_TYPELESS,
                 ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
@@ -3077,7 +3109,7 @@ impl HostHeap {
                 Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                     Buffer: D3D12_BUFFER_SRV {
                         FirstElement: first,
-                        NumElements: desc.SizeInBytes / 4,
+                        NumElements: bytes / 4,
                         StructureByteStride: 0,
                         Flags: D3D12_BUFFER_SRV_FLAG_RAW,
                     },
@@ -3107,7 +3139,7 @@ impl HostHeap {
         let Some(offset) = gpu.checked_sub(base).filter(|&o| o < width && crate::port_cbv::raw_ok(o)) else {
             return false;
         };
-        let bytes = u64::from(constant_bytes(size)).min(width - offset) & !3;
+        let bytes = u64::from(twin_bytes(size)).min(width - offset) & !3;
         if bytes == 0 {
             return false;
         }
@@ -3137,6 +3169,7 @@ impl HostHeap {
             host.device.CreateShaderResourceView(buffer, Some(&raw), twin);
         }
         self.twin_made(index, true);
+        self.write_slot_word(index, None);
         self.keep(index, Some(buffer.clone()));
         true
     }
@@ -4242,6 +4275,20 @@ fn constant_bytes(size: u32) -> u32 {
     size.min(LARGEST).next_multiple_of(256)
 }
 
+/// Bytes of the raw view (the twin) translated shaders read a constant buffer
+/// of `size` bytes through: as its constant buffer view up to 64 KiB, all of a
+/// larger one. D3D12 caps constant buffer views, not raw views, and the
+/// console reads the whole buffer: the title has some of ~950 KB, and reads
+/// past 64 KiB through a capped twin were 0.
+fn twin_bytes(size: u32) -> u32 {
+    if size > 64 << 10 {
+        once!(size, "constant buffer over 64 KiB: its raw view covers all of it");
+        size.next_multiple_of(4)
+    } else {
+        constant_bytes(size)
+    }
+}
+
 /// Renderer port 5 ([`crate::port_cbv`]): the constant buffer of `size` bytes
 /// at `gpu` of `buffer` as a constant buffer view at `at` where it can be (on
 /// 256 bytes; else a null one) and a raw view of its bytes at `twin`, which
@@ -4268,7 +4315,7 @@ fn constant_twinned(
     } else {
         D3D12_CONSTANT_BUFFER_VIEW_DESC::default()
     };
-    let bytes = u64::from(constant_bytes(size)).min(room) & !3;
+    let bytes = u64::from(twin_bytes(size)).min(room) & !3;
     // SAFETY: slots of our heaps; the ranges lie in the live buffer.
     unsafe {
         host.device.CreateConstantBufferView(Some(&cbv), at);
@@ -5373,6 +5420,9 @@ mod tests {
         assert_eq!(constant_bytes(480), 512);
         assert_eq!(constant_bytes(64 << 10), 64 << 10);
         assert_eq!(constant_bytes(u32::MAX), 64 << 10);
+        assert_eq!(twin_bytes(480), 512);
+        assert_eq!(twin_bytes(64 << 10), 64 << 10);
+        assert_eq!(twin_bytes(969_472), 969_472);
     }
 
     /// A null 3D UAV made on the real device leaves it alive.
