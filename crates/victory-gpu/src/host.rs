@@ -6045,6 +6045,8 @@ impl Host {
         }
         stage.next("submit: the lists' steps");
         for list in runs {
+            #[cfg(feature = "diagnostics")]
+            crate::constwatch::filling(std::ptr::from_ref(*list) as usize);
             list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
             firsts.push(lists.len());
             if let Some(prelude) = list.prelude() {
@@ -6265,6 +6267,10 @@ impl Host {
         }
         let _ = &firsts;
         FINISHED.store(this_submission, Ordering::Release);
+        #[cfg(feature = "diagnostics")]
+        for list in runs {
+            crate::constwatch::sent(std::ptr::from_ref(*list) as usize);
+        }
         bury(this_submission);
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
