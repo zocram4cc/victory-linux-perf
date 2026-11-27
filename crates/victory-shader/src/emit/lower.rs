@@ -4616,8 +4616,12 @@ impl<'a> Lower<'a> {
             // the compiler's lane-mask merge (`s_and_b32 sX, sX, exec_lo`)
             // reads a register its variable never set on this path (P.4).
             // No lanes. `p4-shortcuts.md` #2, `VICTORY_DEAD_DESCRIPTOR_JOINS=0`.
+            // Proven, not assumed: only a register that *is* the dword (not a
+            // join that brings it on some paths), so no path set the mask's
+            // variable and the result cannot depend on it.
             Atom::Opaque(v)
-                if matches!(self.vals.get(&v), Some(Val::Missing(w)) if DEAD_DESCRIPTOR_WORDS.contains(w))
+                if (assume_dead_joins() || self.stale.contains(&v))
+                    && matches!(self.vals.get(&v), Some(Val::Missing(w)) if DEAD_DESCRIPTOR_WORDS.contains(w))
                     && !std::env::var_os("VICTORY_DEAD_DESCRIPTOR_JOINS").is_some_and(|x| x == "0") =>
             {
                 Ok(self.s.m.bool(false))
@@ -6065,6 +6069,38 @@ impl<'a> Lower<'a> {
             .args
             .iter()
             .all(|&a| self.dead(a, seen))
+    }
+
+    /// Whether no lane that reads `v` (a join in block `b`) can have come into
+    /// `b` from its predecessor `q`: what that edge brings is never read, so
+    /// any value is right there. False where that is not proven (a read
+    /// in another join, no lanes' paths).
+    fn edge_unread(&self, v: Value, b: usize, q: usize) -> bool {
+        let p = self.x.p;
+        let st = self.x.st;
+        let mut readers = Vec::new();
+        for (rb, block) in p.blocks.iter().enumerate() {
+            if block.phis.iter().any(|ph| ph.args.contains(&v)) {
+                return false;
+            }
+            if block.insts.iter().any(|i| i.reads.iter().any(|r| r.1 == v)) {
+                readers.push(rb);
+            }
+        }
+        if readers.is_empty() {
+            return true;
+        }
+        let mut edge = vec![(st.reach[q], true)];
+        if let LaneExit::Branch { when, taken, not_taken } = st.exits[q]
+            && taken != not_taken
+        {
+            edge.push((when, taken == b));
+        }
+        readers.iter().all(|&r| {
+            let mut all = edge.clone();
+            all.push((st.reach[r], true));
+            !st.bools.meet(&all)
+        })
     }
 
     /// `s_bcnt1_i32_b*` of the lanes that differ from the first lane's value:
@@ -13594,6 +13630,7 @@ impl<'a> Lower<'a> {
                     (Some(Val::Missing(why)), false)
                         if self.read_phis.contains(&phi.value)
                             && DEAD_DESCRIPTOR_WORDS.contains(&why)
+                            && (assume_dead_joins() || self.edge_unread(phi.value, b, q))
                             && !std::env::var_os("VICTORY_DEAD_DESCRIPTOR_JOINS").is_some_and(|v| v == "0") =>
                     {
                         self.s.m.i32(0)
@@ -13622,6 +13659,16 @@ impl<'a> Lower<'a> {
 /// dword, dead where a join or a lane-mask merge reads the register (the
 /// console compiler reuses it), is 0 / no lanes there (`p4-shortcuts.md`
 /// #2, `VICTORY_DEAD_DESCRIPTOR_JOINS=0` refuses).
+/// `VICTORY_DEAD_DESCRIPTOR_JOINS=assume`: the dead-dword rule as an
+/// assumption (any join or lane-mask leaf that brings such a dword), for
+/// tests in game against the default, which takes it only where it is
+/// proven (`edge_unread`, a register that is the dword itself). P.4, 27 Nov:
+/// proven 1,265 programs, assumed 1,340 (`p4-shortcuts.md` #2).
+fn assume_dead_joins() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DEAD_DESCRIPTOR_JOINS").is_some_and(|v| v == "assume"))
+}
+
 const DEAD_DESCRIPTOR_WORDS: [&str; 3] = [
     "a descriptor's address or format read as data",
     "a sampler's descriptor read as data",
