@@ -117,6 +117,28 @@ The dump comes from one game run with `VICTORY_NATIVE_PSO_DUMP=Z:\…\pso-dump` 
 - 21, **descriptor tracing memoized** per (words, lane facts), joins with one source collapsed, and a work bound (3,000 steps) instead of the join depth: "joined too often" 433 → 0. Raising the depth alone to 32 ran out of memory and killed the user's terminal: never again without a work bound.
 - 22, **table addresses through phi chains that bring one value** (`one_leaf`, through cancelled XOR swaps): "outside the heaps" 307 → 0.
 - 23, **zero high halves through phis and XORs** (`is_zero`): not enough. The 459 programs left at "an address with an untracked high half" use 64-bit XOR swaps between misaligned register pairs across joins (the table's high dword traded with another address's low dword, `s_add_u32`). Next: resolve XOR swaps as permutations of registers through phis, not term by term. `VICTORY_WHY_HIGH=1` prints where the proof stops.
+- 24, **XORs that cancel are copies in copy propagation** (`Tracer::xor_copy`, `xor_terms`):
+  - `x ^ 0` is `x`, and `(p ^ q) ^ q` is `p`: the second and third steps of a register swap `a ^= b; b ^= a; a ^= b`;
+  - so joins of swapped registers settle to one origin.
+
+  Correct and kept, but not enough: "untracked high half" went 459 → 511 (programs moved up from other blockers; none lost, still 1,228).
+
+  **What these programs really do** (`218_0000000f002d6300` at its line ~5460):
+
+  ```
+  v_readlane_b32 s84, v142, 13     ; SGPRs back from a spill slot: lanes of a VGPR
+  v_readlane_b32 s85, v142, 12
+  s_xor_b64 s[24:25], s[24:25], s[84:85]   ; swap s[24:25] <-> s[84:85]
+  s_xor_b64 s[84:85], s[24:25], s[84:85]
+  s_xor_b64 s[24:25], s[24:25], s[84:85]
+  s_xor_b32 s92, s92, s24                  ; then swap s92 <-> s24
+  s_xor_b32 s24, s92, s24
+  s_xor_b32 s92, s92, s24
+  ```
+
+  The table address's high dword is one of those spilled values. The swaps now resolve; what does not is **the spill slot**: lane 12 of v142 is written (`v_writelane_b32`) on several paths, so the value read back is a join that `ir::unspill` / `parked` does not turn into a phi.
+
+  **Next:** in `unspill`, when a lane's writes on all paths into the read write the same origin (or 0 for a table's high half), take that origin. Otherwise make the read a phi of the written values at the join, so that `one_leaf` / `is_zero` can see through it. `VICTORY_WHY_UNSPILL=1` exists for this.
 
 ### Deferred on purpose: image stores of the alpha channel alone (69 programs)
 
