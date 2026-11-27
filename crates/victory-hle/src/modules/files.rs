@@ -142,6 +142,29 @@ fn verbatim(root: &[u16], tail: &[u16]) -> Vec<u16> {
     out
 }
 
+/// `tail`'s path components without their separators, `.` dropped and `..`
+/// resolved with the drive's root as the floor, and whether the title's path
+/// ended with a separator; `None` when `tail` names no `.` or `..` component,
+/// the host's own clean-up then agreeing with the console's.
+fn clean_path(tail: &[u16]) -> Option<(Vec<&[u16]>, bool)> {
+    let dot = u16::from(b'.');
+    let mut parts: Vec<&[u16]> = Vec::new();
+    let mut dotted = false;
+    for part in tail.split(|c| SEPARATORS.contains(c)) {
+        match part {
+            [] => {}
+            [d] if *d == dot => dotted = true,
+            [d, e] if [*d, *e] == [dot; 2] => {
+                dotted = true;
+                // An empty stack is the drive's root: `..` stops there.
+                parts.pop();
+            }
+            _ => parts.push(part),
+        }
+    }
+    dotted.then_some((parts, tail.last().is_some_and(|c| SEPARATORS.contains(c))))
+}
+
 /// The host path, NUL-terminated, for `path` (without its NUL) if it is on
 /// a virtual drive.
 pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
@@ -162,6 +185,24 @@ pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
     let tail = &rest[2..];
     if prefix.is_empty() && root.len() + tail.len() >= LONG {
         let mut out = verbatim(root, tail);
+        out.push(0);
+        return Some(out);
+    }
+    // `..` stops at the drive's root, as it does on the console and in the
+    // verbatim form above. The host's own clean-up of a plain path clamps
+    // `..` at the host volume's root instead, so a title path with enough of
+    // them would leave the folder the drive stands for (a save file written
+    // beside its own).
+    if let Some((parts, trailing)) = clean_path(tail) {
+        let mut out = prefix.to_vec();
+        out.extend_from_slice(root);
+        for part in parts {
+            out.push(b'\\'.into());
+            out.extend_from_slice(part);
+        }
+        if trailing {
+            out.push(b'\\'.into());
+        }
         out.push(0);
         return Some(out);
     }
@@ -1016,5 +1057,42 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names, ["present.txt"]);
+    }
+
+    /// A title path's `..` stops at the mounted drive's root, as it does on
+    /// the console: enough of them must not leave the folder the drive stands
+    /// for. `translate`'s plain form leaves the host to clean the path up and
+    /// the host clamps `..` at the host volume's root instead.
+    #[test]
+    fn dots_stop_at_the_mounted_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path().join("storage");
+        std::fs::create_dir(&storage).unwrap();
+        let letter = mount(&storage).unwrap();
+        let tr = |s: String| translate(&w(&s)[..s.encode_utf16().count()]).map(|v| text(&v));
+        // A tree of one folder: two climbs stay at the drive's root.
+        assert_eq!(
+            tr(format!(r"{letter}:\a\..\..\b.txt")),
+            Some(format!(r"{}\b.txt", storage.display()))
+        );
+        // And what the host is asked for lands in the folder, not above it.
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const CREATE_ALWAYS: u32 = 2;
+        let path = w(&format!(r"{letter}:\..\escaped.bin"));
+        let h = CreateFileW(
+            path.as_ptr(),
+            GENERIC_WRITE,
+            0,
+            std::ptr::null_mut(),
+            CREATE_ALWAYS,
+            0,
+            std::ptr::null_mut(),
+        );
+        assert_ne!(h as isize, -1);
+        host!("kernel32.dll", "CloseHandle": extern "system" fn(Handle) -> i32)(h);
+        assert!(
+            storage.join("escaped.bin").is_file(),
+            "a path one level above the drive's root stays in the folder"
+        );
     }
 }
