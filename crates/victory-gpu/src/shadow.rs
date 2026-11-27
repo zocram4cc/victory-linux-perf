@@ -906,7 +906,7 @@ mod card_tests {
 /// Whether the copy-back of what shaders wrote runs on a thread of its own,
 /// beside the submitting thread and outside the submission lock
 /// (`VICTORY_RELAY=1` or `2`; off by default; not with kept snapshots,
-/// [`keeps`]). `crate::host::relay` says what it does; here it changes
+/// [`keeps`], unless [`keep_relay`]). `crate::host::relay` says what it does; here it changes
 /// what a copy keeps:
 ///
 /// - the ranges shaders may be writing are counted per submission
@@ -926,7 +926,11 @@ pub(crate) fn relay() -> bool {
     // The crate's own tests run without it unless they ask: several of
     // them look at title memory right after a submission, which the
     // relay's landing thread may still be writing.
-    *ON.get_or_init(|| std::env::var("VICTORY_RELAY").map_or(!cfg!(test), |v| v == "1" || v == "2") && !keeps())
+    // Kept snapshots turn it off unless they are kept with it
+    // ([`keep_relay`]).
+    *ON.get_or_init(|| {
+        std::env::var("VICTORY_RELAY").map_or(!cfg!(test), |v| v == "1" || v == "2") && (!keeps() || keep_relay())
+    })
 }
 
 /// The submission being prepared (its number among those started): what
@@ -2533,7 +2537,30 @@ impl Drop for Shadow {
 /// wrote there since.
 fn keeps() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_KEEP_SNAPSHOTS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_KEEP_SNAPSHOTS").is_some_and(|v| v == "1") || keep_relay())
+}
+
+/// Kept snapshots ([`keeps`]) with the relay ([`relay`]) left on
+/// (`VICTORY_KEEP_RELAY=1`, which turns kept snapshots on too; off by
+/// default: without it kept snapshots turn the relay off, and every
+/// submission waits for the card). From olivertgwalton/victory-rx6600
+/// c602f77.
+///
+/// What keeps a kept piece honest with the relay: every write into a copy
+/// in the PC's memory either marks its pieces changed ([`Shadow::changed`]:
+/// refreshes, the waited-for copy-back, placed copies) or puts the same
+/// bytes into the snapshot under its lock (the relay's merge,
+/// [`merge_piece`], leaves the snapshot equal to what it read of the copy
+/// where the card wrote; [`Shadow::merge_under_writes`] puts the title's
+/// bytes into both); and a part a flight still holds (`pending`) is never
+/// taken again before its copy-back, kept or not ([`Shadow::writing`] takes
+/// only the parts no declared range holds). With [`wide_back`] the kept
+/// path's pieces are taken with the submission's other snapshots
+/// ([`take_snapshots`]), on the fresh path's terms: a declared range's
+/// bytes do not change before the lists go to the card.
+fn keep_relay() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_KEEP_RELAY").is_some_and(|v| v == "1"))
 }
 
 /// Bytes of the snapshots kept, and the most that may be.
@@ -2690,6 +2717,74 @@ mod landing_tests {
         copy.take_landed(from, from + 100);
         copy.take_landed(from, to);
         assert_eq!(copy.take_dirty(), []);
+        drop(room);
+    }
+}
+
+#[cfg(test)]
+mod kept_relay_tests {
+    use super::{PIECE, Shadow, keeps, take_snapshots};
+
+    /// Two submissions of one range of a copy in the PC's memory, each
+    /// landed as the relay lands it ([`Shadow::relay_merge`] piece by
+    /// piece). Between them the title writes over a byte the card wrote,
+    /// and nothing refreshes the copy. The second landing must not put the
+    /// first flight's byte back over the title's: a kept snapshot
+    /// (`VICTORY_KEEP_RELAY=1`), not taken again, holds what the first
+    /// merge read, as a fresh one would. Run with and without the switch.
+    #[test]
+    fn a_kept_snapshot_holds_what_the_relay_merged() {
+        const LEN: usize = 20 * PIECE;
+        let room = vec![0u8; LEN + PIECE];
+        let title = (room.as_ptr() as usize).next_multiple_of(PIECE);
+        let base: Vec<u8> = (0..LEN as u32).map(|i| (i * 7 + 3) as u8).collect();
+        // SAFETY: in `room`.
+        unsafe { std::ptr::copy_nonoverlapping(base.as_ptr(), title as *mut u8, LEN) };
+        let mut side = base.clone();
+        let data = side.as_mut_ptr();
+        let copy = Shadow::unbacked(title as u64, data, LEN as u64, false);
+        let title_at = |at: usize| unsafe { ((title + at) as *const u8).read_volatile() };
+        let card = |at: usize, v: u8| unsafe { data.add(at).write_volatile(v) };
+        let land = || {
+            let (mut now, mut scratch) = (Vec::new(), Vec::new());
+            let mut written = 0;
+            for piece in 0..LEN / PIECE {
+                written += copy.relay_merge(piece * PIECE, PIECE, &mut now, &mut scratch);
+            }
+            written
+        };
+        let range = (title, title + LEN);
+        let snapshot_is_copy = |what: &str| {
+            let before = copy.before.lock().unwrap();
+            let before = before.as_ref().expect("a snapshot while the range is declared");
+            // SAFETY: the copy, `LEN` bytes, and the snapshot's room (its
+            // bytes of the declared range are set).
+            let (now, before) = unsafe { (std::slice::from_raw_parts(data, LEN), std::slice::from_raw_parts(before.as_ptr(), LEN)) };
+            assert!(before == now, "{what}: kept {}", keeps());
+        };
+        // Flight 1: the card writes three bytes in two pieces.
+        copy.writing(range.0, LEN);
+        take_snapshots();
+        card(10, 0xa1);
+        card(3 * PIECE + 5, 0xa2);
+        card(3 * PIECE + 6, 0xa3);
+        assert_eq!(land(), 3);
+        assert_eq!((title_at(10), title_at(3 * PIECE + 5)), (0xa1, 0xa2));
+        snapshot_is_copy("after the first landing");
+        copy.copy_back_done(&[range]);
+        // The title writes over one of them; the copy is not refreshed.
+        unsafe { ((title + 3 * PIECE + 5) as *mut u8).write_volatile(0x55) };
+        // Flight 2: the card writes one byte elsewhere.
+        copy.writing(range.0, LEN);
+        take_snapshots();
+        snapshot_is_copy("taken again or kept");
+        card(9 * PIECE, 0xb1);
+        assert_eq!(land(), 1);
+        assert_eq!(title_at(9 * PIECE), 0xb1);
+        assert_eq!(title_at(3 * PIECE + 5), 0x55, "the title's byte, kept {}", keeps());
+        assert_eq!((title_at(10), title_at(3 * PIECE + 6)), (0xa1, 0xa3));
+        copy.copy_back_done(&[range]);
+        drop(side);
         drop(room);
     }
 }
@@ -3109,6 +3204,12 @@ impl Shadow {
             if kept.0.is_empty() {
                 kept.0 = vec![false; self.pieces(0, total.max(1)).end];
             }
+            // With the relay kept on ([`keep_relay`]) and `wide_back`:
+            // taken with the submission's other snapshots on several
+            // threads (`take_snapshots`), before its lists go to the card;
+            // marked current now, as they will be by then.
+            let later_on = keep_relay() && wide_back();
+            let mut later = Vec::new();
             for (from, to) in parts {
                 if from >= to {
                     continue;
@@ -3120,12 +3221,19 @@ impl Shadow {
                     let (lo, hi) = self.piece(piece);
                     let whole = from <= lo && hi <= to;
                     let (lo, hi) = (lo.max(from), hi.min(to));
-                    // SAFETY: as below; `hi <= total`.
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(self.data.add(lo), snapshot.as_mut_ptr().add(lo), hi - lo);
+                    if later_on {
+                        later.push((self.data as usize + lo, snapshot.as_mut_ptr() as usize + lo, hi - lo));
+                    } else {
+                        // SAFETY: as below; `hi <= total`.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(self.data.add(lo), snapshot.as_mut_ptr().add(lo), hi - lo);
+                        }
                     }
                     kept.0[piece] = whole;
                 }
+            }
+            if !later.is_empty() {
+                SNAPS.lock().unwrap_or_else(|e| e.into_inner()).extend(later);
             }
             return;
         }
