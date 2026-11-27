@@ -799,6 +799,18 @@ fn sweep_per_heap() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_SWEEP_PER_HEAP").is_some_and(|v| v == "1"))
 }
 
+/// Whether the heap buffer pass keeps each host copy's span from one pass to
+/// the next (`VICTORY_PLAN_REUSE=1`; off by default: merged afresh each pass).
+pub(crate) fn plan_reuse() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("VICTORY_PLAN_REUSE").is_some_and(|v| v == "1"));
+    *ON
+}
+
+/// Under `VICTORY_PLAN_REUSE=1`, since the last frame line: passes that kept
+/// the span plan, and the exact rebuilds of it.
+pub(crate) static PLAN_SPANS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 /// What the heap buffer pass keeps of a view heap, on the heap
 /// ([`crate::descriptor::host::HostHeap`]), so that a heap made where one was
 /// let go starts afresh (codec-d/cool_fox c64fc9b4).
@@ -807,11 +819,14 @@ pub(crate) struct BufferSweep {
     ranges: HeapRanges<std::sync::Arc<crate::shadow::Shadow>>,
     // Last refresh frame and covered interval for throttled, unwatched copies.
     unwatched: std::collections::HashMap<u64, (u64, u64, u64)>,
+    /// The merged span of each host copy, kept from pass to pass under
+    /// `VICTORY_PLAN_REUSE=1` ([`SpanPlan`]).
+    plan: SpanPlan<std::sync::Arc<crate::shadow::Shadow>>,
 }
 
 impl Default for BufferSweep {
     fn default() -> Self {
-        Self { passes: 0, ranges: HeapRanges(Vec::new()), unwatched: Default::default() }
+        Self { passes: 0, ranges: HeapRanges(Vec::new()), unwatched: Default::default(), plan: SpanPlan::default() }
     }
 }
 
@@ -827,6 +842,10 @@ impl<T> HeapRanges<T> {
         self.0[slot] = range;
     }
 
+    fn get(&self, slot: u32) -> Option<&(T, u64, u64)> {
+        self.0.get(slot as usize).and_then(Option::as_ref)
+    }
+
     /// Forgets the slots of one of `parts` parts
     /// (`HostHeap::buffer_slots_of`).
     fn forget_part(&mut self, part: u32, parts: u32) {
@@ -838,9 +857,83 @@ impl<T> HeapRanges<T> {
     }
 }
 
+/// The merged span of each host copy that the views of a [`HeapRanges`]
+/// cover, kept from pass to pass under `VICTORY_PLAN_REUSE=1`
+/// ([`heap_buffer_pass`]). A range that comes or changes widens its copy's
+/// span at once; one that moved or went leaves the span as it was, wider
+/// than the views, until [`SpanPlan::rebuild`] builds it afresh.
+struct SpanPlan<T> {
+    spans: crate::host::ByCopy<(T, u64, u64)>,
+    /// Built from the ranges at least once.
+    valid: bool,
+    /// A range moved or went since the last rebuild.
+    loose: bool,
+    last_compact: u64,
+}
+
+/// Frames after which a [`SpanPlan`] with moved ranges is built afresh.
+const PLAN_COMPACT_FRAMES: u64 = 8;
+
+impl<T> Default for SpanPlan<T> {
+    fn default() -> Self {
+        Self { spans: Default::default(), valid: false, loose: false, last_compact: 0 }
+    }
+}
+
+impl<X> SpanPlan<std::sync::Arc<X>> {
+    fn widen(&mut self, shadow: &std::sync::Arc<X>, from: u64, to: u64) {
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
+        let span = self.spans.entry(key).or_insert_with(|| (shadow.clone(), from, to));
+        span.1 = span.1.min(from);
+        span.2 = span.2.max(to);
+    }
+
+    /// A slot's range was `old` and is `new`.
+    fn moved(&mut self, old: Option<&(std::sync::Arc<X>, u64, u64)>, new: Option<&(std::sync::Arc<X>, u64, u64)>) {
+        if let Some((shadow, from, to)) = new {
+            self.widen(shadow, *from, *to);
+        }
+        let same = match (old, new) {
+            (Some((os, of, ot)), Some((ns, nf, nt))) => std::sync::Arc::ptr_eq(os, ns) && of == nf && ot == nt,
+            _ => false,
+        };
+        if old.is_some() && !same {
+            self.loose = true;
+        }
+    }
+
+    /// The slots of a part are forgotten: their spans may be wider now.
+    fn loosen(&mut self) {
+        self.loose = true;
+    }
+
+    /// Every range is forgotten.
+    fn clear(&mut self) {
+        self.spans.clear();
+        self.loose = false;
+    }
+
+    /// Built afresh from `ranges`; returns the number of views.
+    fn rebuild<'a>(&mut self, ranges: impl Iterator<Item = &'a (std::sync::Arc<X>, u64, u64)>, frame: u64) -> u32
+    where
+        X: 'a,
+    {
+        self.spans.clear();
+        let mut views = 0;
+        for (shadow, from, to) in ranges {
+            views += 1;
+            self.widen(shadow, *from, *to);
+        }
+        self.valid = true;
+        self.loose = false;
+        self.last_compact = frame;
+        views
+    }
+}
+
 #[cfg(test)]
 mod heap_range_tests {
-    use super::{HEAP_ROUND, HeapRanges};
+    use super::{HEAP_ROUND, HeapRanges, SpanPlan};
 
     /// Round by round every slot is looked at again once, whatever was
     /// written between, and what a slot holds is what was found last.
@@ -906,6 +999,37 @@ mod heap_range_tests {
             best(&mut || join::<std::hash::RandomState>(&mut table.values())),
             best(&mut || join::<std::hash::BuildHasherDefault<crate::host::AddressHash>>(&mut slots.ranges())),
         );
+    }
+
+    /// A span plan covers every view's range through views that come, move
+    /// and go, and its rebuild covers exactly the views.
+    #[test]
+    fn a_span_plan_covers_its_views_and_rebuilds_exactly() {
+        use std::sync::Arc;
+        fn set(ranges: &mut HeapRanges<Arc<u8>>, plan: &mut SpanPlan<Arc<u8>>, slot: u32, range: Option<(Arc<u8>, u64, u64)>) {
+            plan.moved(ranges.get(slot), range.as_ref());
+            ranges.set(slot, range);
+        }
+        fn covered(ranges: &HeapRanges<Arc<u8>>, plan: &SpanPlan<Arc<u8>>) {
+            for (shadow, from, to) in ranges.ranges() {
+                let span = plan.spans.get(&(Arc::as_ptr(shadow) as usize)).expect("a view's copy has a span");
+                assert!(span.1 <= *from && *to <= span.2, "view {from}..{to} outside its span {}..{}", span.1, span.2);
+            }
+        }
+        let (a, b) = (Arc::new(1u8), Arc::new(2u8));
+        let (ka, kb) = (Arc::as_ptr(&a) as usize, Arc::as_ptr(&b) as usize);
+        let (mut ranges, mut plan) = (HeapRanges(Vec::new()), SpanPlan::default());
+        set(&mut ranges, &mut plan, 0, Some((a.clone(), 0, 16)));
+        set(&mut ranges, &mut plan, 1, Some((a.clone(), 16, 32)));
+        set(&mut ranges, &mut plan, 2, Some((b.clone(), 100, 120)));
+        covered(&ranges, &plan);
+        set(&mut ranges, &mut plan, 0, None);
+        covered(&ranges, &plan);
+        set(&mut ranges, &mut plan, 1, Some((a.clone(), 8, 40)));
+        covered(&ranges, &plan);
+        assert_eq!(plan.rebuild(ranges.ranges(), 1), 2);
+        assert_eq!((plan.spans[&ka].1, plan.spans[&ka].2), (8, 40));
+        assert_eq!((plan.spans[&kb].1, plan.spans[&kb].2), (100, 120));
     }
 }
 
@@ -1282,16 +1406,19 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     // released resource goes stale without a write, and a slot written
     // before its memory had a host copy is only made then.
     let mut kept = host.buffer_sweep.lock().unwrap_or_else(|e| e.into_inner());
-    let BufferSweep { passes, ranges, unwatched } = &mut *kept;
+    let BufferSweep { passes, ranges, unwatched, plan } = &mut *kept;
+    let reuse = plan_reuse();
     let changed = host.buffer_changes();
     let all = *passes == 0 || (*passes % HEAP_ROUND == 0 && !heap_spread());
     let slots = if all {
         ranges.0.clear();
+        plan.clear();
         host.buffer_slots()
     } else if heap_spread() {
         // The written ones, and this pass's part of the others.
         let (part, parts) = ((*passes % HEAP_ROUND) as u32, HEAP_ROUND as u32);
         ranges.forget_part(part, parts);
+        plan.loosen();
         let mut slots = host.buffer_slots_of::<{ HEAP_ROUND as u32 }>(part);
         slots.extend(changed);
         slots
@@ -1361,22 +1488,30 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
             }
             range
         });
+        if reuse {
+            plan.moved(ranges.get(index), range.as_ref());
+        }
         ranges.set(index, range);
     }
     if crate::picked::on() {
         crate::picked::shown(unordered, all);
     }
     let looked = std::time::Instant::now();
-    // Per host copy, the span its picked views cover.
-    let mut spans: crate::host::ByCopy<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> = Default::default();
-    let mut views = 0u32;
-    for (shadow, from, to) in ranges.ranges() {
-        views += 1;
-        let key = std::sync::Arc::as_ptr(shadow) as usize;
-        let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
-        span.1 = span.1.min(*from);
-        span.2 = span.2.max(*to);
-    }
+    // Per host copy, the span its picked views cover: merged afresh, or kept
+    // from the passes before (`VICTORY_PLAN_REUSE=1`).
+    let mut fresh = SpanPlan::default();
+    let (plan, views) = if reuse {
+        if !plan.valid || (plan.loose && frame >= plan.last_compact + PLAN_COMPACT_FRAMES) {
+            plan.rebuild(ranges.ranges(), frame);
+            PLAN_SPANS[1].fetch_add(1, Ordering::Relaxed);
+        }
+        PLAN_SPANS[0].fetch_add(1, Ordering::Relaxed);
+        (plan, ranges.ranges().count() as u32)
+    } else {
+        let views = fresh.rebuild(ranges.ranges(), frame);
+        (&mut fresh, views)
+    };
+    let spans = &plan.spans;
     let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
     // Memory that is not write-watched is copied whole by every refresh.
     // It was once refreshed only every 120 frames (unmapped pages read
@@ -1404,6 +1539,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         }
         found.push((shadow.clone(), *from, (*to).min(*from + shadow.left(*from))));
     }
+    let copies = spans.len();
     *unwatched = next_unwatched;
     drop(kept);
     let refreshed = std::time::Instant::now();
@@ -1422,7 +1558,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         tracing::info!(
             slots = slots.len(),
             views,
-            copies = spans.len(),
+            copies,
             mb = bytes >> 20,
             ms = started.elapsed().as_millis(),
             "buffer views of the heap made ready for shaders that pick them by index"

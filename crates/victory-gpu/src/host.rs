@@ -10272,6 +10272,11 @@ impl Meter {
                      {hp_textures:.1} ms on textures picked by index ({hp_mirrors:.1} ms making their host views, {hp_readable:.1} ms making them readable)"
                 );
             }
+            if crate::draw::plan_reuse() {
+                let [plan_passes, plan_rebuilds] =
+                    [0, 1].map(|i| crate::draw::PLAN_SPANS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+                tracing::info!("span plan (VICTORY_PLAN_REUSE=1): kept for {plan_passes:.1} passes a frame, rebuilt {plan_rebuilds:.2} a frame");
+            }
             // Copies between depth textures and their colour twins, each way.
             let [twin_to_depth, twin_to_colour] =
                 [2, 3].map(|i| crate::resource::TWINS[i].swap(0, Ordering::Relaxed) as f64 / frames);
