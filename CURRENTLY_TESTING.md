@@ -12,6 +12,35 @@ bimodal; differences under ~5 ms need ≥4 runs an arm).
   world (`draws > 100`). Figure = median `ms_per_frame` of those rows; "prep" = median `cpu_prepare_ms`.
 - Release build (`--features scripted`), caches warm (prebuild + full `warm`, 93,821 pipelines).
 
+## Latest (2026-11-27 evening): `main` = 21a04e3fe
+
+Each step merged into `main` after an A/B against the step before (single runs, 150–200 world rows,
+same play-fast set; caches prebuilt and warm, no builds during runs).
+
+| Step | Adds | Frame | Prep | Copies | Copy-back | Texture refresh | Notes |
+|---|---|---|---|---|---|---|---|
+| combined (below) | r3 + `COMPUTE_WAIT_MS=500` | 48.7 ms | | 20.7 | 21.7 | 16.3 | ab7 arm A |
+| integration 1 | rounds r9–r19 (coolfox, LibsMQG, breakwater, Valhalla, translator v7, guards, remap counters, in-place S1) | 54.3 ms | | | | 16.9 | plain, new switches off |
+| + `VICTORY_SKIP_WC_BACK=1` | LibsMQG: copy-back skips card pieces | **47.8 ms** | | | 18.4 | | 47.4 in a second run |
+| + landings (r20) | `VICTORY_LAND_RING=1 VICTORY_KEEP_SNAPSHOTS=1 VICTORY_BURY_ASIDE=1 VICTORY_WOKEN_WAITS=1` (coolfox, rx6600) | **46.4 ms** | 36.7 | 19.2 | **5.6** | 14.8 | copy-back −2/3 |
+| fast track 1 | `VICTORY_REFRESH_RANGES=1 VICTORY_SEND_CHANGED=1 VICTORY_READBACK_POOL=1 VICTORY_COMPARE_SHARE=1 VICTORY_DIRTY_QUEUE=1` (AntoninMichelq, Belobug) | 50.5 vs 50.2 | 37.0 vs 40.2 | 20.0 vs 22.1 | 5.8 | 14.0 vs 15.9 | ab10, 200 rows; p90 64.3 vs 66.3, worst p95 203 vs 223 |
+
+- Run to run, one setup moves by about 4 ms (same exe and switches: 46.4 ms at 19:55, 50.2 at 20:24).
+- Fast track 1: equal frame, 3 ms less CPU prep, steadier tail. Prep (37 ms) is now below the frame
+  (50 ms) and the card is 80 % busy: what sets the frame now is not our copy work alone (profile next).
+- Where prep goes now: copies 20 ms (38 MB a frame, so the cost is finding and reading what changed,
+  not moving bytes) + heap pass 15 ms (textures picked by index, on the submitting thread; the
+  buffer half already runs beside it, `VICTORY_HEAP_PASS_ASIDE` on by default) + textures 1.4 ms.
+- Picture: violet blinds and trees fixed by `VICTORY_AMBIENT_MAGENTA=1` (Belobug's probe-light filter);
+  integration 1 with it: same scenes as before, hair complete, no new artifacts (captures 1400–3000).
+- Kept off: `VICTORY_HOME_NOHUGE=1` (+19 ms: 4 KiB pages on port 1's heap), `VICTORY_INPLACE=1` (+200 ms
+  texture refresh, until in-place track A), THP collapse (median −1.8 ms, worse tail).
+- d3dcompiler_47 10.0.26100.7705 against our 10.0.22621.608: 49.3 vs 47.4 ms (1 run each), no
+  compile messages either way; kept 22621.
+
+Play set now: the play-fast settings below + combined + `VICTORY_SKIP_WC_BACK=1
+VICTORY_AMBIENT_MAGENTA=1` + the landings and fast track 1 switches above.
+
 ## Ladder on `main` (2026-11-27, cumulative: each rung adds to the one above)
 
 | Rung | Adds | Run 1 | Run 2 | Mean | Prep | GPU busy |
@@ -114,16 +143,19 @@ VICTORY_SHOW_AFTER=1 VICTORY_AMBIENT=0.8 VICTORY_JOIN_PARTS=8 VICTORY_UPLOAD_AHE
 VICTORY_PIPELINE_BOOK=1 VICTORY_LAND_SKIP=1 GLIBC_TUNABLES=glibc.pthread.rseq=0
 WINE_CPU_TOPOLOGY=16:0,8,1,9,2,10,3,11,4,12,5,13,6,14,7,15`, FSR through `VICTORY_FFX_DIR`.
 
-## Known picture issues (all builds tested since 2026-11-26)
+## Known picture issues
 
-Purple vertical blinds on the first balcony (same colour in v7900-final, fx-upscaler and `main`;
-not from the merge); sparkle on glass and speckle on floors; `VICTORY_PORT_CONSTANTS` without
-`PORT_HOME` under Wine: black world.
+Sparkle on glass and speckle on floors; `VICTORY_PORT_CONSTANTS` without `PORT_HOME` under Wine:
+black world. Purple blinds and violet trees on the first balcony: fixed with
+`VICTORY_AMBIENT_MAGENTA=1` (in the play set).
 
 ## Next
 
-1. Pink/magenta blinds and island trees: late captures (world frames 2500/3000) show them with the
-   combined set too, so not a baseline-only problem. Lead: the light-probe fallback with ray tracing
-   off (another fork's "probe rays" change removes violet vegetation with RT off).
-2. More runs of the combined set (4) to firm up the number; `VICTORY_FRAME_INTERVAL_MS=16.667`
-   once frames get near the title's 33 ms.
+1. In flight: Wine `memcmp` (16 bytes a step instead of Wine's 8, same results, so no switch;
+   upstream measured 6.7 % → 2.2 % of process CPU), and behind switches off by default: heap-pass
+   round (staging pool, plan reuse, upload barriers, per-slot bits instead of heap-wide locks),
+   journal round (write-watch journal under a shared lock, `REFRESH_RANGES` on the front path).
+   A survey of every tracked fork's copy and heap work ranks what comes after.
+2. A `perf` profile of the submitting thread on `main` with the play set, to split the 20 ms of
+   copies and 15 ms of heap by function.
+3. `VICTORY_FRAME_INTERVAL_MS=16.667` once frames get near the title's 33 ms.
