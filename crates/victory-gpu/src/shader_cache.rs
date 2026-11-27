@@ -127,6 +127,9 @@ fn build() -> [u8; 32] {
             "VICTORY_D16_BITS",
             "VICTORY_NAN_GUARD",
             "VICTORY_SPILL_STRICT",
+            // Record counts read from the host's table, not a size query
+            // (`victory_shader::emit::lower` `slot_counts`).
+            "VICTORY_SLOT_COUNTS",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
