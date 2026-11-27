@@ -1215,6 +1215,26 @@ impl<'a> Tracer<'a> {
             matches!(*w, Term::Value(v)
                 if self.def(v).is_some_and(|i| i.name().starts_with("s_load_")))
         };
+        // P.4 census (`VICTORY_WHY_DESCRIPTOR=1`): what made each word.
+        if std::env::var_os("VICTORY_WHY_DESCRIPTOR").is_some() && words.iter().any(loaded) {
+            let what: Vec<String> = words
+                .iter()
+                .map(|w| match *w {
+                    Term::Const(c) => format!("const {c:#x}"),
+                    Term::Value(v) => match self.sop2(v, &["s_and_b32", "s_or_b32", "s_mul_i32", "s_lshl_b32", "s_add_u32"]) {
+                        Some((i, [a, b])) => {
+                            let t = |t: Term| match t {
+                                Term::Const(c) => format!("{c:#x}"),
+                                Term::Value(x) => self.def(x).map_or("input".to_owned(), |i| i.name().to_owned()),
+                            };
+                            format!("{}({}, {})", i.name(), t(a), t(b))
+                        }
+                        None => self.def(v).map_or("input".to_owned(), |i| i.name().to_owned()),
+                    },
+                })
+                .collect();
+            eprintln!("WHY-DESCRIPTOR {}", what.join(" | "));
+        }
         Err(if words.iter().any(loaded) {
             "a descriptor changed after loading"
         } else {
