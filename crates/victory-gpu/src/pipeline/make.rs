@@ -20,6 +20,16 @@
 //! pipelines they were dropped; that run had no lamps and no diffuse light to
 //! its end (run textures-d2, the first after a new translation; Belobug
 //! 18e57db8 found the same).
+//!
+//! If asked for (`VICTORY_COMPUTE_WAIT_MS`), the first use of a compute
+//! pass waits for its host pipeline by a budget of its own
+//! ([`compute_budget`]), not within the frame's budget: the table a
+//! character's face is deformed by is filled once on the card when the
+//! character is made; dropped, it is not run again, and without it the
+//! face's vertices all lie in one point (docs/linux-wine.md, "People
+//! without a head"). Upstream's switch; here off by default (our
+//! [`compute_waits`] mechanism is the default), and it takes the pass out
+//! of the frame's budget and of that mechanism's bookkeeping.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -51,6 +61,9 @@ pub(crate) struct Pending {
     compute_given_up: AtomicBool,
     /// When a worker began making it.
     making_since: OnceLock<Instant>,
+    /// A first use that went without it was written down (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    noted: AtomicBool,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -73,6 +86,8 @@ impl Pending {
             compute_dropped: AtomicBool::new(false),
             compute_given_up: AtomicBool::new(false),
             making_since: OnceLock::new(),
+            #[cfg(feature = "diagnostics")]
+            noted: AtomicBool::new(false),
             shaders,
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
@@ -85,6 +100,13 @@ impl Pending {
 
     pub(super) fn key(&self) -> &str {
         &self.key
+    }
+
+    /// A compute pass where those wait apart from the frame's budget
+    /// (`VICTORY_COMPUTE_WAIT_MS` asked for one; a pass of one shader, of
+    /// that stage).
+    fn waits_alone(&self) -> bool {
+        matches!(self.shaders.as_slice(), [cs] if cs.stage == "compute") && !compute_budget().is_zero()
     }
 
     fn make(&self) {
@@ -181,6 +203,15 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     if p.made.get().is_none() {
         start(p, REQUESTED);
         wait(p, crate::frame::current());
+        // (Which first uses go without: once a pipeline.)
+        #[cfg(feature = "diagnostics")]
+        if p.made.get().is_none() && !p.noted.swap(true, Ordering::Relaxed) {
+            tracing::info!(
+                shaders = ?p.shaders,
+                frame = crate::frame::current(),
+                "a first use goes without its host pipeline, which is still being made: dropped"
+            );
+        }
     }
     p.made.get()?.as_ref()
 }
@@ -256,8 +287,78 @@ fn compute_left(since: Duration, making: Duration) -> Duration {
     COMPUTE_BUDGET.saturating_sub(since).min(COMPUTE_BUDGET.saturating_sub(making))
 }
 
+/// What the first use of a compute pass may wait for its pipeline, apart
+/// from the frame's budget and whatever else waits in the frame
+/// (`VICTORY_COMPUTE_WAIT_MS`, read here; set, on under Wine or Windows, to
+/// the milliseconds; unset: not used, [`compute_waits`]; `0`: as before
+/// under Wine too).
+///
+/// Upstream (PR #440, `d9ee5f2f`) defaults this to 10 s under Wine and
+/// replaces the frame's budget for compute passes with it; here it is an
+/// opt-in beside [`compute_waits`], whose per-pipeline cap of 10 s of
+/// making and its per-frame bound it joins: a pass that is not made within
+/// the budget is dropped by the caller, as the frame's budget drops.
+fn compute_budget() -> Duration {
+    static BUDGET: OnceLock<Duration> = OnceLock::new();
+    *BUDGET.get_or_init(|| match std::env::var("VICTORY_COMPUTE_WAIT_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        Some(millis) if millis != 0 => {
+            tracing::info!(millis, "compute passes wait for their host pipeline by a budget of their own (VICTORY_COMPUTE_WAIT_MS)");
+            Duration::from_millis(millis)
+        }
+        _ => Duration::ZERO,
+    })
+}
+
+/// Waits for a compute pass's pipeline ([`compute_budget`]) until it is
+/// made or `budget` after the frame's first such wait, whichever thread
+/// that was: all of a frame's waits end together, and none takes another's
+/// time (a thread that came while another waited found nothing left of a
+/// budget counted as [`wait`] counts it, and dropped its pass at once).
+fn wait_compute(p: &Pending, frame: u64, budget: Duration) {
+    // The frame the waiting belongs to and when it ends.
+    static UNTIL: Mutex<(u64, Option<Instant>)> = Mutex::new((u64::MAX, None));
+    let until = {
+        let mut until = UNTIL.lock().unwrap_or_else(|e| e.into_inner());
+        if until.0 != frame {
+            *until = (frame, None);
+        }
+        *until.1.get_or_insert_with(|| Instant::now() + budget)
+    };
+    let waiting = crate::timeline::span("pipeline: first use waits for a host pipeline");
+    let started = Instant::now();
+    let (lock, done) = &DONE;
+    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while p.made.get().is_none() {
+        let rest = until.saturating_duration_since(Instant::now());
+        if rest.is_zero() {
+            break;
+        }
+        held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
+    }
+    drop(held);
+    let waited = started.elapsed();
+    waiting.end();
+    if waited > Duration::from_millis(100) {
+        tracing::info!(
+            ms = waited.as_millis() as u64,
+            made = p.made.get().is_some(),
+            shaders = ?p.shaders,
+            frame,
+            "a compute pass was waited for (VICTORY_COMPUTE_WAIT_MS: dropped past its own budget)"
+        );
+    }
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::PipelineWaitUs, waited.as_micros() as u64);
+}
+
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
+    if p.waits_alone() {
+        return wait_compute(p, frame, compute_budget());
+    }
     let screen = p.screen && screens_first();
     // A compute dispatch ([`compute_waits`]) waits within its own budget
     // while its pipeline is being made for less than that; then as any other.
