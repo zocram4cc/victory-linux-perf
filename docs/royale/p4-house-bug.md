@@ -78,3 +78,21 @@ Before step 17 that stopped translation ("a descriptor outside the heaps"). **St
 2. **Where the heaps are.** Here the view heap is at n-1, against our n-2 rule. Census which user SGPRs are used as load bases with an index × 32 (view) or × 16 (sampler) across the 2,680 programs, and derive the rule.
 3. With both, the layer fills that SGPR with the heap's console start (as for the existing implicit heaps), and these programs translate as plain heap loads, without step 17's path.
 4. **Every family that becomes whole: check it in game** (`scripts/p4-family-bisect.sh`, or one run per family) before trusting it.
+
+## Follow-up (27 Nov, 17:20-17:40): the heap's place fixed, the house still breaks
+
+- **The view heap's SGPR now comes from the code** (`native::view_heap_sgpr`):
+  - it finds the user SGPR used as a 32-bit base `(sX, 0)` with an offset shifted left by 5, anywhere in the program;
+  - only s[n-1] or s[n-2] are accepted (the census: 187 programs use s[n-1], 59 use s[n-2], always times 32);
+  - root constants are clamped below it.
+
+  This took family 0x33cb3490 through the heap instead of step 17's path, and gave **1,202 → 1,228** overall, none lost.
+- **A test that proved nothing** (`bench/k-20261127-171822-fam10-heapfix`): its list was built with `cat bench/p4-fam/*.txt`, which still held two families that were no longer whole (`0x306fbc40`, 31 programs; `0x33cb34f0`). That made partial chains, which break the picture by themselves. **The family lists are now regenerated from the current whole families only; stale files are removed.**
+- **The clean test** (`bench/k-…-cull-alone-heapfix`), 0x33cb3490 alone with the heap fix: **half the house is still missing**. The user saw it too. So the culprit is certainly this family, and the misplaced heap was *a* fault of it, not the one that culls the house.
+- **0x33cb3490 stays out** (`bench/p4-bad-families.txt`). The play list `bench/p4-full-families.txt` holds the other 9 whole families (40 programs), which held in game (user, 16:55).
+- **Next suspects in the culling programs, offline:**
+  1. **s5.** The record at user data 5 is kind 2 (CBV) with 4 descriptor dwords, which our layout calls root constants. The code reads it as `s_and_b32 s9, s5, 0x3ffffff`, a 32-bit address of a buffer. If it is a root CBV's address, the layer must fill it with the address, not with constants.
+  2. **The depth-pyramid reads** (`image_gather4_l_o`: level rounding, edge clamping, the gather order).
+  3. **The visible-list counter** (raw buffer atomics).
+
+  A way to tell them apart: run one program of the family against a captured dispatch (inputs from a frame), and compare its output with the console's.
