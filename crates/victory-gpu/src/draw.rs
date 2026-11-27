@@ -908,9 +908,9 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
 
 /// Whether a slot stays on the longest wait of [`RECHECK_FRAMES`] after the
-/// schedule ended, for as long as it lives (on by default;
-/// `VICTORY_HEAP_RECHECK_FOREVER=0`: out of the queue after the fifth look,
-/// as before). A texture the title reuses or streams into the same address
+/// schedule ended, for as long as it lives (`VICTORY_HEAP_RECHECK_FOREVER=1`;
+/// off by default: out of the queue after the fifth look, as before). A
+/// texture the title reuses or streams into the same address
 /// minutes later (skin, a shirt, hair) kept the host copy of its first
 /// upload for good: no descriptor write, mapping or CPU write tells of it
 /// (Legendary f085a93, DoubleGhosty 8c23f185, Belobug PR #396). Read once.
@@ -918,9 +918,15 @@ const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
 /// The cost: every texture picked by index and uploaded whole stays in the
 /// queue and is read again every 400 frames, so a frame reads about a
 /// 400th of them (and the queue never empties: each pass walks its slots).
+///
+/// Off by default since two runs of the scripted opening (20261127-143717 and
+/// -145702): in ten minutes the looks read 120 and 134 GB of title memory
+/// and found 215 and 387 textures changed, with 6.2 and 5.2 million looks
+/// left for a later frame at the end, on the queue first uploads wait in. The
+/// changes it found are real; what tells of them cheaply is still to be made.
 fn recheck_forever() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_RECHECK_FOREVER").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_RECHECK_FOREVER").is_some_and(|v| v == "1"))
 }
 
 /// Bytes of whole-texture looks one frame reads ([`full_recheck`]): such a
@@ -934,8 +940,9 @@ const RECHECK_AT_MOST: u64 = 32 << 20;
 pub(crate) static HEAP_TEXTURES_FULL_RECHECK: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// Whether a look at an uploaded texture reads all of its title memory, not
-/// three 16 KiB windows of it (on by default; `VICTORY_TEXTURE_FULL_RECHECK=0`:
-/// the windows, `crate::texture::fingerprint`, as before). A square the
+/// three 16 KiB windows of it (`VICTORY_TEXTURE_FULL_RECHECK=1`; off by
+/// default, with [`recheck_forever`] and for its reason: the windows,
+/// `crate::texture::fingerprint`, as before). A square the
 /// title writes between the windows left them as they were: the look found
 /// nothing and boxes of an older frame stayed on a body or a shirt
 /// (Legendary c2ab4b5). Read once.
@@ -945,7 +952,7 @@ pub(crate) static HEAP_TEXTURES_FULL_RECHECK: [AtomicU64; 3] = [const { AtomicU6
 /// [`RECHECK_AT_MOST`] a frame (the look that crosses the line is finished).
 fn full_recheck() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_FULL_RECHECK").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_FULL_RECHECK").is_some_and(|v| v == "1"))
 }
 
 /// A fingerprint of all of the title memory `[at, at + len)`, never 0: of
@@ -3252,14 +3259,15 @@ impl State {
             // page alone, one whose first page is the one missing counted
             // as not there.)
             // A slot uploaded whole is looked at again (`RECHECK_FRAMES`:
-            // after 4, 12, 40, 120 and 400 frames, then every 400 for as
-            // long as it lives, unless `VICTORY_HEAP_RECHECK_FOREVER=0`):
+            // after 4, 12, 40, 120 and 400 frames; with
+            // `VICTORY_HEAP_RECHECK_FOREVER=1` then every 400 for as long as
+            // it lives):
             // the title writes a texture's view, and may fill the
             // texture's memory itself only afterwards, with no descriptor
             // write and nothing from the runtime to tell of it. The host
             // copy then kept what the memory held at the first look for
-            // the rest of the run. The look reads the texture
-            // (`VICTORY_TEXTURE_FULL_RECHECK=0`: 48 KiB of it); only a
+            // the rest of the run. The look reads 48 KiB of the texture
+            // (`VICTORY_TEXTURE_FULL_RECHECK=1`: all of it); only a
             // changed texture is uploaded again.
             // `VICTORY_HEAP_RECHECK=0`: uploaded once, as before.
             // One found changed by such a look is looked at in the next frame

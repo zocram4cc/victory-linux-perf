@@ -9049,9 +9049,9 @@ impl Meter {
                     [0, 1, 2].map(|i| crate::draw::HEAP_TEXTURES_FULL_RECHECK[i].load(Ordering::Relaxed));
                 tracing::info!(
                     "textures picked by index looked at again after their upload, since the start: {unchanged} looks found \
-                     the memory as it was, {changed} found it changed (uploaded again; VICTORY_HEAP_RECHECK_FOREVER=0: five \
-                     looks, then none); {full} whole looks read {} MB ({left} left for a later frame; \
-                     VICTORY_TEXTURE_FULL_RECHECK=0: three windows)",
+                     the memory as it was, {changed} found it changed (uploaded again; five looks, then none, unless \
+                     VICTORY_HEAP_RECHECK_FOREVER=1); {full} whole looks read {} MB ({left} left for a later frame; three \
+                     windows unless VICTORY_TEXTURE_FULL_RECHECK=1)",
                     bytes >> 20
                 );
             }
