@@ -10943,6 +10943,36 @@ impl<'a> Lower<'a> {
                     .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, 31, &[a]);
                 self.s.m.bin(c, Bin::Add, n, b)
             }
+            "v_mad_u32_u16" | "v_mad_i32_i16" => {
+                // The low 16 bits of each factor (zero- or sign-extended),
+                // times, plus src2. With op_sel (a high half) or clamp:
+                // refused, not guessed.
+                // op_sel bit k: the high half of factor k. Clamp: refused.
+                let opsel = match &inst.fields {
+                    Fields::Valu(v) if v.clamp => return Err("a clamped 16-bit multiply-add"),
+                    Fields::Valu(v) => v.opsel,
+                    _ => 0,
+                };
+                let (a, b, d) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                let (sh, op) = (
+                    k(self, 16),
+                    if name == "v_mad_i32_i16" {
+                        Bin::AShr
+                    } else {
+                        Bin::LShr
+                    },
+                );
+                // A factor's half, extended: the high half shifted down; the
+                // low half shifted up first.
+                let half = |me: &mut Self, x, high: bool| {
+                    let x = if high { x } else { me.s.m.bin(c, Bin::Shl, x, sh) };
+                    me.s.m.bin(c, op, x, sh)
+                };
+                let a = half(self, a, opsel & 1 != 0);
+                let b = half(self, b, opsel & 2 != 0);
+                let m = self.s.m.bin(c, Bin::Mul, a, b);
+                self.s.m.bin(c, Bin::Add, m, d)
+            }
             "v_mad_u32_u24" | "v_mad_i32_i24" => {
                 let (a, b, d) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
                 let (sh, op) = (
