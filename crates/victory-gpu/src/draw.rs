@@ -907,6 +907,67 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 /// memory is looked at again, each counted from the look before.
 const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
 
+/// Whether a slot stays on the longest wait of [`RECHECK_FRAMES`] after the
+/// schedule ended, for as long as it lives (on by default;
+/// `VICTORY_HEAP_RECHECK_FOREVER=0`: out of the queue after the fifth look,
+/// as before). A texture the title reuses or streams into the same address
+/// minutes later (skin, a shirt, hair) kept the host copy of its first
+/// upload for good: no descriptor write, mapping or CPU write tells of it
+/// (Legendary f085a93, DoubleGhosty 8c23f185, Belobug PR #396). Read once.
+///
+/// The cost: every texture picked by index and uploaded whole stays in the
+/// queue and is read again every 400 frames, so a frame reads about a
+/// 400th of them (and the queue never empties: each pass walks its slots).
+fn recheck_forever() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_RECHECK_FOREVER").is_none_or(|v| v != "0"))
+}
+
+/// Bytes of whole-texture looks one frame reads ([`full_recheck`]): such a
+/// look is the work of reading and hashing the texture, and a scene's first
+/// looks are thousands; the slots over it stay due for the frames after.
+const RECHECK_AT_MOST: u64 = 32 << 20;
+
+/// Whole-texture looks at uploaded textures since the start, the bytes they
+/// read, and looks left for a later frame because the frame's bytes were
+/// spent (`VICTORY_TEXTURE_FULL_RECHECK`).
+pub(crate) static HEAP_TEXTURES_FULL_RECHECK: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Whether a look at an uploaded texture reads all of its title memory, not
+/// three 16 KiB windows of it (on by default; `VICTORY_TEXTURE_FULL_RECHECK=0`:
+/// the windows, `crate::texture::fingerprint`, as before). A square the
+/// title writes between the windows left them as they were: the look found
+/// nothing and boxes of an older frame stayed on a body or a shirt
+/// (Legendary c2ab4b5). Read once.
+///
+/// The cost: a texture uploaded whole is read once more at its upload (for
+/// the fingerprint the looks compare), and the looks read at most
+/// [`RECHECK_AT_MOST`] a frame (the look that crosses the line is finished).
+fn full_recheck() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_FULL_RECHECK").is_none_or(|v| v != "0"))
+}
+
+/// A fingerprint of all of the title memory `[at, at + len)`, never 0: of
+/// pieces `crate::texture::fingerprint` reads whole (48 KiB), each read
+/// through the kernel, so pages not there count as zeros.
+fn whole_fingerprint(at: u64, len: u64) -> u64 {
+    const PIECE: u64 = 48 << 10;
+    let (mut print, mut from) = (0u64, 0u64);
+    while from < len {
+        let bytes = (len - from).min(PIECE);
+        print = print.rotate_left(29) ^ crate::texture::fingerprint(at + from, bytes);
+        from += bytes;
+    }
+    print | 1
+}
+
+/// The fingerprint a look at an uploaded texture compares: of all of its
+/// memory with [`full_recheck`], else of three windows.
+fn recheck_fingerprint(at: u64, len: u64) -> u64 {
+    if full_recheck() { whole_fingerprint(at, len) } else { crate::texture::fingerprint(at, len) }
+}
+
 /// Looks at uploaded textures picked by index that found the memory as it
 /// was, and that found it changed (uploaded again), since the start.
 pub(crate) static HEAP_TEXTURES_RECHECKED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
@@ -2966,9 +3027,12 @@ impl State {
         };
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         static SPENT: AtomicU64 = AtomicU64::new(0);
+        // Bytes of whole-texture looks this frame has read (`RECHECK_AT_MOST`).
+        static RECHECK_SPENT: AtomicU64 = AtomicU64::new(0);
         let frame = crate::frame::current();
         if FRAME.swap(frame, Ordering::Relaxed) != frame {
             SPENT.store(0, Ordering::Relaxed);
+            RECHECK_SPENT.store(0, Ordering::Relaxed);
         }
         // No more of them are made while the card has no room
         // (`resource::room`): by what is alive now, not by what was ever
@@ -3150,13 +3214,16 @@ impl State {
             // every 120 frames, changed or not; and asked by its first
             // page alone, one whose first page is the one missing counted
             // as not there.)
-            // A slot uploaded whole is looked at again a few times
-            // (`RECHECK_FRAMES`): the title writes a texture's view, and
-            // may fill the texture's memory itself only afterwards, with
-            // no descriptor write and nothing from the runtime to tell of
-            // it. The host copy then kept what the memory held at the
-            // first look for the rest of the run. The look reads 48 KiB;
-            // only a changed texture is uploaded again.
+            // A slot uploaded whole is looked at again (`RECHECK_FRAMES`:
+            // after 4, 12, 40, 120 and 400 frames, then every 400 for as
+            // long as it lives, unless `VICTORY_HEAP_RECHECK_FOREVER=0`):
+            // the title writes a texture's view, and may fill the
+            // texture's memory itself only afterwards, with no descriptor
+            // write and nothing from the runtime to tell of it. The host
+            // copy then kept what the memory held at the first look for
+            // the rest of the run. The look reads the texture
+            // (`VICTORY_TEXTURE_FULL_RECHECK=0`: 48 KiB of it); only a
+            // changed texture is uploaded again.
             // `VICTORY_HEAP_RECHECK=0`: uploaded once, as before.
             // One found changed by such a look is looked at in the next frame
             // again: the textures left that change unnoticed are ones the
@@ -3165,12 +3232,35 @@ impl State {
             // was shown four frames late, over and over.
             let mut again_in = RECHECK_FRAMES[0];
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
-                if crate::texture::fingerprint(at, len) == print {
+                // A whole look reads all of the texture: this frame's bytes
+                // bound how many; the slots over it stay due for a later
+                // pass, which reads them once the next frame has begun.
+                if full_recheck() {
+                    if RECHECK_SPENT.load(Ordering::Relaxed) >= RECHECK_AT_MOST {
+                        HEAP_TEXTURES_FULL_RECHECK[2].fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    RECHECK_SPENT.fetch_add(len, Ordering::Relaxed);
+                    HEAP_TEXTURES_FULL_RECHECK[0].fetch_add(1, Ordering::Relaxed);
+                    HEAP_TEXTURES_FULL_RECHECK[1].fetch_add(len, Ordering::Relaxed);
+                }
+                if recheck_fingerprint(at, len) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {
                         Some(wait) => {
                             host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
                         }
+                        // The schedule has ended: the slot stays on its
+                        // longest wait (`recheck_forever`).
+                        None if recheck_forever() => host.texture_slot_recheck(
+                            index,
+                            write,
+                            frame + RECHECK_FRAMES[RECHECK_FRAMES.len() - 1],
+                            (at, len),
+                            print,
+                            looks,
+                            uploaded,
+                        ),
                         None => host.texture_slot_done(index, write, None),
                     }
                     continue;
@@ -3389,7 +3479,7 @@ impl State {
                 let memory = if again.is_none() && heap_recheck() { crate::texture::title_span(resource, first) } else { None };
                 match memory {
                     Some((at, len)) => {
-                        let print = crate::texture::fingerprint(at, len);
+                        let print = recheck_fingerprint(at, len);
                         host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
                     }
                     None => host.texture_slot_done(index, write, again),
@@ -3538,7 +3628,7 @@ impl State {
                     } else {
                         len
                     };
-                    let print = crate::texture::fingerprint(at, len);
+                    let print = recheck_fingerprint(at, len);
                     host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
                 }
                 None => host.texture_slot_done(index, write, again),
@@ -5608,6 +5698,32 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::staging_budget_per_frame;
+
+    /// A look that reads the whole texture sees a square written between
+    /// the three windows the short look reads; both find memory left alone
+    /// as it was. (With `--nocapture`: what such a look costs here.)
+    #[test]
+    fn a_whole_look_sees_what_was_written_between_the_windows() {
+        let mut texture = vec![0x5au8; 32 << 20];
+        let (at, len) = (texture.as_ptr() as u64, texture.len() as u64);
+        let windows = crate::texture::fingerprint(at, len);
+        let began = std::time::Instant::now();
+        let whole = super::whole_fingerprint(at, len);
+        eprintln!("a whole look at 32 MiB: {:.2} ms", began.elapsed().as_secs_f64() * 1e3);
+        assert_ne!(whole, 0);
+        assert_eq!(super::whole_fingerprint(at, len), whole);
+        // A 64x64 square of 4 byte texels, 5 MiB in: between the windows at
+        // the start, the middle and the end.
+        texture[5 << 20..(5 << 20) + 64 * 64 * 4].fill(0xa5);
+        assert_eq!(crate::texture::fingerprint(at, len), windows, "the windows are as they were");
+        assert_ne!(super::whole_fingerprint(at, len), whole);
+        // One byte, in the last piece (not a whole one).
+        let whole = super::whole_fingerprint(at, len - 100);
+        texture[(32 << 20) - 101] ^= 1;
+        assert_ne!(super::whole_fingerprint(at, len - 100), whole);
+        // Nothing to read: still not 0.
+        assert_ne!(super::whole_fingerprint(at, 0), 0);
+    }
 
     #[test]
     fn staging_budget_scales_with_vram_budget() {
