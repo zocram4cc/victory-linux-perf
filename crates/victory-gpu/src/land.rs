@@ -52,7 +52,7 @@ fn threads() -> usize {
     static THREADS: OnceLock<usize> = OnceLock::new();
     *THREADS.get_or_init(|| {
         let asked = std::env::var("VICTORY_LAND_THREADS").ok().and_then(|v| v.trim().parse().ok());
-        asked.unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get() / 4).clamp(1, 4)).clamp(1, 16)
+        asked.unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get() / 2).clamp(1, 8)).clamp(1, 16)
     })
 }
 
@@ -63,10 +63,10 @@ fn beside_on() -> bool {
 }
 
 /// Whether pieces an earlier fetch holds as they are now are left out
-/// ([`Had`]; `VICTORY_LAND_SKIP=1`, off by default: counted either way).
+/// ([`Had`]; `VICTORY_LAND_SKIP`, on unless `0`).
 pub(crate) fn skip_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_SKIP").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_SKIP").is_none_or(|v| v != "0"))
 }
 
 /// Since the last frame-rate line; microseconds first.

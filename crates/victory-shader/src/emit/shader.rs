@@ -40,28 +40,35 @@ pub const SLOT_VIEW_ADDRESS_OFFSET: u32 = SLOT_STRIDES_COUNT * 4;
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,
 /// descriptors and other memory (the ray-tracing structure builder and the
-/// programs that walk its structures). The host keeps copies of the title
-/// memory shaders use; a shader with such an access finds the copy by the
-/// address:
+/// programs that walk its structures). The host mirrors the pages shaders
+/// use into reserved 2 GiB window buffers; a shader reaches an address by
+/// window index and offset, without a directory lookup on the hot path:
 ///
-/// - the root SRV `t<SLOT_MEMORY>` in [`ROOT_CBV_SPACE`] is a directory of
-///   [`MEMORY_PAGES`] entries of two dwords, one per 64 KiB of title
-///   address space: the number of the host copy holding that page (0: none
-///   yet; with [`MEMORY_READ_ONLY`]: stores there are dropped) and the page's
-///   byte offset in that copy;
-/// - copy `n` is the raw buffer view at view-heap slot `base + n`, `base`
-///   the user-data dword of kind [`USER_MEMORY_BASE`]; slot `base` itself
-///   reads zeros and drops writes;
+/// - view-heap slot `base` (`base` the user-data dword of kind
+///   [`USER_MEMORY_BASE`]) is a null raw view that reads zeros and drops
+///   writes; slots `base + 1 ..= base + MEMORY_WINDOWS` hold the 64 read
+///   windows of [`MEMORY_WINDOW_BYTES`] (2 GiB each, covering `< 128 GiB`),
+///   and slots `base + 1 + MEMORY_WINDOWS ..= base + 2 * MEMORY_WINDOWS`
+///   hold the 64 write windows (where read-only title-buffer pages stay
+///   unmapped so stray builder stores drop in hardware);
+/// - the root SRV `t<SLOT_MEMORY>` in [`ROOT_CBV_SPACE`] is a 256 KiB
+///   residency bitmap of [`MEMORY_PAGES`] bits (1 bit per 64 KiB page),
+///   consulted on cold zero/store paths to distinguish resident zero data
+///   from unmapped pages;
 /// - the root UAV `u<SLOT_FAULTS>` takes the page numbers of accesses that
-///   found no copy ([`MEMORY_FAULTS`] dwords, dword 0 a sink), which the
-///   host reads afterwards to make those copies for the frames to come.
+///   found an unmapped page ([`MEMORY_FAULTS`] dwords, dword 0 a sink),
+///   which the host reads afterwards to map those pages for frames to come.
 pub const SLOT_MEMORY: u8 = 254;
 /// See [`SLOT_MEMORY`].
 pub const SLOT_FAULTS: u8 = 253;
-/// Entries of the [`SLOT_MEMORY`] directory: title addresses below 128 GiB.
+/// 64 KiB pages covered by [`SLOT_MEMORY`]: title addresses below 128 GiB.
 pub const MEMORY_PAGES: u32 = 1 << 21;
-/// In a directory entry's first dword: shaders do not store there by address
-/// (a title buffer the structure builder has not been given to write).
+/// Reserved 2 GiB windows covering the 128 GiB by-address space.
+pub const MEMORY_WINDOWS: u32 = 64;
+/// Bytes per reserved window buffer (2 GiB: exact multiple of 64 KiB tiles
+/// and within 32-bit signed DXIL byte offsets and RADV `maxBufferSize`).
+pub const MEMORY_WINDOW_BYTES: u64 = 1 << 31;
+/// Legacy read-only flag constant kept for compatibility.
 pub const MEMORY_READ_ONLY: u32 = 1 << 31;
 /// Dwords of the [`SLOT_FAULTS`] buffer.
 pub const MEMORY_FAULTS: u32 = 4096;

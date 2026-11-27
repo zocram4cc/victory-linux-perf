@@ -2982,7 +2982,7 @@ mod relay_tests {
 fn late_most() -> usize {
     static MOST: OnceLock<usize> = OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_LATE_WAIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(256).max(1)
+        std::env::var("VICTORY_LATE_WAIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(512).max(1)
     })
 }
 
@@ -3506,6 +3506,13 @@ pub(crate) fn joinable<'a>(ahead: impl Iterator<Item = &'a HostList>, next: &[&H
         return false;
     }
     let ahead: Vec<&HostList> = ahead.collect();
+    if next.iter().any(|l| l.used(crate::memory::READ_KEY))
+        && ahead.iter().any(|l| {
+            l.deferred().copies.iter().any(|s| matches!(s, Step::GpuWrite(sh, _, _) if sh.is_in_memory()))
+        })
+    {
+        return false;
+    }
     let mut written: Vec<(usize, usize)> = declared_writes(&ahead).into_iter().flat_map(|(_, ranges)| ranges).collect();
     for list in &ahead {
         let deferred = list.deferred();
@@ -4696,8 +4703,12 @@ impl Host {
         let work = work.as_mut()?;
         // A copy whose shader writes are declared for the first time gets
         // its bytes from before, whole.
+        let whole_wc = |s: &crate::shadow::Shadow| {
+            let (bs, bl) = s.span();
+            crate::wcskip::skip_back(bl, (bs as usize, (bs + bl) as usize), 0)
+        };
         let mut whole: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
-        for shadow in declared.iter().map(|d| &d.0).chain(looked.iter().map(|l| &l.0)) {
+        for shadow in declared.iter().filter(|(s, _)| !whole_wc(s)).map(|d| &d.0).chain(looked.iter().map(|l| &l.0)) {
             if shadow.card_make_before(|size| {
                 let before = self.uav_buffer(crate::shadow::card_hash_bytes(size))?;
                 name(&before, || "title buffer on the card, hashes of its pieces".into());
@@ -4869,6 +4880,9 @@ impl Host {
             }
             let twin = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
             for (from, to) in spans {
+                if crate::wcskip::skip_back(shadow.span().1, (from, to), (to - from) as u64) {
+                    continue;
+                }
                 let Some(span) = shadow.card_span(from, to) else {
                     continue;
                 };
@@ -5104,7 +5118,9 @@ impl Host {
                             let (lo, hi) = r.shadow.card_piece(&r.span, p);
                             let (runs, count) = card_page_runs(start, lo, hi, mask);
                             for &(rlo, rhi) in &runs[..count] {
-                                if !seen.contains(&(copy, rlo, rhi)) {
+                                if !crate::wcskip::skip_back(r.shadow.span().1, r.declared, (rhi - rlo) as u64)
+                                    && !seen.contains(&(copy, rlo, rhi))
+                                {
                                     let key = (r.shadow.id(), start + rlo, rhi - rlo);
                                     if fetch.as_ref().is_some_and(|f| f.had.holds(behind, key)) {
                                         land::count(land::stat::HAD, 1);
@@ -5539,7 +5555,9 @@ impl Host {
                     let (lo, hi) = r.shadow.card_piece(&r.span, p);
                     let (runs, count) = card_page_runs(start, lo, hi, mask);
                     for &(rlo, rhi) in &runs[..count] {
-                        if seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, rlo, rhi)) {
+                        if !crate::wcskip::skip_back(r.shadow.span().1, r.declared, (rhi - rlo) as u64)
+                            && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, rlo, rhi))
+                        {
                             pieces.push((i, rlo, rhi, total));
                             total += (rhi - rlo) as u64;
                         }
@@ -6224,6 +6242,7 @@ impl Host {
         for (shadow, at, bytes) in batch.placed.drain(..) {
             shadow.placed_copy(at, &bytes);
         }
+        crate::memory::before_execute(runs);
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             #[cfg(feature = "diagnostics")]
             marks.push((lists.len(), crate::copystat::Timed::Compare));
@@ -6285,6 +6304,13 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             split.part(5);
             let back = crate::picked::with(declared, &picked.written);
+            for (shadow, ranges) in &back {
+                if shadow.is_in_memory() {
+                    for &(from, to) in ranges {
+                        shadow.note_mirror_dirty_addr(from, to);
+                    }
+                }
+            }
             let mut texture_back_ranges = Vec::new();
             for list in runs {
                 texture_back_ranges.extend(list.deferred().texture_backs.iter().map(crate::texback::Back::range));
@@ -6383,6 +6409,18 @@ impl Host {
             let _ = (_i, started);
         }
         let _ = &firsts;
+        for (shadow, ranges) in &declared {
+            if shadow.is_in_memory() {
+                for &(from, to) in ranges {
+                    shadow.note_mirror_dirty_addr(from, to);
+                }
+            }
+        }
+        for (shadow, at, len) in &picked.written {
+            if shadow.is_in_memory() {
+                shadow.note_mirror_dirty_addr(*at, *at + *len);
+            }
+        }
         FINISHED.store(this_submission, Ordering::Release);
         bury(this_submission);
         let gpu = prepared.elapsed();
@@ -7873,6 +7911,25 @@ impl HostList {
     /// reset.
     pub(crate) fn used(&self, key: usize) -> bool {
         self.deferred().textures.contains(&key)
+    }
+
+    /// Returns the `[lo_addr, hi_addr)` title-address span written by any
+    /// `Step::GpuWrite` recorded so far on this list for `shadow`.
+    pub(crate) fn gpu_written_span(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>) -> Option<(u64, u64)> {
+        let mut span: Option<(u64, u64)> = None;
+        for step in &self.deferred().copies {
+            if let Step::GpuWrite(s, at, len) = step
+                && *len > 0
+                && std::sync::Arc::ptr_eq(s, shadow)
+            {
+                let (lo, hi) = (*at as u64, (*at + *len) as u64);
+                span = Some(match span {
+                    Some((a, b)) => (a.min(lo), b.max(hi)),
+                    None => (lo, hi),
+                });
+            }
+        }
+        span
     }
 
     /// Runs `work` when the list is submitted, in order with its copies.

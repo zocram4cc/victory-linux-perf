@@ -152,8 +152,10 @@ thread_local! {
     static TESTED_DEPTH: std::cell::Cell<(usize, bool)> =
         const { std::cell::Cell::new((0, false)) };
     /// While a stage's tables are walked (`State::tables`): whether that
-    /// stage's shader can store to buffers (`Translated::stores`).
+    /// stage's shader can store to buffers (`Translated::stores`), and
+    /// whether the pipeline is a ray-tracing structure builder stage.
     static STORES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    static IS_BUILDER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// While `State::early_textures` runs the texture pass: the
     /// milliseconds and the bytes that run may take, in place of the
     /// pass's own per frame.
@@ -1696,14 +1698,17 @@ impl State {
             // The title may release the pipeline before it submits the list.
             list.bind_pipeline(&p.name, &p.pso, &p.root);
         }
+        let is_bvh_builder = crate::pipeline::is_builder(self.pipeline as This);
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
+            IS_BUILDER.set(is_bvh_builder);
             if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
                 crate::picked::runs_in(list);
             }
             let made = self.tables(list, &t.tables, compute);
             STORES.set(true);
+            IS_BUILDER.set(false);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return false;
@@ -1922,13 +1927,20 @@ impl State {
             }
             Some(s)
         };
+        let is_bvh_builder = crate::pipeline::is_builder(self.pipeline as This);
         let ready = |a: u64, s: &std::sync::Arc<crate::shadow::Shadow>| {
             let len = s.left(a).min(limit);
             s.refresh(list, a, len);
             if writes {
-                #[cfg(feature = "diagnostics")]
-                crate::host::wide_write(a, len, self.pipeline);
-                s.gpu_writes(list, a, len);
+                // Builder scratch and structure buffers (> 64 KiB) stay on the
+                // card; only small result/size buffers (<= 64 KiB) come back.
+                if is_bvh_builder && s.span().1 > (64 << 10) {
+                    s.keep_stores();
+                } else {
+                    #[cfg(feature = "diagnostics")]
+                    crate::host::wide_write(a, len, self.pipeline);
+                    s.gpu_writes(list, a, len);
+                }
             }
         };
         if !crate::pipeline::host::bounded_root_srvs() {
@@ -4585,9 +4597,13 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // A shader that cannot store to buffers leaves the range as
             // the title has it: nothing to find afterwards.
             if STORES.get() || !write_skip() {
-                #[cfg(feature = "diagnostics")]
-                crate::host::wide_write(address, len, 0);
-                shadow.gpu_writes(list, address, len);
+                if IS_BUILDER.get() && shadow.span().1 > (64 << 10) {
+                    shadow.keep_stores();
+                } else {
+                    #[cfg(feature = "diagnostics")]
+                    crate::host::wide_write(address, len, 0);
+                    shadow.gpu_writes(list, address, len);
+                }
             } else {
                 #[cfg(feature = "diagnostics")]
                 {

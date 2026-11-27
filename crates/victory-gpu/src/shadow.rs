@@ -83,6 +83,11 @@ pub(crate) struct Shadow {
     unsized_asks: AtomicU64,
     /// Whether shaders were ever declared to write it.
     written: std::sync::atomic::AtomicBool,
+    /// Whether `crate::memory` mirrors pages of this buffer into its reserved
+    /// 2 GiB windows, and the `[lo, hi)` byte offsets inside `buffer` modified
+    /// since `crate::memory` last synced them.
+    in_memory: std::sync::atomic::AtomicBool,
+    mirror_dirty: Mutex<Option<(usize, usize)>>,
     /// A number no other copy has had. Its address is no name for a copy:
     /// one let go and another made may share it.
     id: u64,
@@ -219,20 +224,24 @@ fn card_limits() -> (u64, u64) {
     *LIMITS.get_or_init(|| {
         let env_mb = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
         let vram_budget = crate::host::host().and_then(|h| h.video_memory()).map(|[budget, ..]| budget);
+        let min_mb_env = env_mb("VICTORY_CARD_BUFFERS_MIN_MB");
         let (mut min_bytes, max_bytes) = resolve_card_limits(
             vram_budget,
-            env_mb("VICTORY_CARD_BUFFERS_MIN_MB"),
+            min_mb_env,
             env_mb("VICTORY_CARD_BUFFERS_MB"),
         );
         // `VICTORY_CARD_BUFFERS_MIN_KB` (after fxceless c36971b2) says the
         // least size in KiB, so that it can go under 1 MiB: 64 is every title
         // buffer. Copies under 1 MiB are nearly all there are and few bytes;
         // in the PC's memory every load, store and atomic a shader does on
-        // them crosses the bus.
+        // them crosses the bus. On >= 20 GiB VRAM cards, default to 64 KiB
+        // unless overridden by env.
         if let Some(kib) = std::env::var("VICTORY_CARD_BUFFERS_MIN_KB").ok().and_then(|v| v.trim().parse::<u64>().ok())
             && kib > 0
         {
             min_bytes = kib << 10;
+        } else if min_mb_env.is_none() && vram_budget.is_some_and(|b| (b >> 20) >= 20 * 1024) {
+            min_bytes = 64 << 10;
         }
         if card_all() {
             min_bytes = 0;
@@ -3224,6 +3233,8 @@ impl Shadow {
             asked: [AtomicU64::new(u64::MAX), AtomicU64::new(0)],
             unsized_asks: AtomicU64::new(0),
             written: Default::default(),
+            in_memory: Default::default(),
+            mirror_dirty: Mutex::default(),
             id: {
                 static NEXT: AtomicU64 = AtomicU64::new(1);
                 NEXT.fetch_add(1, Ordering::Relaxed)
@@ -3962,6 +3973,7 @@ impl Shadow {
                 // written here and nothing around them.
                 unsafe { std::ptr::copy_nonoverlapping(title.as_ptr().add(r), self.data.add(at + r), m) };
                 held[r..r + m].copy_from_slice(&title[r..r + m]);
+                self.note_mirror_dirty(at + r, at + r + m);
             }
             Ok(Some(runs))
         })
@@ -4454,17 +4466,21 @@ impl Shadow {
 
     /// [`Shadow::card_changed`] of each of `runs`.
     fn card_changed_runs(&self, runs: impl Iterator<Item = (usize, usize)>) {
+        let most = runs.size_hint().0;
+        let mut collected: Vec<(usize, usize)> = Vec::with_capacity(most);
+        for (from, to) in runs.filter(|r| r.0 < r.1) {
+            self.note_mirror_dirty(from, to);
+            collected.push((from, to));
+        }
+        if collected.is_empty() {
+            return;
+        }
         let Some(card) = &self.card else {
             return;
         };
-        let most = runs.size_hint().0;
-        let mut runs = runs.filter(|r| r.0 < r.1).peekable();
-        if runs.peek().is_none() {
-            return;
-        }
         let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
-        dirty.reserve(most);
-        for (from, to) in runs {
+        dirty.reserve(collected.len());
+        for (from, to) in collected {
             match dirty.last_mut() {
                 Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
                 _ => dirty.push((from, to)),
@@ -4472,6 +4488,46 @@ impl Shadow {
         }
         // (Under the lock: what takes the list sees it or finds it set.)
         card.touched.store(true, Ordering::Release);
+    }
+
+    /// Marks this buffer as mirrored in `crate::memory`'s reserved windows.
+    pub(crate) fn set_in_memory(&self) {
+        self.in_memory.store(true, Ordering::Release);
+        self.note_mirror_dirty(0, self.len as usize);
+    }
+
+    /// Whether `crate::memory` mirrors pages of this buffer.
+    pub(crate) fn is_in_memory(&self) -> bool {
+        self.in_memory.load(Ordering::Acquire)
+    }
+
+    /// Records that offsets `[from_off, to_off)` inside `buffer` changed.
+    pub(crate) fn note_mirror_dirty(&self, from_off: usize, to_off: usize) {
+        if from_off >= to_off || !self.in_memory.load(Ordering::Acquire) {
+            return;
+        }
+        let mut guard = self.mirror_dirty.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(match *guard {
+            Some((lo, hi)) => (lo.min(from_off), hi.max(to_off)),
+            None => (from_off, to_off),
+        });
+    }
+
+    /// Records that title addresses `[from_addr, to_addr)` inside `buffer` changed.
+    pub(crate) fn note_mirror_dirty_addr(&self, from_addr: usize, to_addr: usize) {
+        if from_addr >= to_addr || !self.in_memory.load(Ordering::Acquire) {
+            return;
+        }
+        let (lo, hi) = self.inside(from_addr, to_addr - from_addr);
+        self.note_mirror_dirty(lo, hi);
+    }
+
+    /// Takes any accumulated `[lo_off, hi_off)` dirty span for `crate::memory`.
+    pub(crate) fn take_mirror_dirty(&self) -> Option<(usize, usize)> {
+        if !self.in_memory.load(Ordering::Acquire) {
+            return None;
+        }
+        self.mirror_dirty.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 
     /// Whether shaders were ever declared to write it.
@@ -4490,6 +4546,7 @@ impl Shadow {
         if from >= to || self.place.is_some() {
             return;
         }
+        self.note_mirror_dirty(from, to);
         let bytes = &bytes[self.start as usize + from - address..][..to - from];
         let _merging = self.merging.write().unwrap_or_else(|e| e.into_inner());
         if self.card.is_some() {

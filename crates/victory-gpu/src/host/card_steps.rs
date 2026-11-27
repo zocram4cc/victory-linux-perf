@@ -100,7 +100,7 @@ fn placed_order() -> bool {
         return on;
     }
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| crate::switch::on("VICTORY_PLACED_ORDER"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PLACED_ORDER").is_none_or(|v| v != "0"))
 }
 
 /// Why [`plan`] refuses for [`place`].
@@ -417,21 +417,52 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
     // Which step each is. One list's lock at a time: a submission may
     // name a list twice.
     let mut steps = Vec::new();
+    // Active `Step::Placed` copies `(dst, src, len)` whose source was not
+    // written by an earlier intra-submission `GpuWrite`/`Run` and has not been
+    // overwritten since: a subsequent `Step::Fill` covered by `[dst, dst + len)`
+    // reads the same bytes at `src + (fill_src - dst)`, avoiding `BEHIND_PLACED`
+    // stalls when both stand in the same list.
+    let mut placed_forwards: Vec<(usize, usize, usize)> = Vec::new();
+    let mut gpu_written: Vec<(usize, usize)> = Vec::new();
+    let invalidate = |forwards: &mut Vec<(usize, usize, usize)>, range: (usize, usize)| {
+        forwards.retain(|&(pdst, psrc, plen)| {
+            !meet(range, (pdst, pdst + plen)) && !meet(range, (psrc, psrc + plen))
+        });
+    };
     for list in runs {
         for (i, step) in list.deferred().copies.iter().enumerate() {
             does.push(match step {
-                &Step::Copy(dst, src, len) => Does::Copy {
-                    dst,
-                    src,
-                    len,
-                    asked: copy_blocked(written, dst, src, len).is_some(),
-                },
-                Step::Fill(_, src, len, to) => Does::Fill {
-                    src: *src,
-                    len: *len,
-                    asked: read_blocked(written, *src, *len),
-                    to: to.is_some(),
-                },
+                &Step::Copy(dst, src, len) => {
+                    invalidate(&mut placed_forwards, (dst, dst + len));
+                    Does::Copy {
+                        dst,
+                        src,
+                        len,
+                        asked: copy_blocked(written, dst, src, len).is_some(),
+                    }
+                }
+                Step::Fill(_, src, len, to) => {
+                    if let Some(&(pdst, psrc, _)) = placed_forwards
+                        .iter()
+                        .rev()
+                        .find(|&&(pdst, _, plen)| pdst <= *src && *src + *len <= pdst + plen)
+                    {
+                        let f_src = psrc + (*src - pdst);
+                        Does::Fill {
+                            src: f_src,
+                            len: *len,
+                            asked: true,
+                            to: to.is_some(),
+                        }
+                    } else {
+                        Does::Fill {
+                            src: *src,
+                            len: *len,
+                            asked: read_blocked(written, *src, *len),
+                            to: to.is_some(),
+                        }
+                    }
+                }
                 Step::Texture(staging) => {
                     let (at, len) = staging.memory();
                     Does::Read {
@@ -446,9 +477,29 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
                     from: *at,
                     to: *at + *len,
                 },
-                Step::Run(_) => Does::Run,
-                Step::Placed(p) => Does::Placed { dst: p.dst, src: p.src, len: p.len },
-                Step::GpuWrite(..) | Step::Host(..) => continue,
+                Step::Run(_) => {
+                    placed_forwards.clear();
+                    Does::Run
+                }
+                Step::Placed(p) => {
+                    invalidate(&mut placed_forwards, (p.dst, p.dst + p.len));
+                    if p.len > 0
+                        && !meet((p.src, p.src + p.len), (p.dst, p.dst + p.len))
+                        && !touched(&gpu_written, (p.src, p.src + p.len))
+                    {
+                        placed_forwards.push((p.dst, p.src, p.len));
+                    }
+                    Does::Placed { dst: p.dst, src: p.src, len: p.len }
+                }
+                Step::GpuWrite(_, at, len) => {
+                    if *len > 0 {
+                        let range = (*at, *at + *len);
+                        invalidate(&mut placed_forwards, range);
+                        join_ranges(&mut gpu_written, [range]);
+                    }
+                    continue;
+                }
+                Step::Host(..) => continue,
             });
             steps.push((std::ptr::from_ref::<HostList>(list) as usize, i));
         }
@@ -504,10 +555,10 @@ type HashMap<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefau
 
 /// Where the bytes of the fill that is `step` (its list by address, its place
 /// in it) go.
-fn fill_to(runs: &[&HostList], step: (usize, usize)) -> Option<FillTo> {
+fn fill_to(runs: &[&HostList], step: (usize, usize)) -> Option<(usize, FillTo)> {
     let list = runs.iter().find(|l| std::ptr::from_ref::<HostList>(l) as usize == step.0)?;
     match list.deferred().copies.get(step.1)? {
-        Step::Fill(_, _, _, to) => to.clone(),
+        Step::Fill(dst, _, _, to) => Some((*dst as usize, to.clone()?)),
         _ => None,
     }
 }
@@ -701,6 +752,7 @@ impl Host {
             all
         };
         let mut ops: Vec<Op> = Vec::with_capacity(chosen.len());
+        let mut cpu_fills: Vec<(usize, usize, usize)> = Vec::new();
         // The places read (host copy, address, bytes, level): where in the
         // buffer between their bytes are.
         let mut places: HashMap<(usize, usize, usize, u32), u64> = HashMap::default();
@@ -721,11 +773,27 @@ impl Host {
             }
             let from = match held.get(&(src, len)) {
                 Some(from) => from.clone(),
-                None => {
-                    let from = holder(&writers, src, src + len)?;
-                    held.insert((src, len), from.clone());
-                    from
-                }
+                None => match holder(&writers, src, src + len) {
+                    Ok(from) => {
+                        held.insert((src, len), from.clone());
+                        from
+                    }
+                    Err(e) => {
+                        if matches!(does[i], Does::Fill { .. })
+                            && !touches(written, src, src + len)
+                            && !writers.iter().any(|w| meet((w.from, w.to), (src, src + len)))
+                            && let Some((fill_dst, _)) = fill_to(runs, steps[i])
+                            && fill_dst != 0
+                        {
+                            if !mapped(src, src + len, &mut room) {
+                                return Err("not all of what it reads is mapped");
+                            }
+                            cpu_fills.push((fill_dst, src, len));
+                            continue;
+                        }
+                        return Err(e);
+                    }
+                },
             };
             let place = (Arc::as_ptr(&from) as usize, src, len, level);
             let at = match places.get(&place) {
@@ -763,7 +831,7 @@ impl Host {
                     held.clear();
                     To::Copy(to, dst)
                 }
-                _ => match fill_to(runs, steps[i]) {
+                _ => match fill_to(runs, steps[i]).map(|(_, to)| to) {
                     Some(FillTo::Slot(heap, index)) => To::Slot(heap, index),
                     Some(FillTo::Buffer(buffer)) => To::Buffer(buffer),
                     None => continue,
@@ -781,6 +849,20 @@ impl Host {
         let Some(own) = self.own_list() else {
             return Err("no host list or buffer for it");
         };
+        for &(fill_dst, src, len) in &cpu_fills {
+            copy_mapped(fill_dst as *mut u8, src as *const u8, len, false);
+        }
+        if ops.is_empty() {
+            own.list.close();
+            DONE[0].fetch_add(cpu_fills.len() as u64, Ordering::Relaxed);
+            DONE[2].fetch_add(cpu_fills.iter().map(|f| f.2 as u64).sum(), Ordering::Relaxed);
+            spent.end();
+            return Ok(Some(Taken {
+                own,
+                steps: chosen.iter().map(|&(i, _)| steps[i]).collect(),
+                copied: Vec::new(),
+            }));
+        }
         // First every refresh, then the writes: the bytes compared with are
         // the title's. (One step for each host copy, over all that is read of
         // it: a flush brings a copy up to date from the first range asked for
@@ -846,9 +928,13 @@ impl Host {
             }
         });
         let copies = ops.iter().filter(|op| matches!(op.to, To::Copy(..))).count();
-        DONE[0].fetch_add((ops.len() - copies) as u64, Ordering::Relaxed);
+        DONE[0].fetch_add((ops.len() - copies + cpu_fills.len()) as u64, Ordering::Relaxed);
         DONE[1].fetch_add(copies as u64, Ordering::Relaxed);
-        DONE[2].fetch_add(ops.iter().map(|op| op.len as u64).sum(), Ordering::Relaxed);
+        DONE[2].fetch_add(
+            ops.iter().map(|op| op.len as u64).sum::<u64>()
+                + cpu_fills.iter().map(|f| f.2 as u64).sum::<u64>(),
+            Ordering::Relaxed,
+        );
         #[cfg(feature = "diagnostics")]
         noted(&ops);
         spent.end();

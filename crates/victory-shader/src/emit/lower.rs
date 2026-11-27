@@ -3165,16 +3165,100 @@ impl<'a> Lower<'a> {
         (sum, hi)
     }
 
-    /// Title memory at the 40-bit address `lo`, `hi` (`shader.rs`
-    /// `SLOT_MEMORY`): the handle of the raw view of the host copy holding
-    /// it and the byte in that view. A page without a copy reads zeros
-    /// (and drops writes) through the null view at the first slot, and its
-    /// number is left for the host, for lanes that run (`guard`). Goes on in
-    /// another block.
-    /// With `store`, a page that is not to be written ([`super::shader::MEMORY_READ_ONLY`])
-    /// is the null view.
-    fn memory(&mut self, lo: V, hi: V, guard: Option<V>, store: bool) -> (V, V) {
-        use super::shader::{MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE};
+    /// Windowed title memory at the 40-bit address `lo`, `hi`: the handle of
+    /// the 2 GiB reserved window view holding it and the byte offset in that
+    /// window, computed directly from the address in the current block without
+    /// a directory lookup.
+    ///
+    /// Heap slot, byte offset, and DXIL resource-annotation properties for
+    /// 40-bit address `lo`, `hi` in the reserved 2 GiB windows:
+    /// - `base + 0`: null SRV (`ByteAddressBuffer`)
+    /// - `base + 1`: null UAV (`RWByteAddressBuffer`)
+    /// - `base + 2 .. base + 2 + MEMORY_WINDOWS`: read SRV windows (non-builder loads)
+    /// - `base + 2 + MEMORY_WINDOWS .. base + 2 + 2 * MEMORY_WINDOWS`: read UAV windows (builder loads)
+    /// - `base + 2 + 2 * MEMORY_WINDOWS .. base + 2 + 3 * MEMORY_WINDOWS`: write UAV windows (stores/atomics)
+    pub(super) fn memory_window_slot(&mut self, lo: V, hi: V, store: bool) -> (V, V, (u32, u32)) {
+        use super::shader::{MEMORY_WINDOWS, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE};
+        let _ = self.s.root_srv_handle(SLOT_MEMORY);
+        let _ = self.s.root_uav_handle(SLOT_FAULTS);
+        let spilled = crate::spill::is_spilled(self.x.native);
+        let use_uav = store || spilled;
+        let c = self.cur;
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        let (null_slot, k1, k31, k8, k32) = (
+            k(self, u32::from(use_uav)),
+            k(self, 1),
+            k(self, 31),
+            k(self, 0xFF),
+            k(self, 0x20),
+        );
+        let hi8 = self.s.m.bin(c, Bin::And, hi, k8);
+        let win_hi = self.s.m.bin(c, Bin::Shl, hi8, k1);
+        let win_lo = self.s.m.bin(c, Bin::LShr, lo, k31);
+        let win = self.s.m.bin(c, Bin::Or, win_hi, win_lo);
+        let win_bias = if store {
+            2 + 2 * MEMORY_WINDOWS
+        } else if spilled {
+            2 + MEMORY_WINDOWS
+        } else {
+            2
+        };
+        let bias = k(self, win_bias);
+        let win_slot = self.s.m.bin(c, Bin::Add, win, bias);
+        let in_range = self.s.m.cmp(c, pred::IULT, hi8, k32);
+        let win_slot = self.s.m.select(c, in_range, win_slot, null_slot);
+        let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
+        let slot = self.s.m.bin(c, Bin::Add, base, win_slot);
+        let props = if use_uav {
+            let coherent = if spilled { 0x4000 } else { 0 };
+            (11 | 0x1000 | coherent, 0)
+        } else {
+            (11, 0)
+        };
+        let byte_mask = k(self, 0x7FFF_FFFF);
+        let byte = self.s.m.bin(c, Bin::And, lo, byte_mask);
+        (slot, byte, props)
+    }
+
+    /// Wave-uniform check for `slot` across active host lanes (compute/vertex/mesh
+    /// stages): returns `Some((uniform_slot, is_uniform))` when `!self.s.pixel`.
+    pub(super) fn wave_uniform_slot(&mut self, slot: V) -> Option<(V, V)> {
+        if self.s.pixel {
+            return None;
+        }
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        self.s.flags |= flags::WAVE_OPS;
+        let first = self
+            .s
+            .op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[slot]);
+        let diff = self.s.m.bin(c, Bin::Xor, slot, first);
+        let or_op = self.s.m.i8(1);
+        let any_diff = self
+            .s
+            .op(c, "waveActiveBit.i32", Attr::NoUnwind, i32t, 120, &[diff, or_op]);
+        let zero = self.s.m.i32(0);
+        let is_uniform = self.s.m.cmp(c, pred::EQ, any_diff, zero);
+        Some((first, is_uniform))
+    }
+
+    /// Windowed title memory at 40-bit address `lo`, `hi`: returns the raw
+    /// buffer handle of its 2 GiB window and the byte offset inside that
+    /// window, computed directly from the address in the current block without
+    /// a directory lookup.
+    pub(super) fn memory_window(&mut self, lo: V, hi: V, store: bool) -> (V, V) {
+        let (slot, byte, props) = self.memory_window_slot(lo, hi, store);
+        let c = self.cur;
+        let h = self.s.heap_handle(c, slot, false, true, props);
+        (h, byte)
+    }
+
+    /// Checks the 256 KiB residency bitmap (`SLOT_MEMORY`, 1 bit per 64 KiB
+    /// page) for `lo`, `hi`; if the page is unmapped, records its page number
+    /// into `SLOT_FAULTS` for lanes that run (`guard`). Leaves `self.cur` at
+    /// the joined block and returns whether the page is resident (`i1`).
+    pub(super) fn memory_resident_or_fault(&mut self, lo: V, hi: V, guard: Option<V>) -> V {
+        use super::shader::{MEMORY_FAULTS, MEMORY_PAGES, SLOT_FAULTS, SLOT_MEMORY};
         let c = self.cur;
         let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
@@ -3183,34 +3267,33 @@ impl<'a> Lower<'a> {
         let high = self.s.m.bin(c, Bin::And, hi, k8);
         let high = self.s.m.bin(c, Bin::Shl, high, k16);
         let page = self.s.m.bin(c, Bin::Or, low, high);
-        // Inside the directory whatever the address (lanes that do not run
-        // compute one too); its last entry is never filled.
+        // Inside the bitmap whatever the address (lanes that do not run
+        // compute one too); its last bit is never set.
         let last = k(self, MEMORY_PAGES - 1);
         let page = self
             .s
             .op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[page, last]);
         self.s.m.tag(page, Tag::Clamp);
-        let k3 = k(self, 3);
-        let at = self.s.m.bin(c, Bin::Shl, page, k3);
+        let (k3, align4_mask) = (k(self, 3), k(self, !3));
+        let word_byte = self.s.m.bin(c, Bin::LShr, page, k3);
+        let word_byte = self.s.m.bin(c, Bin::And, word_byte, align4_mask);
         let directory = self.s.root_srv_handle(SLOT_MEMORY);
-        let (iu, both, align) = (self.s.m.undef(i32t), self.s.m.i8(3), k(self, 4));
+        let (iu, one_mask, align) = (self.s.m.undef(i32t), self.s.m.i8(1), k(self, 4));
         let entry = self.s.op(
             c,
             "rawBufferLoad.f32",
             Attr::ReadOnly,
             res,
             139,
-            &[directory, at, iu, both, align],
+            &[directory, word_byte, iu, one_mask, align],
         );
-        let (copy, start) = (self.s.m.extract(c, entry, 0), self.s.m.extract(c, entry, 1));
-        let (number, start) = (self.as_int(copy), self.as_int(start));
-        let mask = k(self, !MEMORY_READ_ONLY);
-        let copy = self.s.m.bin(c, Bin::And, number, mask);
-        // A page without a copy: its number, at a place by the number. In a
-        // branch: the notes lie in the PC's memory, and a store there with
-        // every node of every ray would be most of what a trace does.
-        let zero = k(self, 0);
-        let mut missing = self.s.m.cmp(c, pred::EQ, copy, zero);
+        let bits = self.s.m.extract(c, entry, 0);
+        let bits = self.as_int(bits);
+        let (k31, one, zero) = (k(self, 31), k(self, 1), k(self, 0));
+        let bit_idx = self.s.m.bin(c, Bin::And, page, k31);
+        let shifted = self.s.m.bin(c, Bin::LShr, bits, bit_idx);
+        let bit = self.s.m.bin(c, Bin::And, shifted, one);
+        let mut missing = self.s.m.cmp(c, pred::EQ, bit, zero);
         if let Some(g) = guard {
             missing = self.s.m.bin(c, Bin::And, missing, g);
         }
@@ -3219,39 +3302,33 @@ impl<'a> Lower<'a> {
         let noting = self.begin_guarded(Some(missing));
         let c = self.cur;
         let place = self.s.m.bin(c, Bin::URem, page, places);
-        let one = k(self, 1);
         let place = self.s.m.bin(c, Bin::Add, place, one);
         let k2 = k(self, 2);
         let place = self.s.m.bin(c, Bin::Shl, place, k2);
         let void = self.s.t.void;
-        let mask = self.s.m.i8(1);
         self.s.op(
             c,
             "rawBufferStore.i32",
             Attr::NoUnwind,
             void,
             140,
-            &[faults, place, iu, page, iu, iu, iu, mask, align],
+            &[faults, place, iu, page, iu, iu, iu, one_mask, align],
         );
         self.end_guarded(noting, &[]);
         let c = self.cur;
-        self.page_there = Some(self.s.m.cmp(c, pred::NE, copy, zero));
-        let copy = if store {
-            let closed = self.s.m.cmp(c, pred::SLT, number, zero);
-            self.s.m.select(c, closed, zero, copy)
-        } else {
-            copy
-        };
-        let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
-        let slot = self.s.m.bin(c, Bin::Add, base, copy);
-        // The builder's threads read what others of the dispatch wrote (a
-        // refit climbs from children to parents): globally coherent.
-        let coherent = if crate::spill::is_spilled(self.x.native) { 0x4000 } else { 0 };
-        let h = self.s.heap_handle(c, slot, false, true, (11 | 0x1000 | coherent, 0));
-        let k64k = k(self, 0xFFFF);
-        let within = self.s.m.bin(c, Bin::And, lo, k64k);
-        let byte = self.s.m.bin(c, Bin::Add, start, within);
-        (h, byte)
+        let there = self.s.m.cmp(c, pred::NE, bit, zero);
+        self.page_there = Some(there);
+        there
+    }
+
+    /// Title memory at the 40-bit address `lo`, `hi` (`shader.rs`
+    /// `SLOT_MEMORY`): the handle of the reserved 2 GiB window view holding
+    /// it and the byte in that view. Unmapped tiles read zeros and drop
+    /// writes in hardware, and missing pages are noted in `SLOT_FAULTS` for
+    /// lanes that run (`guard`). Goes on in another block.
+    fn memory(&mut self, lo: V, hi: V, guard: Option<V>, store: bool) -> (V, V) {
+        let _ = self.memory_resident_or_fault(lo, hi, guard);
+        self.memory_window(lo, hi, store)
     }
 
     /// The title address in the root view `src` is built around, in a program
@@ -3354,21 +3431,86 @@ impl<'a> Lower<'a> {
             let Some(Operand::Vector { reg, .. }) = *dst else {
                 return Err("a global load result");
             };
-            let (h, byte) = self.memory(lo, hi, guard, false);
-            let c = self.cur;
+            let zero = self.s.m.i32(0);
             let mask = self.s.m.i8((1u8 << n) - 1);
-            let r = self.s.op(
-                c,
-                "rawBufferLoad.f32",
-                Attr::ReadOnly,
-                res,
-                139,
-                &[h, byte, iu, mask, align],
-            );
-            for k in 0..n {
-                let x = self.s.m.extract(c, r, u32::from(k));
-                let x = self.as_int(x);
-                self.write(inst, Reg::V(reg + k), x, guard);
+            let gate = self.begin_guarded(guard);
+            let (slot, byte, props) = self.memory_window_slot(lo, hi, false);
+            let vals = match self.wave_uniform_slot(slot) {
+                Some((uni_slot, is_uni)) => {
+                    let head = self.cur;
+                    let (uni_blk, div_blk, join_blk) = (
+                        self.s.m.new_block(),
+                        self.s.m.new_block(),
+                        self.s.m.new_block(),
+                    );
+                    self.s
+                        .m
+                        .terminate(head, Term::CondBr(is_uni, uni_blk, div_blk));
+
+                    let emit_load = |l: &mut Self, blk: usize, s_idx: V, nonuni: bool| -> Vec<V> {
+                        let h = l.s.heap_handle(blk, s_idx, false, nonuni, props);
+                        let r = l.s.op(
+                            blk,
+                            "rawBufferLoad.f32",
+                            Attr::ReadOnly,
+                            res,
+                            139,
+                            &[h, byte, iu, mask, align],
+                        );
+                        l.cur = blk;
+                        let mut out = Vec::with_capacity(usize::from(n));
+                        for k in 0..n {
+                            let x = l.s.m.extract(blk, r, u32::from(k));
+                            out.push(l.as_int(x));
+                        }
+                        l.s.m.terminate(blk, Term::Br(join_blk));
+                        out
+                    };
+                    let u_vals = emit_load(self, uni_blk, uni_slot, false);
+                    let d_vals = emit_load(self, div_blk, slot, true);
+                    self.cur = join_blk;
+                    u_vals
+                        .into_iter()
+                        .zip(d_vals)
+                        .map(|(a, b)| {
+                            let phi = self.s.m.phi(join_blk, i32t);
+                            self.s.m.set_phi(phi, vec![(a, uni_blk), (b, div_blk)]);
+                            phi
+                        })
+                        .collect::<Vec<V>>()
+                }
+                None => {
+                    let c = self.cur;
+                    let h = self.s.heap_handle(c, slot, false, true, props);
+                    let r = self.s.op(
+                        c,
+                        "rawBufferLoad.f32",
+                        Attr::ReadOnly,
+                        res,
+                        139,
+                        &[h, byte, iu, mask, align],
+                    );
+                    let mut out = Vec::with_capacity(usize::from(n));
+                    for k in 0..n {
+                        let x = self.s.m.extract(c, r, u32::from(k));
+                        out.push(self.as_int(x));
+                    }
+                    out
+                }
+            };
+            let c = self.cur;
+            let mut any = vals[0];
+            for &v in &vals[1..] {
+                any = self.s.m.bin(c, Bin::Or, any, v);
+            }
+            let maybe_missing = self.s.m.cmp(c, pred::EQ, any, zero);
+            let check = self.begin_guarded(Some(maybe_missing));
+            let _ = self.memory_resident_or_fault(lo, hi, None);
+            self.end_guarded(check, &[]);
+            let pairs: Vec<(V, V)> = vals.into_iter().map(|v| (v, zero)).collect();
+            let vals = self.end_guarded(gate, &pairs);
+            for (k, &x) in vals.iter().enumerate() {
+                self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());
         }
