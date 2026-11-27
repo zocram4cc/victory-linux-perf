@@ -69,7 +69,7 @@ fn no_back_min() -> usize {
 }
 
 /// Declared writes left to the card ([`skip_back`]) and small ones kept,
-/// in declared bytes (not bytes shaders changed), since the last line.
+/// in declared bytes (not bytes shaders changed), taken by [`take`].
 static SKIPPED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// Whether shaders' writes to `[address, address + len)` stay on the card
@@ -210,7 +210,7 @@ pub(crate) fn back(address: usize, bytes: u64) {
 }
 
 /// MB per frame, by kind, copied up and copied back.
-pub(crate) type Sample = Option<([f64; KINDS], [f64; KINDS])>;
+pub(crate) type Sample = Option<([f64; KINDS], [f64; KINDS], [f64; 4])>;
 
 /// Takes the counters as the frame-rate line takes its own (every second,
 /// over the same frames), so that the line printed beside it matches it.
@@ -221,13 +221,15 @@ pub(crate) fn take(frames: f64) -> Sample {
     let take = |a: &[AtomicU64; KINDS]| -> [f64; KINDS] {
         std::array::from_fn(|i| a[i].swap(0, Ordering::Relaxed) as f64 / 1e6 / frames.max(1.0))
     };
-    Some((take(&UP), take(&BACK)))
+    let per_frame = |v: u64| v as f64 / frames.max(1.0);
+    let skipped = std::array::from_fn(|i| per_frame(SKIPPED[i].swap(0, Ordering::Relaxed)));
+    Some((take(&UP), take(&BACK), skipped))
 }
 
 /// With the frame-rate line: what [`take`] took, and the title memory
 /// noted of each kind.
 pub(crate) fn log(sample: Sample) {
-    let Some((up, back)) = sample else {
+    let Some((up, back, skipped)) = sample else {
         return;
     };
     let mut noted = [0u64; KINDS];
@@ -245,13 +247,14 @@ pub(crate) fn log(sample: Sample) {
         (0..KINDS).skip(1).map(|i| format!("{} {} MB", NAMES[i], noted[i] >> 20)).collect::<Vec<_>>().join(", ")
     );
     if no_back() {
-        let [n, bytes, small, small_bytes] = std::array::from_fn(|i| SKIPPED[i].swap(0, Ordering::Relaxed));
+        let [n, bytes, small, small_bytes] = skipped;
         tracing::info!(
             "shaders' writes into write-combined title memory left on the card (VICTORY_WC_NO_BACK, under {} KiB kept), \
-             since the last line: {n} ranges declared, {} MB; kept and copied back as before: {small} ranges, {:.1} MB",
+             per frame: {n:.0} declarations, {:.0} MB declared (a range counted each time it is declared); \
+             small ones kept and copied back as before: {small:.0}, {:.1} MB declared",
             no_back_min() >> 10,
-            bytes >> 20,
-            small_bytes as f64 / 1e6
+            bytes / 1e6,
+            small_bytes / 1e6
         );
     }
 }
