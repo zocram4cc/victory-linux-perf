@@ -6633,6 +6633,24 @@ impl<'a> Lower<'a> {
                 let w = self.s.m.bin(c, Bin::And, w, k127);
                 (self.bfe(a, b, w, name == "s_bfe_i32"), None)
             }
+            "s_pack_ll_b32_b16" | "s_pack_lh_b32_b16" | "s_pack_hh_b32_b16" => {
+                // Two 16-bit halves into one dword (SCC untouched): the low
+                // half from src0's low (ll, lh) or high (hh) half, the high
+                // half from src1's low (ll) or high (lh, hh) half.
+                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                let (k16, low16, high16) = (self.s.m.i32(16), self.s.m.i32(0xFFFF), self.s.m.i32(0xFFFF_0000));
+                let lo = if name == "s_pack_hh_b32_b16" {
+                    self.s.m.bin(c, Bin::LShr, a, k16)
+                } else {
+                    self.s.m.bin(c, Bin::And, a, low16)
+                };
+                let hi = if name == "s_pack_ll_b32_b16" {
+                    self.s.m.bin(c, Bin::Shl, b, k16)
+                } else {
+                    self.s.m.bin(c, Bin::And, b, high16)
+                };
+                (self.s.m.bin(c, Bin::Or, lo, hi), None)
+            }
             "s_and_b32" | "s_or_b32" | "s_xor_b32" | "s_andn2_b32" | "s_orn2_b32"
             | "s_nand_b32" | "s_nor_b32" | "s_xnor_b32" => {
                 let (a, mut b) = (src32(self, 0)?, src32(self, 1)?);
