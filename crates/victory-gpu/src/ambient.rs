@@ -53,10 +53,18 @@ pub(crate) enum Role {
     Air,
     /// Writes the title's reflections for the last time in a frame.
     Reflected,
+    /// Gives see-through surfaces the sky probe's light as their
+    /// reflection where no ray answered (glass, a tank of water).
+    ReflectedAlpha,
 }
 
 /// The program's part in this, by its name in the container.
 pub(crate) fn role(container: &[u8]) -> Option<Role> {
+    role_when(container, see_through())
+}
+
+/// [`role`] with the see-through switch given.
+fn role_when(container: &[u8], see_through: bool) -> Option<Role> {
     let has = |name: &[u8]| container.windows(name.len()).any(|w| w == name);
     if has(b"CS_ScreenProbes_TemporalResolve") {
         Some(Role::Resolve)
@@ -64,6 +72,8 @@ pub(crate) fn role(container: &[u8]) -> Option<Role> {
         Some(Role::Radiance)
     } else if has(b"CS_AccumulateLocalLightInscatteringVolume") {
         Some(Role::Air)
+    } else if see_through && has(b"CS_DeferredFallbacksAlpha_SkyProbe") {
+        Some(Role::ReflectedAlpha)
     } else if has(b"CS_UpdateHistory") {
         Some(Role::Reflected)
     } else {
@@ -82,6 +92,10 @@ pub(crate) const AIR: (u8, u32) = (1, 32);
 /// Where the reflections are (R9G9B9E5 as 32-bit integers): beloooo's find
 /// (VIctory-Belobug-AMD 44dcd43, GPL-3.0-or-later).
 pub(crate) const REFLECTIONS: (u8, u32) = (1, 40);
+/// Where the see-through surfaces' reflections are (R11G11B10_FLOAT,
+/// 1280x720): read off the program's tables with breakwater's
+/// `VICTORY_VIEWS_OF`, not ported here.
+pub(crate) const REFLECTIONS_ALPHA: (u8, u32) = (1, 48);
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Set {
@@ -151,6 +165,15 @@ fn reflect() -> f32 {
         let set = std::env::var("VICTORY_AMBIENT_REFLECT").unwrap_or_default();
         set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0)
     })
+}
+
+/// Whether the see-through surfaces' reflections are held too
+/// (`VICTORY_REFLECT_SEE_THROUGH=1`, off by default). Breakwater held them
+/// under VICTORY_AMBIENT_REFLECT alone; here they have their own switch, so
+/// the two can be compared apart.
+fn see_through() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REFLECT_SEE_THROUGH").is_some_and(|v| v == "1"))
 }
 
 /// How the slow mean of the light around follows the frames
@@ -444,6 +467,21 @@ void hold(uint3 at : SV_DispatchThreadID) {
 }
 #endif
 
+#ifdef HOLDF
+RWTexture2D<float3> reflected_f : register(u0);
+// As `hold`, for an image of floats: glass indoors took the open sky's
+// light from the sky probe (a tank of water shone white).
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void hold_f(uint3 at : SV_DispatchThreadID) {
+    if (at.x >= width || at.y >= height) return;
+    float cap = max(air * dot(cells[CELLS].rgb, LUMA), 1e-6);
+    float3 c = reflected_f[at.xy];
+    float has = dot(c, LUMA);
+    reflected_f[at.xy] = c / (1.0 + has / cap);
+}
+#endif
+
 #ifdef RAISE
 RWTexture2D<uint> light : register(u0);
 float3 unpack(uint v) {
@@ -559,6 +597,7 @@ struct Pass {
     raise: ID3D12PipelineState,
     air: ID3D12PipelineState,
     hold: ID3D12PipelineState,
+    hold_f: ID3D12PipelineState,
     zero_f: ID3D12PipelineState,
     zero_u: ID3D12PipelineState,
     cells: ID3D12Resource,
@@ -601,6 +640,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     let raise = pipeline("RAISE", s!("raise"))?;
     let air = pipeline("AIR", s!("clear_air"))?;
     let hold = pipeline("HOLD", s!("hold"))?;
+    let hold_f = pipeline("HOLDF", s!("hold_f"))?;
     let zero_f = pipeline("ZEROF", s!("zero_f"))?;
     let zero_u = pipeline("ZEROU", s!("zero_u"))?;
     let made = |bytes| buffer(bytes).ok_or_else(windows::core::Error::empty);
@@ -613,6 +653,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
         raise,
         air,
         hold,
+        hold_f,
         zero_f,
         zero_u,
         cells: made(CELL_BYTES)?,
@@ -715,7 +756,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     if role == Role::Air && (constant > 0.0 || air() == 0.0) {
         return false;
     }
-    if role == Role::Reflected && (constant > 0.0 || reflect() == 0.0) {
+    if matches!(role, Role::Reflected | Role::ReflectedAlpha) && (constant > 0.0 || reflect() == 0.0) {
         return false;
     }
     static SAID: Mutex<u32> = Mutex::new(0);
@@ -730,6 +771,10 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
         static HELD: std::sync::Once = std::sync::Once::new();
         HELD.call_once(|| tracing::info!(size = ?views.size, multiple = reflect(), "reflections held to the light around (VICTORY_AMBIENT_REFLECT)"));
     }
+    if role == Role::ReflectedAlpha {
+        static HELD: std::sync::Once = std::sync::Once::new();
+        HELD.call_once(|| tracing::info!(size = ?views.size, multiple = reflect(), "see-through surfaces' reflections held to the light around"));
+    }
     list.keep(&pass.cells);
     list.keep(&pass.points);
     list.keep(&pass.stats);
@@ -743,7 +788,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[7] = views.size[1];
     words[8] = follow(role).to_bits();
     words[9] = 4.0f32.to_bits();
-    words[10] = if role == Role::Reflected { reflect() } else { air() }.to_bits();
+    words[10] = if matches!(role, Role::Reflected | Role::ReflectedAlpha) { reflect() } else { air() }.to_bits();
     words[11] = u32::from(crate::lightprobe::on());
     words[12] = settle().map_or(0.0, |s| s.jump).to_bits();
     words[13] = settle().map_or(0.0, |s| s.fresh).to_bits();
@@ -773,6 +818,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                 KEPT.store(true, Ordering::Relaxed);
             }
             Role::Reflected => run(&pass.hold, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1),
+            Role::ReflectedAlpha => run(&pass.hold_f, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1),
             Role::Air => run(&pass.air, views.size[0].div_ceil(8), views.size[1].div_ceil(8), views.slices.div_ceil(2)),
             Role::Resolve => {
                 if constant == 0.0 {
@@ -807,6 +853,12 @@ mod tests {
         assert_eq!(role(b"CS_AccumulateLocalLightInscatteringVolume_7e2f5eef"), Some(Role::Air));
         assert_eq!(role(b"..CS_UpdateHistory_0badf00d.."), Some(Role::Reflected));
         assert_eq!(role(b"CS_TemporalResolve"), None);
+    }
+
+    #[test]
+    fn see_through_is_a_role_by_its_switch() {
+        assert_eq!(role_when(b"CS_DeferredFallbacksAlpha_SkyProbe", true), Some(Role::ReflectedAlpha));
+        assert_eq!(role_when(b"CS_DeferredFallbacksAlpha_SkyProbe", false), None);
     }
 
     #[test]
