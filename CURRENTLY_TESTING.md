@@ -22,13 +22,27 @@ bimodal; differences under ~5 ms need ≥4 runs an arm).
   hand-off included. The card's own timestamps (`VICTORY_CARD_SPANS=1`, diag) give the real figure (below).
 - Release build (`--features scripted`), caches warm (prebuild + full `warm`, 93,821 pipelines).
 
-## Latest (2026-11-28 day): `main` = 195754956
+## Latest (2026-11-28 day): `main` = afc584092
 
-**Play set now: `play-fast10.sh`** = `play-fast9.sh` on `main` 195754956 (`bin/main-f8`): + clankerVI waves 24a/24b/29c
+**Play set now: `play-fast10.sh`** on `main` afc584092 (`bin/main-f9`) with **`VICTORY_BUFFER_NO_WAIT=1
+VICTORY_ASK_ONE_WAVE=1 VICTORY_SWEEP_ASYNC=1`** (each can be set to 0): `play-fast9.sh` + clankerVI waves 24a/24b/29c
 (`send_copied` tests a copy's range before upgrading it; refresh jobs of 32 copies; `Batch::add` remembers its last
-hit; Some1sm) + **`VICTORY_BUFFER_NO_WAIT=1`** (eikkapine/victory-amd: new buffers of the submissions are not waited
-for until mapped; textures keep the wait that guards against the 2026-11-25 device losses; set for fewer hitches).
-If a device loss ever appears in play, drop `VICTORY_BUFFER_NO_WAIT` first. Rollback: `play-fast9.sh`.
+hit; Some1sm) + buffer no-wait (eikkapine/victory-amd: new buffers of the submissions are not waited for until mapped;
+textures keep the wait that guards against the 2026-11-25 device losses) + `ASK_ONE_WAVE` (clankerVI wave 31b adapted by
+ZeroCopy: a submission's write-watch asks in one parallel wave) + `SWEEP_ASYNC` (RAZDA4A XEN: the periodic sweep on a
+thread of its own, no drain of the flights). If a device loss ever appears in play, drop `VICTORY_BUFFER_NO_WAIT`
+first. Rollback: `play-fast9.sh`.
+
+**Validation `stack1`** (restored save, 2 interleaved pairs, 0 device losses; `play-fast10` before the last two
+switches vs with them): frame **50.1 / 48.3 → 47.1 / 46.9 ms** (−2.2 mean), frame p95 69.5 / 60.8 → 53.5 / 61.6,
+worst frame per second p95 **194 / 223 → 147 / 169**, seconds with a frame >100 ms **16 / 15 → 12 / 8**, submit thread
+40.0 / 37.9 → 36.7 / 36.0. The first change of the day that moved the hitches.
+
+**Where the frame waits now** (`lc-m1`, release, this play set, ListCaches' counters): the submitting thread idles
+**8.4 ms a frame (median, p90 12.1) waiting for list translation** — 96 % of its idle; other idle (polls, fences)
+~0.4 ms. The 8 list threads do ~343 ms of work a frame (57.6k list calls) of ~384 available: the pool is ~90 %
+saturated. Since `ASK_ONE_WAVE` and `SWEEP_ASYNC` sped the submitting thread up, list translation is the critical
+path; cutting the submitting thread's own work (e.g. `CLEAN_FAST` below) can't show until lists get faster.
 
 `play-fast9.sh` (the step before): `play-fast8.sh`'s settings on a **thin-LTO + x86-64-v3 build** and the Proton copy
 **`Proton-Experimental-viewtree-homebo-ww`**, whose hand-built `ntdll.so` runs `NtGetWriteWatch`'s kernel scan
@@ -92,6 +106,7 @@ graphics pool 15 %, the rest 4 %. Only 0.4 MB of the ~30 MB refreshed a frame ac
 | `VICTORY_ASK_REST_CHUNKS=1` (clankerVI A4) | in-run: +0.9 | | zc-ab9: no gain; off |
 | **`VICTORY_SWEEP_ASYNC=1`** (RAZDA4A XEN d16ca9a7d, sweep part: the periodic sweep on a thread of its own, no drain of the flights) | in-run, 9 matched pairs: −0.8 | **worst frame per second −9.0 ms** (6 pairs; the 9–11 ms sweep stalls) | sc-swp2: 0 device losses; in the validation stack |
 | fewer allocations on the submitting thread (SubmitChain 8a35163e9/7d464be82, result-identical) | 48.9 / 47.9 vs 47.8 / 49.4 | per 1k draws 5.67 / 5.63 vs 5.36 / 5.66 | sc-ab2: pairs disagree; neutral; kept out of the stack |
+| `VICTORY_CLEAN_FAST` (clankerVI's PAGE_MAX idea, by ZeroCopy: the 'is this copy clean?' check answered from lock-free per-page latest-write atomics) | in-run, 3 matched pairs: +0.15 (8 skipped) | all phases: per 1k draws 6.60 → 6.05, but on-phases drew +9 % | zc-cf-ab: verify 0 differences in 16.8 M answers; no gain measurable while the submit thread waits on lists; off; re-test after the list fixes |
 
 - Wine microbenchmark (`GetWriteWatch` latency while 4 threads storm the lock): with others asking too,
   p99 124–175 µs → 4–6 µs and 5–6× the throughput; with others taking guard faults the asking thread
@@ -137,13 +152,20 @@ The median moved; the 100–280 ms hitches did not (they vary 4–19 seconds a r
 RAZDA4A's unlocked fence/value settle and 2 MB compare buffer (those settles cost 0.0 ms here), victory-amd's
 `HOLES_ONCE` (0–4 hole questions a frame here), RYUKI's list-thread priority and count, fat LTO.
 
-### In progress
+### In progress (queue as of 16:40; the GPU queue stops at the build window ~17:41 today)
 
-- **Validation:** one stack exe (`perf/stack-1` = `main` + `ASK_ONE_WAVE` + `SWEEP_ASYNC`) against `play-fast10`,
-  2 interleaved pairs; if it holds, into `main` and `play-fast10`.
-- Then: list translation (clankerVI waves 27/28/30: the submitting thread waits ~2–3 ms a frame for list threads),
-  the Lane's 1 ms poll granularity (1–2.6 ms a frame idle), GPU detile (skornuta's port), mimalloc, an upstream
-  re-triage (`notes/upstream-triage-1600.md`).
+| ~When | Run | What | Upside [estimate] |
+|---|---|---|---|
+| 16:33 → 16:40 | `lc-ab1` (ListCaches) | `VICTORY_LIST_CBV_CACHE` (clankerVI wave 27: in-place constant-buffer views cached per list), in-run | 2–5 ms (ceiling ~8, the list wait) |
+| 16:40 → 16:54 | ListCaches pairs | main vs main + waves 28 (batched CopyDescriptors), 27B, 30 (result-identical) | 1–3 ms |
+| 16:54 → 17:06 | ListCaches pictures | M, M2 (control: runs aren't pixel-deterministic), P, P + CBV cache | gate before any merge |
+| 17:06 → 17:20 | `sc-ab3` (SubmitChain) | list-thread lock cuts (texture_at read lock, `HostHeap::keep` lock-free fast path), pairs | 1–4 ms |
+| 17:20 → 17:41 | `thin1` | 8 / 10 / 12 list threads on this play set | 0–3 ms |
+
+Next session: validation of the list winners vs `play-fast10`; `CLEAN_FAST` re-test (600 rows); ZeroCopy's skip of
+Wine's `VirtualQuery` when our books know a block's protection; the Lane's 100 µs wake (`VICTORY_LANE_FINE`, ceiling
+~0.4 ms now); GPU detile (skornuta's port, with a verify readback); mimalloc. Open risk: `VICTORY_WINDOWS_BAR_MB=4096`
+(clankerVI removed it after CPU overwrites of in-flight BAR windows; ours not checked; see RISKS in the lab notes).
 
 ## Latest (2026-11-28 night): `main` = 123ea30a0
 
