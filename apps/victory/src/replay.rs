@@ -158,12 +158,12 @@ pub(crate) struct Replay {
     #[arg(long)]
     listing: Option<String>,
     /// For the draws of these lists (`3..7`) whose pipeline names one of
-    /// --reach-shader: how far the streams their root SRV's header names
+    /// --reach-shader: how far the streams their root SRV's header can name
     /// reach, against the view the runtime gave it (from the capture alone).
     #[arg(long)]
     root_reach: Option<String>,
-    /// With --root-reach: a program hash (repeatable; default the two
-    /// pre-skinned character mesh programs).
+    /// With --root-reach: a program hash (repeatable; default the 17
+    /// `MS_VS_PedTransformPreSkinD*` programs that read through a root SRV).
     #[arg(long)]
     reach_shader: Vec<String>,
     /// With --root-reach: the host graphics root parameter of the root SRV's
@@ -271,7 +271,14 @@ pub(crate) fn run(r: Replay) -> Result<()> {
     if let Some(text) = &r.root_reach {
         let lists = range(text).with_context(|| format!("--root-reach {text}"))?;
         let shaders = if r.reach_shader.is_empty() {
-            vec!["093c64546c55554e".to_owned(), "5bd95fdec765c0d6".to_owned()]
+            [
+                "005fe88ec1bdc0c7", "093c64546c55554e", "0979c5189155cf3f", "235e56869c1ea883", "41b1fbed3ee9b8ff",
+                "4ee6e34d8e008c63", "51ff151f75cd5759", "5408a8dd45df9e6f", "5bd95fdec765c0d6", "882797cbb4999358",
+                "994f3767080d25e7", "a4fcba2259cdaae0", "a91e3fe6f391a0ce", "d6c491e1d17d60cb", "ef5409053e14aa82",
+                "f841ad74ec6e7367", "fc2e14d6971785dd",
+            ]
+            .map(str::to_owned)
+            .to_vec()
         } else {
             r.reach_shader.clone()
         };

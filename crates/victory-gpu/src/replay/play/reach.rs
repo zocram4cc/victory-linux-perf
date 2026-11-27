@@ -9,9 +9,12 @@
 //! byte offset from the root address in bits 9-31 (`(w >> 7) & 0x1fffffc`)
 //! and its stride in bits 5-8 (`(w >> 3) & 60`); a vertex is read at
 //! `offset + stride * index`, the index 16 bits from a remap stream the
-//! program reads through a table (not looked at here). The streams' words
-//! lie at header bytes 0x0, 0x4, 0x8, 0xc, 0x10, 0x2c, 0x30, 0x38 and 0x3c
-//! (programs 093c64546c55554e and 5bd95fdec765c0d6, read from their code).
+//! program reads through a table (not looked at here). Which header words
+//! a program reads differs between the variants (093c64546c55554e: 0x0-0x10,
+//! 0x2c, 0x30, 0x38, 0x3c; 5bd95fdec765c0d6: 0x0-0x10, 0x30-0x3c, 0x48;
+//! others 0x4c, 0x68, 0x78), so every word up to the dequantisation
+//! constants at 0x60 is taken for a stream of up to 12 bytes a vertex: a
+//! bound, not the program's exact reads.
 //!
 //! The header is read from the capture's contents and the CPU's writes up
 //! to the draw's submission (not what shaders wrote). Read from the
@@ -27,10 +30,10 @@ use anyhow::Result;
 use super::super::wire::{Cmd, Frame, MISSING, NONE, Slot, ZERO, slot};
 use super::find;
 
-/// Header bytes of the stream words, and the bytes one vertex's read takes
-/// from each stream at most.
-pub const STREAMS: [(usize, u64); 9] =
-    [(0x0, 8), (0x4, 12), (0x8, 4), (0xc, 8), (0x10, 8), (0x2c, 4), (0x30, 4), (0x38, 8), (0x3c, 8)];
+/// Header words taken for stream words (bytes 0x0-0x5c), and the bytes one
+/// vertex's read takes from a stream at most.
+pub const WORDS: usize = 24;
+const VERTEX_BYTES: u64 = 12;
 
 /// A stream word's byte offset from the root address and its stride.
 pub fn stream(word: u32) -> (u64, u64) {
@@ -41,12 +44,12 @@ pub fn stream(word: u32) -> (u64, u64) {
 /// with every index at most `last`, and with the vertex count the layout
 /// gives (the position stream at word 0 ends where the next stream above
 /// it begins; `None` if no stream lies above it).
-pub fn reach(header: &[u32; 16], last: u64) -> (u64, Option<u64>) {
-    let words: Vec<(u64, u64, u64)> = STREAMS
+pub fn reach(header: &[u32; WORDS], last: u64) -> (u64, Option<u64>) {
+    let words: Vec<(u64, u64, u64)> = header
         .iter()
-        .map(|&(at, size)| {
-            let (offset, stride) = stream(header[at / 4]);
-            (offset, stride, size)
+        .map(|&w| {
+            let (offset, stride) = stream(w);
+            (offset, stride, VERTEX_BYTES)
         })
         .collect();
     let worst = words.iter().map(|&(o, s, size)| o + s * last + size).max().unwrap_or(0);
@@ -177,8 +180,8 @@ pub fn root_reach(
                         // A raw view: elements of 4 bytes from word 4 on.
                         let first = u64::from(word(&v, 4)) | u64::from(word(&v, 5)) << 32;
                         let (start, held) = (first * 4, u64::from(word(&v, 6)) * 4);
-                        let header = bytes.read(&frame, v.res, start, 64, i)?;
-                        let header: [u32; 16] =
+                        let header = bytes.read(&frame, v.res, start, 4 * WORDS as u64, i)?;
+                        let header: [u32; WORDS] =
                             std::array::from_fn(|k| u32::from_le_bytes(header[k * 4..k * 4 + 4].try_into().unwrap()));
                         let (worst, laid) = reach(&header, 0xffff);
                         let end = widths.get(&v.res).copied().unwrap_or(0);
@@ -191,7 +194,7 @@ pub fn root_reach(
                             start + held,
                             laid.map_or("?".into(), |r| r.to_string()),
                             if over { " PAST THE VIEW" } else { "" },
-                            &header[..16],
+                            &header[..],
                         ));
                     }
                     _ => {}
@@ -214,17 +217,18 @@ mod tests {
         let header = [
             0x0000_4042, 0x008c_e026, 0x001f_8021, 0x00bb_c028, 0x00cb_6028, 0, 0x004e_6026, 0x005e_0026,
             0x006d_a025, 0x007d_4025, 0, 0x002f_2027, 0x009c_8026, 0x00ac_2026, 0x00db_0042, 0x00fa_4028,
+            0, 0x0109_e084, 0, 0x003e_c027, 0, 0, 0, 0x0000_0200,
         ];
         assert_eq!(stream(header[0]), (0x80, 8));
         let (worst, laid) = reach(&header, 0xffff);
-        // The stream at 0x3c begins furthest out: 0x1f480 + 4 * 1999 + 8.
-        assert_eq!(laid, Some(0x1f480 + 4 * 1999 + 8));
-        assert_eq!(worst, 0x1b600 + 8 * 0xffff + 8);
+        // The word at 0x44 (0x213c0, 16 apart) reaches furthest, read or not.
+        assert_eq!(laid, Some(0x213c0 + 16 * 1999 + 12));
+        assert_eq!(worst, 0x213c0 + 16 * 0xffff + 12);
     }
 
     #[test]
     fn a_header_with_nothing_above_its_positions_has_no_layout_reach() {
-        let mut header = [0u32; 16];
+        let mut header = [0u32; WORDS];
         header[0] = 0x0000_4042;
         assert_eq!(reach(&header, 0xffff).1, None);
     }
