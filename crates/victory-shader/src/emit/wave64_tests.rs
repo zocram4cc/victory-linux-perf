@@ -970,15 +970,108 @@ fn mask_scc_behind_a_kept_skip() -> NativeProgram {
         0xE070_1000,
         0x8002_0201, // buffer_store_dword v2, v1, s[8:11], 0 offen
         0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0 (again: the lanes that skipped have none)
         0x7E06_0214, // v_mov_b32 v3, s20
-        0xE070_1000,
-        0x8002_0301, // buffer_store_dword v3, v1, s[8:11], 0 offen
+        0xE070_1100,
+        0x8002_0301, // buffer_store_dword v3, v1, s[8:11], 256 offen
     ])
+}
+
+/// The program of [`mask_scc_behind_a_kept_skip`] as `emit` gives it to a host of 32-lane
+/// waves, and as it does without the last form (`wave_wide_last`).
+fn emit_kept_skip(native: &NativeProgram, p: &ir::Program, last: bool) -> (Result<HostShader, ShaderError>, Result<HostShader, ShaderError>) {
+    let st = structure::structure(p).expect("structure");
+    let res = resource::track(p, &native.layout, native.stage, Some(&st)).expect("resources");
+    let io = io::raise(p, native).expect("io");
+    let c = crate::Container { digest: [0; 16], version: (1, 0), parts: Vec::new() };
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    super::NO_WIDE_LAST.set(!last);
+    let exact = super::emit_forms(&c, native, p, &st, &io, &res);
+    let shader = super::emit(&c, native, p, &st, &io, &res);
+    super::NO_WIDE_LAST.set(false);
+    lower::TEST_HOST_WAVE.set(was);
+    (exact, shader)
+}
+
+/// A console wave64 program that no other form takes off 64-lane waves is taken, last of
+/// all, with its branches wave-wide (fxceless PR #1176): exact, where it was refused (or,
+/// with a branch on a mask's SCC, split per lane). On a card of 32-lane waves: every thread
+/// below `below` stores what the wave's SCC says, and every thread stores the scalar the
+/// skipped code set once some lane ran it.
+#[test]
+fn a_program_no_other_form_takes_is_taken_wave_wide_last_of_all() {
+    if !structure::wave_scc() || !super::wave_wide_last() || std::env::var_os("VICTORY_WAVE_WIDE").is_some() {
+        eprintln!("VICTORY_WAVE_SCC=0, VICTORY_WAVE_WIDE_LAST=0 or VICTORY_WAVE_WIDE set; skipped");
+        return;
+    }
+    let native = mask_scc_behind_a_kept_skip();
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("IR");
+    let (exact, shader) = emit_kept_skip(&native, &p, true);
+    exact.expect("wave-wide, last of all");
+    let shader = shader.expect("wave-wide, last of all");
+    let (_, per_lane) = emit_kept_skip(&native, &p, false);
+    let per_lane = per_lane.expect("split per lane");
+    assert_ne!(shader.dxil, per_lane.dxil);
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone()).expect("DXIL validation");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let run = |shader: &HostShader, below: u32, selected: u32| -> Option<Vec<u32>> {
+        let (root, pso) = match host.compute_pipeline(shader) {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("the hardware device does not take this program: {e}; not run");
+                return None;
+            }
+        };
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            if let (RootType::Constants, 0, d @ 0..=1) = (u.root, u.slot, u.dword) {
+                ud[u.index as usize] = [below, selected][d as usize];
+            }
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(128)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        Some(out[0][..128].to_vec())
+    };
+    let mut old_wrong = 0;
+    for (below, selected) in MASK_SCC_CASES {
+        let Some(got) = run(&shader, below, selected) else { return };
+        let expected: Vec<u32> = (0..128u32)
+            .map(|i| match i {
+                // the arm the wave's SCC chose, in the lanes below `below`
+                0..64 if i < below => 1 + u32::from(selected < below),
+                0..64 => 0,
+                // s20, set by the skipped code once some lane runs it
+                _ => 7 * u32::from(below > 0),
+            })
+            .collect();
+        assert_eq!(got, expected, "below {below}, selected {selected}");
+        if let Some(before) = run(&per_lane, below, selected) {
+            old_wrong += before.iter().zip(&expected).filter(|(a, b)| a != b).count();
+        }
+    }
+    eprintln!("ran on the hardware device: the console's words in every case; split per lane, {old_wrong} words differ");
 }
 
 /// A program none of whose forms can take a branch on a mask's SCC wave-wide is translated
 /// with it split per lane (as before) instead of being dropped (DoubleGhosty #80: a dropped
-/// dispatch the title read back as a pointer).
+/// dispatch the title read back as a pointer). (Without the last form, `wave_wide_last`,
+/// which takes this one.)
 #[test]
 fn a_wave_wide_scc_branch_no_form_can_take_falls_back_to_the_per_lane_split() {
     if !structure::wave_scc() {
@@ -991,13 +1084,7 @@ fn a_wave_wide_scc_branch_no_form_can_take_falls_back_to_the_per_lane_split() {
     let st = structure::structure(&p).expect("structure");
     assert_eq!(st.wave_scc.len(), 1, "the branch on the mask's SCC is the wave's");
     assert!(structure::with_per_lane(|| structure::structure(&p)).expect("structure").wave_scc.is_empty());
-    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resources");
-    let io = io::raise(&p, &native).expect("io");
-    let c = crate::Container { digest: [0; 16], version: (1, 0), parts: Vec::new() };
-    let was = lower::TEST_HOST_WAVE.replace(Some(32));
-    let exact = super::emit_forms(&c, &native, &p, &st, &io, &res);
-    let shader = super::emit(&c, &native, &p, &st, &io, &res);
-    lower::TEST_HOST_WAVE.set(was);
+    let (exact, shader) = emit_kept_skip(&native, &p, false);
     assert!(
         matches!(&exact, Err(ShaderError::Unsupported { what, .. }) if *what == lower::WAVE_WIDE_ELSEWHERE),
         "{:?}",

@@ -200,6 +200,27 @@ pub fn scalar_splits() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_SCALAR_SPLITS").is_none_or(|v| v != "0"))
 }
 
+/// Whether a console wave64 compute program that no other form takes off 64-lane waves is
+/// tried, last of all, with its branches taken wave-wide ([`widen`]: two host waves of 32
+/// exchanging, with group barriers inside those branches) instead of being refused; on
+/// unless `VICTORY_WAVE_WIDE_LAST=0` (or `VICTORY_WAVE_WIDE=0`). Part of the translation:
+/// the shader cache keys on it.
+pub fn wave_wide_last() -> bool {
+    #[cfg(test)]
+    if NO_WIDE_LAST.get() {
+        return false;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_WIDE_LAST").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's way of seeing the forms before the last one ([`wave_wide_last`]), on its
+    /// thread only.
+    pub(crate) static NO_WIDE_LAST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Which of a translated program's group barriers wait for the whole
 /// group (`GroupMemoryBarrierWithGroupSync`); the others keep their memory
 /// fence and lose the wait. A wait that some thread of the group never
@@ -797,6 +818,31 @@ fn emit_forms(
                 report("loose LDS + local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
                     return local.map(|(shader, _)| shader);
+                }
+            }
+        }
+        // Last of all, with the wave-wide form not asked for: a program that no other form
+        // takes off 64-lane waves is refused by a 32-lane host, and its dispatches are
+        // dropped (`sr_tracing:CS_Tiling_Generate_Opaque` and `GpuParticleUpdate:CS_Visibility`
+        // on an RTX 5060 Ti in fxceless PR #1176). The wave-wide form is exact, so it is tried
+        // here, where the only other outcome is the pass not running at all (or, for a branch
+        // on a mask's SCC, running split per lane, `emit`). The programs that lost a card with
+        // it had another form and never reach this point. `VICTORY_WAVE_WIDE=0` and
+        // `VICTORY_WAVE_WIDE_LAST=0` leave them refused, as before.
+        if !wide_on && wide_option.as_ref().is_none_or(|v| v != "0") && wave_wide_last() {
+            let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
+            let deep = if deep_on { form("without skips, scalars followed", ir::without_skips(p, true)) } else { None };
+            let bases = [
+                deep.as_ref().map(|f| &f.0),
+                forms[1].1.as_ref().map(|f| &f.0),
+                forms[0].1.as_ref().map(|f| &f.0),
+                Some(p),
+            ];
+            if let Some(base) = bases.into_iter().flatten().next() {
+                let again = widen(c, native, base, &[], why, false);
+                report("wave-wide branches (last resort)", &again);
+                if done(&again) {
+                    return again.map(|(shader, _)| shader);
                 }
             }
         }
