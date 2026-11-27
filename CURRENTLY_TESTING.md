@@ -12,7 +12,7 @@ bimodal; differences under ~5 ms need ≥4 runs an arm).
   world (`draws > 100`). Figure = median `ms_per_frame` of those rows; "prep" = median `cpu_prepare_ms`.
 - Release build (`--features scripted`), caches warm (prebuild + full `warm`, 93,821 pipelines).
 
-## Latest (2026-11-27 evening): `main` = 21a04e3fe
+## Latest (2026-11-27 night): `main` = fce609012
 
 Each step merged into `main` after an A/B against the step before (single runs, 150–200 world rows,
 same play-fast set; caches prebuilt and warm, no builds during runs).
@@ -24,6 +24,9 @@ same play-fast set; caches prebuilt and warm, no builds during runs).
 | + `VICTORY_SKIP_WC_BACK=1` | LibsMQG: copy-back skips card pieces | **47.8 ms** | | | 18.4 | | 47.4 in a second run |
 | + landings (r20) | `VICTORY_LAND_RING=1 VICTORY_KEEP_SNAPSHOTS=1 VICTORY_BURY_ASIDE=1 VICTORY_WOKEN_WAITS=1` (coolfox, rx6600) | **46.4 ms** | 36.7 | 19.2 | **5.6** | 14.8 | copy-back −2/3 |
 | fast track 1 | `VICTORY_REFRESH_RANGES=1 VICTORY_SEND_CHANGED=1 VICTORY_READBACK_POOL=1 VICTORY_COMPARE_SHARE=1 VICTORY_DIRTY_QUEUE=1` (AntoninMichelq, Belobug) | 50.5 vs 50.2 | 37.0 vs 40.2 | 20.0 vs 22.1 | 5.8 | 14.0 vs 15.9 | ab10, 200 rows; p90 64.3 vs 66.3, worst p95 203 vs 223 |
+| + Wine `memcmp` | DoubleGhosty d78b9eb5b: 16 bytes a step under Wine (no switch, same results) | 50.1 vs 50.3 | 37.7 vs 38.3 | 21.0 vs 22.0 | 5.7 | | prof2; p90 63.6 vs 67.9 |
+| fast track 2 (switches off) | heap round, journal round, guard round: `PLAN_REUSE`, `UPLOAD_BARRIERS`, `JOURNAL_SHARED=2`, `HEAP_RECHECK_PERSISTENT`, `EXACT_NO_WAIT` | 48.3 vs 47.1 (all on) | 38.0 vs 35.8 | 20.5 vs 19.2 | 5.4 | 12.7 vs 13.1 | ab11: no gain, worse tail (p95 210 vs 152); merged with the switches off |
+| + alias hold fix | `alias_of` released a reference it never took when the texture was being released (`then_some` builds its argument eagerly) | | | | | | crash fix, no switch |
 
 - Run to run, one setup moves by about 4 ms (same exe and switches: 46.4 ms at 19:55, 50.2 at 20:24).
 - Fast track 1: equal frame, 3 ms less CPU prep, steadier tail. Prep (37 ms) is now below the frame
@@ -37,9 +40,24 @@ same play-fast set; caches prebuilt and warm, no builds during runs).
   texture refresh, until in-place track A), THP collapse (median −1.8 ms, worse tail).
 - d3dcompiler_47 10.0.26100.7705 against our 10.0.22621.608: 49.3 vs 47.4 ms (1 run each), no
   compile messages either way; kept 22621.
+- Whole-process profile (prof2-P, 10 s, all threads): ~11 of 16 hardware threads busy. The 8
+  list-recording threads take ~4.7 cores (a fifth of it in d3d12core and RADV, much of the rest our
+  locks and descriptor writes); the submitting thread ~0.46 core (write-watch asks: kernel page-map
+  scans and TLB-flush interrupts); vkd3d's queue thread 41 % in the kernel's `hmm_vma_walk_pmd`; the
+  title's main thread ~0.65 core spinning in `Sleep(0)`. Wine's `memcpy` is not a cost (1.4 %).
+- vkd3d's queue thread (bpftrace, hmm1/hh1/ab11): amdgpu walks the page tables of the one userptr
+  buffer, port 1's 185 MB home heap, at EVERY submission: ~17,500 walks in 10 s (~90 a frame),
+  64–512 µs each, 1.7–4.2 s of every 10 s; never caused by invalidation. `VICTORY_HOME_HUGE=1`
+  (huge pages on that heap, branch `perf/home-huge`): the advice takes (180 of 185 MB huge) but no
+  gain (49.7 vs 48.4 ms): the walk fills a 4 KiB-granular page array whatever the page size. The
+  lever is fewer submissions a frame.
+- `VICTORY_HEAP_WORKER=1` (fxceless #1007, branch `perf/heap-worker`): heap time on the submitting
+  thread 16.1 → 0.0 ms, but frame 46.4 vs 46.3 and a worse tail (p95 214 vs 134): each submission
+  waits for the worker's pass, so it is still in series. Its first run crashed at start-up (the
+  `then_some` bug above, hit at once by the worker). Off until the pass can begin at present.
 
 Play set now: the play-fast settings below + combined + `VICTORY_SKIP_WC_BACK=1
-VICTORY_AMBIENT_MAGENTA=1` + the landings and fast track 1 switches above.
+VICTORY_AMBIENT_MAGENTA=1` + the landings and fast track 1 switches above (`play-fast5.sh`).
 
 ## Ladder on `main` (2026-11-27, cumulative: each rung adds to the one above)
 
@@ -151,11 +169,11 @@ black world. Purple blinds and violet trees on the first balcony: fixed with
 
 ## Next
 
-1. In flight: Wine `memcmp` (16 bytes a step instead of Wine's 8, same results, so no switch;
-   upstream measured 6.7 % → 2.2 % of process CPU), and behind switches off by default: heap-pass
-   round (staging pool, plan reuse, upload barriers, per-slot bits instead of heap-wide locks),
-   journal round (write-watch journal under a shared lock, `REFRESH_RANGES` on the front path).
-   A survey of every tracked fork's copy and heap work ranks what comes after.
-2. A `perf` profile of the submitting thread on `main` with the play set, to split the 20 ms of
-   copies and 15 ms of heap by function.
-3. `VICTORY_FRAME_INTERVAL_MS=16.667` once frames get near the title's 33 ms.
+1. Submissions a frame (~90, each one a walk of the 185 MB home heap): what sets the count, and
+   joining more of them.
+2. Heap worker with the pass begun at present for the next frame (`VICTORY_HEAP_WORKER_EARLY`), and
+   a count of how long submissions wait for it; A/B against `main`.
+3. Picture A/B for the correctness switches of fast track 2 (`HEAP_RECHECK_PERSISTENT`,
+   `EXACT_NO_WAIT`, `JOURNAL_SHARED=2`).
+4. List-recording threads (~4.7 cores): lock and descriptor-write costs.
+5. `VICTORY_FRAME_INTERVAL_MS=16.667` once frames get near the title's 33 ms.
