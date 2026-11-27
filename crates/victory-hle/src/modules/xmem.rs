@@ -180,6 +180,11 @@ pub extern "system" fn XMemVirtualAlloc(
     if !at.is_null() && !placeholder {
         victory_gpu::title_memory_allocated(at as usize, size);
     }
+    // (Where the host cannot say what is a placeholder, Wine: the guards
+    // know the holes of this one by our word.)
+    if !at.is_null() && placeholder {
+        victory_gpu::title_placeholder_reserved(at as usize, size);
+    }
     note_protection(asked, kind, flags, at as usize, size);
     at
 }

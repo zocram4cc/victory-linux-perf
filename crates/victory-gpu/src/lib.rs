@@ -115,5 +115,5 @@ pub use inplace::{title_memory_freeing, title_memory_section, title_memory_secti
 pub use watch::{
     kernel_writing, title_memory_allocated, title_memory_freed, title_memory_reading, title_memory_remapped,
     title_memory_remapping, title_memory_splitting, title_memory_unmapping, title_memory_written,
-    writing as kernel_will_write,
+    title_placeholder_reserved, writing as kernel_will_write,
 };

@@ -1100,19 +1100,76 @@ fn placeholder(block: usize) -> bool {
     // (Class 3 answers with the kind of memory in that word, not the flags.)
     const MEMORY_REGION_INFORMATION_EX: u32 = 7;
     const PLACEHOLDER_RESERVATION: u32 = 1 << 8;
-    let mut region = Region::default();
-    // SAFETY: the answer's room and its size.
-    let status = unsafe {
-        NtQueryVirtualMemory(
-            windows_sys::Win32::System::Threading::GetCurrentProcess(),
-            (block * BLOCK) as *const _,
-            MEMORY_REGION_INFORMATION_EX,
-            (&raw mut region).cast(),
-            size_of::<Region>(),
-            std::ptr::null_mut(),
-        )
-    };
-    status >= 0 && region.region_type & PLACEHOLDER_RESERVATION != 0
+    // The host said once that it has no such class (Wine): not asked again.
+    static NO_SUCH_CLASS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    const STATUS_NOT_IMPLEMENTED: i32 = 0xC000_0002u32 as i32;
+    const STATUS_INVALID_INFO_CLASS: i32 = 0xC000_0003u32 as i32;
+    if !NO_SUCH_CLASS.load(std::sync::atomic::Ordering::Relaxed) {
+        let mut region = Region::default();
+        // SAFETY: the answer's room and its size.
+        let status = unsafe {
+            NtQueryVirtualMemory(
+                windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                (block * BLOCK) as *const _,
+                MEMORY_REGION_INFORMATION_EX,
+                (&raw mut region).cast(),
+                size_of::<Region>(),
+                std::ptr::null_mut(),
+            )
+        };
+        if status >= 0 {
+            return region.region_type & PLACEHOLDER_RESERVATION != 0;
+        }
+        if matches!(status, STATUS_NOT_IMPLEMENTED | STATUS_INVALID_INFO_CLASS) {
+            NO_SUCH_CLASS.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    // Wine has no class 7 (and its class 6 says no kind): what the runtime
+    // reserved as placeholders for the title answers instead. Asked of
+    // Wine, no hole was ever known, and every asking put a question to it
+    // for each of its holes (upstream 10,210 a frame while the world
+    // streamed in, 17 with this); each one walks Wine's page table under
+    // its one lock, behind which the title's mapping and our guards' faults
+    // waited (DoubleGhosty f9d2da8; zeex64 502e905 has the same as
+    // `VICTORY_HOLES_TOLD`).
+    holes_told() && told_placeholder(&PLACEHOLDERS.lock().unwrap_or_else(|e| e.into_inner()), block * BLOCK)
+}
+
+/// Whether a hole in a placeholder the runtime reserved for the title is
+/// known as one by the runtime's word where the host cannot say
+/// ([`placeholder`]). On by default; `VICTORY_HOLES_TOLD=0`: only what the
+/// host says, as before (under Wine: no hole is ever known).
+fn holes_told() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HOLES_TOLD").is_none_or(|v| v != "0"))
+}
+
+/// The placeholder reservations the runtime made for the title, start to end
+/// (for [`placeholder`] where the host cannot tell).
+static PLACEHOLDERS: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+
+/// Whether `at` lies in one of `reservations`.
+fn told_placeholder(reservations: &BTreeMap<usize, usize>, at: usize) -> bool {
+    reservations.range(..=at).next_back().is_some_and(|(_, end)| at < *end)
+}
+
+/// The runtime reserved `[at, at + len)` for the title as a placeholder,
+/// into which only views (or allocations) come.
+pub fn title_placeholder_reserved(at: usize, len: usize) {
+    if len != 0 {
+        PLACEHOLDERS.lock().unwrap_or_else(|e| e.into_inner()).insert(at, at.saturating_add(len));
+    }
+}
+
+/// The title frees `[at, at + len)` (no length: the allocation at `at`):
+/// no placeholder reservation there is known any more. One cut more than
+/// that is only asked of the host again.
+fn placeholders_freed(reservations: &mut BTreeMap<usize, usize>, at: usize, len: usize) {
+    let end = if len == 0 { at.saturating_add(1) } else { at.saturating_add(len) };
+    let gone: Vec<usize> = reservations.range(..end).filter(|(_, e)| **e > at).map(|(s, _)| *s).collect();
+    for start in gone {
+        reservations.remove(&start);
+    }
 }
 
 /// The runtime gave the title memory at `[at, at + len)`, allocated or
@@ -2719,6 +2776,7 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// was noted of its blocks (guarded, clean, absent) would be taken for true
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
+    placeholders_freed(&mut PLACEHOLDERS.lock().unwrap_or_else(|e| e.into_inner()), at, len);
     let mut g = guards();
     let first = at / BLOCK;
     let noted = [g.protected.range(first..).next(), g.absent.range(first..).next(), g.foreign.range(first..).next().copied()];
@@ -3173,11 +3231,49 @@ mod tests {
         unsafe { UnmapViewOfFile(view) };
     }
 
+    /// What the runtime reserved as a placeholder for the title is known as
+    /// one where the host cannot say (Wine has no MemoryRegionInformationEx),
+    /// until the title frees there.
+    #[test]
+    fn told_placeholders_answer_where_the_host_cannot() {
+        let mut r = BTreeMap::new();
+        r.insert(0x10_0000, 0x50_0000);
+        r.insert(0x80_0000, 0x90_0000);
+        assert!(told_placeholder(&r, 0x10_0000) && told_placeholder(&r, 0x4f_ffff) && told_placeholder(&r, 0x8f_0000));
+        assert!(!told_placeholder(&r, 0x50_0000) && !told_placeholder(&r, 0x0f_ffff) && !told_placeholder(&r, 0x7f_0000));
+        // A part freed: nothing of that reservation is known any more.
+        placeholders_freed(&mut r, 0x20_0000, 0x1_0000);
+        assert!(!told_placeholder(&r, 0x10_0000) && told_placeholder(&r, 0x80_0000));
+        // Freed with no length: the allocation at the address; one beside
+        // it stays.
+        r.insert(0x90_0000, 0xa0_0000);
+        placeholders_freed(&mut r, 0x80_0000, 0);
+        assert!(!told_placeholder(&r, 0x80_0000) && told_placeholder(&r, 0x90_0000));
+        // A placeholder the runtime told of answers so on any host; one it
+        // did not tell of only where the host can say.
+        let p = placeholder(2);
+        let untold = super::placeholder(p / BLOCK);
+        title_placeholder_reserved(p, 2 * BLOCK);
+        assert_eq!(super::placeholder(p / BLOCK) && super::placeholder(p / BLOCK + 1), untold || holes_told());
+        title_memory_freed(p, 0);
+        assert!(!told_placeholder(&PLACEHOLDERS.lock().unwrap(), p));
+        assert_eq!(super::placeholder(p / BLOCK), untold);
+        // SAFETY: our placeholders.
+        unsafe {
+            for block in 0..2 {
+                VirtualFree((p + block * BLOCK) as *mut _, 0, MEM_RELEASE);
+            }
+        }
+    }
+
     /// A hole the kernel is to write is no known hole meanwhile, nor is one
     /// the runtime has begun to change; after that it is again.
     #[test]
     fn what_is_left_alone_is_no_known_hole() {
         let p = placeholder(3);
+        // (As the runtime tells of the title's: under Wine the host cannot
+        // say what is a placeholder.)
+        title_placeholder_reserved(p, 3 * BLOCK);
         let known = |block: usize| published(p + block * BLOCK, p + (block + 1) * BLOCK);
         let ask = || writes(p, p + 3 * BLOCK, true).expect("as a view");
         ask();
