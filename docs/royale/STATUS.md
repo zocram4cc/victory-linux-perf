@@ -67,12 +67,12 @@ Moving into new areas: 2-6 fps for a few seconds while the title streams (its ma
 
 - **0x218 = compute programs as the pieces of an `FSPX` program**: (1,2) 0x1c pipeline registers (thread-group size, RSRC1/RSRC2), (3,4) 0x14 metadata (hash), (5,6) GFX10 code in title GPU memory, (7,8) program metadata (`0x403` header, 0x41 resource / 0x42 view / 0x43 hash records). Rebuilt as FSPX inside a one-part `ACCC` container, they go through the normal compute path.
 - Offline: **542 of 2,680 translate**. The rest: 1,366 "an address with two computed terms", 226 "an address not from a root parameter", 166 "an image store of some channels", then small groups (unsupported scalar instructions, unknown structured-buffer stride, thread-group info SGPR, lane masks read as data).
-- In game with `VICTORY_NATIVE_COMPUTE=1`: all 2,689 are accepted, but **the scene goes black when the world starts** (the HUD shows a moment), even with only the 542 that translate running. Being bisected now with `p4-bisect.sh`.
+- In game with `VICTORY_NATIVE_COMPUTE=1`: all 2,689 are accepted, but **the scene goes black when the world starts** (the HUD shows a moment), even with only the 542 that translate running. Not a few bad programs: ~30 break the scene even made alone (`p4-grow.sh`), so the fault is systematic, most likely the mapping of FSPX records onto the translator's bindings. Next step offline (see the journal's stop point).
 - **0x1c8 (10,206 descriptions) is graphics**: word 0 root signature, (1,2) a 0x1d8 header, (3,4) 0x50, then per stage (code, metadata) pairs at words 5-8, 9-12, 13-16. Not started; likely FSPX-like stage metadata plus a graphics packet.
 
 ## 8. Open threads, in order
 
-1. **P.4 0x218**: find the program that blacks out the picture (bisect), fix its binding; then the translator's "two computed terms" (1,366 programs).
+1. **P.4 0x218**: find the systematic binding fault offline (compare with a regular container holding the same code, or check one small program by hand); then the translator's "two computed terms" (1,366 programs).
 2. **P.4 0x1c8** (graphics): decode the header and per-stage metadata against FSSM's records; same approach (rebuild a container the existing path takes).
 3. **Streaming flicker**: Belobug's texture uploads in the submission prelude (`5d6bd84`, "fix frame-order & flickering") are a candidate to port and measure.
 4. **The author's three fixes** (known_holes under Wine, PORT_DESCRIPTORS with port 1, COPY_COMPARE on BAR) once he pushes them: merge and measure.
