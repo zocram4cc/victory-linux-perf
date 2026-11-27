@@ -2808,10 +2808,17 @@ impl HostHeap {
     /// made one, else as [`HostHeap::make_at`] does, and keeps that
     /// ([`ListViews`]). What is known of the record in this recording;
     /// `None` (the slot is not made): not a view kept so.
-    pub(crate) fn make_listed(&self, recording: u64, words: [u32; 3], index: u32) -> Option<Listed> {
+    pub(crate) fn make_listed(
+        &self,
+        list: &crate::host::HostList,
+        recording: u64,
+        words: [u32; 3],
+        index: u32,
+    ) -> Option<Listed> {
         if self.sampler {
             return None;
         }
+        let mut tat = crate::draw::tables_start();
         LIST_VIEWS.with(|views| {
             let mut views = views.borrow_mut();
             if views.is_none() {
@@ -2838,9 +2845,25 @@ impl HostHeap {
                     ready: (0, 0, false),
                     tabled: None,
                 };
-                views.made.insert(words, ListView { view, at, twin, kept, listed });
+                // (`VICTORY_LIST_HOLDS=1`) The list holds what the view
+                // shows, once, for as long as its submission may run: the
+                // dynamic slots it copies the view into hold nothing.
+                views.made.insert(words, ListView { view, at, twin, kept, listed, holder: 0 });
+                crate::draw::tables_lap(19, &mut tat);
+            }
+            let holds = list_holds();
+            if holds {
+                let holder = list.identity();
+                let made = views.made.get_mut(&words)?;
+                if made.holder != holder {
+                    made.holder = holder;
+                    if let Some(resource) = &made.kept {
+                        list.keep(resource);
+                    }
+                }
             }
             let made = &views.made[&words];
+            crate::draw::tables_lap(16, &mut tat);
             self.copy_from(index, views.slot(made.at));
             if made.twin && twins {
                 self.copy_from(self.raw + index, views.slot(made.at + 1));
@@ -2848,7 +2871,13 @@ impl HostHeap {
             } else {
                 self.clear_twin(index);
             }
-            self.keep(index, made.kept.clone());
+            crate::draw::tables_lap(17, &mut tat);
+            if holds {
+                self.hold_nothing(index);
+            } else {
+                self.keep(index, made.kept.clone());
+            }
+            crate::draw::tables_lap(18, &mut tat);
             Some(made.listed)
         })
     }
@@ -2920,6 +2949,19 @@ impl HostHeap {
         };
         // A running submission may still read the old resource through
         // this slot.
+        if let Some(old) = old {
+            crate::host::retire_resource(old);
+        }
+    }
+
+    /// [`HostHeap::keep`] of nothing, for a dynamic slot whose list holds
+    /// what it shows ([`list_holds`]): a lock and a look, nothing retired,
+    /// when the slot held nothing before either.
+    fn hold_nothing(&self, index: u32) {
+        let Some(slot) = self.kept.get(index as usize) else {
+            return;
+        };
+        let old = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(old) = old {
             crate::host::retire_resource(old);
         }
@@ -6106,6 +6148,9 @@ struct ListView {
     twin: bool,
     kept: Kept,
     listed: Listed,
+    /// (`VICTORY_LIST_HOLDS=1`) The host list that holds `kept`: another
+    /// part of the same list (cut at waits) holds it again.
+    holder: usize,
 }
 
 /// The descriptors a thread made for one recording of a list, by the record
@@ -6175,6 +6220,21 @@ pub(crate) fn note_listed(recording: u64, words: [u32; 3], listed: Listed) {
             made.listed = listed;
         }
     });
+}
+
+/// `VICTORY_LIST_HOLDS=1`: a list holds the resources of the views it makes
+/// once ([`HostHeap::make_listed`]), instead of each dynamic slot it copies
+/// one into holding it (a lock, a reference and a retirement per copy, ~2
+/// million copies a second in the city). Off by default; with
+/// `VICTORY_AB=<s>,VICTORY_LIST_HOLDS` (diagnostics builds) on and off while
+/// the title runs.
+fn list_holds() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_LIST_HOLDS") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_LIST_HOLDS"))
 }
 
 /// Whether a list makes a view its tables hold once (`VICTORY_LIST_VIEWS=0`:

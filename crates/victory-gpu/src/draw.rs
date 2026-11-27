@@ -1612,6 +1612,7 @@ impl State {
         if !self.bind(list, p, false) {
             return false;
         }
+        let mut bat = bind_start();
         let l = &list.list;
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
@@ -1654,6 +1655,7 @@ impl State {
             // SAFETY: an open list; the view names a live host buffer.
             unsafe { l.IASetIndexBuffer(Some(&view)) };
         }
+        bind_lap(8, &mut bat);
         const RENDER_TARGET: u32 = 0x4;
         for &t in &self.targets {
             crate::list::ensure_state(list, t as This, RENDER_TARGET);
@@ -1678,6 +1680,7 @@ impl State {
             };
             crate::list::ensure_state(list, self.depth as This, state);
         }
+        bind_lap(9, &mut bat);
         true
     }
 
@@ -1690,11 +1693,13 @@ impl State {
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
+        let mut bat = bind_start();
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
         if crate::host::walls_trace() {
             self.walls_census(p, compute);
         }
+        bind_lap(0, &mut bat);
         // A list without a view heap: one of the title's for the views the
         // host itself puts into heap slots.
         if self.heaps[0] == 0
@@ -1778,6 +1783,7 @@ impl State {
             // The title may release the pipeline before it submits the list.
             list.bind_pipeline(&p.name, &p.pso, &p.root);
         }
+        bind_lap(1, &mut bat);
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
@@ -1786,6 +1792,7 @@ impl State {
             }
             let made = self.tables(list, &t.tables, compute);
             STORES.set(true);
+            bind_lap(2, &mut bat);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return false;
@@ -1815,6 +1822,7 @@ impl State {
             } else {
                 None
             };
+            bind_lap(3, &mut bat);
             if let Some((param, dwords)) = stage.user_data {
                 // (A root signature holds 64 dwords.)
                 let mut room = [0u32; 64];
@@ -1854,6 +1862,7 @@ impl State {
                     }
                 }
             }
+            bind_lap(4, &mut bat);
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
                     if srv && slot == victory_shader::emit::SLOT_MEMORY {
@@ -1933,6 +1942,7 @@ impl State {
                     }
                 }
             }
+            bind_lap(5, &mut bat);
             for &(slot, param) in &stage.root_uavs {
                 if slot == victory_shader::emit::SLOT_FAULTS {
                     // Ours: where shaders note the pages they found empty.
@@ -1961,9 +1971,11 @@ impl State {
                 }
             }
         }
+        bind_lap(6, &mut bat);
         // Depth textures it writes through unordered access: their colour
         // twins hold what they lack from here on.
         list.twins_written();
+        bind_lap(7, &mut bat);
         true
     }
 
@@ -3731,6 +3743,7 @@ impl State {
         plan: &TablePlan,
         compute: bool,
     ) -> Few<(u8, u32), 16> {
+        let mut tat = tables_start();
         let mut fresh = [0u64; 4];
         let selected_slot = |mask: &[u64; 4], slot: u8| mask[usize::from(slot / 64)] & (1u64 << (slot % 64)) != 0;
         for group in &plan.groups {
@@ -3747,12 +3760,14 @@ impl State {
                 fresh[usize::from(slot / 64)] |= 1u64 << (slot % 64);
             }
         }
+        tables_lap(0, &mut tat);
         for &(g, e) in &plan.direct {
             let group = &plan.groups[g];
             if !selected_slot(&fresh, group.slot) {
                 self.table_entry(list, &group.entries[e], compute);
             }
         }
+        tables_lap(1, &mut tat);
         let mut made = Few::default();
         for group in &plan.groups {
             let slot = group.slot;
@@ -3808,6 +3823,7 @@ impl State {
             };
             // Who reads of it, and as what, as far as [`readable`] goes by it.
             let reader = (std::ptr::from_ref(plan) as usize, plan.direct.len(), STORES.get(), TESTED_DEPTH.get().0);
+            tables_lap(2, &mut tat);
             if let Some(known) = self.fresh_tables.get_mut(&key) {
                 let first = known.first;
                 // This reader had it brought up to date, and nothing in the
@@ -3821,6 +3837,7 @@ impl State {
                         TESTED_DEPTH.set((reader.3, true));
                     }
                     made.push((slot, first * 32));
+                    tables_lap(3, &mut tat);
                     continue;
                 }
                 let depth_before = TESTED_DEPTH.get();
@@ -3863,6 +3880,7 @@ impl State {
                     }
                 }
                 made.push((slot, first * 32));
+                tables_lap(4, &mut tat);
                 continue;
             }
             let Some(first) = host.dynamic(n) else {
@@ -3891,6 +3909,7 @@ impl State {
                 self.recording = NEXT.fetch_add(1, Ordering::Relaxed);
             }
             let recording = self.recording;
+            tables_lap(6, &mut tat);
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -3899,8 +3918,9 @@ impl State {
                 // and nothing more if nothing changed in the list since.
                 if list_views
                     && let Some(words) = crate::descriptor::record_at(table + u64::from(k) * 32)
-                    && let Some(mut listed) = host.make_listed(recording, words, index)
+                    && let Some(mut listed) = host.make_listed(list, recording, words, index)
                 {
+                    tables_lap(12, &mut tat);
                     let kind = group
                         .entry(k)
                         .map(|u| u.kind)
@@ -3920,8 +3940,10 @@ impl State {
                             if kind == ResourceType::Srv {
                                 listed.ready = (list.epoch(), tested.0, depth);
                             }
+                            tables_lap(13, &mut tat);
                         }
                     }
+                    tables_lap(14, &mut tat);
                     if let Some(title) = title_first
                         && listed.texture
                         && listed.tabled != Some((title + k, kind.is_some()))
@@ -3931,10 +3953,12 @@ impl State {
                         if kind.is_some() {
                             host.mirror_after(list, title + k, table + u64::from(k) * 32);
                         }
+                        tables_lap(15, &mut tat);
                     }
                     if was != (listed.ready, listed.tabled) {
                         crate::descriptor::host::note_listed(recording, words, listed);
                     }
+                    tables_lap(7, &mut tat);
                     continue;
                 }
                 let used = group.entry(k);
@@ -3947,6 +3971,7 @@ impl State {
                                 Some(shadow) => {
                                     if host.constant_raw_at(index, &shadow.buffer, shadow.gpu(address), size) {
                                         crate::port_cbv::in_place(size);
+                                        tables_lap(8, &mut tat);
                                         continue;
                                     }
                                     crate::port_cbv::copied(false);
@@ -3961,6 +3986,7 @@ impl State {
                         let slot = (std::ptr::from_ref(heap) as usize, index);
                         list.defer_constants(to, address as *const u8, size as usize, slot);
                         host.constant_at(index, &buffer, gpu, size);
+                        tables_lap(9, &mut tat);
                     }
                     Some(view) => {
                         host.make_at(index, &view);
@@ -3983,16 +4009,19 @@ impl State {
                                 host.mirror_after(list, title + k, table + u64::from(k) * 32);
                             }
                         }
+                        tables_lap(10, &mut tat);
                     }
                     None => {
                         host.make_null(index);
                         if used.is_some() {
                             once!(slot, "a table entry without a view");
                         }
+                        tables_lap(11, &mut tat);
                     }
                 }
             }
             made.push((slot, first * 32));
+            tables_lap(5, &mut tat);
         }
         made
     }
@@ -4371,6 +4400,17 @@ impl State {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
         }
+        #[cfg(feature = "diagnostics")]
+        let mut lap_at = ei_steps::on().then(std::time::Instant::now);
+        #[cfg(feature = "diagnostics")]
+        let mut lap = |i: usize| {
+            if let Some(at) = lap_at.as_mut() {
+                ei_steps::lap(i, at);
+            }
+        };
+        #[cfg(not(feature = "diagnostics"))]
+        let lap = |_: usize| {};
+        lap(0);
         // One record without a count: clamped in a batch (`batches`).
         let batch = if batches() > 0 && max == 1 && count.is_none() {
             args.refresh(list, arguments, len);
@@ -4378,6 +4418,7 @@ impl State {
         } else {
             None
         };
+        lap(2);
         if batch.is_some() {
             self.window = None;
         }
@@ -4432,6 +4473,7 @@ impl State {
                 if let Some((s, at)) = &counter {
                     s.refresh(list, *at, 4);
                 }
+                lap(1);
                 // Bounded first: the clamp binds a compute pipeline of its
                 // own and copies clamped active records into a scratch
                 // buffer at offset 0.
@@ -4462,12 +4504,14 @@ impl State {
                 (bounded, 0)
             }
         };
+        lap(3);
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
             DISPATCH => self.bind(list, p, true),
             _ => false,
         };
+        lap(4);
         if !ran {
             why("prepare failed");
             return false;
@@ -4493,6 +4537,7 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
+        lap(5);
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
@@ -4509,6 +4554,7 @@ impl State {
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
+        lap(6);
         true
     }
 }
@@ -5088,3 +5134,115 @@ mod record_hash_tests {
         assert!(zeros.iter().all(|h| seen.insert(*h)));
     }
 }
+
+/// (`VICTORY_LIST_METER=1`, diagnostics builds) The steps of an indirect
+/// execution, timed: a line every 5 s (ms a second over all threads, and
+/// microseconds a step).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn tables_start() -> Option<std::time::Instant> {
+    tables_steps::on().then(std::time::Instant::now)
+}
+#[cfg(not(feature = "diagnostics"))]
+#[inline(always)]
+pub(crate) fn tables_start() -> Option<std::time::Instant> {
+    None
+}
+#[cfg(feature = "diagnostics")]
+pub(crate) fn tables_lap(i: usize, at: &mut Option<std::time::Instant>) {
+    if let Some(a) = at.as_mut() {
+        tables_steps::lap(i, a);
+    }
+}
+#[cfg(not(feature = "diagnostics"))]
+#[inline(always)]
+pub(crate) fn tables_lap(_: usize, _: &mut Option<std::time::Instant>) {}
+#[cfg(feature = "diagnostics")]
+fn bind_start() -> Option<std::time::Instant> {
+    bind_steps::on().then(std::time::Instant::now)
+}
+#[cfg(not(feature = "diagnostics"))]
+#[inline(always)]
+fn bind_start() -> Option<std::time::Instant> {
+    None
+}
+#[cfg(feature = "diagnostics")]
+fn bind_lap(i: usize, at: &mut Option<std::time::Instant>) {
+    if let Some(a) = at.as_mut() {
+        bind_steps::lap(i, a);
+    }
+}
+#[cfg(not(feature = "diagnostics"))]
+#[inline(always)]
+fn bind_lap(_: usize, _: &mut Option<std::time::Instant>) {}
+
+macro_rules! step_meter {
+    ($m:ident, $title:literal, $n:literal, [$($name:literal),* $(,)?]) => {
+#[cfg(feature = "diagnostics")]
+pub(crate) mod $m {
+    use std::cell::RefCell;
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub(crate) const NAMES: [&str; $n] = [$($name),*];
+    static NANOS: [AtomicU64; $n] = [const { AtomicU64::new(0) }; $n];
+    static COUNT: [AtomicU64; $n] = [const { AtomicU64::new(0) }; $n];
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    thread_local! {
+        static LOCAL: RefCell<([u64; $n], [u64; $n], u32)> = const { RefCell::new(([0; $n], [0; $n], 0)) };
+    }
+
+    pub(crate) fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_METER").is_some_and(|v| v == "1"))
+    }
+
+    fn start() -> &'static std::time::Instant {
+        static START: OnceLock<std::time::Instant> = OnceLock::new();
+        START.get_or_init(std::time::Instant::now)
+    }
+
+    /// Step `i` took from `since` to now; the next step starts now.
+    pub(crate) fn lap(i: usize, since: &mut std::time::Instant) {
+        let now = std::time::Instant::now();
+        let nanos = (now - *since).as_nanos() as u64;
+        *since = now;
+        let flush = LOCAL.with_borrow_mut(|(n, c, k)| {
+            n[i] += nanos;
+            c[i] += 1;
+            *k += 1;
+            if *k < 2048 {
+                return false;
+            }
+            *k = 0;
+            for j in 0..$n {
+                NANOS[j].fetch_add(std::mem::take(&mut n[j]), Ordering::Relaxed);
+                COUNT[j].fetch_add(std::mem::take(&mut c[j]), Ordering::Relaxed);
+            }
+            true
+        });
+        if flush {
+            line();
+        }
+    }
+
+    fn line() {
+        let now = start().elapsed().as_millis() as u64;
+        let last = LAST.load(Ordering::Relaxed);
+        if now < last + 5000 || LAST.compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+            return;
+        }
+        let secs = (now - last).max(1) as f64 / 1000.0;
+        let parts: Vec<String> = (0..$n)
+            .map(|j| {
+                let (n, c) = (NANOS[j].swap(0, Ordering::Relaxed), COUNT[j].swap(0, Ordering::Relaxed));
+                format!("{} {:.1} ms/s ({:.2} us, {:.0}/s)", NAMES[j], n as f64 / 1e6 / secs, n as f64 / 1e3 / c.max(1) as f64, c as f64 / secs)
+            })
+            .collect();
+        tracing::info!("{} (VICTORY_LIST_METER): {}", $title, parts.join("; "));
+    }
+}
+    };
+}
+step_meter!(ei_steps, "indirect executions by step", 7, ["checks and finds", "refresh of the arguments", "batch clamp", "window or clamp", "prepare (bind)", "the host call", "after"]);
+step_meter!(bind_steps, "binds by step", 10, ["early textures", "heaps, root signature, pipeline", "tables", "memory views", "user data", "root views", "root UAVs", "twins written", "vertex and index buffers", "target and depth states"]);
+step_meter!(tables_steps, "descriptor tables by step", 20, ["which tables are made fresh", "direct entries", "a fresh table: its key", "known, ready for this reader", "known, made ready again", "made new (the rest)", "new: its slots", "new: an entry this list made (copied)", "new: a constant buffer in place", "new: a constant buffer copied", "new: a view made", "new: a null view", "listed: copied (make_listed)", "listed: made readable", "listed: kind and ready checks", "listed: tabled and mirrored", "make_listed: lookup", "make_listed: descriptor copies", "make_listed: keep", "make_listed: a view made for the list"]);

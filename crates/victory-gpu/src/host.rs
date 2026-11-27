@@ -7570,6 +7570,13 @@ impl HostList {
     }
 
     /// Keeps `object` alive until the list is reset.
+    /// What tells this host list from the others alive: its allocator, which
+    /// goes where it goes (a list cut at a wait puts another host list
+    /// where it was, with an allocator of its own).
+    pub(crate) fn identity(&self) -> usize {
+        self.allocator.as_raw() as usize
+    }
+
     pub(crate) fn keep(&self, object: &impl Interface) {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
             self.deferred().kept.push(object);

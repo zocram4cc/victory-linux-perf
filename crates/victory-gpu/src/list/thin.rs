@@ -304,11 +304,27 @@ fn back_list(kind: u32) -> This {
     list
 }
 
+/// `VICTORY_THIN_PRIORITY=<-2..2>`: the threads that translate lists run at
+/// that Windows priority (-1 below normal, the default 0 as other threads),
+/// so that more of them than the title leaves cores for wait on its own
+/// threads instead of taking their turns (eight at normal priority fell to
+/// about 3.5 fps on 8 cores).
+fn set_priority() {
+    let Some(priority) = std::env::var("VICTORY_THIN_PRIORITY").ok().and_then(|v| v.trim().parse::<i32>().ok()) else {
+        return;
+    };
+    let priority = priority.clamp(-2, 2);
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority};
+    // SAFETY: our own thread, by its pseudo handle.
+    unsafe { SetThreadPriority(GetCurrentThread(), priority) };
+}
+
 fn start() {
     let threads = std::env::var("VICTORY_THIN_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8usize).clamp(1, 32);
     for i in 0..threads {
         let worker = move || {
             crate::cores::keep_many_on_fast_cores("victory-list");
+            set_priority();
             crate::queue::no_drain_here();
             loop {
                 let recording = {
@@ -428,6 +444,9 @@ macro_rules! plain {
         #[allow(clippy::upper_case_acronyms, non_camel_case_types)]
         #[repr(u64)]
         enum Plain { $($op),* , END }
+        /// (`VICTORY_LIST_METER`) The plain ops' names, by number.
+        #[cfg(feature = "diagnostics")]
+        const PLAIN_NAMES: &[&str] = &[$(stringify!($op)),*];
         $(extern "system" fn $name(this: This $(, $a: $t)*) {
             front(this).put(Plain::$op as u64, &[$(Word::word($a)),*]);
         })*
@@ -499,6 +518,99 @@ const TARGETS: u64 = after(13);
 const CLEAR_RTV: u64 = after(14);
 const CLEAR_DSV: u64 = after(15);
 const COPY_TEXTURE: u64 = after(16);
+
+/// (`VICTORY_LIST_METER=1`, diagnostics builds) The time each translated call
+/// takes, by op, on the threads that translate them: a line every 5 s with the
+/// costliest ops (ms a second over all threads, calls a second, microseconds a
+/// call). Read only where a call is translated; off, one load a call.
+#[cfg(feature = "diagnostics")]
+mod meter {
+    use std::cell::RefCell;
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const OPS: usize = 256;
+    static NANOS: [AtomicU64; OPS] = [const { AtomicU64::new(0) }; OPS];
+    static COUNT: [AtomicU64; OPS] = [const { AtomicU64::new(0) }; OPS];
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    thread_local! {
+        static LOCAL: RefCell<(Box<[u64; OPS]>, Box<[u64; OPS]>, u32)> =
+            RefCell::new((Box::new([0; OPS]), Box::new([0; OPS]), 0));
+    }
+
+    pub(super) fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_METER").is_some_and(|v| v == "1"))
+    }
+
+    fn start() -> &'static std::time::Instant {
+        static START: OnceLock<std::time::Instant> = OnceLock::new();
+        START.get_or_init(std::time::Instant::now)
+    }
+
+    fn name(op: usize) -> String {
+        const AFTER: [&str; 17] = [
+            "RESET", "CLOSE", "UPLOAD", "BARRIER", "BARRIER_GROUPS", "VIEWPORTS", "SCISSORS", "BLEND_FACTOR", "HEAPS",
+            "COMPUTE_CONSTANTS", "GRAPHICS_CONSTANTS", "INDEX_BUFFER", "VERTEX_BUFFERS", "TARGETS", "CLEAR_RTV",
+            "CLEAR_DSV", "COPY_TEXTURE",
+        ];
+        let plain = super::PLAIN_NAMES;
+        if op < plain.len() {
+            plain[op].to_string()
+        } else {
+            AFTER.get(op - plain.len()).map_or_else(|| format!("op {op}"), |n| (*n).to_string())
+        }
+    }
+
+    /// A call of `op` took `nanos`.
+    pub(super) fn note(op: u64, nanos: u64) {
+        let op = (op as usize).min(OPS - 1);
+        let flush = LOCAL.with_borrow_mut(|(n, c, k)| {
+            n[op] += nanos;
+            c[op] += 1;
+            *k += 1;
+            if *k < 4096 {
+                return false;
+            }
+            *k = 0;
+            for i in 0..OPS {
+                if c[i] != 0 {
+                    NANOS[i].fetch_add(std::mem::take(&mut n[i]), Ordering::Relaxed);
+                    COUNT[i].fetch_add(std::mem::take(&mut c[i]), Ordering::Relaxed);
+                }
+            }
+            true
+        });
+        if flush {
+            line();
+        }
+    }
+
+    fn line() {
+        let now = start().elapsed().as_millis() as u64;
+        let last = LAST.load(Ordering::Relaxed);
+        if now < last + 5000 || LAST.compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+            return;
+        }
+        let secs = (now - last).max(1) as f64 / 1000.0;
+        let mut all: Vec<(u64, u64, usize)> = (0..OPS)
+            .map(|i| (NANOS[i].swap(0, Ordering::Relaxed), COUNT[i].swap(0, Ordering::Relaxed), i))
+            .filter(|t| t.1 != 0)
+            .collect();
+        all.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        let total: u64 = all.iter().map(|t| t.0).sum();
+        let top: Vec<String> = all
+            .iter()
+            .take(15)
+            .map(|&(n, c, i)| format!("{} {:.1} ms/s {:.0}/s {:.2} us", name(i), n as f64 / 1e6 / secs, c as f64 / secs, n as f64 / 1e3 / c as f64))
+            .collect();
+        tracing::info!(
+            "list calls by op (VICTORY_LIST_METER), over all translating threads: {:.1} ms a second in all; {}",
+            total as f64 / 1e6 / secs,
+            top.join("; ")
+        );
+    }
+}
 
 /// The bytes of `count` things at `items` (none if null).
 fn bytes_of<'a, T>(items: *const T, count: usize) -> &'a [u8] {
@@ -708,6 +820,17 @@ extern "system" fn copy_texture_region_x(
     copy_texture_region(this, dst, x, y, z, src, source_box);
 }
 
+/// (`VICTORY_LIST_METER`) One call's time, noted when it is dropped.
+#[cfg(feature = "diagnostics")]
+struct Timed(u64, std::time::Instant);
+
+#[cfg(feature = "diagnostics")]
+impl Drop for Timed {
+    fn drop(&mut self) {
+        meter::note(self.0, self.1.elapsed().as_nanos() as u64);
+    }
+}
+
 /// Makes the calls of a stream on `list`: how many, and whether the last one
 /// closed it. Once `left` says so only what must not be lost is done.
 fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool) {
@@ -732,6 +855,8 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
         if skip && op != CLOSE && op != RESET {
             continue;
         }
+        #[cfg(feature = "diagnostics")]
+        let _timed = meter::on().then(|| Timed(op, std::time::Instant::now()));
         if run_plain(op, list, w) {
             continue;
         }

@@ -9,6 +9,39 @@ generation's frames, "rendered" the title's own.
 Changes before this base (the older RYUKI line on avatarmanz's tree) are in CHANGELOG.md on the
 branch `xtx-2026-11-27`.
 
+## 2026-11-28
+
+### Ten list threads below normal priority (`VICTORY_THIN_PRIORITY=-1`, `-FrameGen`)
+The threads that translate list calls run at the Windows priority given (-2 to 2; unset: as
+before). Eight at normal priority fell to about 3.5 fps: they took the title's own threads' turns.
+Below normal they wait for them, and more of them use the cores the title leaves idle. Release
+build, `-FrameGen` settings with list holds and the table memo, same route: six at normal 29.9
+standing / 24.7 walking (rendered median over the run 25.2); below normal: six 28.0 / 23.9 (24.6),
+eight 30.6 / 26.4 (26.7) and again 29.6 / 25.9 (26.4), **ten 30.5 / 27.2 (28.8)**, twelve 28.6 /
+26.0 (26.4). No faults; shown 30+ in 99.6-100 % of seconds. `-FrameGen` now sets ten below normal,
+and the table memo (`VICTORY_TABLE_MEMO=1`: every run above had it on).
+
+### List holds (`VICTORY_LIST_HOLDS=1`, off; on in `-FrameGen`)
+A host list holds the resource of each view it makes for its tables once (again in each part of a
+list cut at waits), and the dynamic descriptor slots it copies the view into hold nothing: no lock,
+reference and retirement for each of ~2.2 million copies a second. Measured with the list meter
+(below): 0.24 us of a copy's 0.73 us was that. In-run A/B (diagnostics build, 20 s phases, same
+scenes): frames about 1 ms shorter in every matched pair (walking 45.2 against 47.0 and 45.8 ms,
+45.2 against 45.8 and 46.6; standing 36.0 against 35.9 and 37.3), no faults.
+
+### List meter (`VICTORY_LIST_METER=1`, diagnostics builds)
+Where the list threads' time goes, a line every 5 s: list calls by op; indirect executions, binds
+and descriptor tables by step. What it found in the city (six threads, ~5.4 s of CPU a second):
+indirect executions are ~175,000 a second at 23 us, 21 of them the bind; of a bind, 10 us a stage
+are its descriptor tables; of those, tables holding a constant buffer, made afresh for each draw
+(~380,000 a second at 6.9 us), most of it copying ~2.2 million views a second.
+
+### Tried, not kept: constant-buffer tables read in place
+With renderer port 5 a title slot's constant buffer is a raw view of its bytes in place, so a table
+whose constant buffers are all in place could be read where the title has it instead of made
+afresh. In-run A/B: 3-6 ms a frame slower (the title writes those slots anew for its draws, and
+making each title slot again costs more than the copies it spared). Removed.
+
 ## 2026-11-27
 
 ### Descriptor-table memo, ported (`VICTORY_TABLE_MEMO=1|verify`, off)
