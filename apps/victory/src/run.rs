@@ -236,7 +236,7 @@ pub fn run(
         late.load(file, show).map_err(|e| format!("{e:#}"))
     }));
     // The host GPU is made now, before any title code runs
-    // (`VICTORY_HOST_EARLY`, on unless `0`), not at the title's first command
+    // (`VICTORY_HOST_EARLY=1`, off by default), not at the title's first command
     // list: the time the driver takes is then not spent inside the title's
     // start, which the title's own watchdog ends after about 30 s without
     // progress. The driver alone took that long in some runs (AMD's reads its
