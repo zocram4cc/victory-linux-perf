@@ -102,14 +102,22 @@ pub(crate) fn on() -> bool {
     set() != Set::Off && !crate::pipeline::builder_runs()
 }
 
-/// Whether the stand-in drops probe light the title left magenta
-/// (`VICTORY_AMBIENT_MAGENTA=1`, off by default): green below half the
-/// lesser of red and blue, and not black, is taken for uninitialized or
-/// corrupted memory, not light (Belobug e9428969: "magenta garbage probes
-/// left by uninitialized/corrupted memory on AMD"), and counts as none.
-fn magenta_filter() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_AMBIENT_MAGENTA").is_some_and(|v| v == "1"))
+/// Which probe light the title left counts as none (`VICTORY_AMBIENT_MAGENTA`,
+/// off by default; the shader's filter is `is_garbage`, the number its mode):
+/// `1` magenta (Belobug e9428969: "magenta garbage probes left by
+/// uninitialized/corrupted memory on AMD"), `2` magenta and green alone
+/// (breakwater 874af5e56).
+fn magenta_filter() -> u8 {
+    static ON: OnceLock<u8> = OnceLock::new();
+    *ON.get_or_init(|| parse_magenta(&std::env::var("VICTORY_AMBIENT_MAGENTA").unwrap_or_default()))
+}
+
+fn parse_magenta(set: &str) -> u8 {
+    match set.trim() {
+        "1" => 1,
+        "2" => 2,
+        _ => 0,
+    }
 }
 
 /// The most the air scatters, as a multiple of the light around
@@ -239,6 +247,21 @@ float3 seen(int2 p, float2 size) {
     float2 ndc = (float2(p) + 0.5) / size * 2.0 - 1.0;
     return float3(ndc.x * tan_y * size.x / size.y * z, -ndc.y * tan_y * z, z);
 }
+
+#ifdef MAGENTA_FILTER
+// Probe light the title left that is not light: green below half the lesser
+// of red and blue, and not black (magenta).
+bool is_garbage(float3 c) {
+    if (c.g < 0.5 * min(c.r, c.b) && max(c.r, c.b) > 0.02) return true;
+#if MAGENTA_FILTER == 2
+    // Green alone, as magenta alone: red, orange and blue light is left
+    // (taking every nearly pure colour made knuckles and elbows black: the
+    // light in creases of skin is red).
+    if (c.g > 4.0 * max(c.r, c.b) && c.g > 0.02) return true;
+#endif
+    return false;
+}
+#endif
 
 #ifdef KEEP
 RWTexture2D<float3> radiance : register(u0);
@@ -414,7 +437,7 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
     float3 was = unpack(light[p]);
 #ifdef MAGENTA_FILTER
-    if (was.g < 0.5 * min(was.r, was.b) && max(was.r, was.b) > 0.02) was = 0.0;
+    if (is_garbage(was)) was = 0.0;
 #endif
     float left = dot(was, LUMA);
     // What the program left counts as far as it can be true: the sky's light
@@ -463,11 +486,17 @@ unsafe impl Send for Pass {}
 // SAFETY: as above.
 unsafe impl Sync for Pass {}
 
+/// The source of one part of the passes, and the magenta filter's mode.
+fn source(part: &str, magenta: u8) -> String {
+    let filter = if magenta > 0 { format!("#define MAGENTA_FILTER {magenta}\n") } else { String::new() };
+    format!("#define {part}\n{filter}{SOURCE}")
+}
+
 fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -> windows::core::Result<Pass> {
     let mut root: Option<ID3D12RootSignature> = None;
+    let magenta = magenta_filter();
     let mut pipeline = |part: &str, entry| -> windows::core::Result<ID3D12PipelineState> {
-        let filter = if magenta_filter() { "#define MAGENTA_FILTER\n" } else { "" };
-        let code = crate::host::compile(&format!("#define {part}\n{filter}{SOURCE}"), entry, s!("cs_5_1"))?;
+        let code = crate::host::compile(&source(part, magenta), entry, s!("cs_5_1"))?;
         // SAFETY: the root signature is inside the shader; plain creations.
         unsafe {
             if root.is_none() {
@@ -645,6 +674,24 @@ mod tests {
         assert_eq!(role(b"..CS_CacheScreenSpaceRadiance_eed2fc35.."), Some(Role::Radiance));
         assert_eq!(role(b"CS_AccumulateLocalLightInscatteringVolume_7e2f5eef"), Some(Role::Air));
         assert_eq!(role(b"CS_TemporalResolve"), None);
+    }
+
+    #[test]
+    fn magenta_modes_by_value() {
+        assert_eq!(parse_magenta(""), 0);
+        assert_eq!(parse_magenta("0"), 0);
+        assert_eq!(parse_magenta("1"), 1);
+        assert_eq!(parse_magenta(" 2 "), 2);
+        assert_eq!(parse_magenta("4"), 0);
+    }
+
+    /// Modes 1 and 2 are different programs; a mode compiles the same way twice.
+    #[test]
+    fn magenta_modes_compile_apart() {
+        let raise = |m| crate::host::compile(&source("RAISE", m), s!("raise"), s!("cs_5_1")).expect("raise");
+        let one = raise(1);
+        assert_eq!(raise(1), one);
+        assert_ne!(raise(2), one);
     }
 
     /// The passes compile with the system's compiler and the host takes them.
