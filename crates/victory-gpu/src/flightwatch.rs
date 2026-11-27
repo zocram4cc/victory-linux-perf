@@ -123,7 +123,14 @@ struct Caught {
     /// The 16 bytes after, read when the flight landed (for a write before
     /// that: what the title had put there, before any landing's bytes).
     after: Option<[u8; 16]>,
+    /// The address the title wrote through (another view of the same page
+    /// than the copy's `at`, or `at`).
+    through: usize,
 }
+
+/// Since the start: the guards' faults on title writes while a flight was
+/// watched, and those that were a watched block's (at any of its views).
+static GUARD_FAULTS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
 /// When a write came, by our events.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -425,6 +432,8 @@ fn say(a: Armed) {
         landed = a.landed.is_some(),
         blocks_landed = a.landed_blocks.len(),
         armed_ms = a.since.elapsed().as_millis() as u64,
+        guard_faults_while_watched = GUARD_FAULTS[0].load(Ordering::Relaxed),
+        of_them_a_watched_blocks = GUARD_FAULTS[1].load(Ordering::Relaxed),
         lines_left_out = left_out,
         "flight write watch: title writes into a copy's pages from a refresh to the next, around a flight that writes them"
     );
@@ -444,6 +453,7 @@ fn say(a: Armed) {
             thread = c.thread,
             code = %code_at(c.rip),
             at = format_args!("{:#x}", c.at),
+            through = format_args!("{:#x}", c.through),
             offset = format_args!("{:#x}", c.at as u64 - a.copy),
             before = %hex(&c.before),
             after = %hex(&after),
@@ -524,6 +534,7 @@ fn caught(at: usize, rip: usize) -> bool {
             window: window_of(a.sent, a.landed.is_some()),
             in_landed: a.landed_blocks.contains(&(at / crate::watch::PAGE)),
             after: None,
+            through: at,
         });
     }
     true
@@ -537,14 +548,27 @@ pub(crate) fn guard_fault(at: usize, rip: usize) {
     if !ANY.load(Ordering::Acquire) {
         return;
     }
-    let block = at / crate::watch::PAGE;
+    GUARD_FAULTS[0].fetch_add(1, Ordering::Relaxed);
+    let block = crate::watch::PAGE;
+    // The title shows a page at several addresses and may write it through
+    // another than the copy's: each of them is looked at.
+    let within = at % block;
+    let mut at_views = vec![at];
+    at_views.extend(
+        crate::inplace::pages_of(at / block * block).into_iter().map(|view| view + within).filter(|&v| v != at),
+    );
     let mut armed = ARMED.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(a) = armed.iter_mut().find(|a| a.guarded.contains(&block)) else {
+    let found = armed.iter_mut().find_map(|a| {
+        let view = at_views.iter().copied().find(|v| a.guarded.contains(&(v / block)))?;
+        Some((a, view))
+    });
+    let Some((a, view)) = found else {
         return;
     };
-    a.guarded.remove(&block);
-    let page = at / PAGE * PAGE;
-    let from = at.min(page + PAGE - 16);
+    GUARD_FAULTS[1].fetch_add(1, Ordering::Relaxed);
+    a.guarded.remove(&(view / block));
+    let page = view / PAGE * PAGE;
+    let from = view.min(page + PAGE - 16);
     let mut before = [0u8; 16];
     crate::host::read_into(from as *const u8, &mut before);
     if a.caught.len() < 256 {
@@ -558,8 +582,9 @@ pub(crate) fn guard_fault(at: usize, rip: usize) {
             fences: FENCES.load(Ordering::Relaxed) - a.fences,
             after_us: a.since.elapsed().as_micros() as u64,
             window: window_of(a.sent, a.landed.is_some()),
-            in_landed: a.landed_blocks.contains(&(at / crate::watch::PAGE)),
+            in_landed: a.landed_blocks.contains(&(view / block)),
             after: None,
+            through: at,
         });
     }
 }
