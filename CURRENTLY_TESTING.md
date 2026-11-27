@@ -14,15 +14,19 @@ bimodal; differences under ~5 ms need ≥4 runs an arm).
 
 ## Ladder on `main` (2026-11-27, cumulative: each rung adds to the one above)
 
-| Rung | Adds | Frame (median) | p90 | Prep | GPU busy | Runs |
+| Rung | Adds | Run 1 | Run 2 | Mean | Prep | GPU busy |
 |---|---|---|---|---|---|---|
-| r0 | every new switch off (play-fast settings) | 80.9 ms | 97.5 | 70.7 | 60 % | 1 |
-| r1 | `VICTORY_CARD_BUFFERS_MIN_KB=64` | 70.0 ms | 88.0 | 57.7 | 64 % | 1 |
-| r2 | + `VICTORY_WINE_MAP=1 VICTORY_PORT_CONSTANTS=1 VICTORY_PORT_HOME=1` (renderer port 1 under Wine) | 53.9 ms | 103.4 | 43.5 | 77 % | 1 |
-| r3 | + `VICTORY_DYNAMIC_BITS=1 VICTORY_TABLE_MEMO=1` | **50.1 ms** | 67.2 | 40.4 | 79 % | 1 |
-| r4 | + `VICTORY_GRAPHICS_WATCH=1 VICTORY_SMALL_ALIGN=1 VICTORY_PIPELINE_WATCH=1` | running | | | | 0 |
+| r0 | every new switch off (play-fast settings) | 80.9 | 74.5 | 77.7 ms | 70.7 / 63.7 | 60 / 58 % |
+| r1 | `VICTORY_CARD_BUFFERS_MIN_KB=64` | 70.0 | 64.0 | 67.0 ms | 57.7 / 52.4 | 64 / 61 % |
+| r2 | + `VICTORY_WINE_MAP=1 VICTORY_PORT_CONSTANTS=1 VICTORY_PORT_HOME=1` (renderer port 1 under Wine) | 53.9 | 52.2 | 53.1 ms | 43.5 / 43.7 | 77 / 76 % |
+| r3 | + `VICTORY_DYNAMIC_BITS=1 VICTORY_TABLE_MEMO=1` | 50.1 | 49.2 | **49.7 ms** | 40.4 / 41.3 | 79 / 78 % |
+| r4 | + `VICTORY_GRAPHICS_WATCH=1 VICTORY_SMALL_ALIGN=1 VICTORY_PIPELINE_WATCH=1` | 51.0 | 52.6 | 51.8 ms | 42.1 / 42.4 | 76 / 76 % |
 
-Second repetition of every rung is running. r2: port 1 opened part of the title's constants in
+p90 of the frame: r0 97.5/92.5, r1 88.0/88.9, r2 103.4/69.9, r3 67.2/63.9, r4 66.7/68.2 ms.
+**Best so far: r3, 49.7 ms (−36 % against r0).** r4's three switches gave nothing here (+2 ms, within
+noise): left off for now.
+
+r2: port 1 opened part of the title's constants in
 place and fell back to copies for stretches that are not one section ("title memory not in place,
 a copy as before"); the world was drawn (6,594 draws a frame), picture not yet checked by capture.
 
@@ -48,15 +52,15 @@ in Windows sibling order: −3 %. Measured flat or worse (not retried without a 
 
 | Switch | What | Code default | Tested here |
 |---|---|---|---|
-| `VICTORY_CARD_BUFFERS_MIN_KB` / `_MIN_MB` / `_MB` | title buffers from this size up keep their copy in card memory | 4 MiB / 2 GiB on a 16 GB card | `MIN_KB=64`: 80.9 → 70.0 ms (1 run) |
+| `VICTORY_CARD_BUFFERS_MIN_KB` / `_MIN_MB` / `_MB` | title buffers from this size up keep their copy in card memory | 4 MiB / 2 GiB on a 16 GB card | `MIN_KB=64`: 77.7 → 67.0 ms (2 runs) |
 | `VICTORY_WINE_MAP` | Wine: title physical pages shown with the host's `mmap` instead of views | off (`=1`) | with port 1: see r2 |
 | `VICTORY_PORT_CONSTANTS` | renderer port 1: the title's graphics heap read by the card in place | off; under Wine also needs `_WINE=1` or the home path | alone under Wine: black world; with `PORT_HOME`: r2 |
-| `VICTORY_PORT_HOME` | port 1's heap opened on the title's own pages (needs `WINE_MAP=1`) | off (`=1`) | r2: 70.0 → 53.9 ms (1 run) |
-| `VICTORY_DYNAMIC_BITS` | dynamic descriptor slots found a word at a time | on (`=0` off) | with `TABLE_MEMO`: 53.9 → 50.1 ms (1 run) |
+| `VICTORY_PORT_HOME` | port 1's heap opened on the title's own pages (needs `WINE_MAP=1`) | off (`=1`) | r2: 67.0 → 53.1 ms (2 runs) |
+| `VICTORY_DYNAMIC_BITS` | dynamic descriptor slots found a word at a time | on (`=0` off) | with `TABLE_MEMO`: 53.1 → 49.7 ms (2 runs) |
 | `VICTORY_TABLE_MEMO` (`=verify`, `_SLOTS`) | a list remembers table entries it already made readable | off (`=1`) | see r3 |
-| `VICTORY_GRAPHICS_WATCH` | D3D blocks ≥64 KiB get write-watched memory of their own | on (`=0` off) | r4 running |
-| `VICTORY_SMALL_ALIGN` | title told 4 KiB alignment for small textures (console value) | on (`=0`: 64 KiB) | r4 running |
-| `VICTORY_PIPELINE_WATCH` | Wine: a pipeline worker that dies is replaced, its pipeline given up | on under Wine | r4 running |
+| `VICTORY_GRAPHICS_WATCH` | D3D blocks ≥64 KiB get write-watched memory of their own | on (`=0` off) | r4: no gain |
+| `VICTORY_SMALL_ALIGN` | title told 4 KiB alignment for small textures (console value) | on (`=0`: 64 KiB) | r4: no gain |
+| `VICTORY_PIPELINE_WATCH` | Wine: a pipeline worker that dies is replaced, its pipeline given up | on under Wine | r4: no gain (recovery only) |
 | `VICTORY_CLAMP_SYNC` | Wine: clamp waits as narrow (compute-only) barriers | off here (`=1`) | not yet; upstream saw no gain with batched clamps |
 | `VICTORY_SLOT_COUNTS` | shaders read buffer record counts from a host table (RDNA 4 compiler crash workaround) | on (`=0` off) | off in all runs here |
 | `VICTORY_COMPUTE_WAIT_MS` | first compute use waits for its pipeline up to this budget | off | not yet (upstream: fixes missing heads) |
@@ -87,6 +91,8 @@ not from the merge); sparkle on glass and speckle on floors; `VICTORY_PORT_CONST
 
 ## Next
 
-1. Second run of every rung; r4.
-2. Picture check of r2/r3 (captures) — port 1 must not change the image.
-3. Combine the winners into the play settings, then A/B the untested switches one at a time on top.
+1. Picture check of r3 (captures) — port 1 must not change the image.
+2. Combine: r3 becomes the play settings (play-fast2), then on top of it, one at a time, 2 runs
+   each: `VICTORY_CLAMP_SYNC=1` (upstream: 56 → 34 ms where port 1 leaves many lone clamps),
+   `VICTORY_COMPUTE_WAIT_MS=500`, `VICTORY_WAKE_ONE=1`, `VICTORY_JOIN_PARTS_DRAWS=500`,
+   `VICTORY_CARD_BUFFERS_MB` above 2 GiB.
