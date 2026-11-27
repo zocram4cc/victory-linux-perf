@@ -1023,6 +1023,27 @@ impl<'a> Tracer<'a> {
             || matches!(hi, Term::Value(v) if self.sop2(v, &["s_addc_u32"]).is_some_and(
                 |(_, [a, b])| a == want && b == Term::Const(0) || b == want && a == Term::Const(0)
             ))
+            || matches!(hi, Term::Value(v) if self.plus_scc(v).is_some_and(|t| t == want))
+    }
+
+    /// `x` where `v` is `s_add_u32 v, x, src_scc` (either way round): the
+    /// carry of the low half's add written out (P.4's programs build a
+    /// heap address so).
+    fn plus_scc(&self, v: Value) -> Option<Term> {
+        let inst = self.def(v)?;
+        if inst.name() != "s_add_u32" || inst.writes.first()?.1 != v {
+            return None;
+        }
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return None;
+        };
+        let (a, b) = (src.first()?, src.get(1)?);
+        let scc = |o: &Operand| matches!(o, Operand::Const(253));
+        match (scc(a), scc(b)) {
+            (false, true) => self.term(inst, a),
+            (true, false) => self.term(inst, b),
+            _ => None,
+        }
     }
 
     /// `hi` adds something (with carry) to `high`: `s_addc_u32` or
