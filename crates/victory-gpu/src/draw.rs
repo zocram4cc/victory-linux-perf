@@ -484,6 +484,17 @@ impl Drop for State {
     }
 }
 
+/// Whether a list cut at a wait for a memory value forgets the tables made
+/// for its draws ([`State::replay`]; LooperSalty/AnyXboxX ad9b80d, from its
+/// PR #433). A suspect for the geometry spikes on characters: a skinning
+/// dispatch, a wait, then draws reading constant-buffer tables filled when
+/// the part before the wait was submitted (bone palettes of the frame
+/// before). Off until a run shows it helps: `VICTORY_CUT_FORGETS_TABLES=1`.
+fn cut_forgets_tables() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CUT_FORGETS_TABLES").is_some_and(|v| v == "1"))
+}
+
 impl State {
     /// The list's submission has run (submissions are waited for): the
     /// dynamic slots its tables were made in are given back, not kept
@@ -1257,9 +1268,13 @@ impl State {
     /// The pipeline, the root signatures and the heaps are set by the next
     /// draw or dispatch (`bind`, which is told here that the host list has
     /// none); root arguments, vertex and index buffers are set by every
-    /// draw anyway. The dynamic descriptor slots and the tables made in
-    /// them stay: the parts before the cut have not run yet, and they are
-    /// given back when the title's list is reset.
+    /// draw anyway. The dynamic descriptor slots stay until the title's list
+    /// is reset or has run (the parts before the cut have not run yet), but
+    /// the tables made in them are forgotten (`fresh_tables`): a constant
+    /// buffer view of such a table points into the scratch memory of the
+    /// earlier host list, filled from the title's memory when *that* part is
+    /// submitted, so the new part would read what the title held then.
+    /// (LooperSalty/AnyXboxX ad9b80d, from its PR #433.)
     /// shortcut: the render target views are made again from the handles'
     /// descriptors as they are now, not as they were when the title set
     /// the targets (a descriptor rewritten in between names another view).
@@ -1268,6 +1283,9 @@ impl State {
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
         self.host_heaps_set = false;
+        if cut_forgets_tables() {
+            self.fresh_tables.clear();
+        }
         if self.topology_set {
             self.set_topology(list, self.topology);
         }
