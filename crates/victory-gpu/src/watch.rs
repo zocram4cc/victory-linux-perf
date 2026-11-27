@@ -3159,16 +3159,84 @@ fn protect_here(g: &Guards, from: usize, to: usize) {
     }
 }
 
-/// Uncommitted regions found by [`uncommitted_end`] (start and end block),
-/// and the stretch of frames they were found in. Every asking looked the
-/// absent blocks of each region up again: 75,000-216,000 `VirtualQuery` a
-/// second from here (vqstat, 2026-11-26), each under Wine's process-wide
-/// lock that every thread of ours queued at. Regions become memory through
-/// the runtime (`title_memory_remapped`) or `XMemVirtualAlloc`
-/// (`title_memory_allocated`), which drop what they cover; every 8 frames
-/// everything is asked again, for any other way. `VICTORY_ABSENT_CACHE=0`:
-/// asked every time.
-static UNCOMMITTED: Mutex<(BTreeMap<usize, usize>, u64)> = Mutex::new((BTreeMap::new(), u64::MAX));
+/// Uncommitted regions found by [`uncommitted_end`] (disjoint intervals
+/// `[start, end)`), the stretch of frames they were found in, and a generation
+/// bumped whenever memory becomes committed or mapped (`forget_uncommitted`).
+/// Maintaining strictly disjoint intervals prevents a shorter nested entry from
+/// masking an enclosing entry during invalidation, while `remap_gen` rejects
+/// stale `VirtualQuery` answers that raced with a concurrent remap.
+/// `VICTORY_ABSENT_CACHE=0`: asked every time.
+struct UncommittedCache {
+    intervals: BTreeMap<usize, usize>,
+    epoch: u64,
+    remap_gen: u64,
+}
+
+impl UncommittedCache {
+    const fn new() -> Self {
+        Self { intervals: BTreeMap::new(), epoch: u64::MAX, remap_gen: 0 }
+    }
+
+    fn reset_epoch(&mut self, epoch: u64) {
+        if self.epoch != epoch {
+            self.intervals.clear();
+            self.epoch = epoch;
+        }
+    }
+
+    fn lookup(&self, block: usize) -> Option<usize> {
+        self.intervals
+            .range(..=block)
+            .next_back()
+            .filter(|&(_, &end)| block < end)
+            .map(|(_, &end)| end)
+    }
+
+    /// Inserts `[start, end)`, merging any overlapping or adjacent intervals so
+    /// the map remains strictly disjoint (`s1 < e1 < s2 < e2`).
+    fn insert(&mut self, mut start: usize, mut end: usize) {
+        if start >= end || self.intervals.len() >= 1 << 18 {
+            return;
+        }
+        if let Some((&prev_s, &prev_e)) = self.intervals.range(..start).next_back()
+            && prev_e >= start
+        {
+            self.intervals.remove(&prev_s);
+            start = prev_s;
+            end = end.max(prev_e);
+        }
+        let overlap: Vec<(usize, usize)> = self.intervals.range(start..=end).map(|(&s, &e)| (s, e)).collect();
+        for (s, e) in overlap {
+            self.intervals.remove(&s);
+            end = end.max(e);
+        }
+        self.intervals.insert(start, end);
+    }
+
+    fn forget(&mut self, first: usize, last: usize) {
+        self.remap_gen = self.remap_gen.wrapping_add(1);
+        if first >= last {
+            return;
+        }
+        if let Some((&s, &e)) = self.intervals.range(..first).next_back()
+            && e > first
+        {
+            self.intervals.insert(s, first);
+            if e > last {
+                self.intervals.insert(last, e);
+            }
+        }
+        let mid: Vec<(usize, usize)> = self.intervals.range(first..last).map(|(&s, &e)| (s, e)).collect();
+        for (s, e) in mid {
+            self.intervals.remove(&s);
+            if e > last {
+                self.intervals.insert(last, e);
+            }
+        }
+    }
+}
+
+static UNCOMMITTED: Mutex<UncommittedCache> = Mutex::new(UncommittedCache::new());
 
 fn absent_cache() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -3178,49 +3246,43 @@ fn absent_cache() -> bool {
 /// Drops the remembered uncommitted regions that touch blocks `[first, last)`.
 fn forget_uncommitted(first: usize, last: usize) {
     let mut cache = UNCOMMITTED.lock().unwrap_or_else(|e| e.into_inner());
-    let gone: Vec<usize> = cache
-        .0
-        .range(..last)
-        .rev()
-        .take_while(|&(_, &end)| end > first)
-        .map(|(&start, _)| start)
-        .chain(cache.0.range(first..last).map(|(&s, _)| s))
-        .collect();
-    for start in gone {
-        cache.0.remove(&start);
-    }
+    cache.forget(first, last);
 }
 
 /// The end (exclusive) of the whole uncommitted blocks starting at `block`.
 fn uncommitted_end(block: usize) -> usize {
     if !absent_cache() {
-        return uncommitted_end_asked(block);
+        return uncommitted_span_asked(block).1;
     }
-    let epoch = crate::queue::presented() / 8;
-    {
+    for attempt in 0..3 {
+        let epoch = crate::queue::presented() / 8;
+        let gen_before = {
+            let mut cache = UNCOMMITTED.lock().unwrap_or_else(|e| e.into_inner());
+            cache.reset_epoch(epoch);
+            if let Some(end) = cache.lookup(block) {
+                return end;
+            }
+            cache.remap_gen
+        };
+        let (start, end) = uncommitted_span_asked(block);
         let mut cache = UNCOMMITTED.lock().unwrap_or_else(|e| e.into_inner());
-        if cache.1 != epoch {
-            cache.0.clear();
-            cache.1 = epoch;
-        }
-        if let Some((_, &end)) = cache.0.range(..=block).next_back()
-            && block < end
-        {
+        if cache.remap_gen == gen_before {
+            cache.reset_epoch(epoch);
+            if end > block {
+                cache.insert(start, end);
+            }
             return end;
         }
-    }
-    let end = uncommitted_end_asked(block);
-    if end > block {
-        let mut cache = UNCOMMITTED.lock().unwrap_or_else(|e| e.into_inner());
-        if cache.1 == epoch && cache.0.len() < 1 << 18 {
-            cache.0.insert(block, end);
+        if attempt == 2 {
+            break;
         }
     }
-    end
+    uncommitted_span_asked(block).1
 }
 
-/// [`uncommitted_end`] as Wine answers it.
-fn uncommitted_end_asked(block: usize) -> usize {
+/// Uncommitted block span `[start, end)` containing `block` as Wine answers
+/// it; returns `(block, block)` if `block` is committed.
+fn uncommitted_span_asked(block: usize) -> (usize, usize) {
     use windows_sys::Win32::System::Memory::{
         MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
@@ -3230,9 +3292,11 @@ fn uncommitted_end_asked(block: usize) -> usize {
     crate::vqstat::hit(6);
     let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
     if n != 0 && matches!(info.State, MEM_RESERVE | MEM_FREE) {
-        (info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK
+        let base_block = (info.BaseAddress as usize).div_ceil(BLOCK).min(block);
+        let end_block = (info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK;
+        (base_block, end_block.max(block))
     } else {
-        block
+        (block, block)
     }
 }
 
@@ -6067,5 +6131,45 @@ mod rearm_tests {
         assert_eq!(NOT_REARMED.load(Relaxed), before + 2);
         // SAFETY: our allocation.
         unsafe { VirtualFree(page as *mut _, 0, MEM_RELEASE) };
+    }
+}
+
+#[cfg(test)]
+mod uncommitted_cache_tests {
+    use super::UncommittedCache;
+
+    #[test]
+    fn disjoint_intervals_survive_partial_forget_and_merge() {
+        let mut cache = UncommittedCache::new();
+        cache.reset_epoch(1);
+        cache.insert(300, 310);
+        cache.insert(100, 500);
+        // Merging must leave one disjoint interval [100, 500), not a nested (300, 310).
+        assert_eq!(cache.intervals.len(), 1);
+        assert_eq!(cache.lookup(350), Some(500));
+
+        // Forgetting a slice inside [100, 500) must invalidate [350, 360) and keep both sides.
+        cache.forget(350, 360);
+        assert_eq!(cache.lookup(349), Some(350));
+        assert_eq!(cache.lookup(350), None);
+        assert_eq!(cache.lookup(359), None);
+        assert_eq!(cache.lookup(360), Some(500));
+        assert_eq!(cache.remap_gen, 1);
+
+        // Adjacent insert reconnects seamlessly.
+        cache.insert(350, 360);
+        assert_eq!(cache.intervals.len(), 1);
+        assert_eq!(cache.lookup(200), Some(500));
+    }
+
+    #[test]
+    fn forget_bumps_remap_generation() {
+        let mut cache = UncommittedCache::new();
+        cache.reset_epoch(4);
+        let gen0 = cache.remap_gen;
+        cache.forget(10, 12);
+        assert_ne!(cache.remap_gen, gen0);
+        cache.reset_epoch(5);
+        assert_ne!(cache.remap_gen, gen0);
     }
 }

@@ -829,8 +829,9 @@ const PAGE_WRITE_AFTER: u64 = 2;
 /// ranges; locks one mutex and calls nothing.
 pub(crate) fn page_written(at: usize, len: usize) {
     use std::sync::atomic::Ordering::Relaxed;
-    /// Ranges kept until a pass takes them.
-    const MOST: usize = 1 << 15;
+    /// Ranges kept until a pass takes them (2^15 overflowed while streaming:
+    /// 163,840 ranges dropped in harbor-x-play-16; after triippywhale 70656d56).
+    const MOST: usize = 1 << 18;
     let (start, end) = (at as u64, at.saturating_add(len) as u64);
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
@@ -891,8 +892,9 @@ fn stale_rule() -> Rule {
 /// locks held: this locks one mutex of its own and calls nothing.
 pub(crate) fn remapped(at: usize, len: usize) {
     use std::sync::atomic::Ordering::Relaxed;
-    /// Ranges kept until a pass takes them.
-    const MOST: usize = 1 << 15;
+    /// Ranges kept until a pass takes them (2^15 overflowed while streaming:
+    /// 163,840 ranges dropped in harbor-x-play-16; after triippywhale 70656d56).
+    const MOST: usize = 1 << 18;
     let (start, end) = (at as u64, at.saturating_add(len) as u64);
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
@@ -993,6 +995,14 @@ struct Waiting {
     waited: bool,
     /// When a look last found its memory away (or no more of it): 0 none.
     away: u64,
+}
+
+/// Whether due texture slots are served in turns, a slot looked at before
+/// and one never looked at ([`TextureQueue::in_order`]; on unless
+/// `VICTORY_FAIR_DUE=0`).
+fn fair_due() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FAIR_DUE").is_none_or(|v| v != "0"))
 }
 
 /// The queue of title slots whose texture view waits to be brought up to
@@ -1125,15 +1135,38 @@ impl TextureQueue {
         let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
         again.sort_unstable_by(newest_first);
         fresh.sort_unstable_by(newest_first);
-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
+        let mut fresh_order: Vec<(u32, u64)> = Vec::with_capacity(fresh.len().min(max));
         let (mut new, mut old) = (0, fresh.len());
-        while new < old && order.len() < max {
-            order.push((fresh[new].1, fresh[new].2));
+        while new < old && fresh_order.len() < max {
+            fresh_order.push((fresh[new].1, fresh[new].2));
             new += 1;
-            if new < old && order.len() < max {
+            if new < old && fresh_order.len() < max {
                 old -= 1;
-                order.push((fresh[old].1, fresh[old].2));
+                fresh_order.push((fresh[old].1, fresh[old].2));
             }
+        }
+        let mut again_order = again.iter().map(|&(_, index, write)| (index, write));
+        // The two kinds in turns, a slot looked at before first
+        // (`VICTORY_FAIR_DUE=0`: all those looked at before first, as
+        // before): a backlog of slots streaming in a part at a time filled
+        // every pass, and slots never looked at waited hundreds of frames;
+        // faces and hair whose textures are picked by index read an empty
+        // slot meanwhile (after fxceless/victory-fork #1246, faf709b5).
+        if !fair_due() {
+            let mut order: Vec<(u32, u64)> = again_order.collect();
+            order.extend(fresh_order);
+            order.truncate(max);
+            return order;
+        }
+        let mut fresh_order = fresh_order.into_iter();
+        let mut order = Vec::with_capacity(max.min(fresh.len() + again.len()));
+        while order.len() < max {
+            let (a, b) = (again_order.next(), fresh_order.next());
+            if a.is_none() && b.is_none() {
+                break;
+            }
+            order.extend(a);
+            order.extend(b);
         }
         order.truncate(max);
         order
@@ -5308,8 +5341,9 @@ mod tests {
     /// slot; a view that is no buffer's, and none, enter 0.
     #[test]
     fn view_addresses_follow_the_strides() {
-        use victory_shader::emit::{SLOT_STRIDES_BYTES, SLOT_STRIDES_COUNT, VIEW_ADDRESSES};
-        let mut table = vec![0xdead_beefu32; SLOT_STRIDES_BYTES as usize / 4];
+        use victory_shader::emit::{SLOT_STRIDES_COUNT, SLOT_VIEW_ADDRESS_OFFSET};
+        let total_bytes = SLOT_VIEW_ADDRESS_OFFSET as usize + SLOT_STRIDES_COUNT as usize * 8;
+        let mut table = vec![0xdead_beefu32; total_bytes / 4];
         let data = table.as_mut_ptr() as usize;
         // A ray-tracing structure's view: its address in words 4 and 5.
         const STRUCTURE: u32 = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32;
@@ -5322,7 +5356,7 @@ mod tests {
         write_view_address(data, SLOT_STRIDES_COUNT - 1, Some(&view));
         // Past the table: nothing written.
         write_view_address(data, SLOT_STRIDES_COUNT, Some(&view));
-        let at = VIEW_ADDRESSES as usize / 4;
+        let at = SLOT_VIEW_ADDRESS_OFFSET as usize / 4;
         assert_eq!(table[at + 14..at + 18], [0x1234_5600, 0x42, 0, 0]);
         assert_eq!(table[at + 12..at + 14], [0xdead_beef; 2], "slot 6 untouched");
         let last = at + 2 * (SLOT_STRIDES_COUNT as usize - 1);

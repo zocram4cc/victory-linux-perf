@@ -195,6 +195,49 @@ pub fn raw_views() -> u32 {
     RAW_VIEWS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// For a test's thread alone: [`constants_raw`].
+    pub(crate) static CONSTANTS_RAW_HERE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// For a test's thread alone: [`bvh_empty`].
+    pub(crate) static BVH_EMPTY_HERE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Renderer port 5 (`VICTORY_PORT_CBV=1`; off by default): constant buffers are read as raw
+/// bytes, a table's through the raw twin of its slot ([`raw_views`]), a root one as a root SRV,
+/// so the host can give the card the title's bytes where they are (16-byte aligned, which a
+/// constant buffer view cannot take) instead of a copy made at every submission.
+pub fn constants_raw() -> bool {
+    #[cfg(test)]
+    if let Some(on) = CONSTANTS_RAW_HERE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_PORT_CBV").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Empty-BVH architectural miss (`VICTORY_BVH_EMPTY=1`; off by default): when
+/// `VICTORY_BVH_BUILDER=0`, `image_bvh*_intersect_ray` immediately returns
+/// `bvh::NONE` (`[0xffff_ffff; 4]`) for box nodes and `bvh::MISS` for leaf nodes
+/// without touching unbuilt BVH memory or marking pages for host upload.
+pub fn bvh_empty() -> bool {
+    #[cfg(test)]
+    if let Some(on) = BVH_EMPTY_HERE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_BVH_EMPTY").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// RDNA 2 legacy multiply-add semantics (`VICTORY_LEGACY_FTZ=1`; off by default):
+/// flushes f32 subnormal inputs to signed zero before applying the legacy
+/// zero-factor rule (`0 * Inf/NaN = +0`), matching console hardware in hair
+/// strand simulation and ped skinning shaders.
+pub fn legacy_ftz() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_LEGACY_FTZ").is_ok_and(|v| v.trim() == "1"))
+}
+
 pub(crate) struct Shader {
     pub m: Module,
     pub t: Types,

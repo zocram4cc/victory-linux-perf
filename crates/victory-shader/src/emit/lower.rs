@@ -4069,9 +4069,47 @@ impl<'a> Lower<'a> {
         self.s.m.cast(c, Cast::Trunc, hi, self.s.t.i32)
     }
 
+    /// Flushes f32 subnormals to signed zero, keeping all other values and
+    /// the sign of zero intact.
+    fn ftz(&mut self, x: V) -> V {
+        let c = self.cur;
+        let bits = self.as_int(x);
+        let exp_mask = self.s.m.i32(0x7F80_0000);
+        let sign_mask = self.s.m.i32(0x8000_0000);
+        let zero = self.s.m.i32(0);
+        let exp = self.s.m.bin(c, Bin::And, bits, exp_mask);
+        let sub = self.s.m.cmp(c, pred::EQ, exp, zero);
+        let signed_zero = self.s.m.bin(c, Bin::And, bits, sign_mask);
+        let flushed = self.s.m.select(c, sub, signed_zero, bits);
+        self.as_float(flushed)
+    }
+
+    /// A legacy multiply-add as RDNA 2 runs it: fused (`v_fma_legacy_f32`),
+    /// with the legacy rule that a zero factor makes the product a +0 rather
+    /// than turning an infinite or NaN factor into a NaN.
+    fn legacy_fmad(&mut self, a: V, b: V, c: V) -> V {
+        let cur = self.cur;
+        let fused = self.fmad(a, b, c);
+        let zero = self.s.m.f32(0);
+        let az = self.s.m.cmp(cur, pred::OEQ, a, zero);
+        let bz = self.s.m.cmp(cur, pred::OEQ, b, zero);
+        let z = self.s.m.bin(cur, Bin::Or, az, bz);
+        let addend = self.s.m.bin(cur, Bin::Add, zero, c);
+        self.s.m.select(cur, z, addend, fused)
+    }
+
     /// `0 × anything = 0`, as in D3D9.
     fn legacy_mul(&mut self, a: V, b: V) -> V {
         let c = self.cur;
+        if super::shader::legacy_ftz() {
+            let (a, b) = (self.ftz(a), self.ftz(b));
+            let m = self.s.m.bin(c, Bin::Mul, a, b);
+            let zero = self.s.m.f32(0);
+            let az = self.s.m.cmp(c, pred::OEQ, a, zero);
+            let bz = self.s.m.cmp(c, pred::OEQ, b, zero);
+            let z = self.s.m.bin(c, Bin::Or, az, bz);
+            return self.s.m.select(c, z, zero, m);
+        }
         if host_rdna() & super::rdna::LEGACY != 0 {
             let m = self.s.m.bin(c, Bin::Mul, a, b);
             let zero = self.s.m.f32(0);
@@ -6332,13 +6370,26 @@ impl<'a> Lower<'a> {
             let raw = self.end_guarded(at, &raw);
             let other = self.s.m.cmp(self.cur, pred::EQ, stride, zero);
             let at = self.begin_guarded(Some(other));
-            let h = self.handle(site, src, false, (13, 0x1_0000))?;
+            // (Renderer port 5: the twin of a constant buffer's slot is a
+            // raw view of its bytes, read as one.)
+            let as_raw = super::shader::constants_raw() && super::shader::raw_views() != 0;
+            let h = if as_raw {
+                self.handle(site, src, false, (11, 0))?
+            } else {
+                self.handle(site, src, false, (13, 0x1_0000))?
+            };
             let mut both = Vec::new();
+            let dwords = if as_raw { self.raw_dwords(h, addr, raw.len() as u32) } else { Vec::new() };
             for (k, &r) in raw.iter().enumerate() {
                 let b = self.cur;
-                let off = self.s.m.i32(4 * k as u32);
-                let a = self.s.m.bin(b, Bin::Add, addr, off);
-                let x = self.cbuffer_dword(h, a);
+                let x = match dwords.get(k) {
+                    Some(&x) => x,
+                    None => {
+                        let off = self.s.m.i32(4 * k as u32);
+                        let a = self.s.m.bin(b, Bin::Add, addr, off);
+                        self.cbuffer_dword(h, a)
+                    }
+                };
                 both.push((x, r));
             }
             let both = self.end_guarded(at, &both);
@@ -6391,6 +6442,12 @@ impl<'a> Lower<'a> {
                     let sane = self.s.m.cmp(c, pred::IULT, x, most);
                     x = self.s.m.select(c, sane, x, zero);
                 }
+                self.write(inst, Reg::S(code + k as u8), x, None);
+            }
+            return Ok(());
+        }
+        if let Some(h) = self.constants_raw(site, src)? {
+            for (k, x) in self.raw_dwords(h, addr, count).into_iter().enumerate() {
                 self.write(inst, Reg::S(code + k as u8), x, None);
             }
             return Ok(());
@@ -6864,6 +6921,44 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::S(code + k as u8), x, None);
         }
         Ok(())
+    }
+
+    /// Renderer port 5 (`VICTORY_PORT_CBV=1`, [`super::shader::constants_raw`]):
+    /// the handle a constant buffer `src` is read through as raw bytes, or
+    /// `None` to read it as a constant buffer, as before.
+    fn constants_raw(&mut self, site: Site, src: &Source) -> Result<Option<V>, Why> {
+        if !super::shader::constants_raw() {
+            return Ok(None);
+        }
+        if let Source::Built { address, .. } = src {
+            if self.root_copy.is_some() {
+                return Ok(None);
+            }
+            let Some(&rp) = self.x.native.layout.get(address.param) else {
+                return Ok(None);
+            };
+            let kind = self.x.native.used.iter().find(|u| u.user_data == rp.user_data).map(|u| u.kind);
+            if rp.root == RootType::Descriptor && matches!(kind, Some(ResourceType::Cbv) | None) {
+                return Ok(Some(self.s.root_srv_handle(rp.slot)));
+            }
+            return Ok(None);
+        }
+        if super::shader::raw_views() == 0 {
+            return Ok(None);
+        }
+        let x = self.x;
+        let scalar = &self.scalar;
+        let through_heap = src.leaves().iter().all(|leaf| match leaf {
+            Source::Loaded { load, .. } | Source::Fetched { load, .. } => scalar
+                .get(load)
+                .and_then(|a| x.native.layout.get(a.param))
+                .is_some_and(|p| matches!(p.root, RootType::Table | RootType::ResourceHeap)),
+            _ => false,
+        });
+        if !through_heap {
+            return Ok(None);
+        }
+        Ok(Some(self.handle(site, src, false, (11, 0))?))
     }
 
     /// The dword at a computed byte address of a constant buffer.
@@ -8451,20 +8546,30 @@ impl<'a> Lower<'a> {
                         self.s.m.bin(c, Bin::Add, m, acc)
                     }
                     _ => {
-                        let m = self.legacy_mul(a, bb);
-                        self.s.m.bin(c, Bin::Add, m, acc)
+                        if super::shader::legacy_ftz() {
+                            let (a, bb, acc) = (self.ftz(a), self.ftz(bb), self.ftz(acc));
+                            self.legacy_fmad(a, bb, acc)
+                        } else {
+                            let m = self.legacy_mul(a, bb);
+                            self.s.m.bin(c, Bin::Add, m, acc)
+                        }
                     }
                 };
                 float(self, r)
             }
             "v_mad_f32" | "v_madak_f32" | "v_madmk_f32" | "v_mad_legacy_f32" => {
                 let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
-                let m = if name == "v_mad_legacy_f32" {
-                    self.legacy_mul(a, bb)
+                let r = if name == "v_mad_legacy_f32" && super::shader::legacy_ftz() {
+                    let (a, bb, cc) = (self.ftz(a), self.ftz(bb), self.ftz(cc));
+                    self.legacy_fmad(a, bb, cc)
                 } else {
-                    self.s.m.bin(c, Bin::Mul, a, bb)
+                    let m = if name == "v_mad_legacy_f32" {
+                        self.legacy_mul(a, bb)
+                    } else {
+                        self.s.m.bin(c, Bin::Mul, a, bb)
+                    };
+                    self.s.m.bin(c, Bin::Add, m, cc)
                 };
-                let r = self.s.m.bin(c, Bin::Add, m, cc);
                 float(self, r)
             }
             "v_max3_f32" | "v_min3_f32" | "v_med3_f32" => {
@@ -11811,7 +11916,11 @@ impl<'a> Lower<'a> {
             // A constant buffer read per lane (a dynamically indexed array).
             // shortcut: the console's CBV descriptor is taken to have a 16-byte
             // stride, as the vector loads of whole rows suggest.
-            let h = self.handle(site, src, false, (13, 0x1_0000))?;
+            let raw = self.constants_raw(site, src)?;
+            let h = match raw {
+                Some(h) => h,
+                None => self.handle(site, src, false, (13, 0x1_0000))?,
+            };
             let byte = match index {
                 Some(i) => {
                     let sixteen = self.s.m.i32(16);
@@ -11826,7 +11935,10 @@ impl<'a> Lower<'a> {
             for k in 0..count {
                 let four = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, byte, four);
-                let x = self.cbuffer_dword(h, a);
+                let x = match raw {
+                    Some(_) => self.raw_dwords(h, a, 1)[0],
+                    None => self.cbuffer_dword(h, a),
+                };
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());

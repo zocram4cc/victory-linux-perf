@@ -102,6 +102,11 @@ struct Last {
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
+    /// The last read of a partly mapped texture found nothing but zeros: it
+    /// is the one a streaming arrival changes next, so it is looked at again
+    /// in a frame or two rather than after thirty (after DoubleGhosty/cool_fox
+    /// c3410461: character skins stayed black for seconds).
+    zero: bool,
     /// Until this frame a guarded texture is hashed at every check: its
     /// first checks, and after the hash found a change the guard had not
     /// seen ([`hot_textures`]). 0: not checked under the guard yet.
@@ -270,7 +275,12 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
             }
         }
     };
-    let first = list.first_use(placed as usize);
+    list.first_use(placed as usize);
+    // (fxceless 19a45d1, via Scarlett) An upload of this view from title memory earlier in
+    // the list has used its first use already: only a copy from the same card-written
+    // source satisfies this read (before: the copy was skipped and the shader read the
+    // uploaded bytes, zero where the card wrote packed light).
+    let new_source = list.alias_source_changed(&to, &from);
     // The source's first use in the list records nothing (its prelude
     // brings it to the state); a use in another way since the last copy
     // shows as a change of state.
@@ -285,7 +295,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         unsafe { list.list.ResourceBarrier(&[barrier]) };
         before
     });
-    if !first && before.is_none() {
+    if !new_source && before.is_none() {
         return true;
     }
     card_writes(list, placed, to, None);
@@ -1326,7 +1336,8 @@ impl Staging {
             // unmapped pages is slow, and nothing tells us when pages
             // arrive): a mip that streams in shows up to 30 frames late.
             let frame = crate::frame::current();
-            if last.partial.is_some_and(|at| frame < at + 30) {
+            let every = if last.zero { 2 } else { 30 };
+            if last.partial.is_some_and(|at| frame < at + every) {
                 return 0;
             }
             last.partial = Some(frame);
@@ -1340,8 +1351,10 @@ impl Staging {
                 }
                 last.hash = Some(hash);
                 if read.iter().all(|&b| b == 0) {
+                    last.zero = true;
                     return false;
                 }
+                last.zero = false;
                 self.detile(read);
                 true
             });

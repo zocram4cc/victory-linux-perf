@@ -131,6 +131,28 @@ impl<'a> Lower<'a> {
             x.push(self.i32_of(v)?);
         }
         let pointer = x[0];
+        if crate::emit::shader::bvh_empty() {
+            // When the BVH builder is disabled (`VICTORY_BVH_BUILDER=0`), the
+            // title's BVH buffers hold zeros or stale heap memory. Return a
+            // clean architectural miss (`bvh::NONE` for box nodes, `bvh::MISS`
+            // for triangles/other) without touching memory or faulting pages.
+            let c = self.cur;
+            let (k4, k6) = (self.s.m.i32(4), self.s.m.i32(6));
+            let pair = self.s.m.bin(c, Bin::And, pointer, k6);
+            let is_box = self.s.m.cmp(c, pred::EQ, pair, k4);
+            let none = self.s.m.i32(bvh::NONE);
+            let zero = self.s.m.i32(0);
+            let miss = bvh::MISS.map(|f| self.s.m.i32(f.to_bits()));
+            for k in 0..4 {
+                let r = self.s.m.select(c, is_box, none, miss[k]);
+                let r = match guard {
+                    Some(g) => self.s.m.select(c, g, r, zero),
+                    None => r,
+                };
+                self.write(inst, Reg::V(dst + k as u8), r, guard);
+            }
+            return Ok(());
+        }
         let pointer_high = wide.then(|| x[1]);
         let f: Vec<V> = x[1 + usize::from(wide)..]
             .iter()

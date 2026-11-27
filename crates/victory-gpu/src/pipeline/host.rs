@@ -728,7 +728,7 @@ impl HostPipeline {
             }),
             BlendState: host_blend(&g.blend, &g.targets),
             SampleMask: g.sample_mask,
-            RasterizerState: g.rasterizer,
+            RasterizerState: cull_none(g.rasterizer),
             DepthStencilState: g.depth,
             InputLayout: D3D12_INPUT_LAYOUT_DESC {
                 pInputElementDescs: g.inputs.as_ptr(),
@@ -1265,7 +1265,7 @@ mod tests {
             PS: code(&ps),
             BlendState: g.blend,
             SampleMask: g.sample_mask,
-            RasterizerState: g.rasterizer,
+            RasterizerState: cull_none(g.rasterizer),
             DepthStencilState: g.depth,
             IBStripCutValue: g.strip_cut,
             PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
@@ -1522,5 +1522,20 @@ mod tests {
             element(DXGI_FORMAT_R32_FLOAT, D3D12_APPEND_ALIGNED_ELEMENT),
         ];
         let _ = offsets(&inputs);
+    }
+}
+
+/// Diagnostic (`VICTORY_CULL_NONE=1`; off by default): every pipeline draws
+/// both faces, to tell a mesh lost to winding or culling (a whole head, hair)
+/// from one lost to its textures (after meeyao/victory-8gb-linux 3e42a23).
+/// The pipeline library's keys do not know of it: for a run on a seed of
+/// its own.
+#[cfg(windows)]
+fn cull_none(rasterizer: D3D12_RASTERIZER_DESC) -> D3D12_RASTERIZER_DESC {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("VICTORY_CULL_NONE").is_some_and(|v| v == "1")) {
+        D3D12_RASTERIZER_DESC { CullMode: D3D12_CULL_MODE_NONE, ..rasterizer }
+    } else {
+        rasterizer
     }
 }

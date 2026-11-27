@@ -34,7 +34,7 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 /// (`victory_shader::emit::constants_raw`) and the host's views follow the
 /// same switch.
 pub(crate) fn on() -> bool {
-    false
+    victory_shader::emit::constants_raw()
 }
 
 /// Whether a table's constant buffer in title memory in place is given to the

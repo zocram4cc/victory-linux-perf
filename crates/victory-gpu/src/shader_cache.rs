@@ -85,6 +85,17 @@ fn build() -> [u8; 32] {
         }
         // And which clean-up passes ran over the translated code.
         bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
+        // Opt-in translation switches: appended only when on, so cached
+        // translations without them keep their existing key.
+        if victory_shader::emit::bvh_empty() {
+            bytes.extend_from_slice(b"VICTORY_BVH_EMPTY=1");
+        }
+        if victory_shader::emit::legacy_ftz() {
+            bytes.extend_from_slice(b"VICTORY_LEGACY_FTZ=1");
+        }
+        if victory_shader::emit::constants_raw() {
+            bytes.extend_from_slice(b"VICTORY_PORT_CBV=1");
+        }
         bytes
     });
     let mut hash = blake3::Hasher::new();

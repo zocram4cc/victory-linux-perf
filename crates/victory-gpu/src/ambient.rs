@@ -141,6 +141,23 @@ fn reflect() -> f32 {
     })
 }
 
+/// Separate reflection cap for see-through surfaces (`Role::ReflectedAlpha`,
+/// `CS_DeferredFallbacksAlpha_SkyProbe`): glass tabletops, aquarium lids, and
+/// indoor phone cover glass blow out sky-white in sunlit rooms at the opaque
+/// floor's multiple (`1.0`). Defaults to `0.25 * reflect()` unless overridden
+/// by `VICTORY_AMBIENT_REFLECT_ALPHA`.
+fn reflect_alpha() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let set = std::env::var("VICTORY_AMBIENT_REFLECT_ALPHA").unwrap_or_default();
+        set.trim()
+            .parse()
+            .ok()
+            .filter(|v: &f32| v.is_finite() && *v > 0.0)
+            .unwrap_or_else(|| reflect() * 0.25)
+    })
+}
+
 /// How the slow mean of the light around follows the frames
 /// (`VICTORY_AMBIENT_SETTLE=<time constant in ms>[,<jump factor>[,<fresh
 /// seconds>]]`; unset: 250,3; 0: 0.04 of the way a frame, as before, which is 25
@@ -225,6 +242,15 @@ fn shade() -> [f32; 2] {
         }
         shade
     })
+}
+
+/// Whether `raise` selects between the resolve's leftover light and the
+/// stand-in estimate by luminance instead of taking component-wise `max`
+/// (`VICTORY_AMBIENT_CHROMA=0` restores component-wise `max`), preventing
+/// cool sky-probe leftovers from tinting warm indoor bounce onto skin.
+fn chroma_select() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_AMBIENT_CHROMA").is_none_or(|v| v != "0"))
 }
 
 const SOURCE: &str = r#"
@@ -387,6 +413,12 @@ void hold_f(uint3 at : SV_DispatchThreadID) {
     if (at.x >= width || at.y >= height) return;
     float cap = max(air * dot(cells[CELLS].rgb, LUMA), 1e-6);
     float3 c = reflected_f[at.xy];
+    if (any(isnan(c)) || any(isinf(c))) c = 0.0;
+    c = max(c, 0.0);
+    {
+        float hi = max(c.r, max(c.g, c.b)), lo = min(c.r, min(c.g, c.b));
+        if ((c.g < 0.5 * min(c.r, c.b) && max(c.r, c.b) > 0.02) || (c.g > 4.0 * max(c.r, c.b) && hi > 0.02 && lo < hi)) c = 0.0;
+    }
     float has = dot(c, LUMA);
     reflected_f[at.xy] = c / (1.0 + has / cap);
 }
@@ -501,6 +533,8 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
     float3 was = unpack(light[p]);
+    if (any(isnan(was)) || any(isinf(was))) was = 0.0;
+    was = max(was, 0.0);
     // What the probes' memory held where the rays wrote nothing: specks of
     // magenta and green on paper, cloth and leaves. Magenta is beloooo's
     // filter (VIctory-Belobug-AMD e942896); the second line takes green
@@ -520,9 +554,12 @@ void raise(uint3 at : SV_DispatchThreadID) {
     float top = max(dot(found, LUMA) * bound, 1e-6);
     float has = dot(was, LUMA);
     was *= min(1.0, top / max(has, 1e-6));
-    float3 written = max(was, found);
+    float l_was = dot(was, LUMA), l_found = dot(found, LUMA);
+    float3 written = (probe & 2) != 0
+        ? (l_was > l_found ? lerp(found, was, saturate((l_was - l_found) / max(0.25 * l_found, 1e-4))) : found)
+        : max(was, found);
     light[p] = pack(written);
-    if (probe != 0 && (at.x & 15) == 0 && (at.y & 15) == 0) {
+    if ((probe & 1) != 0 && (at.x & 15) == 0 && (at.y & 15) == 0) {
         uint ignored;
         stats.InterlockedAdd(0, 1, ignored);
         stats.InterlockedAdd(4, uint(min(left, 1000.0) * 256.0), ignored);
@@ -714,7 +751,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     }
     if role == Role::ReflectedAlpha {
         static HELD: std::sync::Once = std::sync::Once::new();
-        HELD.call_once(|| tracing::info!(size = ?views.size, multiple = reflect(), "see-through surfaces' reflections held to the light around"));
+        HELD.call_once(|| tracing::info!(size = ?views.size, multiple = reflect_alpha(), "see-through surfaces' reflections held to the light around (VICTORY_AMBIENT_REFLECT_ALPHA)"));
     }
     if role == Role::Reflected {
         static HELD: std::sync::Once = std::sync::Once::new();
@@ -733,8 +770,13 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[7] = views.size[1];
     words[8] = follow(role).to_bits();
     words[9] = 4.0f32.to_bits();
-    words[10] = if matches!(role, Role::Reflected | Role::ReflectedAlpha) { reflect() } else { air() }.to_bits();
-    words[11] = u32::from(crate::lightprobe::on());
+    words[10] = match role {
+        Role::Reflected => reflect(),
+        Role::ReflectedAlpha => reflect_alpha(),
+        _ => air(),
+    }
+    .to_bits();
+    words[11] = u32::from(crate::lightprobe::on()) | (u32::from(chroma_select()) << 1);
     words[12] = settle().map_or(0.0, |s| s.jump).to_bits();
     words[13] = settle().map_or(0.0, |s| s.fresh).to_bits();
     words[14] = (frame_ms(role) / 1000.0).to_bits();

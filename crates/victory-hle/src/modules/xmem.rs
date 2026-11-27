@@ -178,13 +178,24 @@ pub extern "system" fn XMemVirtualAlloc(
         );
     }
     if !at.is_null() && !placeholder {
-        victory_gpu::title_memory_allocated(at as usize, size);
+        // Windows rounds a fixed commit's address down to a page: told with
+        // the rounded address and the caller's length, the watch kept the
+        // last block's "absent" note (after fxceless/victory-fork #1212,
+        // d03859a2). The whole of what was committed is told: from the
+        // rounded start to the caller's end.
+        let asked_at = base as usize;
+        let len = if asked_at > at as usize { size + (asked_at - at as usize) } else { size };
+        victory_gpu::title_memory_allocated(at as usize, len);
     }
     // (Grand Theft Auto VI asks for its 32-bit heap with kind 0x42000,
     // without the 64 KiB page bits: not `placeholder` above, though the host
     // makes a placeholder of it all the same.)
     if !at.is_null() && constrained && kind & MEM_COMMIT == 0 && flags & ADDRESS_32BIT != 0 {
         LOW_RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner()).push((at as usize, size));
+    }
+    // What the title asked for, for VICTORY_SKIP_WC_BACK (write-combining reservations).
+    if base.is_null() {
+        victory_gpu::title_memory_reserved(at as usize, size, asked);
     }
     note_protection(asked, kind, flags, at as usize, size);
     at
@@ -2092,12 +2103,64 @@ extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u
     unsafe { VirtualFree(address, size, kind) }
 }
 
+/// The title's own `VirtualAlloc` (it imports it from the kernel beside
+/// `XMemVirtualAlloc`; nothing told the GPU side of it before). A commit
+/// through it fills pages the watch may hold as absent or as a known hole
+/// (`victory_gpu::title_memory_allocated`): "a placeholder of the title's was
+/// filled with nobody telling" in the play sessions of 2026-11-27.
+/// `VICTORY_TITLE_VIRTUAL_ALLOC=0`: passed through untold, as before.
+extern "system" fn title_virtual_alloc(address: *mut c_void, size: usize, kind: u32, protect: u32) -> *mut c_void {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static TELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // Calls, commits, bytes committed, commits at an address the title named.
+    static SEEN: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    // SAFETY: the title's own arguments.
+    let at = unsafe { VirtualAlloc(address, size, kind, protect) };
+    let n = SEEN[0].fetch_add(1, Relaxed) + 1;
+    if !at.is_null() && kind & MEM_COMMIT != 0 {
+        SEEN[1].fetch_add(1, Relaxed);
+        SEEN[2].fetch_add(size as u64, Relaxed);
+        if !address.is_null() {
+            SEEN[3].fetch_add(1, Relaxed);
+        }
+        if *TELL.get_or_init(|| std::env::var_os("VICTORY_TITLE_VIRTUAL_ALLOC").is_none_or(|v| v != "0")) {
+            // (Windows rounds the address down to a page: from there to the
+            // caller's end.)
+            let asked = address as usize;
+            let len = if asked > at as usize { size + (asked - at as usize) } else { size };
+            victory_gpu::title_memory_allocated(at as usize, len);
+        }
+    }
+    if n.is_power_of_two() || n.is_multiple_of(500) {
+        // (Also to the standard error stream: the first calls come before
+        // the log is set up.)
+        eprintln!(
+            "title VirtualAlloc: calls={n} commits={} committed_mb={} commits_at_an_address={} last_at={at:p} asked={address:p} size={size} kind={kind:#x} protect={protect:#x}",
+            SEEN[1].load(Relaxed),
+            SEEN[2].load(Relaxed) >> 20,
+            SEEN[3].load(Relaxed)
+        );
+        tracing::info!(
+            calls = n,
+            commits = SEEN[1].load(Relaxed),
+            committed_mb = SEEN[2].load(Relaxed) >> 20,
+            commits_at_an_address = SEEN[3].load(Relaxed),
+            last_at = format_args!("{at:p}"),
+            last_size = size,
+            last_kind = format_args!("{kind:#x}"),
+            "the title's own VirtualAlloc, since the start"
+        );
+    }
+    at
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "xmem",
         dlls: &["xmem.dll", "kernel32.dll", "kernelbase.dll", "api-ms-win-core-memory-*"],
         exports: vec![
             crate::HleExport { name: "VirtualFree", address: title_virtual_free as *const () as usize },
+            crate::HleExport { name: "VirtualAlloc", address: title_virtual_alloc as *const () as usize },
             hle_export!(XMemAlloc),
             hle_export!(XMemFree),
             hle_export!(XMemAllocDefault),
