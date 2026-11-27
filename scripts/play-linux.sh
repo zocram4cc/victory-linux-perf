@@ -36,6 +36,14 @@ export VICTORY_NO_WATCHDOG=1
 # Lighting: the title's own path for no ray tracing (without it the title traces into an empty structure: eyes glow
 # blue-white, rooms go grey), with Belobug's stand-in for the missing bounce light at 0.35, no crease shading.
 export VICTORY_RT_FALLBACK_NO_BVH=1 VICTORY_AMBIENT=0.35 VICTORY_AMBIENT_SHADE=0
+# Faces (and any shader whose waves share data through typed views): through vkd3d-proton's VK_EXT_descriptor_heap,
+# RADV (Mesa 26.3) compiles typed UAV loads and stores without their coherence bits and waves read stale values
+# (Lucia's mouth hung open and misshapen). Without the extension stock vkd3d-proton caps view heaps at 1,000,000,
+# below the 4,194,304 VIctory's raw twins need; our Proton's vkd3d-proton takes VKD3D_VIEW_HEAP_DESCRIPTORS. Only
+# with that build is the extension turned off.
+if grep -qa VKD3D_VIEW_HEAP_DESCRIPTORS "$(dirname "$PROTON")/files/lib/wine/vkd3d-proton/x86_64-windows/d3d12core.dll" 2> /dev/null; then
+  export VKD3D_DISABLE_EXTENSIONS=VK_EXT_descriptor_heap VKD3D_VIEW_HEAP_DESCRIPTORS=4194304
+fi
 if [ "$SAFE" = 0 ]; then
   export VICTORY_TEXTURE_NO_WAIT=1 VICTORY_RELAY=2 VICTORY_WIDE_BACK=1 VICTORY_CARD_REHASH_RUNS=1 \
     VICTORY_JOIN_COPIES=1 VICTORY_INDIRECT_WINDOW=1 VICTORY_RELAY_COPY=1 VICTORY_CARD_STEPS=2 \

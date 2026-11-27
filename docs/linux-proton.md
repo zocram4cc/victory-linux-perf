@@ -119,6 +119,14 @@ re-checks those at every submission and rejected them; VIctory keeps copies
 there): a deliberate, VIctory-specific choice, so other programs that import
 private memory fall back or fail under this build. `/dev/udmabuf` must be
 readable and writable for the user (on most distributions the `kvm` group).
+Its vkd3d-proton also takes `VKD3D_VIEW_HEAP_DESCRIPTORS`, the most views a
+heap may hold when `VK_EXT_descriptor_heap` is not used (stock: 1,000,000,
+below the 4,194,304 VIctory's raw twins need). `scripts/play-linux.sh` turns
+the extension off (`VKD3D_DISABLE_EXTENSIONS=VK_EXT_descriptor_heap`) and asks
+for 4,194,304 when the build has the switch: through the extension, RADV
+(Mesa 26.3) compiles typed UAV loads and stores without their coherence bits,
+and shaders whose waves share data through them read stale values (the face
+network that animates Lucia went wrong this way; her mouth hung open).
 More fixes for VIctory under Wine go there as they come. It is not supported
 by GloriousEggroll: report problems with it here, not to GE-Proton.
 
