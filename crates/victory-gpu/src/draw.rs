@@ -2839,6 +2839,27 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        // P.4 (`VICTORY_NATIVE_TRACE=N`): the first N dispatches of pipelines
+        // made from 0x218's pieces: the root values the title's list holds,
+        // its heaps, the groups.
+        {
+            static LEFT: std::sync::OnceLock<std::sync::atomic::AtomicU32> = std::sync::OnceLock::new();
+            let left = LEFT.get_or_init(|| {
+                std::sync::atomic::AtomicU32::new(std::env::var("VICTORY_NATIVE_TRACE").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+            });
+            if left.load(Ordering::Relaxed) > 0
+                && crate::pipeline::is_native(self.pipeline)
+                && left.fetch_sub(1, Ordering::Relaxed) > 0
+            {
+                tracing::info!(
+                    pipeline = format_args!("{:#x}", self.pipeline),
+                    groups = format_args!("{x}x{y}x{z}"),
+                    heaps = format_args!("{:x?}", self.heaps),
+                    roots = format_args!("{:x?}", self.compute),
+                    "P.4 trace: a dispatch of a native pipeline"
+                );
+            }
+        }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
