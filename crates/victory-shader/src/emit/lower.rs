@@ -11695,7 +11695,16 @@ impl<'a> Lower<'a> {
             // single-channel targets so). Other masks could leave channels
             // the format has: refused.
             let prefix = matches!(*dmask, 1 | 3 | 7) && !counter;
-            if *dmask != 0xF && !counter && !prefix {
+            // Other masks (553 of 566 P.4 programs: alpha alone, `0x8`, to
+            // mark texels a pass did not light): the texel is read, the
+            // channels the mask names replaced, all four written back.
+            // shortcut: right where each texel has one writing thread in the
+            // dispatch, as in those programs (each thread takes one entry of
+            // a list of texels); two threads writing different channels of
+            // one texel at once could lose one's write.
+            // `VICTORY_PARTIAL_IMAGE_STORES=0` refuses them, as before.
+            let merge = *dmask != 0xF && !counter && !prefix;
+            if merge && std::env::var_os("VICTORY_PARTIAL_IMAGE_STORES").is_some_and(|v| v == "0") {
                 return Err("an image store of some channels");
             }
             let iu = self.s.m.undef(self.s.t.i32);
@@ -11734,9 +11743,34 @@ impl<'a> Lower<'a> {
                 self.end_guarded(at, &[]);
                 return Ok(());
             }
+            let h = self.handle(site, src, false, props)?;
+            let at = self.begin_guarded(guard);
+            // The texel as it is, for the channels a merged store keeps.
+            let kept = if merge {
+                self.s.flags |= flags::TYPED_UAV_LOADS;
+                let mut args = vec![h, iu];
+                args.extend(&cs);
+                args.extend([iu; 3]);
+                let rr = self.s.t.res_ret;
+                Some(self.s.op(self.cur, "textureLoad.f32", Attr::ReadOnly, rr, 66, &args))
+            } else {
+                None
+            };
             let mut vals = Vec::new();
             let present = (*dmask as u32).count_ones() as u8;
-            for k in 0..4u8 {
+            for c in 0..4u8 {
+                // The data register of channel `c`: the channels the mask
+                // names, packed in order.
+                let k = if merge {
+                    if *dmask & (1 << c) == 0 {
+                        let r = kept.expect("loaded");
+                        vals.push(self.s.m.extract(self.cur, r, u32::from(c)));
+                        continue;
+                    }
+                    (*dmask & ((1u8 << c) - 1)).count_ones() as u8
+                } else {
+                    c
+                };
                 if k >= present {
                     // A channel the store does not write (a prefix mask).
                     vals.push(self.s.m.f32(0));
@@ -11758,8 +11792,6 @@ impl<'a> Lower<'a> {
                     self.float_of(v)?
                 });
             }
-            let h = self.handle(site, src, false, props)?;
-            let at = self.begin_guarded(guard);
             let mut args = vec![h];
             args.extend(cs);
             args.extend(vals);
