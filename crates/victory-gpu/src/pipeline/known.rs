@@ -215,6 +215,17 @@ pub fn fingerprint() -> String {
         h.update(std::env::var(name).unwrap_or_default().as_bytes());
         h.update(&[0]);
     }
+    // The exe itself: NVIDIA's shader disk cache under vkd3d-proton keeps
+    // pipelines per executable build. A rebuilt or diagnostics exe found
+    // none of what warm had made with another (39.6 ms a pipeline against
+    // 1.4 ms cached), so warm said "0 to make" and the run compiled while it
+    // drew. Its size and modification time tell builds apart cheaply.
+    if let Some(meta) = std::env::current_exe().ok().and_then(|exe| std::fs::metadata(exe).ok()) {
+        h.update(&meta.len().to_le_bytes());
+        if let Ok(at) = meta.modified().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).map_err(std::io::Error::other)) {
+            h.update(&at.as_nanos().to_le_bytes());
+        }
+    }
     h.finalize().to_hex()[..16].to_owned()
 }
 
