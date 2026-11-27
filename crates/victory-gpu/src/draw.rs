@@ -160,6 +160,20 @@ thread_local! {
     /// milliseconds and the bytes that run may take, in place of the
     /// pass's own per frame.
     static PASS_BUDGET: std::cell::Cell<Option<(u64, u64, bool)>> = const { std::cell::Cell::new(None) };
+    /// For the run of the texture pass `State::early_textures` makes
+    /// before a bake draw: the title slots that draw samples
+    /// (`State::bake_sources`), which the pass serves first, whatever
+    /// their turn, the card's room and the pass's budget; and whether it
+    /// serves nothing else.
+    static PASS_SOURCES: std::cell::RefCell<Option<(Vec<u32>, bool)>> = const { std::cell::RefCell::new(None) };
+    /// What that run did with them: uploaded, their bytes, left because
+    /// their memory is not mapped, and left because no more of their
+    /// memory is mapped than at their last upload.
+    static PASS_SOURCED: std::cell::Cell<[u64; 4]> = const { std::cell::Cell::new([0; 4]) };
+    /// The tables a pixel shader reads as a decoration bake does
+    /// ([`bake_tables`]), by the shader's hash: asked at every draw.
+    static BAKE_TABLES: std::cell::RefCell<std::collections::HashMap<String, Option<BakeTables>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 /// The milliseconds of every frame the pass that uploads textures picked
@@ -225,6 +239,131 @@ static BAKE_SERVED: AtomicU64 = AtomicU64::new(0);
 /// targets and name no texture in a table.
 const BAKE_PIXEL_SHADERS: [&str; 4] =
     ["c0a7fe77b1862e10", "0d1575a396dfe513", "b7cfd8dda91ebb6b", "280967ad158cee0b"];
+
+/// Where a pixel shader of the title's decoration bake finds what it
+/// samples: the root parameter of its one table, and in that table the
+/// dwords of its buffer of decoration records and of its constants.
+///
+/// The bake names no texture in a table. Its constants hold the view heap
+/// indices of up to five textures (bytes 0x20, 0x30, 0x40, 0x50 and 0x60)
+/// and the records it walks (first at 0x78, the one past the last at 0x7c,
+/// of the count at 0); a record is 304 bytes and holds five more indices
+/// (bytes 0, 0x10, 0x20, 0x30 and 0x40). Read from the programs' code,
+/// which is the same in all 322 of them but for the two table offsets, and
+/// checked at every draw: an index counts only if the slot it names holds
+/// a texture view.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct BakeTables {
+    slot: u8,
+    records: u32,
+    constants: u32,
+}
+
+/// The stride of the bake's records.
+const BAKE_RECORD: u64 = 304;
+/// Where its constants and each of its records hold view heap indices.
+const BAKE_CONSTANT_INDICES: [usize; 5] = [0x20, 0x30, 0x40, 0x50, 0x60];
+const BAKE_RECORD_INDICES: [usize; 5] = [0, 0x10, 0x20, 0x30, 0x40];
+
+/// [`BakeTables`] of pipeline `p`, if its pixel shader reads one table
+/// with a buffer of 304-byte records and constants and nothing else
+/// through tables.
+fn bake_tables(p: &HostPipeline) -> Option<BakeTables> {
+    let stage = p.stages.iter().find(|s| s.shader.stage == "pixel")?;
+    let read = || {
+        let mut tabled = stage.translated().used.iter().filter(|u| u.root == RootType::Table);
+        let (a, b) = (tabled.next()?, tabled.next()?);
+        if tabled.next().is_some() {
+            return None;
+        }
+        let (records, constants) = if a.kind == ResourceType::Srv { (a, b) } else { (b, a) };
+        (records.kind == ResourceType::Srv
+            && u64::from(records.stride) == BAKE_RECORD
+            && constants.kind == ResourceType::Cbv
+            && records.slot == constants.slot)
+            .then_some(BakeTables {
+                slot: records.slot,
+                records: records.table_offset_dwords,
+                constants: constants.table_offset_dwords,
+            })
+    };
+    BAKE_TABLES.with_borrow_mut(|known| match known.get(stage.shader.hash.as_str()) {
+        Some(&tables) => tables,
+        None => {
+            let tables = read();
+            known.insert(stage.shader.hash.clone(), tables);
+            tables
+        }
+    })
+}
+
+/// The view heap indices a bake draw names, in order and each once, and
+/// the records it walks with how many of them were read: from its
+/// constants, and from the records `first..end` they give and the one
+/// after them, which the program looks at as well; no more records than
+/// the buffer holds (`held`), and no more than 256. `record` reads the
+/// start of one.
+fn bake_named(
+    constants: &[u8; 0x80],
+    held: u32,
+    mut record: impl FnMut(u32) -> Option<[u8; 0x44]>,
+) -> (Vec<u32>, (u32, u32)) {
+    let word = |bytes: &[u8], at: usize| u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
+    let mut named: Vec<u32> = BAKE_CONSTANT_INDICES.iter().map(|&at| word(constants, at)).collect();
+    let (first, end) = (word(constants, 0x78), word(constants, 0x7c));
+    let mut read = 0;
+    // (No record is looked at where none is walked.)
+    let last = if end > first { end.saturating_add(1) } else { first };
+    for i in first..last.min(held).min(first.saturating_add(256)) {
+        let Some(record) = record(i) else {
+            break;
+        };
+        named.extend(BAKE_RECORD_INDICES.iter().map(|&at| word(&record, at)));
+        read += 1;
+    }
+    named.sort_unstable();
+    named.dedup();
+    (named, (end.saturating_sub(first), read))
+}
+
+/// Whether the textures a bake draw samples are uploaded before it,
+/// whatever the queue's order and the card's room
+/// (`VICTORY_BAKE_SOURCES=0`: they are only counted), and the megabytes
+/// one draw may have uploaded so (`VICTORY_BAKE_SOURCES_MB`, 1024).
+fn bake_sources_forced() -> (bool, u64) {
+    static ON: std::sync::OnceLock<(bool, u64)> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        (
+            std::env::var_os("VICTORY_BAKE_SOURCES").is_none_or(|v| v != "0"),
+            std::env::var("VICTORY_BAKE_SOURCES_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1024),
+        )
+    })
+}
+
+/// What a bake draw samples ([`State::bake_sources`]).
+#[derive(Default, Debug)]
+struct BakeSources {
+    /// The records the draw walks, and how many of them were read.
+    records: (u32, u32),
+    /// Slots named that hold a texture view, and their handles.
+    textures: Vec<(u32, u64)>,
+    /// Of them: with their host texture made from that view and nothing
+    /// waiting.
+    ready: u32,
+    /// Waiting in the queue of textures picked by index.
+    queued: Vec<u32>,
+    /// Neither, and a texture the title placed in memory that is there:
+    /// the host slot shows nothing, and nothing would make it (the title
+    /// wrote a newer view of memory this one clashes with, which made
+    /// this one stale to the layer; the bake reads it all the same).
+    unmade: Vec<u32>,
+    /// Neither, and something else: a texture the host itself writes.
+    other: u32,
+}
+
+/// Since the start: bytes uploaded for bake draws as their own textures
+/// ([`State::bake_sources`]).
+static BAKE_SOURCED_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// Since the start: early runs of the texture pass, and those of them
 /// made for a bake draw.
@@ -2183,7 +2322,11 @@ impl State {
     /// of the draw being bound, as the world's pass records them.
     fn early_textures(&self, list: &HostList, p: &HostPipeline, compute: bool) {
         let (early_ms, bake_ms) = early_budgets();
-        if compute || (early_ms == 0 && bake_ms == 0) {
+        if compute {
+            return;
+        }
+        let tables = bake_tables(p);
+        if early_ms == 0 && bake_ms == 0 && tables.is_none() {
             return;
         }
         let bake = bake_ms > 0
@@ -2200,12 +2343,15 @@ impl State {
         let left = bake_ms.saturating_sub(BAKED_MS.load(Ordering::Relaxed));
         let budget = if bake && left > 0 {
             // What a bake may read must be there now: up to 2 GiB.
-            (left, 2 << 30)
+            Some((left, 2 << 30))
         } else if first && early_ms > 0 {
-            (early_ms, 64 << 20)
+            Some((early_ms, 64 << 20))
         } else {
-            return;
+            None
         };
+        if budget.is_none() && tables.is_none() {
+            return;
+        }
         let Some(heap) = self
             .heaps
             .iter()
@@ -2219,34 +2365,193 @@ impl State {
             return;
         };
         let bake = bake && left > 0;
-        if bake && !first && bake_exact() {
+        // What this very draw samples, by the draw's own constants: served
+        // whether or not the budgeted pass below gets to it (after
+        // fxceless/victory-fork#1264).
+        let sources = tables.and_then(|tables| self.bake_sources(tables, heap, host));
+        let force = bake_sources_forced().0
+            && sources.as_ref().is_some_and(|s| !s.queued.is_empty() || !s.unmade.is_empty());
+        if budget.is_none() && !force {
+            if let Some(sources) = &sources {
+                Self::log_bake_sources(p, sources, [0; 4], Self::bake_missing(sources, host), false);
+            }
+            return;
+        }
+        if bake && !first && bake_exact() && !force {
             let (writes, noted) = host.texture_news();
             if !noted && BAKE_SERVED.load(Ordering::Relaxed) == writes + 1 {
                 return;
             }
         }
-        let n = EARLY_TEXTURE_PASSES[usize::from(bake)].fetch_add(1, Ordering::Relaxed) + 1;
-        if bake && n.is_power_of_two() {
-            let [slots, due, ..] = HEAP_TEXTURES_QUEUE.each_ref().map(|c| c.load(Ordering::Relaxed));
-            tracing::info!(
-                frame,
-                bakes = n,
-                queued_at_the_last_pass = slots,
-                due_at_the_last_pass = due,
-                uploaded_so_far = HEAP_TEXTURES.load(Ordering::Relaxed),
-                "a draw of the title's decoration bake: textures picked by index are uploaded first (VICTORY_BAKE_TEXTURES_MS=0: not)"
-            );
+        if budget.is_some() {
+            let n = EARLY_TEXTURE_PASSES[usize::from(bake)].fetch_add(1, Ordering::Relaxed) + 1;
+            if bake && n.is_power_of_two() {
+                let [slots, due, ..] = HEAP_TEXTURES_QUEUE.each_ref().map(|c| c.load(Ordering::Relaxed));
+                tracing::info!(
+                    frame,
+                    bakes = n,
+                    queued_at_the_last_pass = slots,
+                    due_at_the_last_pass = due,
+                    uploaded_so_far = HEAP_TEXTURES.load(Ordering::Relaxed),
+                    "a draw of the title's decoration bake: textures picked by index are uploaded first (VICTORY_BAKE_TEXTURES_MS=0: not)"
+                );
+            }
         }
         let began = std::time::Instant::now();
-        PASS_BUDGET.set(Some((budget.0, budget.1, bake)));
-        crate::texture::BAKING.set(bake && bake_exact());
+        let (ms, bytes) = budget.unwrap_or((0, 0));
+        let budgeted_bake = bake && budget.is_some();
+        PASS_BUDGET.set(Some((ms, bytes, budgeted_bake)));
+        if force && let Some(sources) = &sources {
+            host.texture_slots_requeue(&sources.unmade, frame);
+            let slots = sources.queued.iter().chain(&sources.unmade).copied().collect();
+            PASS_SOURCES.set(Some((slots, budget.is_none())));
+        }
+        PASS_SOURCED.set([0; 4]);
+        crate::texture::BAKING.set(budgeted_bake && bake_exact());
         self.heap_textures(list, heap, host);
         crate::texture::BAKING.set(false);
         PASS_BUDGET.set(None);
+        PASS_SOURCES.set(None);
+        if let Some(sources) = &sources {
+            let done = PASS_SOURCED.get();
+            BAKE_SOURCED_BYTES.fetch_add(done[1], Ordering::Relaxed);
+            Self::log_bake_sources(p, sources, done, Self::bake_missing(sources, host), force);
+        }
         if bake {
             BAKED_MS.fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
         }
     }
+
+    /// The textures a draw of the title's decoration bake samples
+    /// ([`BakeTables`]), by what the queue of textures picked by index
+    /// holds of them. `None`: the draw's table does not hold what a bake's
+    /// does.
+    fn bake_sources(
+        &self,
+        tables: BakeTables,
+        heap: &crate::descriptor::Heap,
+        host: &crate::descriptor::host::HostHeap,
+    ) -> Option<BakeSources> {
+        let Some(&Root::Table(table)) = self.roots_ref(false).get(usize::from(tables.slot)) else {
+            return None;
+        };
+        let View::Constant(constants, size) = crate::descriptor::view(table + u64::from(tables.constants) * 4)?
+        else {
+            return None;
+        };
+        let mut words = [0u8; 0x80];
+        if (size as usize) < words.len() || !crate::host::read_into(constants as *const u8, &mut words) {
+            return None;
+        }
+        let (address, len) = crate::descriptor::view(table + u64::from(tables.records) * 4)
+            .and_then(|view| crate::descriptor::host::buffer_range(&view))
+            .unwrap_or((0, 0));
+        let held = u32::try_from(len / BAKE_RECORD).unwrap_or(u32::MAX);
+        let (named, records) = bake_named(&words, held, |i| {
+            let mut record = [0u8; 0x44];
+            crate::host::read_into((address + u64::from(i) * BAKE_RECORD) as *const u8, &mut record).then_some(record)
+        });
+        let mut sources = BakeSources { records, ..Default::default() };
+        let mut textures = Vec::new();
+        for index in named {
+            let Some(handle) = heap.handle(index) else {
+                continue;
+            };
+            if crate::descriptor::view(handle).is_some_and(|view| crate::descriptor::host::is_texture_view(&view)) {
+                textures.push((index, handle));
+            }
+        }
+        let indices: Vec<u32> = textures.iter().map(|t| t.0).collect();
+        sources.queued = host.texture_slots_queued(&indices).into_iter().map(|q| q.0).collect();
+        sources.textures = textures;
+        for &(index, handle) in &sources.textures {
+            if sources.queued.contains(&index) {
+                continue;
+            }
+            if host.texture_slot_made_from(index, handle) {
+                sources.ready += 1;
+            } else if let Some(View::Placed(false, resource, desc)) = crate::descriptor::view(handle)
+                && crate::texture::mapped_bytes(
+                    (u64::from(desc[10]) | u64::from(desc[11]) << 32) as *const u8,
+                    crate::resource::placed_bytes(&resource).unwrap_or(1) as usize,
+                ) > 0
+            {
+                sources.unmade.push(index);
+            } else {
+                sources.other += 1;
+            }
+        }
+        Some(sources)
+    }
+
+    /// Of a bake draw's textures, the ones the draw samples wrong: placed
+    /// by the title in memory that is there, with a host slot that shows
+    /// nothing of them. Counted when the passes before the draw are done.
+    fn bake_missing(sources: &BakeSources, host: &crate::descriptor::host::HostHeap) -> u64 {
+        let missing = |&&(index, handle): &&(u32, u64)| {
+            !host.texture_slot_made_from(index, handle)
+                && matches!(
+                    crate::descriptor::view(handle),
+                    Some(View::Placed(false, resource, desc)) if crate::texture::mapped_bytes(
+                        (u64::from(desc[10]) | u64::from(desc[11]) << 32) as *const u8,
+                        crate::resource::placed_bytes(&resource).unwrap_or(1) as usize,
+                    ) > 0
+                )
+        };
+        sources.textures.iter().filter(missing).count() as u64
+    }
+
+    /// A line for a bake draw's sources: for the first draws, then at
+    /// counts that double, and for up to 256 draws that sample some of
+    /// theirs wrong (`missing`, [`State::bake_missing`]).
+    fn log_bake_sources(p: &HostPipeline, sources: &BakeSources, done: [u64; 4], missing: u64, forced: bool) {
+        static DRAWS: AtomicU64 = AtomicU64::new(0);
+        static SHORT: AtomicU64 = AtomicU64::new(0);
+        static TOTALS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+        let n = DRAWS.fetch_add(1, Ordering::Relaxed) + 1;
+        let waiting = sources.queued.len() as u64;
+        let unmade = sources.unmade.len() as u64;
+        let [uploaded, bytes, unmapped, as_before] = done;
+        for (total, now) in
+            TOTALS.iter().zip([waiting, uploaded, unmapped, u64::from(sources.other), unmade, as_before, missing])
+        {
+            total.fetch_add(now, Ordering::Relaxed);
+        }
+        if !(n.is_power_of_two() || (missing > 0 && SHORT.fetch_add(1, Ordering::Relaxed) < 256)) {
+            return;
+        }
+        let pixel = p.stages.iter().find(|s| s.shader.stage == "pixel").map_or("", |s| s.shader.hash.as_str());
+        let [waited, uploads, unmapped_so_far, others, unmade_so_far, as_before_so_far, missing_so_far] =
+            TOTALS.each_ref().map(|t| t.load(Ordering::Relaxed));
+        tracing::info!(
+            frame = crate::frame::current(),
+            draws = n,
+            pixel,
+            records = sources.records.0,
+            records_read = sources.records.1,
+            textures = sources.textures.len(),
+            on_the_card = sources.ready,
+            waiting,
+            made_stale = unmade,
+            the_host_s_own = sources.other,
+            forced,
+            uploaded,
+            kilobytes = bytes >> 10,
+            as_far_as_mapped_already = as_before,
+            not_mapped = unmapped,
+            sampled_wrong = missing,
+            sampled_wrong_so_far = missing_so_far,
+            megabytes_so_far = BAKE_SOURCED_BYTES.load(Ordering::Relaxed) >> 20,
+            waited_so_far = waited,
+            uploaded_so_far = uploads,
+            as_far_as_mapped_already_so_far = as_before_so_far,
+            not_mapped_so_far = unmapped_so_far,
+            made_stale_so_far = unmade_so_far,
+            the_host_s_own_so_far = others,
+            "a decoration bake draw's own textures, by its constants and records: the ones still waiting are uploaded before it (VICTORY_BAKE_SOURCES=0: only counted)"
+        );
+    }
+
 
     /// The queue's side of the card accounting line
     /// (`crate::resource::card_accounting`, which says what the line
@@ -2376,38 +2681,45 @@ impl State {
         // returned here, and a slot whose texture had been streamed out
         // kept its host copy for as long as the card was full).
         let mut room = crate::resource::room(memory);
+        // A bake draw's own textures (`State::early_textures`), and whether
+        // this run is for them alone: then nothing of the queue's upkeep is
+        // done, which a pass of this frame did or will do.
+        let sources = PASS_SOURCES.take();
+        let only = sources.as_ref().is_some_and(|s| s.1);
         // Bytes uploaded by this pass since the card was last asked
         // whether it has room: asked again every 32 MiB (a pass may upload
         // 192 MB and more, and one asking a pass let the queue run some
         // 400 MB past its line while the world loaded: run 193).
         let mut since_asked = 0u64;
-        if !room {
+        if !room && !only {
             HEAP_TEXTURES_FULL.fetch_add(1, Ordering::Relaxed);
             once!("textures picked by index: the card has no room for more; they wait");
         }
         let mut refused = 0;
         // Room again: the slots held back while the card was full are due
         // now (`full_card_pass`).
-        if room {
+        if room && !only {
             host.texture_slots_room(frame);
         }
-        // Slots whose texture's memory the runtime mapped, unmapped or
-        // wrote since the last pass are due again.
-        host.texture_slots_remapped(frame);
-        host.texture_slots_short(frame);
-        // The slots of textures whose first level with memory (levels on
-        // demand), or whose host copy for one with more levels, changed since
-        // the last pass are made again from it; those whose new view's upload
-        // has run are made from that.
-        host.texture_views_remade();
-        host.texture_slots_flip();
+        if !only {
+            // Slots whose texture's memory the runtime mapped, unmapped or
+            // wrote since the last pass are due again.
+            host.texture_slots_remapped(frame);
+            host.texture_slots_short(frame);
+            // The slots of textures whose first level with memory (levels on
+            // demand), or whose host copy for one with more levels, changed since
+            // the last pass are made again from it; those whose new view's upload
+            // has run are made from that.
+            host.texture_views_remade();
+            host.texture_slots_flip();
+        }
         // And with room, the textures whose upload left a held level
         // without the card's memory are uploaded again.
-        if room {
+        if room && !only {
             host.texture_slots_waiting(frame);
         }
         let baking = crate::texture::BAKING.get();
-        let (mut due, census) = host.texture_slots_due(frame, if baking { 1 << 16 } else { 4096 });
+        let (mut due, census) = host.texture_slots_due(frame, if only { 0 } else if baking { 1 << 16 } else { 4096 });
         // (Those that are due later after all that are due.)
         let on_time = due.len();
         if baking {
@@ -2421,10 +2733,25 @@ impl State {
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
             count.store(now, Ordering::Relaxed);
         }
+        // The bake draw's own come first, due or not, and once.
+        let sourced = match &sources {
+            Some((slots, _)) => {
+                let first = host.texture_slots_queued(slots);
+                due.retain(|d| !first.iter().any(|f| f.0 == d.0));
+                let n = first.len();
+                due.splice(0..0, first);
+                n
+            }
+            None => 0,
+        };
+        let sourced_at_most = bake_sources_forced().1 << 20;
+        let mut sourced_bytes = 0u64;
         // Where the card's memory is, and what the due slots would need
         // (`VICTORY_CARD_ACCOUNTING=1`; a line when the card first has no
         // room, and every five seconds after it).
-        Self::card_accounting(heap, host, frame, room);
+        if !only {
+            Self::card_accounting(heap, host, frame, room);
+        }
         // The frames in about four seconds, between 16 and 256: how long a
         // slot with nothing to upload waits at most for its next look. In
         // frames alone it was 120: four minutes at the opening cutscene's
@@ -2433,7 +2760,7 @@ impl State {
         // the looks are now only for what that does not tell.)
         static PASSED: AtomicU64 = AtomicU64::new(0);
         let now = crate::host::now_ms();
-        let took = now.saturating_sub(PASSED.swap(now, Ordering::Relaxed)).max(1);
+        let took = if only { 100 } else { now.saturating_sub(PASSED.swap(now, Ordering::Relaxed)).max(1) };
         // (`took` is since the last pass, of any heap and list: several a
         // frame, so this was often 256 frames, 13-18 s at 14-20 frames a
         // second; `VICTORY_TEXTURE_LOOK_MS` counts by the frame's time.)
@@ -2503,8 +2830,14 @@ impl State {
         let began = std::time::Instant::now();
         BAKE_SERVED.store(0, Ordering::Relaxed);
         let mut served = true;
-        for (index, write) in due {
-            if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
+        for (n, (index, write)) in due.into_iter().enumerate() {
+            // One of a bake draw's own: now, whatever the budget and the
+            // card's room, up to bytes of its own.
+            let source = n < sourced && sourced_bytes < sourced_at_most;
+            if n < sourced && !source {
+                once!("a decoration bake draw samples more than VICTORY_BAKE_SOURCES_MB megabytes of textures not on the card yet: the rest take their turn");
+            }
+            if !source && (SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span) {
                 served = false;
                 break;
             }
@@ -2593,6 +2926,10 @@ impl State {
                 let len = crate::resource::placed_bytes_from(&resource, first).unwrap_or(1);
                 let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
                 if mapped == 0 {
+                    if source {
+                        let [uploaded, bytes, unmapped, as_before] = PASS_SOURCED.get();
+                        PASS_SOURCED.set([uploaded, bytes, unmapped + 1, as_before]);
+                    }
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
                     // Streamed out: what the slot showed is let go.
                     host.texture_slot_gone(index);
@@ -2602,7 +2939,16 @@ impl State {
                 host.texture_slot_here(index);
                 there = Some(mapped);
                 if mapped < len {
-                    if mapped <= host.texture_slot_mapped(index) {
+                    // (One of a bake draw's own is left so only if the
+                    // host slot shows what was uploaded then.)
+                    if mapped <= host.texture_slot_mapped(index)
+                        && !(source
+                            && !heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle)))
+                    {
+                        if source {
+                            let [uploaded, bytes, unmapped, as_before] = PASS_SOURCED.get();
+                            PASS_SOURCED.set([uploaded, bytes, unmapped, as_before + 1]);
+                        }
                         HEAP_TEXTURES_PARTLY[0].fetch_add(1, Ordering::Relaxed);
                         host.texture_slot_later(index, write, frame, most);
                         continue;
@@ -2637,7 +2983,7 @@ impl State {
             // had its colour only in the launches that entered the world
             // under the line. `VICTORY_REUPLOAD_WHEN_FULL=0`: refused, as
             // before.
-            if !room {
+            if !room && !source {
                 let has_its_texture = reupload_when_full()
                     && heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle));
                 if !has_its_texture {
@@ -2829,6 +3175,11 @@ impl State {
             };
             if again.is_some() {
                 HEAP_TEXTURES_PARTLY[1].fetch_add(1, Ordering::Relaxed);
+            }
+            if source {
+                let [uploaded, was, unmapped, as_before] = PASS_SOURCED.get();
+                PASS_SOURCED.set([uploaded + 1, was + if tabled { 0 } else { bytes }, unmapped, as_before]);
+                sourced_bytes += bytes;
             }
             if tabled {
                 // Nothing was staged here, so nothing is counted or spent,
@@ -4551,6 +4902,7 @@ impl<T: Copy, const N: usize> Few<T, N> {
             self.many.push(what);
         }
     }
+
 }
 
 impl<T, const N: usize> std::ops::Deref for Few<T, N> {
@@ -4948,6 +5300,49 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
 
 #[cfg(test)]
 mod tests {
+
+    /// A bake draw names the indices in its constants, and those in the
+    /// records its constants give and in the one after them; not those of
+    /// records past the buffer, nor of one that cannot be read.
+    #[test]
+    fn a_bake_draw_names_the_indices_of_its_constants_and_records() {
+        let mut constants = [0u8; 0x80];
+        let put = |bytes: &mut [u8], at: usize, value: u32| bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        for (n, at) in BAKE_CONSTANT_INDICES.into_iter().enumerate() {
+            put(&mut constants, at, 100 + n as u32);
+        }
+        // Records 2 and 3, of 9 in all.
+        put(&mut constants, 0, 9);
+        put(&mut constants, 0x78, 2);
+        put(&mut constants, 0x7c, 4);
+        // Record `i` names 1000 + 10 i + n at its n-th place; record 3 the
+        // index of the constants' first once more.
+        let record = |i: u32| {
+            let mut record = [0xffu8; 0x44];
+            for (n, at) in BAKE_RECORD_INDICES.into_iter().enumerate() {
+                put(&mut record, at, 1000 + 10 * i + n as u32);
+            }
+            if i == 3 {
+                put(&mut record, 0, 100);
+            }
+            Some(record)
+        };
+        let (named, records) = bake_named(&constants, 9, record);
+        assert_eq!(records, (2, 3), "two records walked, and the one after them looked at");
+        let mut expected: Vec<u32> = (100..105).collect();
+        expected.extend((1020..1025).chain(1031..1035).chain(1040..1045));
+        assert_eq!(named, expected);
+        // The buffer ends with record 3: the one after is not there.
+        assert_eq!(bake_named(&constants, 4, record).1, (2, 2));
+        // A record that cannot be read ends the walk.
+        let (named, records) = bake_named(&constants, 9, |i| if i == 3 { None } else { record(i) });
+        assert_eq!(records, (2, 1));
+        assert!(named.contains(&1024) && !named.contains(&1040));
+        // No records at all: the constants' own.
+        put(&mut constants, 0x7c, 2);
+        assert_eq!(bake_named(&constants, 0, record), ((100..105).collect(), (0, 0)));
+    }
+
     use super::staging_budget_per_frame;
 
     #[test]

@@ -233,9 +233,13 @@ impl<'a> Lower<'a> {
         let triangle_end = self.cur;
         self.s.m.terminate(triangle_end, Term::Br(join));
         self.cur = join;
-        // Kinds 6 and 7 (an instance, a procedural primitive): not known
-        // what the console returns; the title's programs do not read it.
-        let other = bvh::MISS.map(|f| self.s.m.i32(f.to_bits()));
+        // Kinds 6 and 7 (an instance, a procedural primitive): the hardware
+        // returns 0xFFFFFFFF in all four dwords (AMD GPURT
+        // IntersectCommon.hlsl: "User defined node. HW returns -1"); a
+        // traversal tells such a node by that answer and handles it itself
+        // (an instance: the ray goes into the object's structure). This
+        // returned a miss before (after fxceless/victory-fork 9a9091d1).
+        let other = [u32::MAX; 4].map(|v| self.s.m.i32(v));
         let i32t = self.s.t.i32;
         let mut results = Vec::with_capacity(4);
         for k in 0..4 {
