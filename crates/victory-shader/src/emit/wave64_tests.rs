@@ -702,6 +702,71 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
     eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
 }
 
+/// A 32-lane console wave, the sequence of `bvh_skinning:CSComputeSkinningPedBlendShapes*`
+/// (82a2ad6d07417d36 at 0x14a8-0x14f4, 90a0692af4320129 likewise): a waterfall over a
+/// per-lane value ends with `s_andn2_wrexec_b32` (SCC: the new EXEC has a lane, so 0
+/// when the loop is left); after EXEC is restored, `s_cselect_b32 s3, exec_lo, 0` reads
+/// that SCC, `s_or_b32` adds `vcc_lo` (the lanes whose bit of s0 is set) and
+/// `v_cndmask_b32` picks per lane by s3. So s3 is s0's mask and v3 is 2 in its lanes, 1
+/// elsewhere. With SCC taken as 1 every lane picks 2, and those programs skip their
+/// blend-shape block for every vertex (the structural side: `structure`'s
+/// `a_select_on_the_condition_a_lane_loop_ended_with_takes_its_second_operand`). As in
+/// those programs s3 is read only as the select's mask. s1 picks the waterfall's values
+/// (lane & s1, so 1 to 32 rounds). Lane l stores v3 at dword l.
+#[test]
+fn blend_shape_wrexec_scc_read_by_cselect_wave32() {
+    let words = [
+        0x7E0E_0200, // v_mov_b32 v7, s0
+        0x2C0E_0F00, // v_lshrrev_b32 v7, v0, v7
+        0x360E_0E81, // v_and_b32 v7, 1, v7          (this lane's bit of s0)
+        0x360A_0001, // v_and_b32 v5, s1, v0         (the waterfall's value)
+        0x7E06_0281, // v_mov_b32 v3, 1
+        0x7E08_0282, // v_mov_b32 v4, 2
+        0xBE83_037E, // s_mov_b32 s3, exec_lo
+        0xBE86_037E, // s_mov_b32 s6, exec_lo
+        0x7E0E_0505, // v_readfirstlane_b32 s7, v5
+        0x7DA4_0A07, // v_cmpx_eq_u32 exec_lo, s7, v5
+        0xBE86_4706, // s_andn2_wrexec_b32 s6, s6
+        0xBF89_FFFC, // s_cbranch_execnz -> the readfirstlane
+        0xBEFE_0303, // s_mov_b32 exec_lo, s3
+        0x8503_807E, // s_cselect_b32 s3, exec_lo, 0
+        0x7D8A_0E80, // v_cmp_ne_u32_e32 vcc_lo, 0, v7
+        0x8803_036A, // s_or_b32 s3, vcc_lo, s3
+        0xD501_0003,
+        0x000E_0903, // v_cndmask_b32 v3, v3, v4, s3
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0xE070_1000,
+        0x8002_0301, // buffer_store_dword v3, v1, s[8:11], 0 offen
+    ];
+    let native = native_of(&words, false, 32);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    // As `translate` does: once more with mask operations on numbers if refused so.
+    let shader = match lowered(&native, &p, &HashSet::new()) {
+        Ok(shader) => shader,
+        Err(e) => {
+            eprintln!("first lowering refused ({e}); with mask operations on numbers");
+            lower::with_mask_ops_on_numbers(|| lowered(&native, &p, &HashSet::new())).expect("lower")
+        }
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut wrong = Vec::new();
+    for (b, sel) in [(0x8421_00F6u32, 31u32), (0, 0x0F), (u32::MAX, 1), (1, 0x18), (0xF000_000F, 0)] {
+        let Some(out) = whole_uav(&shader, [b, sel], 32) else { return };
+        let want: Vec<u32> = (0..32).map(|l| if b >> l & 1 != 0 { 2 } else { 1 }).collect();
+        let got = out.iter().enumerate().fold(0u32, |m, (l, &v)| m | u32::from(v == 2) << l);
+        let ok = out == want;
+        eprintln!("b {b:#010x}, values lane & {sel:#x}: lanes picking 2 {got:#010x}: {}", if ok { "correct" } else { "WRONG" });
+        if !ok {
+            wrong.push((b, sel, got));
+        }
+    }
+    assert!(wrong.is_empty(), "SCC after the waterfall read wrong (b, s1, lanes picking 2): {wrong:x?}");
+}
+
 /// A dispatch counted in threads: of the last group only the lanes below the
 /// count store (after DexNom/VIctory bc3cd4b0).
 #[test]
