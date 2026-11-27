@@ -37,6 +37,16 @@ pub(crate) struct Pending {
     /// Taken by a worker from [`Queue::slow`].
     was_slow: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
+    /// A thread is making it ([`Pending::make_with`]); others wait for
+    /// `made` or `failed` instead of making it too.
+    building: AtomicBool,
+    /// Its making ended the thread making it, and the thread that made it
+    /// again ([`reap`], [`rescue`]): `made` is then never set, and no one
+    /// waits for it.
+    failed: AtomicBool,
+    /// Made again on a thread with a larger stack after its worker ended
+    /// ([`rescue`]).
+    rescued: AtomicBool,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw or dispatch has requested it yet.
     key: String,
@@ -147,6 +157,9 @@ impl Pending {
             queue_state: AtomicU8::new(NOT_QUEUED),
             was_slow: AtomicBool::new(false),
             made: OnceLock::new(),
+            building: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
+            rescued: AtomicBool::new(false),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
             claimed: OnceLock::new(),
@@ -181,13 +194,59 @@ impl Pending {
         true
     }
 
+    /// The host pipeline, made here and now.
+    fn build(&self) -> Option<HostPipeline> {
+        let began = Instant::now();
+        let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+        super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
+        made
+    }
+
     fn make(&self) {
-        self.made.get_or_init(|| {
-            let began = Instant::now();
-            let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
-            super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
-            made
-        });
+        self.make_with(|| self.build());
+    }
+
+    /// Makes it with `build` unless made, or waits for the thread making it
+    /// until it is made or given up ([`reap`]). Not inside `made`'s
+    /// initialisation: a thread that ends while making a pipeline (a stack
+    /// overflow in vkd3d-proton under Wine ends it without unwinding) would
+    /// hold that for good, and every later caller ([`now`], on the title's
+    /// own thread) would wait for ever (DoubleGhosty 5e7faab).
+    fn make_with(&self, build: impl FnOnce() -> Option<HostPipeline>) {
+        if self.made.get().is_none() {
+            if self.building.swap(true, Ordering::AcqRel) {
+                let (lock, done) = &DONE;
+                let mut asked = Instant::now();
+                while self.made.get().is_none() && !self.failed.load(Ordering::Acquire) {
+                    {
+                        let held = lock.lock().unwrap_or_else(|e| e.into_inner());
+                        if self.made.get().is_some() || self.failed.load(Ordering::Acquire) {
+                            break;
+                        }
+                        // (Timed: a notification may come between the test
+                        // and the wait.)
+                        let _ = done.wait_timeout(held, Duration::from_millis(50));
+                    }
+                    // Whether the thread making it ended is asked here too:
+                    // nobody else may be waiting who would ask. Outside
+                    // `DONE`, which `give_up` takes (DoubleGhosty 42b95b9).
+                    if asked.elapsed() >= Duration::from_secs(1) {
+                        reap();
+                        asked = Instant::now();
+                    }
+                }
+                return;
+            }
+            // A build that panics must end this making and wake its waiters.
+            let made = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(build)) {
+                Ok(pipeline) => pipeline,
+                Err(_) => {
+                    tracing::warn!(shaders = ?self.shaders, "host pipeline build panicked");
+                    None
+                }
+            };
+            let _ = self.made.set(made);
+        }
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -292,8 +351,11 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
         super::library::note_used(&p.key);
     }
-    if p.made.get().is_none() {
+    if p.made.get().is_none() && !p.failed.load(Ordering::Relaxed) {
         start(p, REQUESTED);
+        // (A worker that ended is found even when nobody waits to the end
+        // of a budget any more.)
+        reap_now_and_then();
         if p.stalled(Instant::now(), stall_bound()) {
             // Its worker has not come back: nothing is waited for.
         } else if p.graphics.is_none() && compute_waits() {
@@ -424,7 +486,7 @@ fn compute_waits() -> bool {
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
 /// that is making it); whether it has a host pipeline.
 pub(crate) fn now(p: &Arc<Pending>) -> bool {
-    if p.left_out.is_some() {
+    if p.left_out.is_some() || p.failed.load(Ordering::Relaxed) {
         return false;
     }
     p.make();
@@ -535,7 +597,7 @@ fn wait(p: &Arc<Pending>, frame: u64) {
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
-    while p.made.get().is_none() {
+    while p.made.get().is_none() && !p.failed.load(Ordering::Relaxed) {
         let rest = left.saturating_sub(started.elapsed());
         if rest.is_zero() {
             break;
@@ -544,6 +606,10 @@ fn wait(p: &Arc<Pending>, frame: u64) {
     }
     drop(held);
     let waited = started.elapsed().min(left);
+    if p.made.get().is_none() && waited >= left {
+        // Waited to the end for nothing: did its worker end?
+        reap();
+    }
     if compute {
         if p.made.get().is_none() && waited >= COMPUTE_CHANCE.min(compute_budget() / 2) {
             p.compute_waited.store(true, Ordering::Relaxed);
@@ -830,14 +896,30 @@ fn workers() -> bool {
             std::thread::available_parallelism().map_or(2, |n| n.get()),
             crate::residency::limited_host_ram(),
         );
-        let stack = worker_stack(std::env::var("VICTORY_PIPELINE_STACK_MB").ok().and_then(|v| v.trim().parse().ok()));
-        tracing::info!(workers, stack_mib = stack.map_or(0, |s| s >> 20), "pipeline workers");
+        tracing::info!(workers, stack_mib = stack_now().map_or(0, |s| s >> 20), "pipeline workers");
         let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
         WORKERS.store(workers, Ordering::Relaxed);
         for i in 0..workers + screens {
-            let screens_only = i >= workers;
+            running |= spawn_worker(i);
+        }
+        running
+    })
+}
+
+/// [`worker_stack`] of this run.
+fn stack_now() -> Option<usize> {
+    static STACK: OnceLock<Option<usize>> = OnceLock::new();
+    *STACK.get_or_init(|| worker_stack(std::env::var("VICTORY_PIPELINE_STACK_MB").ok().and_then(|v| v.trim().parse().ok())))
+}
+
+/// Starts worker `i` (its slot in [`NOW_MAKING`]; from [`WORKERS`] on, one
+/// that makes passes over the screen alone); whether it started.
+fn spawn_worker(i: usize) -> bool {
+    {
+        {
+            let screens_only = i >= WORKERS.load(Ordering::Relaxed);
             let mut builder = std::thread::Builder::new().name(format!("victory-pipelines-{i}"));
-            if let Some(stack) = stack {
+            if let Some(stack) = stack_now() {
                 builder = builder.stack_size(stack);
             }
             let spawned = builder
@@ -852,29 +934,207 @@ fn workers() -> bool {
                         let priority = if lowest { THREAD_PRIORITY_LOWEST } else { THREAD_PRIORITY_BELOW_NORMAL };
                         let _ = SetThreadPriority(GetCurrentThread(), priority);
                     }
+                    let slot = &NOW_MAKING[i.min(NOW_MAKING.len() - 1)];
+                    // SAFETY: a plain query of this thread.
+                    let thread = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
                     loop {
                         let p = next(screens_only);
+                        *slot.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some(Making { pipeline: p.clone(), thread, since: Instant::now() });
                         p.make();
+                        *slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
                         if p.was_slow.load(Ordering::Relaxed) {
                             let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-                            queue.slow_now -= 1;
+                            queue.slow_now = queue.slow_now.saturating_sub(1);
                             AVAILABLE.notify_all();
                         }
-                        if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
+                        // (Saturating: [`reap`] counts down too, for a
+                        // worker that ended, and a count must not wrap.)
+                        let before = WAITING
+                            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |w| Some(w.saturating_sub(1)))
+                            .unwrap_or(0);
+                        if before == 1 {
                             drained();
                         } else {
                             super::library::save(false);
                         }
                     }
                 });
-            if let Err(e) = spawned {
-                tracing::warn!(error = %e, "no pipeline worker");
-            } else {
-                running = true;
+            match spawned {
+                Err(e) => {
+                    tracing::warn!(error = %e, "no pipeline worker");
+                    false
+                }
+                Ok(_) => true,
             }
         }
-        running
-    })
+    }
+}
+
+/// What a worker is making, on which thread, since when.
+struct Making {
+    pipeline: Arc<Pending>,
+    thread: u32,
+    since: Instant,
+}
+
+/// What each worker is making ([`reap`]).
+static NOW_MAKING: [Mutex<Option<Making>>; 80] = [const { Mutex::new(None) }; 80];
+
+/// Whether the thread with id `tid` has ended (or is no more).
+fn ended(tid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{GetExitCodeThread, OpenThread, THREAD_QUERY_LIMITED_INFORMATION};
+    const STILL_ACTIVE: u32 = 259;
+    // SAFETY: plain queries of a thread of this process, its handle closed.
+    unsafe {
+        let thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, 0, tid);
+        if thread.is_null() {
+            return true;
+        }
+        let mut code = 0u32;
+        let ok = GetExitCodeThread(thread, &mut code) != 0;
+        CloseHandle(thread);
+        ok && code != STILL_ACTIVE
+    }
+}
+
+/// [`reap`], at most once a second over all threads: asked at every use of
+/// a pipeline that is not made, where nobody may wait to the end of a
+/// budget any more ([`wait_once`]).
+fn reap_now_and_then() {
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    {
+        let Ok(mut last) = LAST.try_lock() else { return };
+        if last.is_some_and(|t| t.elapsed() < Duration::from_secs(1)) {
+            return;
+        }
+        *last = Some(Instant::now());
+    }
+    reap();
+}
+
+/// Pipelines whose worker ended while making them (a stack overflow in the
+/// host's compiler ends a thread under Wine without an exception anyone can
+/// catch): made once more on a thread with a larger stack ([`rescue`]), and
+/// the worker started again. A pipeline whose second making ends its thread
+/// too is failed: draws and dispatches go without it at once and nobody
+/// waits for it. Before this the worker was gone for the run with no word
+/// in the log (sixteen such pipelines and no worker is left), and its
+/// pipeline stayed "being made" for good: upstream `CS_Prop_BatchNoCull`
+/// under Proton, its dispatch dropped right before the title's write to 0
+/// (DoubleGhosty 5e7faab, its issue #39).
+fn reap() {
+    for (i, slot) in NOW_MAKING.iter().enumerate() {
+        let dead = {
+            let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+            match slot.as_ref() {
+                Some(m) if m.since.elapsed() > Duration::from_secs(2) && ended(m.thread) => slot.take(),
+                _ => None,
+            }
+        };
+        let Some(m) = dead else { continue };
+        let p = &m.pipeline;
+        {
+            let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+            if p.was_slow.load(Ordering::Relaxed) {
+                queue.slow_now = queue.slow_now.saturating_sub(1);
+            }
+            // (Its worker is started again below: not one taken.)
+            queue.taken.retain(|q| !Arc::ptr_eq(q, p));
+        }
+        let _ = WAITING.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |w| Some(w.saturating_sub(1)));
+        let again = !p.rescued.swap(true, Ordering::AcqRel) && rescue(p.clone());
+        tracing::warn!(
+            pipeline = %hashes(p),
+            key = %p.key,
+            thread = m.thread,
+            after_ms = m.since.elapsed().as_millis() as u64,
+            again,
+            "a pipeline worker ended while making a pipeline (a stack overflow in the host's compiler?): \
+             made again on a thread with a larger stack if `again` (VICTORY_PIPELINE_RESCUE_MB, 0: not), \
+             and the worker is started again"
+        );
+        if !again {
+            give_up(p);
+        }
+        spawn_worker(i);
+    }
+    let gone: Vec<Making> = {
+        let mut rescuing = RESCUING.lock().unwrap_or_else(|e| e.into_inner());
+        let (gone, alive) =
+            std::mem::take(&mut *rescuing).into_iter().partition(|m| m.pipeline.made.get().is_some() || ended(m.thread));
+        *rescuing = alive;
+        gone
+    };
+    for m in gone {
+        if m.pipeline.made.get().is_none() {
+            tracing::warn!(
+                pipeline = %hashes(&m.pipeline),
+                key = %m.pipeline.key,
+                after_ms = m.since.elapsed().as_millis() as u64,
+                "making a pipeline ended its thread again, on the larger stack: \
+                 its draws and dispatches go without it for this run"
+            );
+            give_up(&m.pipeline);
+        }
+    }
+}
+
+/// The stack of the thread that makes a pipeline again after its worker
+/// ended ([`rescue`]), in bytes: `asked` MiB (`VICTORY_PIPELINE_RESCUE_MB`,
+/// at most 4,096), else 1 GiB; `None` for 0, not made again. Reserved only,
+/// its pages committed as they are used. Upstream gives 4 GiB; a program
+/// whose conversion never ends its recursion (two loop headers, Vice-Tay PR
+/// #198) commits all of it before its thread ends, and 1 GiB is sixteen
+/// times what a worker has.
+fn rescue_stack(asked: Option<usize>) -> Option<usize> {
+    match asked {
+        Some(0) => None,
+        Some(mib) => Some(mib.min(4096) << 20),
+        None => Some(1 << 30),
+    }
+}
+
+/// Pipelines being made again on a thread of their own ([`rescue`]), for [`reap`].
+static RESCUING: Mutex<Vec<Making>> = Mutex::new(Vec::new());
+
+/// Makes `p` again on a thread with [`rescue_stack`]; whether that thread
+/// started.
+fn rescue(p: Arc<Pending>) -> bool {
+    static STACK: OnceLock<Option<usize>> = OnceLock::new();
+    let stack = *STACK
+        .get_or_init(|| rescue_stack(std::env::var("VICTORY_PIPELINE_RESCUE_MB").ok().and_then(|v| v.trim().parse().ok())));
+    stack.is_some_and(|stack| rescue_with(p, stack, |p| p.build()))
+}
+
+fn rescue_with(p: Arc<Pending>, stack: usize, build: impl FnOnce(&Pending) -> Option<HostPipeline> + Send + 'static) -> bool {
+    let (tell, told) = std::sync::mpsc::channel();
+    let pipeline = p.clone();
+    let started = std::thread::Builder::new().name("victory-pipeline-rescue".to_owned()).stack_size(stack).spawn(move || {
+        // SAFETY: a plain query of this thread.
+        let _ = tell.send(unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() });
+        let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build(&pipeline))).unwrap_or(None);
+        let _ = pipeline.made.set(made);
+        let (lock, done) = &DONE;
+        let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+        done.notify_all();
+    });
+    if started.is_err() {
+        return false;
+    }
+    let Ok(thread) = told.recv_timeout(Duration::from_secs(5)) else { return false };
+    RESCUING.lock().unwrap_or_else(|e| e.into_inner()).push(Making { pipeline: p, thread, since: Instant::now() });
+    true
+}
+
+/// `p` is not made: its draws and dispatches go without it, and no one
+/// waits for it.
+fn give_up(p: &Pending) {
+    p.failed.store(true, Ordering::Release);
+    let (lock, done) = &DONE;
+    let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    done.notify_all();
 }
 
 /// The most pipelines waiting at once since the workers last ran out.
@@ -935,6 +1195,127 @@ mod tests {
             .unwrap()
             .join();
         assert_eq!(made.ok(), Some(4096));
+    }
+
+    #[test]
+    fn the_rescue_stack_is_a_gibibyte_or_what_the_switch_says() {
+        assert_eq!(rescue_stack(None), Some(1 << 30));
+        assert_eq!(rescue_stack(Some(0)), None);
+        assert_eq!(rescue_stack(Some(256)), Some(256 << 20));
+        assert_eq!(rescue_stack(Some(1 << 20)), Some(4 << 30));
+    }
+
+    /// A thread that ends while making a pipeline without unwinding
+    /// (ExitThread: what a stack overflow in vkd3d-proton does under Wine)
+    /// leaves it "being made". A second caller waits instead of making it
+    /// too or waiting for ever; [`rescue_with`] makes it and wakes it, and a
+    /// rescue that ends its thread too has [`reap`] give it up.
+    #[test]
+    fn a_pipeline_whose_maker_ended_is_made_again_or_given_up() {
+        fn ends_its_thread(p: Arc<Pending>) {
+            std::thread::spawn(move || {
+                p.make_with(|| {
+                    // SAFETY: ends this test thread, which holds nothing but `p`'s claim.
+                    unsafe { windows_sys::Win32::System::Threading::ExitThread(0) }
+                })
+            });
+        }
+        let waits_for = |p: &Arc<Pending>| {
+            let (tell, told) = std::sync::mpsc::channel();
+            let q = p.clone();
+            std::thread::spawn(move || {
+                q.make_with(|| panic!("the second caller must not make it too"));
+                let _ = tell.send(q.made.get().is_some());
+            });
+            told
+        };
+        for rescue_ends_too in [false, true] {
+            let mut p = Pending::new(Vec::new(), None);
+            p.key = format!("rescue-test-{rescue_ends_too}");
+            let p = Arc::new(p);
+            ends_its_thread(p.clone());
+            let started = Instant::now();
+            while !p.building.load(Ordering::Acquire) && started.elapsed() < Duration::from_secs(10) {
+                std::thread::yield_now();
+            }
+            let told = waits_for(&p);
+            assert!(told.recv_timeout(Duration::from_millis(300)).is_err(), "the second caller waits");
+            assert!(rescue_with(p.clone(), 1 << 30, move |_| {
+                if rescue_ends_too {
+                    // SAFETY: as above, the rescue thread.
+                    unsafe { windows_sys::Win32::System::Threading::ExitThread(0) }
+                }
+                None
+            }));
+            if rescue_ends_too {
+                let started = Instant::now();
+                while !p.failed.load(Ordering::Acquire) && started.elapsed() < Duration::from_secs(10) {
+                    reap();
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                assert!(p.failed.load(Ordering::Acquire), "given up once the rescue ended too");
+                assert_eq!(told.recv_timeout(Duration::from_secs(10)), Ok(false));
+                // Nothing waits for it any more, and nothing makes it.
+                let started = Instant::now();
+                assert!(ready(&p).is_none() && !now(&p));
+                assert!(started.elapsed() < Duration::from_millis(100));
+            } else {
+                assert_eq!(told.recv_timeout(Duration::from_secs(10)), Ok(true), "made by the rescue");
+                assert!(!p.failed.load(Ordering::Acquire));
+            }
+        }
+    }
+
+    /// A worker whose thread ended in a making is found, its pipeline made
+    /// again, and the count of what is waiting put right.
+    #[test]
+    fn a_worker_that_ended_is_found_by_its_thread() {
+        // A thread that has ended, and this one, which has not.
+        let (tell, told) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // SAFETY: a plain query of this thread.
+            let _ = tell.send(unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() });
+        })
+        .join()
+        .unwrap();
+        let gone = told.recv().unwrap();
+        // SAFETY: a plain query of this thread.
+        let here = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+        assert!(!ended(here));
+        let started = Instant::now();
+        while !ended(gone) && started.elapsed() < Duration::from_secs(10) {
+            std::thread::yield_now();
+        }
+        assert!(ended(gone));
+        // That thread as a worker that was making a pipeline for 3 s: the
+        // pipeline is made again (here: no host pipeline for no shaders),
+        // or given up with the rescue switched off.
+        let Some(since) = Instant::now().checked_sub(Duration::from_secs(3)) else { return };
+        let p = Arc::new(Pending::new(Vec::new(), None));
+        p.building.store(true, Ordering::Release);
+        *NOW_MAKING[NOW_MAKING.len() - 1].lock().unwrap() = Some(Making { pipeline: p.clone(), thread: gone, since });
+        reap();
+        assert!(NOW_MAKING[NOW_MAKING.len() - 1].lock().unwrap().is_none());
+        assert!(p.rescued.load(Ordering::Acquire));
+        let started = Instant::now();
+        while p.made.get().is_none() && !p.failed.load(Ordering::Acquire) && started.elapsed() < Duration::from_secs(10) {
+            std::thread::yield_now();
+        }
+        assert!(matches!(p.made.get(), Some(None)) || p.failed.load(Ordering::Acquire));
+        // A second ending of the same pipeline's worker is not rescued again.
+        let again = Arc::new(Pending::new(Vec::new(), None));
+        again.rescued.store(true, Ordering::Release);
+        *NOW_MAKING[NOW_MAKING.len() - 1].lock().unwrap() = Some(Making { pipeline: again.clone(), thread: gone, since });
+        reap();
+        assert!(again.failed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_panicking_build_ends_the_making() {
+        let bad = Arc::new(Pending::new(Vec::new(), None));
+        bad.make_with(|| panic!("synthetic pipeline build panic"));
+        assert!(matches!(bad.made.get(), Some(None)));
+        assert!(!now(&bad));
     }
 
     #[test]
