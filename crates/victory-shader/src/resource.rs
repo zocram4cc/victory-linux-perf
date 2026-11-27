@@ -514,6 +514,63 @@ impl<'a> Tracer<'a> {
         Ok(t)
     }
 
+    /// Dword `k` of an `s_xor_b32` / `s_xor_b64`'s operands as origins
+    /// so far (`o`, the propagation's table).
+    fn xor_terms(&self, inst: &Inst, k: usize, o: &[Option<Term>]) -> Option<[Term; 2]> {
+        let name = inst.name();
+        if name != "s_xor_b32" && name != "s_xor_b64" {
+            return None;
+        }
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return None;
+        };
+        let half = if name == "s_xor_b64" { k as u8 } else { 0 };
+        let op = |x: &Operand| -> Option<Term> {
+            match *x {
+                Operand::Scalar { code, .. } if code != NULL => o[inst.read(Reg::S(code + half))?.0 as usize],
+                Operand::Scalar { .. } => Some(Term::Const(0)),
+                Operand::Const(c) if half == 0 || name == "s_xor_b32" => inline(c).map(Term::Const),
+                Operand::Const(c) => inline(c).map(|x| Term::Const(if (x as i32) < 0 { u32::MAX } else { 0 })),
+                Operand::Literal(x) => Some(Term::Const(if half == 0 { x } else { 0 })),
+                _ => None,
+            }
+        };
+        Some([op(src.first()?)?, op(src.get(1)?)?])
+    }
+
+    /// Dword `k` of an XOR that is a copy, during copy propagation: `x ^ 0`,
+    /// or `(p ^ q) ^ q` (the second and third steps of a register swap
+    /// `a ^= b; b ^= a; a ^= b`). Seen here, the joins of swapped registers
+    /// settle to one origin (P.4: a table address swapped with 64-bit XORs
+    /// across branches, 459 programs).
+    fn xor_copy(&self, inst: &Inst, k: usize, o: &[Option<Term>]) -> Option<Term> {
+        let [x, y] = self.xor_terms(inst, k, o)?;
+        if x == Term::Const(0) {
+            return Some(y);
+        }
+        if y == Term::Const(0) {
+            return Some(x);
+        }
+        let inner = |t: Term| -> Option<[Term; 2]> {
+            let Term::Value(v) = t else { return None };
+            let (b, i) = self.defs[v.0 as usize]?;
+            let d = &self.p.blocks[b].insts[i];
+            let kk = d.writes.iter().position(|w| w.1 == v)?;
+            self.xor_terms(d, kk, o)
+        };
+        for (a, other) in [(x, y), (y, x)] {
+            if let Some([p, q]) = inner(a) {
+                if other == q {
+                    return Some(p);
+                }
+                if other == p {
+                    return Some(q);
+                }
+            }
+        }
+        None
+    }
+
     /// Optimistic copy propagation: a move's result is its source's
     /// origin, a phi's the one origin its arguments agree on.
     fn propagate_copies(&self, n: usize) -> Result<Vec<Term>, ShaderError> {
@@ -546,7 +603,7 @@ impl<'a> Tracer<'a> {
                         let new = match copy_source(inst, k).or_else(|| self.restored(inst)) {
                             Some(Moved::Const(c)) => Some(Term::Const(c)),
                             Some(Moved::Value(s)) => o[s.0 as usize],
-                            None => Some(Term::Value(v)),
+                            None => Some(self.xor_copy(inst, k, &o).unwrap_or(Term::Value(v))),
                         };
                         if new.is_some() && new != o[v.0 as usize] {
                             o[v.0 as usize] = new;
