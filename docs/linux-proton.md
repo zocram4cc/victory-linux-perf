@@ -154,8 +154,9 @@ once with `run` (`"$PROTON" run cmd /c exit`) before using `runinprefix`.
 
 Use a Proton prefix of its own and Proton's vkd3d-proton (`d3d12` native).
 `scripts/play-linux.sh <game folder>` does all of the below (the fast set,
-the lighting, the shader store once per build, the game at nice 10;
-`--safe` for Belobug's defaults, `--fsr` for the PC upscaler). By hand:
+the lighting, the face fix with our Proton build, the shader store once per
+build, the game at nice 10; `--safe` for Belobug's defaults, `--fsr` for the
+PC upscaler). By hand:
 
 ```sh
 PROTON=~/.steam/steam/compatibilitytools.d/GE-Proton11-14-victory5/proton
@@ -165,19 +166,23 @@ export VICTORY_GAME_DIR='Z:\path\to\GTA6.Xbox.v1.0.2.1'
 export VICTORY_NO_WATCHDOG=1
 # Lighting (see "Lighting" above).
 export VICTORY_RT_FALLBACK_NO_BVH=1 VICTORY_AMBIENT=0.35 VICTORY_AMBIENT_SHADE=0
+# Faces (needs our Proton build, see above): vkd3d-proton's descriptor heap
+# off, and a view heap large enough for VIctory's raw twins.
+export VKD3D_DISABLE_EXTENSIONS=VK_EXT_descriptor_heap VKD3D_VIEW_HEAP_DESCRIPTORS=4194304
 # Optional: go on past the instance-list pool stop in the intro (things go
 # missing from then on).
 # export VICTORY_NO_POOL_TRAP=1
 
-# The fast set (scripts\play.ps1's settings and the five renderer patches;
-# VICTORY_PORT_CONSTANTS needs our Proton build, see above). Leave it out for
-# Belobug's defaults.
+# The fast set (scripts\play.ps1's settings, the five renderer patches and
+# VICTORY_WC_NO_BACK: shaders' writes into write-combined title memory stay on
+# the card, 66 -> 57 ms a frame on an RX 6800 XT; VICTORY_PORT_CONSTANTS needs
+# our Proton build, see above). Leave it out for Belobug's defaults.
 export VICTORY_TEXTURE_NO_WAIT=1 VICTORY_RELAY=2 VICTORY_WIDE_BACK=1 VICTORY_CARD_REHASH_RUNS=1 \
   VICTORY_JOIN_COPIES=1 VICTORY_INDIRECT_WINDOW=1 VICTORY_RELAY_COPY=1 VICTORY_CARD_STEPS=2 \
   VICTORY_INDIRECT_BATCH=2 VICTORY_MAP_THREADS=1 VICTORY_CARD_AWAKE=1 VICTORY_SHOW_AFTER=1 \
   VICTORY_THIN=1 VICTORY_JOIN_PARTS=8 VICTORY_UPLOAD_AHEAD=1 \
   VICTORY_PORT_CONSTANTS=1 VICTORY_PORT_DESCRIPTORS=1 VICTORY_PORT_CBV=1 VICTORY_PORT_GUARD=1 \
-  VICTORY_PORT_JOURNAL=1
+  VICTORY_PORT_JOURNAL=1 VICTORY_WC_NO_BACK=1
 # Optional, PC FSR (see "PC FSR" above):
 # export VICTORY_FIDELITYFX_DIR='Z:\path\to\fidelityfx' VICTORY_FSR_4K=performance
 
