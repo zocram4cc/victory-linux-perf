@@ -4808,20 +4808,34 @@ fn same_placed_texture(a: &View, b: &View) -> bool {
     }
 }
 
-/// A shader view of a texture the title placed in memory itself, as a view
-/// of the resource made for that memory (on first use).
+/// A shader or unordered access view of a texture the title placed in
+/// memory itself, as a view of the resource made for that memory (on first
+/// use). Unordered views were left out before (DoubleGhosty/cool_fox
+/// e11479a): what shaders wrote through them never reached the host.
 pub(crate) fn placed_texture(view: &View) -> Option<View> {
     const BUFFER: u32 = 1;
-    let View::Placed(false, resource, desc) = view else {
+    const TARGET_DEPTH_UNORDERED: u32 = 0x7;
+    let &View::Placed(unordered, mut resource, ref desc) = view else {
         return None;
     };
     if resource[0] == BUFFER {
         return None;
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-    let texture = crate::resource::texture_at(address, resource)?;
-    crate::resource::want_level(texture, crate::resource::first_mip(desc));
-    Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
+    let words = desc[..10].try_into().ok();
+    if unordered {
+        let texture = crate::resource::uav_texture_at(address, &resource, desc[0])?;
+        Some(View::Unordered(texture as usize, 0, words))
+    } else {
+        // Shader views placed in memory take their texels either from title
+        // memory or from `TARGETS_AT` (`resource::alias_of`): clear target
+        // flags the title left on the resource description so this view
+        // never replaces that target in `TARGETS_AT`.
+        resource[12] &= !TARGET_DEPTH_UNORDERED;
+        let texture = crate::resource::texture_at(address, &resource)?;
+        crate::resource::want_level(texture, crate::resource::first_mip(desc));
+        Some(View::Shader(texture as usize, words))
+    }
 }
 
 /// A null view of the kind `view` is, for a slot whose view the host
@@ -6358,5 +6372,203 @@ mod bake_flip_tests {
         assert_eq!(cb1(), None);
         drop(cb2);
         assert!(take_pending_list_flip(id2).is_none(), "dropping uncalled closure cleans up entry");
+    }
+
+    /// Placed unordered texture views (2D and 3D) mirror onto host unordered
+    /// access textures when written into a shader-visible heap, reuse an
+    /// existing target at the same address, and feed shader views placed at
+    /// that address in another format through `texture::alias`.
+    #[test]
+    fn placed_unordered_texture_view_mirrors_and_aliases_to_shader_view() {
+        use super::*;
+
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return;
+        };
+
+        // 1. 3D volume UAV (4x4x4 R32_UINT, resource flags = 0) mirrored via
+        // `HostHeap::mirror(..., for_draw = false)` as a shader-visible heap
+        // copy does.
+        let vol_at = 0x7fed_1000_0000u64;
+        let vol_res = [4, 0, 0, 0, 4, 0, 4, 0x1_0004, 42, 1, 0, 0, 0, 0];
+        let mut vol_uav = [0u32; 16];
+        (vol_uav[0], vol_uav[1], vol_uav[4]) = (42, 8, 4);
+        (vol_uav[10], vol_uav[11]) = (vol_at as u32, (vol_at >> 32) as u32);
+        let slot_mem = [0u64; 4];
+        let slot_handle = slot_mem.as_ptr() as u64;
+        super::super::create_placed_uav(std::ptr::null(), &vol_res, &vol_uav, slot_handle);
+        assert!(heap.mirror(0, slot_handle, false).is_some());
+        {
+            let kept = heap.kept.lock().unwrap();
+            let tex = kept[0].as_ref().expect("3D placed UAV must mirror immediately");
+            // SAFETY: live D3D12 resource.
+            let d = unsafe { tex.GetDesc() };
+            assert_eq!(d.Dimension, D3D12_RESOURCE_DIMENSION_TEXTURE3D);
+            assert_ne!(d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0, 0);
+        }
+        // SAFETY: plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+
+        // Another placed UAV at the same address with compatible format reuses
+        // the resource already recorded in `TARGETS_AT`.
+        let Some(View::Unordered(first_vol, _, _)) =
+            placed_texture(&View::Placed(true, vol_res, vol_uav))
+        else {
+            panic!("expected View::Unordered");
+        };
+        let mut explicit_flags = vol_res;
+        explicit_flags[12] = 0x4;
+        let Some(View::Unordered(second_vol, _, _)) =
+            placed_texture(&View::Placed(true, explicit_flags, vol_uav))
+        else {
+            panic!("expected View::Unordered");
+        };
+        assert_eq!(first_vol, second_vol, "must reuse existing UAV texture at address");
+
+        // 2. Cross-format aliasing: a 4x4 R9G9B9E5_SHAREDEXP (67) description
+        // written through an R32_UINT (42) placed UAV and then read through an
+        // R9G9B9E5_SHAREDEXP placed SRV (even if `ALLOW_UNORDERED_ACCESS` was
+        // left on the SRV's resource description) copies the GPU texels across.
+        let alias_at = 0x7fed_2000_0000u64;
+        let rgb9e5_res = [3, 0, 0, 0, 4, 0, 4, 0x1_0001, 67, 1, 0, 0, 0x4, 0];
+        let mut uav_desc = [0u32; 16];
+        (uav_desc[0], uav_desc[1]) = (42, 4);
+        (uav_desc[10], uav_desc[11]) = (alias_at as u32, (alias_at >> 32) as u32);
+        let uav_placed = View::Placed(true, rgb9e5_res, uav_desc);
+        let Some(View::Unordered(uav_obj, _, _)) = placed_texture(&uav_placed) else {
+            panic!("expected placed UAV texture");
+        };
+        assert!(make(&uav_placed, heap.cpu(1)).flatten().is_some());
+
+        let mut srv_words = [0u32; 16];
+        (srv_words[0], srv_words[1], srv_words[2], srv_words[5]) =
+            (67, 4, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, 1);
+        (srv_words[10], srv_words[11]) = (alias_at as u32, (alias_at >> 32) as u32);
+        let srv_placed = View::Placed(false, rgb9e5_res, srv_words);
+        let Some(View::Shader(srv_obj, _)) = placed_texture(&srv_placed) else {
+            panic!("expected placed SRV texture");
+        };
+        assert!(make(&srv_placed, heap.cpu(2)).flatten().is_some());
+        assert_eq!(
+            crate::resource::alias_of(srv_obj as crate::object::This),
+            Some(uav_obj as crate::object::This),
+            "placed SRV must find the placed UAV texture in TARGETS_AT"
+        );
+
+        // Upload a known R32_UINT pattern into `uav_obj` on the GPU, run
+        // `texture::alias` into `srv_obj`, and read `srv_obj` back.
+        let uav_tex = crate::resource::host_resource(uav_obj as crate::object::This).unwrap();
+        let srv_tex = crate::resource::host_resource(srv_obj as crate::object::This).unwrap();
+        let pattern = 0x7c40_8210u32;
+        let make_buf = |heap_type, state| {
+            let hp = D3D12_HEAP_PROPERTIES {
+                Type: heap_type,
+                ..Default::default()
+            };
+            let rd = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 1024,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut out: Option<ID3D12Resource> = None;
+            // SAFETY: valid buffer description.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, state, None, &mut out)
+                    .unwrap();
+            }
+            out.unwrap()
+        };
+        let upload = make_buf(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        let readback = make_buf(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+        // SAFETY: 1024-byte upload buffer mapped on CPU.
+        unsafe {
+            let mut ptr = std::ptr::null_mut();
+            upload.Map(0, None, Some(&mut ptr)).unwrap();
+            std::slice::from_raw_parts_mut(ptr.cast::<u32>(), 256).fill(pattern);
+            upload.Unmap(0, None);
+        }
+
+        let list = host.new_list().unwrap();
+        crate::list::ensure_state(&list, uav_obj as crate::object::This, 0x400); // COPY_DEST
+        let buf_loc = |buf: &ID3D12Resource, format| D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: borrowed pointer not released by the copy location.
+            pResource: unsafe { std::mem::transmute_copy(buf) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: 0,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                        Format: format,
+                        Width: 4,
+                        Height: 4,
+                        Depth: 1,
+                        RowPitch: 256,
+                    },
+                },
+            },
+        };
+        let tex_loc = |tex: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: borrowed pointer not released by the copy location.
+            pResource: unsafe { std::mem::transmute_copy(tex) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: 0,
+            },
+        };
+        // SAFETY: open list and live resources in matching copy states.
+        unsafe {
+            list.list.CopyTextureRegion(
+                &tex_loc(uav_tex),
+                0,
+                0,
+                0,
+                &buf_loc(&upload, DXGI_FORMAT_R32_UINT),
+                None,
+            );
+        }
+        crate::list::ensure_state(&list, uav_obj as crate::object::This, 0x8); // UNORDERED_ACCESS
+        assert!(crate::texture::alias(
+            &list,
+            srv_obj as crate::object::This,
+            uav_obj as crate::object::This
+        ));
+        crate::list::ensure_state(&list, srv_obj as crate::object::This, 0x800); // COPY_SOURCE
+        // SAFETY: open list and `srv_tex` transitioned to `COPY_SOURCE`.
+        unsafe {
+            list.list.CopyTextureRegion(
+                &buf_loc(&readback, DXGI_FORMAT_R9G9B9E5_SHAREDEXP),
+                0,
+                0,
+                0,
+                &tex_loc(srv_tex),
+                None,
+            );
+        }
+        list.close();
+        host.execute(&[&list]);
+
+        // SAFETY: GPU execution finished; readback holds 1024 bytes.
+        let got = unsafe {
+            let mut ptr = std::ptr::null_mut();
+            readback.Map(0, None, Some(&mut ptr)).unwrap();
+            let word = *ptr.cast::<u32>();
+            readback.Unmap(0, None);
+            word
+        };
+        assert_eq!(got, pattern);
+        // SAFETY: plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 }
