@@ -5994,11 +5994,34 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
             let mut bytes = [0u8; 32];
             crate::host::read_into(at.ptr as *const u8, &mut bytes).then_some(bytes)
         };
+        // Descriptors are the driver's own: a copy holds the bytes made
+        // beside the heap (WARP's point to an object of their own, made anew
+        // each time), or those of the same view made in place (AMD's name
+        // the slot they are in, and change as they are copied in).
+        let copied_as_made = |made_in_place: &dyn Fn()| {
+            let (slot, beside) = (bytes(heap.cpu(index)), bytes(staged(false, 0).unwrap()));
+            made_in_place();
+            slot == beside || slot == bytes(heap.cpu(index))
+        };
         heap.raw_at(index, &buffer, 64, 1024);
-        let (slot, beside) = (bytes(heap.cpu(index)), bytes(staged(false, 0).unwrap()));
-        assert_eq!(slot, beside, "copied as it was made");
+        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    FirstElement: 64 / 4,
+                    NumElements: 1024 / 4,
+                    StructureByteStride: 0,
+                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                },
+            },
+        };
+        // SAFETY: a slot of our heap and a live buffer covering the range.
+        let raw = || unsafe { host.device.CreateShaderResourceView(&buffer, Some(&desc), heap.cpu(index)) };
+        assert!(copied_as_made(&raw), "copied as it was made");
         heap.null_raw_at(index);
-        assert_ne!(bytes(heap.cpu(index)), slot, "another view since");
+        assert!(copied_as_made(&|| null_buffer_view(heap.cpu(index))), "another view since, copied as it was made");
         // SAFETY: a plain query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
