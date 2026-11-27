@@ -1153,6 +1153,11 @@ impl<'a> Tracer<'a> {
         joins: &mut Vec<usize>,
         known: &mut Known,
     ) -> Result<Source, &'static str> {
+        // Words that went through XOR chains that cancel out (the console
+        // compiler swaps registers with `s_xor_b32` three times): the word
+        // they come back to.
+        let unxored: Vec<Term> = words.iter().map(|&w| self.xor_cancelled(w)).collect();
+        let words = &unxored[..];
         if let Some(source) = self.phi(words, joins, known)? {
             return Ok(source);
         }
@@ -1224,7 +1229,7 @@ impl<'a> Tracer<'a> {
                 .iter()
                 .map(|w| match *w {
                     Term::Const(c) => format!("const {c:#x}"),
-                    Term::Value(v) => match self.sop2(v, &["s_and_b32", "s_or_b32", "s_mul_i32", "s_lshl_b32", "s_add_u32"]) {
+                    Term::Value(v) => match self.sop2(v, &["s_and_b32", "s_or_b32", "s_mul_i32", "s_lshl_b32", "s_add_u32", "s_xor_b32", "s_xor_b64"]) {
                         Some((i, [a, b])) => {
                             let t = |t: Term| match t {
                                 Term::Const(c) => format!("{c:#x}"),
@@ -2152,6 +2157,44 @@ impl<'a> Tracer<'a> {
     }
 
     /// Consecutive dwords of one scalar load.
+    /// `w` with the XOR chains it went through cancelled: when the leaves of
+    /// its `s_xor_b32` tree (values not made by `s_xor_b32`, and constants)
+    /// leave one value an odd number of times and constants that XOR to 0,
+    /// that value; otherwise `w` itself.
+    fn xor_cancelled(&self, w: Term) -> Term {
+        let Term::Value(v) = w else {
+            return w;
+        };
+        if self.sop2(v, &["s_xor_b32"]).is_none() {
+            return w;
+        }
+        let mut odd: Vec<Value> = Vec::new();
+        let mut constant = 0u32;
+        let mut stack = vec![(Term::Value(v), 0u8)];
+        while let Some((t, depth)) = stack.pop() {
+            match t {
+                Term::Const(c) => constant ^= c,
+                Term::Value(x) => match self.sop2(x, &["s_xor_b32"]) {
+                    Some((_, [a, b])) if depth < 8 => {
+                        stack.push((a, depth + 1));
+                        stack.push((b, depth + 1));
+                    }
+                    Some(_) => return w,
+                    None => match odd.iter().position(|&y| y == x) {
+                        Some(i) => {
+                            odd.swap_remove(i);
+                        }
+                        None => odd.push(x),
+                    },
+                },
+            }
+        }
+        match (odd.as_slice(), constant) {
+            ([one], 0) => Term::Value(*one),
+            _ => w,
+        }
+    }
+
     /// A loaded buffer descriptor made into a byte-address (raw) view of the
     /// same buffer: `[d0, d1 & 0xc000ffff, d2 * n, (d3 & m) | 0x30000000]`
     /// (the stride cleared, the record count in bytes, OOB_SELECT raw), all
