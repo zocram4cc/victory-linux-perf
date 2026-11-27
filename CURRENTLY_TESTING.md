@@ -26,9 +26,29 @@ p90 of the frame: r0 97.5/92.5, r1 88.0/88.9, r2 103.4/69.9, r3 67.2/63.9, r4 66
 **Best so far: r3, 49.7 ms (−36 % against r0).** r4's three switches gave nothing here (+2 ms, within
 noise): left off for now.
 
-r2: port 1 opened part of the title's constants in
-place and fell back to copies for stretches that are not one section ("title memory not in place,
-a copy as before"); the world was drawn (6,594 draws a frame), picture not yet checked by capture.
+r2: port 1 opened part of the title's constants in place and fell back to copies for stretches
+that are not one section ("title memory not in place, a copy as before"). Picture check (captures
+of world frames 1400/1500, r0 against r3): the same image.
+
+## On top of r3 (one switch at a time, 2 runs each)
+
+| Added to r3 | Run 1 | Run 2 | Mean |
+|---|---|---|---|
+| `VICTORY_CLAMP_SYNC=1` | 49.0 | 49.0 | 49.0 ms |
+| `VICTORY_COMPUTE_WAIT_MS=500` | 47.9 | 48.5 | **48.2 ms** |
+| `VICTORY_WAKE_ONE=1` | 51.9 | 48.2 | 50.0 ms |
+| `VICTORY_JOIN_PARTS_DRAWS=500` | 50.4 | 49.1 (rerun: the first title stopped itself at start) | 49.8 ms |
+| `VICTORY_CARD_BUFFERS_MB=4096` | 49.5 | 50.2 | 49.8 ms |
+| **all on** (r4 + the five above) | 51.2 | 49.2 | 50.2 ms |
+
+Only `COMPUTE_WAIT_MS=500` gains (−1.5 ms, both runs; upstream also has it put missing heads
+right). The rest are within noise, and all of them at once gain nothing over r3.
+
+## Combined (play-fast2's defaults now)
+
+`VICTORY_CARD_BUFFERS_MIN_KB=64 VICTORY_WINE_MAP=1 VICTORY_PORT_CONSTANTS=1 VICTORY_PORT_HOME=1
+VICTORY_DYNAMIC_BITS=1 VICTORY_TABLE_MEMO=1 VICTORY_COMPUTE_WAIT_MS=500` on top of the play-fast
+settings: **48.2 ms** against 77.7 with every new switch off (−38 %).
 
 ## Earlier measurements on this machine (300 world seconds, 1 run each, `perf/v7900-final`)
 
@@ -91,8 +111,7 @@ not from the merge); sparkle on glass and speckle on floors; `VICTORY_PORT_CONST
 
 ## Next
 
-1. Picture check of r3 (captures) — port 1 must not change the image.
-2. Combine: r3 becomes the play settings (play-fast2), then on top of it, one at a time, 2 runs
-   each: `VICTORY_CLAMP_SYNC=1` (upstream: 56 → 34 ms where port 1 leaves many lone clamps),
-   `VICTORY_COMPUTE_WAIT_MS=500`, `VICTORY_WAKE_ONE=1`, `VICTORY_JOIN_PARTS_DRAWS=500`,
-   `VICTORY_CARD_BUFFERS_MB` above 2 GiB.
+1. Late captures (world frame 3000+) of r0 and the combined set: the pink blinds and trees may
+   only be a baseline problem (they look gone on screen with the combined set).
+2. More runs of the combined set (4) to firm up the number; `VICTORY_FRAME_INTERVAL_MS=16.667`
+   once frames get near the title's 33 ms.
