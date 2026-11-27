@@ -457,7 +457,17 @@ struct Section {
     /// With pages shown by the host's mmap (`wine_map`): the section's file
     /// there.
     fd: Option<i32>,
+    /// Under Wine, with renderer port 1 ([`home_for`]): where the section's
+    /// first page is at home (0: nowhere so far; [`NO_HOME`]: nowhere, for
+    /// good), and a bit per page: shown there now, as memory of its own, and
+    /// its bytes are there and not in the section.
+    home: AtomicUsize,
+    at_home: Box<[std::sync::atomic::AtomicU64]>,
 }
+
+/// [`Section::home`] of a section whose pages the title shows at more than
+/// one address.
+const NO_HOME: usize = usize::MAX;
 
 impl Section {
     /// Where bytes of `n` pages from page `index` on can be written,
@@ -471,11 +481,23 @@ impl Section {
     /// costs that once per page.
     /// `VICTORY_SECTION_WINDOW=0`: a view for each write, as before.
     fn window(&self, index: usize, n: usize) -> Option<usize> {
-        use std::sync::atomic::Ordering;
-        use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
+        // (Under Wine: pages at home have their bytes there, [`runs`].)
+        if let Some(at) = self.homed(index, n) {
+            return Some(at);
+        }
         static ON: LazyLock<bool> =
             LazyLock::new(|| std::env::var_os("VICTORY_SECTION_WINDOW").is_none_or(|v| v != "0"));
-        if !*ON || index + n > self.pages {
+        if !*ON {
+            return None;
+        }
+        self.kept(index, n)
+    }
+
+    /// [`Section::window`]'s view of the section itself.
+    fn kept(&self, index: usize, n: usize) -> Option<usize> {
+        use std::sync::atomic::Ordering;
+        use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
+        if index + n > self.pages {
             return None;
         }
         let base = *self.window.get_or_init(|| {
@@ -532,6 +554,252 @@ impl Section {
             word.fetch_or(bit, Ordering::AcqRel);
         }
         true
+    }
+}
+
+impl Section {
+    /// Whether page `index` is at home.
+    fn is_home(&self, index: usize) -> bool {
+        self.at_home.get(index / 64).is_some_and(|word| word.load(Ordering::Acquire) >> (index % 64) & 1 != 0)
+    }
+
+    /// Whether any page is at home (one look where none ever was).
+    fn any_home(&self) -> bool {
+        !matches!(self.home.load(Ordering::Acquire), 0 | NO_HOME) && self.at_home.iter().any(|word| word.load(Ordering::Acquire) != 0)
+    }
+
+    /// Where page `index` is, if it and the `n - 1` after it are at home.
+    fn homed(&self, index: usize, n: usize) -> Option<usize> {
+        let home = self.home.load(Ordering::Acquire);
+        if matches!(home, 0 | NO_HOME) || n == 0 || !(index..index + n).all(|page| self.is_home(page)) {
+            return None;
+        }
+        Some(home + index * PAGE)
+    }
+}
+
+/// Under Wine, with renderer port 1 (`VICTORY_PORT_CONSTANTS=1`) and pages
+/// shown by the host's mmap (`VICTORY_WINE_MAP=1`), when `VICTORY_PORT_HOME=1`
+/// is set too: whether the title's 32-bit graphics pages are shown as memory
+/// of their own (unset: as their section's file, like every other page; the
+/// GPU side then leaves that memory to copies, as without the port). Off
+/// unless set here; upstream has it on whenever the other two are.
+/// Read here, once.
+///
+/// vkd3d-proton opens a host heap on memory by importing it into Vulkan, and
+/// with RADV that works for private memory only: a heap on a view of the
+/// section, or on its file shown with `mmap`, is given memory of the host's
+/// own with no word of it, and the card read zeros where the title wrote its
+/// constants: every frame black. So where the port wants one stretch of one
+/// section ([`arrange`]) each page is committed private memory at the one
+/// address the title shows it at; the section keeps what it held when it is
+/// not shown.
+///
+/// What it assumes: the title shows such a page at one address at a time (it
+/// maps the heap's five pieces once). Shown at a second one, the section's
+/// pages all go back to being its file ([`homeless`]), with a warning.
+fn home_on() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| port_on() && wine_map::on() && std::env::var_os("VICTORY_PORT_HOME").is_some_and(|v| v == "1"));
+    *ON
+}
+
+/// The sections with a home: the reservation's start and bytes.
+static HOMES: Mutex<Vec<(usize, usize, std::sync::Weak<Section>)>> = Mutex::new(Vec::new());
+static HOMES_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The 32-bit graphics reservation `[base, base + len)` lies in, if `slice`
+/// may be shown there as memory of its own ([`home_on`]): the reservation
+/// holds the whole section, each page at its offset, and no page of the range
+/// is shown anywhere now.
+fn home_for(base: usize, len: usize, slice: &Slice) -> Option<usize> {
+    // (32-bit graphics memory lies below 4 GiB: no more than this look for
+    // the thousands of pages a second that are shown above it.)
+    if base >> 32 != 0 || !home_on() {
+        return None;
+    }
+    let (first, bytes) = LOW_RESERVATIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .copied()
+        .find(|&(at, size)| at <= base && base + len <= at + size)?;
+    let section = &slice.section;
+    let was = section.home.load(Ordering::Acquire);
+    if (was != 0 && was != first) || section.pages * PAGE > bytes || base != first + slice.index * PAGE {
+        return None;
+    }
+    let shown = SHOWN.read().unwrap_or_else(|e| e.into_inner());
+    let free = (0..len / PAGE).all(|k| shown.at(&Slice { section: section.clone(), index: slice.index + k }).is_empty());
+    free.then_some(first)
+}
+
+/// Makes `[first, first + bytes)`, the stretch a section's pages go home to,
+/// committed memory in one mapping of the host's, before the first piece is
+/// shown there; false, with nothing done, if any of it is committed already.
+///
+/// The host opens a heap on memory by handing its address to the card's
+/// driver, and the kernel's side of that (amdgpu's
+/// `amdgpu_ttm_tt_get_user_pages`, read in its source) takes the memory only
+/// if one mapping of the process's own holds all of it, from its first byte
+/// to its last. The title maps this heap in five pieces. Committed one by
+/// one they are one mapping to the kernel only as long as no two of them
+/// that do not touch were written to before the pieces between them were
+/// committed (each mapping written to has books of its own from then on,
+/// and the kernel joins no two such). The title's threads write as soon as
+/// a piece is there: upstream saw, in 3 launches of 13, the host unable to
+/// hand the memory over, giving the heap memory of its own without a word,
+/// and the card reading zeros. Outside the title (`heap-probe repeat`):
+/// pieces committed and written to one by one, zeros every time; the stretch
+/// committed in one call first, the bytes every time.
+///
+/// shortcut: the pieces the title has not mapped yet can be read and written
+/// (zeros) from here on, where they were out of reach.
+fn whole_home(first: usize, bytes: usize) -> bool {
+    use windows_sys::Win32::System::Memory::VirtualQuery;
+    let mut at = first;
+    while at < first + bytes {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        if unsafe { VirtualQuery(at as *const c_void, &mut info, size_of_val(&info)) } == 0 || info.State != MEM_RESERVE {
+            return false;
+        }
+        at = (info.BaseAddress as usize).saturating_add(info.RegionSize).max(at + PAGE);
+    }
+    wine_map::own(first, bytes)
+}
+
+/// Shows `slice`'s pages at `[base, base + len)` as memory of their own, with
+/// what the section holds of them ([`home_for`] said they may be).
+fn show_home(base: usize, len: usize, slice: &Slice, first: usize) -> bool {
+    let section = &slice.section;
+    // Before the section's first piece goes home: all of its stretch one
+    // mapping of the host's ([`whole_home`]).
+    if section.home.load(Ordering::Acquire) == 0 && !whole_home(first, section.pages * PAGE) {
+        tracing::warn!(
+            at = format_args!("{first:#x}"),
+            pages = section.pages,
+            "renderer port 1 under Wine: the stretch the title's 32-bit graphics pages go home to shows something already: committed piece by piece, which the host may not open as a heap"
+        );
+    }
+    // SAFETY: a range of a plain reservation of the title's that shows nothing
+    // (the caller unmapped it): committed, it is fresh memory of the process's.
+    if unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
+        commit_refused(len, "physical pages at home", std::io::Error::last_os_error());
+        return false;
+    }
+    // What the pages held: written or shown before, their bytes are in the
+    // section.
+    let pages = slice.index..slice.index + len / PAGE;
+    let held = |page: usize| section.committed[page / 64].load(Ordering::Acquire) >> (page % 64) & 1 != 0;
+    let mut page = pages.start;
+    while page < pages.end {
+        let run = (page..pages.end).take_while(|&p| held(p)).count();
+        if run == 0 {
+            page += 1;
+            continue;
+        }
+        let Some(from) = section.kept(page, run) else {
+            tracing::warn!(address = format_args!("{base:#x}"), len, "physical pages are not shown as memory of their own: what they held cannot be read");
+            // SAFETY: the range committed above.
+            unsafe { VirtualFree(base as *mut c_void, len, MEM_DECOMMIT) };
+            return false;
+        };
+        // SAFETY: `run` pages of the section's view, and as many of the range
+        // just committed.
+        unsafe { std::ptr::copy_nonoverlapping(from as *const u8, (base + (page - pages.start) * PAGE) as *mut u8, run * PAGE) };
+        page += run;
+    }
+    if section.home.swap(first, Ordering::AcqRel) == 0 {
+        HOMES.lock().unwrap_or_else(|e| e.into_inner()).push((first, section.pages * PAGE, Arc::downgrade(section)));
+        HOMES_ANY.store(true, Ordering::Release);
+        tracing::info!(
+            at = format_args!("{first:#x}"),
+            pages = section.pages,
+            "renderer port 1 under Wine: the title's 32-bit graphics pages are shown as memory of their own, which the host can open as a heap (VICTORY_PORT_HOME=1)"
+        );
+    }
+    for p in pages {
+        section.at_home[p / 64].fetch_or(1 << (p % 64), Ordering::AcqRel);
+        // (Fresh no more, [`arrange`].)
+        section.committed[p / 64].fetch_or(1 << (p % 64), Ordering::AcqRel);
+    }
+    victory_gpu::title_memory_home(base, len, true);
+    true
+}
+
+/// Before `[base, base + len)` stops showing what it shows: the pages at home
+/// there give their bytes back to their section, and the GPU side lets go of
+/// the heap it has on them.
+///
+/// shortcut: the heap may outlive this by the lists that still name it, and a
+/// submission made meanwhile is refused by the kernel (its pages are gone).
+/// The title unmaps this heap in no run seen; wait for the heap here if one
+/// does.
+fn leave_home(base: usize, len: usize) {
+    if base >> 32 != 0 || !HOMES_ANY.load(Ordering::Acquire) {
+        return;
+    }
+    let homes: Vec<(usize, Arc<Section>)> = HOMES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|h| h.0 < base + len && base < h.0 + h.1)
+        .filter_map(|h| Some((h.0, h.2.upgrade()?)))
+        .collect();
+    for (first, section) in homes {
+        let from = base.max(first);
+        let pages = (from - first) / PAGE..((base + len).min(first + section.pages * PAGE) - first).div_ceil(PAGE);
+        let mut page = pages.start;
+        while page < pages.end {
+            let run = (page..pages.end).take_while(|&p| section.is_home(p)).count();
+            if run == 0 {
+                page += 1;
+                continue;
+            }
+            let at = first + page * PAGE;
+            victory_gpu::title_memory_home(at, run * PAGE, false);
+            match section.kept(page, run) {
+                // SAFETY: `run` pages at home, committed and the title's until
+                // the caller takes them away, and as many of the section's view.
+                Some(to) => unsafe { std::ptr::copy_nonoverlapping(at as *const u8, to as *mut u8, run * PAGE) },
+                None => tracing::warn!(address = format_args!("{at:#x}"), pages = run, "physical pages leave their home and the section cannot take what they held"),
+            }
+            for p in page..page + run {
+                section.at_home[p / 64].fetch_and(!(1 << (p % 64)), Ordering::AcqRel);
+            }
+            page += run;
+        }
+    }
+}
+
+/// The title shows pages of `section` that are at home at another address
+/// too: every page of the section goes back to being its file, where it is
+/// shown, and none is at home again ([`home_on`]).
+fn homeless(section: &Arc<Section>) {
+    let first = section.home.swap(NO_HOME, Ordering::AcqRel);
+    if matches!(first, 0 | NO_HOME) {
+        return;
+    }
+    tracing::warn!(
+        at = format_args!("{first:#x}"),
+        "renderer port 1 under Wine: the title shows its 32-bit graphics pages at a second address: they are their section's file again, and the port's memory there is copied as before"
+    );
+    let mut page = 0;
+    while page < section.pages {
+        let run = (page..section.pages).take_while(|&p| section.is_home(p)).count();
+        if run == 0 {
+            page += 1;
+            continue;
+        }
+        let at = first + page * PAGE;
+        // (Gives the bytes back and clears the pages' bits.)
+        leave_home(at, run * PAGE);
+        let shown = section.fd.is_some_and(|fd| wine_map::show(at, run * PAGE, fd, (page * PAGE) as u64));
+        if !shown {
+            tracing::warn!(address = format_args!("{at:#x}"), pages = run, "physical pages were not shown as their section's file again");
+        }
+        page += run;
     }
 }
 
@@ -752,6 +1020,8 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         window: std::sync::OnceLock::new(),
         committed: (0..n.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
         fd: wine_map::fd_of(handle),
+        home: AtomicUsize::new(0),
+        at_home: (0..n.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
     });
     if wine_map::on() && section.fd.is_none() {
         tracing::warn!(n, "the host gave no file descriptor for a section of physical pages: its pages cannot be shown (VICTORY_WINE_MAP unset shows them as views)");
@@ -863,7 +1133,10 @@ fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)
         match runs.last_mut() {
             Some((first, n))
                 if Arc::ptr_eq(&first.section, &slice.section)
-                    && slice.index == first.index + *n =>
+                    && slice.index == first.index + *n
+                    // (Under Wine: pages at home are written there, the
+                    // others in the section, [`Section::window`].)
+                    && slice.section.is_home(slice.index) == first.section.is_home(first.index) =>
             {
                 *n += 1;
             }
@@ -1803,6 +2076,14 @@ fn split(base: usize, len: usize) {
 /// long already.
 fn show(base: usize, len: usize, slice: &Slice, own: bool) -> bool {
     if wine_map::holds(base) {
+        // Under Wine, with renderer port 1: the title's 32-bit graphics pages
+        // as memory of their own ([`home_on`]).
+        if let Some(first) = home_for(base, len, slice) {
+            return counted(Call::Map, || show_home(base, len, slice, first));
+        }
+        if slice.section.any_home() {
+            homeless(&slice.section);
+        }
         // With `wine_map`: the section's file mapped there by the host's
         // kernel, committed whole as the section is.
         let Some(fd) = slice.section.fd else {
@@ -1860,6 +2141,7 @@ fn show(base: usize, len: usize, slice: &Slice, own: bool) -> bool {
 /// host did.
 fn hide(base: usize, len: usize) -> bool {
     if wine_map::holds(base) {
+        leave_home(base, len);
         return wine_map::hide(base, len);
     }
     // SAFETY: a view we mapped; it becomes a placeholder again.
@@ -2354,6 +2636,75 @@ mod tests {
         assert_eq!(index(pages[0]), Some(2));
         // SAFETY: mapped read-write.
         unsafe { at(3).cast::<u32>().write(7) };
+        assert_eq!(XMemMapPhysicalPages(base, 4, std::ptr::null()), base);
+        assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
+    }
+
+    /// Under Wine with renderer port 1 (the tests run with
+    /// `VICTORY_WINE_MAP=1 VICTORY_PORT_CONSTANTS=1 VICTORY_PORT_HOME=1`;
+    /// nothing is tried otherwise): the 32-bit heap's pages are memory of
+    /// their own where the title maps them, are written by their numbers
+    /// there, keep their bytes unmapped and mapped again, and are their
+    /// section's file again, with those bytes, once the title shows one at a
+    /// second address.
+    #[test]
+    fn under_wine_the_32_bit_heap_is_shown_as_memory_of_its_own() {
+        if !home_on() {
+            eprintln!("not tried: not under Wine with pages shown by mmap, or without VICTORY_PORT_CONSTANTS=1 and VICTORY_PORT_HOME=1");
+            return;
+        }
+        let base = XMemVirtualAlloc(std::ptr::null_mut(), 4 * PAGE, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, GRAPHICS | ADDRESS_32BIT, PAGE_NOACCESS);
+        assert!(!base.is_null() && (base as usize) < 1 << 32);
+        let pages = allocate(4);
+        let at = |page: usize| base.wrapping_byte_add(page * PAGE);
+        // The last two pages' place first, from the array's start, as the
+        // title does: `pages[1]` is the section's fourth page.
+        assert_eq!(XMemMapPhysicalPages(at(2), 2, pages.as_ptr()), at(2));
+        // The title writes to a piece before it maps the next, as its threads
+        // do. The stretch is one mapping to the host all the same: its
+        // kernel's graphics driver takes memory by address only so
+        // (`whole_home`).
+        // SAFETY: mapped read-write.
+        unsafe { at(2).cast::<u32>().write(1) };
+        assert_eq!(XMemMapPhysicalPages(base, 2, pages[2..].as_ptr()), base);
+        // SAFETY: mapped read-write.
+        unsafe { base.cast::<u32>().write(1) };
+        match wine_map::one_own_mapping(base as usize, 4 * PAGE) {
+            Some(one) => assert!(one, "one mapping of the process's own holds the stretch"),
+            None => eprintln!("not looked at: the host's list of this process's mappings could not be read"),
+        }
+        let section = page_table().pages.get(&pages[0]).map(|s| s.section.clone()).unwrap();
+        assert_eq!(section.home.load(Ordering::Acquire), base as usize);
+        assert!((0..4).all(|page| section.is_home(page)), "every page is at home");
+        // SAFETY: mapped read-write.
+        unsafe { at(3).cast::<u32>().write(7) };
+        assert_eq!(page_window(&pages[1..2], 0, 4).unwrap().bytes(), 7u32.to_le_bytes(), "read by its number where it is");
+        assert!(write_physical(&pages[1..2], 4, &[9]));
+        // SAFETY: mapped read-write.
+        assert_eq!(unsafe { at(3).cast::<u8>().add(4).read() }, 9, "written by its number where it is");
+        // Unmapped, the section holds the bytes; mapped again, the home does.
+        assert_eq!(XMemMapPhysicalPages(at(2), 2, std::ptr::null()), at(2));
+        assert!(!section.is_home(3) && section.is_home(0));
+        assert_eq!(page_window(&pages[1..2], 0, 5).unwrap().bytes(), [7, 0, 0, 0, 9]);
+        assert_eq!(XMemMapPhysicalPages(at(2), 2, pages.as_ptr()), at(2));
+        assert!(section.is_home(3));
+        // SAFETY: mapped read-write.
+        assert_eq!(unsafe { at(3).cast::<u32>().read() }, 7);
+        // At a second address: the same bytes at both, through the section.
+        let other = XMemVirtualAlloc(std::ptr::null_mut(), PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        assert!(!other.is_null());
+        assert_eq!(XMemMapPhysicalPages(other, 1, pages[1..].as_ptr()), other);
+        assert_eq!(section.home.load(Ordering::Acquire), NO_HOME);
+        assert!(!section.any_home() && !section.is_home(0));
+        // SAFETY: both mapped read-write.
+        unsafe {
+            assert_eq!(other.cast::<u32>().read(), 7);
+            other.cast::<u32>().write(11);
+            assert_eq!(at(3).cast::<u32>().read(), 11);
+            at(0).cast::<u32>().write(13);
+        }
+        assert_eq!(page_window(&pages[2..3], 0, 4).unwrap().bytes(), 13u32.to_le_bytes());
+        assert_eq!(XMemMapPhysicalPages(other, 1, std::ptr::null()), other);
         assert_eq!(XMemMapPhysicalPages(base, 4, std::ptr::null()), base);
         assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
     }
