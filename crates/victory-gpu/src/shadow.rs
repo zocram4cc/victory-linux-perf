@@ -3264,6 +3264,20 @@ impl Shadow {
         self.place.is_some()
     }
 
+    /// Where the card reads the copy (diagnostics, `crate::host`'s GPU reads
+    /// line): 0 title memory in place, 1 the card's memory (a copy there, or
+    /// a window the CPU maps there), 2 the PC's memory.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn read_class(&self) -> usize {
+        if self.place.is_some() {
+            0
+        } else if self.card.is_some() || self.mapped {
+            1
+        } else {
+            2
+        }
+    }
+
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
         address - self.start + self.place.as_ref().map_or(0, |place| place.1)

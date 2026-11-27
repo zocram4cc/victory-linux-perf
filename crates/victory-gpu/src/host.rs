@@ -7790,6 +7790,9 @@ impl HostList {
         let (mut us, mut bytes) = (std::time::Duration::ZERO, 0u64);
         #[cfg(feature = "diagnostics")]
         let (mut copies, mut refreshes, mut refreshed) = (0u64, 0u64, 0u64);
+        // The refreshed bytes, by where the card reads them ([`READS`]).
+        #[cfg(feature = "diagnostics")]
+        let mut reads = [0u64; 3];
         for (i, step) in self.deferred().copies.iter().enumerate() {
             if matches!(step, Step::Copy(..) | Step::Fill(..)) && taken(i) {
                 continue;
@@ -7854,6 +7857,7 @@ impl HostList {
                     {
                         refreshes += 1;
                         refreshed += *len as u64;
+                        reads[shadow.read_class()] += *len as u64;
                     }
                     batch.add(shadow, *address, *len);
                     continue;
@@ -7920,6 +7924,9 @@ impl HostList {
             add(C::Refreshes, refreshes);
             add(C::RefreshBytes, refreshed);
             SPLIT[7].fetch_add(us.as_nanos() as u64, Ordering::Relaxed);
+            for (all, these) in READS.iter().zip(reads) {
+                all.fetch_add(these, Ordering::Relaxed);
+            }
         }
     }
 
@@ -7979,6 +7986,14 @@ impl std::hash::Hasher for AddressHash {
 /// end, the wait for the heaps' records.
 #[cfg(feature = "diagnostics")]
 static SPLIT: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
+
+/// Since the last frame-rate line: the bytes the lists' refreshes declare the
+/// card reads (shaders, vertex and index fetch), by where it reads them: title
+/// memory in place, copies in the card's memory (and windows the CPU maps
+/// there), copies in the PC's memory. Their sum is [`crate::copystat`]'s
+/// refreshed bytes. Whether memory belongs in place or on the card goes by it.
+#[cfg(feature = "diagnostics")]
+static READS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// Since the last frame-rate line: flushes of refreshes, their refreshes,
 /// those known to copy nothing, and those done on several threads.
@@ -9706,6 +9721,15 @@ impl Meter {
             );
             crate::shadow::exact_line(frames);
             crate::shadow::owners_line();
+            #[cfg(feature = "diagnostics")]
+            {
+                let [placed, card, pc] = [0, 1, 2].map(|i| READS[i].swap(0, Ordering::Relaxed) as f64 / 1e6 / frames);
+                tracing::info!(
+                    "GPU reads declared per frame (the lists' refreshes, diagnostics): {:.1} MB; of them {placed:.1} MB of title memory \
+                     in place and {pc:.1} MB of copies in the PC's memory, both read across the bus, {card:.1} MB of copies in the card's memory",
+                    placed + card + pc
+                );
+            }
             crate::descriptor::sync_line(frames);
             late_line(frames);
             crate::queue::behind_line(frames);
