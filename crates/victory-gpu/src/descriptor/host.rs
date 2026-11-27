@@ -1027,6 +1027,175 @@ pub(crate) fn page_written(at: usize, len: usize) {
     ranges.push((start, end));
 }
 
+/// Whether the title's writes the guards see make the slots of placed
+/// textures uploaded before them due again (`VICTORY_GUARD_WRITES=1`; off
+/// by default: not looked for, as before).
+///
+/// A slot of a texture picked by index learnt of new bytes only from a
+/// descriptor write, a mapping, a write of the kernel's or ours, or a look
+/// at a few of its bytes (five looks, then none). A texture the title fills
+/// with its own stores after its view is written and its first upload has
+/// run kept what the memory held then for the rest of the run: a guard's
+/// forearm and hand drawn with compressed data (corridor2, #175176) or with
+/// another object's 16-bit numbers (corridor3, #151218) as its skin. One
+/// uploaded while only partly mapped was never looked at again at all, the
+/// lifelong whole looks included, until more of it was mapped. The guards
+/// (`crate::watch`) see those stores: a block a copy took is read-only,
+/// and the title's first write to it faults or is put beside it.
+pub(crate) fn guard_writes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_WRITES").is_some_and(|v| v == "1"))
+}
+
+/// Slots [`guard_written`] makes due in one pass at most
+/// (`VICTORY_GUARD_WRITES_MOST`, 64); the rest wait for later passes. Each
+/// costs a read and a hash of its levels' memory (`texture::unchanged`; a
+/// 512x512 BC3 texture is 0.35 MB), and an upload only if they changed,
+/// within the pass's own byte budget: some 22 MB of reading a frame at
+/// worst. The guards see 130-490 writes a frame (run 20261127-195341),
+/// most of them not under textures.
+fn guard_writes_most() -> usize {
+    static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_GUARD_WRITES_MOST").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(64)
+    })
+}
+
+/// Frames before a slot a guard write made due may be made due by one
+/// again: a title that keeps writing a texture has it uploaded once in that
+/// many frames, and its last write is not lost (it waits, see [`GuardDue`]).
+const GUARD_WRITE_EVERY: u64 = 8;
+
+/// Blocks of title memory the title wrote and the guards saw, since a pass
+/// last took them ([`guard_written`]).
+static GUARD_WRITTEN: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+
+/// Since the start: blocks noted; ranges dropped because no pass took
+/// them; slots of placed textures holding bytes of them; of those, slots
+/// uploaded before the write; slots made due; slots put off (written again
+/// within [`GUARD_WRITE_EVERY`] frames, or over a pass's share; the number
+/// now, not a sum); uploads of slots made due so; their bytes; and looks
+/// at such slots that found the host copy holding title memory's bytes
+/// already (no upload).
+pub(crate) static GUARD_WRITES: [std::sync::atomic::AtomicU64; 9] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 9];
+
+/// The title wrote title memory `[at, at + len)` and the guards saw it (a
+/// fault that opened a block, or a store or copy put beside a guarded
+/// block). Kept for the next texture pass
+/// ([`HostHeap::texture_slots_guard_written`]). Called from the guards'
+/// fault handler: locks one mutex of its own and calls nothing.
+pub(crate) fn guard_written(at: usize, len: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    /// Ranges kept until a pass takes them.
+    const MOST: usize = 1 << 15;
+    if !guard_writes() {
+        return;
+    }
+    let (start, end) = (at as u64, at.saturating_add(len) as u64);
+    if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
+        return;
+    }
+    let mut ranges = GUARD_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    GUARD_WRITES[0].fetch_add(1, Relaxed);
+    if let Some(last) = ranges.last_mut()
+        && last.0 <= start
+        && start <= last.1
+    {
+        last.1 = last.1.max(end);
+        return;
+    }
+    if ranges.len() >= MOST {
+        GUARD_WRITES[1].fetch_add(ranges.len() as u64, Relaxed);
+        ranges.clear();
+    }
+    ranges.push((start, end));
+}
+
+/// Which slots guard writes make due, pass by pass: at most a share each,
+/// none again within a few frames of the last time, and those put off
+/// first in a later pass (oldest first), so that none is lost.
+#[derive(Default)]
+struct GuardDue {
+    /// Slots put off, in the order they were found.
+    left: Vec<u32>,
+    /// The frame a slot was last made due so.
+    last: std::collections::HashMap<u32, u64>,
+    /// Slots made due so whose upload has not been counted yet.
+    pending: std::collections::HashMap<u32, u64>,
+}
+
+impl GuardDue {
+    /// Slots kept put off at most (past it the oldest are let go: a write
+    /// that came after is noted again).
+    const LEFT_MOST: usize = 1 << 16;
+
+    /// Of the slots put off before and `found` now, the ones to make due
+    /// at `frame` (at most `most`), and how many were put off.
+    fn pick(&mut self, found: &[u32], frame: u64, most: usize, every: u64) -> (Vec<u32>, usize) {
+        let mut seen = std::collections::HashSet::new();
+        let all: Vec<u32> =
+            std::mem::take(&mut self.left).into_iter().chain(found.iter().copied()).filter(|s| seen.insert(*s)).collect();
+        let mut due = Vec::new();
+        for slot in all {
+            let recent = self.last.get(&slot).is_some_and(|&at| frame < at + every);
+            if recent || due.len() >= most {
+                self.left.push(slot);
+                continue;
+            }
+            self.last.insert(slot, frame);
+            self.pending.insert(slot, frame);
+            due.push(slot);
+        }
+        if self.left.len() > Self::LEFT_MOST {
+            let over = self.left.len() - Self::LEFT_MOST;
+            self.left.drain(..over);
+        }
+        // Forget what no longer holds anything back.
+        if self.last.len() > 4 * most.max(1024) {
+            self.last.retain(|_, at| frame < *at + every);
+        }
+        if self.pending.len() > 4 * most.max(1024) {
+            self.pending.retain(|_, at| frame < *at + 600);
+        }
+        let put_off = self.left.len();
+        (due, put_off)
+    }
+
+    /// Whether slot `index` was made due by a guard write and not uploaded
+    /// since (then it is now).
+    fn uploaded(&mut self, index: u32) -> bool {
+        self.pending.remove(&index).is_some()
+    }
+}
+
+static GUARD_DUE: std::sync::LazyLock<Mutex<GuardDue>> = std::sync::LazyLock::new(Mutex::default);
+
+/// A slot of a texture picked by index was found holding title memory's
+/// bytes already: counted if a guard write made it due ([`GUARD_WRITES`] 8).
+pub(crate) fn guard_due_same(index: u32) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !guard_writes() {
+        return;
+    }
+    if GUARD_DUE.lock().unwrap_or_else(|e| e.into_inner()).uploaded(index) {
+        GUARD_WRITES[8].fetch_add(1, Relaxed);
+    }
+}
+
+/// A slot of a texture picked by index was uploaded with `bytes`: counted
+/// if a guard write made it due ([`GUARD_WRITES`] 6 and 7).
+pub(crate) fn guard_due_uploaded(index: u32, bytes: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !guard_writes() {
+        return;
+    }
+    if GUARD_DUE.lock().unwrap_or_else(|e| e.into_inner()).uploaded(index) {
+        GUARD_WRITES[6].fetch_add(1, Relaxed);
+        GUARD_WRITES[7].fetch_add(bytes, Relaxed);
+    }
+}
+
 /// Title memory the runtime mapped, unmapped or is about to write since a
 /// texture pass last took the ranges ([`remapped`]).
 static REMAPPED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
@@ -2396,6 +2565,7 @@ impl HostHeap {
     pub(crate) fn texture_slots_remapped(&self, frame: u64) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
         self.texture_slots_page_written(frame);
+        self.texture_slots_guard_written(frame);
         let mut ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
         if ranges.is_empty() {
             return 0;
@@ -2486,6 +2656,57 @@ impl HostHeap {
             textures.changed(slot, frame, frame + PAGE_WRITE_AFTER);
         }
         [held, slots.len(), slots.len()]
+    }
+
+    /// Takes the blocks the title wrote that the guards saw since the last
+    /// call ([`guard_written`]) and makes due again, two frames on, the
+    /// slots whose placed texture holds bytes of them and was uploaded
+    /// before ([`HostHeap::slots_guard_written_under`]). Returns how many.
+    fn texture_slots_guard_written(&self, frame: u64) -> usize {
+        if !guard_writes() {
+            return 0;
+        }
+        let mut ranges = std::mem::take(&mut *GUARD_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()));
+        join(&mut ranges);
+        self.slots_guard_written_under(&ranges, frame, guard_writes_most(), GUARD_WRITE_EVERY)
+    }
+
+    /// [`HostHeap::texture_slots_guard_written`] for the ranges given: the
+    /// slots holding bytes of them, of those the ones uploaded before (out
+    /// of the queue, or in it after an upload in part or whole), made due
+    /// at most `most` in this pass and none within `every` frames of the
+    /// last time; the others wait for a later pass (also when no range is
+    /// new). Making a slot due forgets what was mapped at its last upload,
+    /// so one uploaded in part is uploaded again even with no more mapped.
+    fn slots_guard_written_under(&self, ranges: &[(u64, u64)], frame: u64, most: usize, every: u64) -> usize {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut slots: Vec<u32> = if ranges.is_empty() {
+            Vec::new()
+        } else {
+            let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+            ranges.iter().flat_map(|&(start, end)| placed.slots_holding(start, end)).collect()
+        };
+        slots.sort_unstable();
+        slots.dedup();
+        slots.retain(|&slot| !self.tabled_lately(slot, frame));
+        let held = slots.len();
+        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        slots.retain(|slot| textures.slots.get(slot).is_none_or(|w| w.mapped > 0 || w.checked.fingerprint != 0));
+        let (due, put_off) = {
+            let mut picker = GUARD_DUE.lock().unwrap_or_else(|e| e.into_inner());
+            if slots.is_empty() && picker.left.is_empty() {
+                return 0;
+            }
+            picker.pick(&slots, frame, most, every)
+        };
+        GUARD_WRITES[2].fetch_add(held as u64, Relaxed);
+        GUARD_WRITES[3].fetch_add(slots.len() as u64, Relaxed);
+        GUARD_WRITES[4].fetch_add(due.len() as u64, Relaxed);
+        GUARD_WRITES[5].store(put_off as u64, Relaxed);
+        for &slot in &due {
+            textures.changed(slot, frame, frame + PAGE_WRITE_AFTER);
+        }
+        due.len()
     }
 
     /// Whether host slot `index` is made from the very record the title
@@ -7107,6 +7328,75 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert_eq!(heap.slots_written_under(&written, 60, true), [1, 1, 1]);
         assert_eq!(slots(61), []);
         assert_eq!(slots(62), [1]);
+    }
+
+    /// Guard writes make at most a pass's share of slots due, none again
+    /// within a few frames, and lose none: what is put off comes first in a
+    /// later pass. An upload or a look counts a slot once.
+    #[test]
+    fn guard_writes_are_bounded_and_none_is_lost() {
+        let mut g = GuardDue::default();
+        // Three slots, a share of two: the third waits.
+        assert_eq!(g.pick(&[5, 6, 7], 100, 2, 8), (vec![5, 6], 1));
+        // Next pass: nothing new; the one put off goes now.
+        assert_eq!(g.pick(&[], 101, 2, 8), (vec![7], 0));
+        // Slot 5 written again three frames on: put off, not dropped, and
+        // the same slot found twice is one.
+        assert_eq!(g.pick(&[5, 5, 9], 103, 2, 8), (vec![9], 1));
+        // Still too soon at 107, due at 108 (eight frames after 100).
+        assert_eq!(g.pick(&[], 107, 2, 8), (vec![], 1));
+        assert_eq!(g.pick(&[], 108, 2, 8), (vec![5], 0));
+        // Uploads and looks are counted once per making due.
+        assert!(g.uploaded(5));
+        assert!(!g.uploaded(5));
+        assert!(g.uploaded(9) && g.uploaded(6) && g.uploaded(7));
+        assert!(!g.uploaded(42));
+        // A title that writes one slot every frame: one making due in eight.
+        let mut g = GuardDue::default();
+        let made: usize = (0..64).map(|f| g.pick(&[3], 200 + f, 256, 8).0.len()).sum();
+        assert_eq!(made, 8);
+    }
+
+    /// A write the guards saw under a placed texture: a slot waiting for
+    /// its first upload is left alone; one uploaded before is due two
+    /// frames on; one uploaded while partly mapped is due too, with what
+    /// was mapped forgotten, though no more of it is mapped. (Ranges handed
+    /// over here, not through the list all heaps share.)
+    #[test]
+    fn a_guarded_write_makes_an_uploaded_texture_slot_due() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let slots = |at: u64| -> Vec<u32> { heap.texture_slots_due(at, 8, true).0.into_iter().map(|d| d.0).collect() };
+        // 64x64 BC7, one mip, at an address no test and no title uses.
+        let at = 0x7fec_0000_0000u64;
+        let mut desc = [0u32; 16];
+        (desc[10], desc[11]) = (at as u32, (at >> 32) as u32);
+        let view = View::Placed(false, [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0], desc);
+        assert!(heap.note_buffer(1, Some(&view), false).is_empty());
+        let written = [(at, at + 0x1_0000)];
+        // Waiting for its first upload: nothing made due.
+        assert_eq!(heap.slots_guard_written_under(&written, 1_000, 256, 8), 0);
+        let (queued, write) = heap.texture_slots_due(u64::MAX, 8, true).0[0];
+        assert_eq!(queued, 1);
+        // Uploaded whole: out of the queue.
+        heap.texture_slot_done(1, write, None);
+        assert_eq!(slots(u64::MAX), []);
+        // Memory elsewhere: nothing.
+        assert_eq!(heap.slots_guard_written_under(&[(at + 0x10_0000, at + 0x11_0000)], 1_000, 256, 8), 0);
+        // Under it: due two frames on, not before.
+        assert_eq!(heap.slots_guard_written_under(&written, 1_000, 256, 8), 1);
+        assert_eq!(slots(1_001), []);
+        assert_eq!(slots(1_002), [1]);
+        // Uploaded in part, then written with no more mapped: due again
+        // all the same, and what was mapped is forgotten (else the pass
+        // passes it over as having no more mapped).
+        let (_, write) = heap.texture_slots_due(u64::MAX, 8, true).0[0];
+        heap.texture_slot_done(1, write, Some((1_003, 0x800)));
+        assert_eq!(heap.texture_slot_mapped(1), 0x800);
+        assert_eq!(heap.slots_guard_written_under(&written, 1_020, 256, 8), 1);
+        assert_eq!(heap.texture_slot_mapped(1), 0);
+        assert_eq!(slots(1_022), [1]);
     }
 
     /// `VICTORY_STALE_TEXTURES=0`: nothing is ever stale, and a view that

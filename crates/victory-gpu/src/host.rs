@@ -10544,6 +10544,29 @@ impl Meter {
                         crate::draw::NO_HEAP_DROPPED.load(Ordering::Relaxed)
                     );
                 }
+                if crate::descriptor::host::guard_writes() {
+                    // Since the line before (about five seconds), but the slots
+                    // put off: their number now.
+                    static BEFORE: [std::sync::atomic::AtomicU64; 9] = [const { std::sync::atomic::AtomicU64::new(0) }; 9];
+                    let now = crate::descriptor::host::GUARD_WRITES.each_ref().map(|c| c.load(Ordering::Relaxed));
+                    let d: [u64; 9] = std::array::from_fn(|i| now[i].saturating_sub(BEFORE[i].swap(now[i], Ordering::Relaxed)));
+                    tracing::info!(
+                        "the title's writes the guards saw under textures picked by index, since the line before \
+                         (VICTORY_GUARD_WRITES=1; unset: not looked for): {} blocks noted ({} ranges dropped), {} slots held bytes \
+                         of them, {} of those uploaded before the write, {} made due again ({} put off now: written again \
+                         within a few frames, or over a pass's share of VICTORY_GUARD_WRITES_MOST); of those looked at: {} \
+                         uploaded again ({} MB), {} found holding the bytes already",
+                        d[0],
+                        d[1],
+                        d[2],
+                        d[3],
+                        d[4],
+                        now[5],
+                        d[6],
+                        d[7] >> 20,
+                        d[8]
+                    );
+                }
                 if crate::resource::held_only() {
                     let [copies, bytes, grown, whole] = [0, 1, 2, 3].map(|i| crate::resource::HELD[i].load(Ordering::Relaxed));
                     let [flipped, missed] = [0, 1].map(|i| crate::descriptor::host::FLIPPED[i].load(Ordering::Relaxed));
