@@ -245,6 +245,25 @@ pub fn builder_bounds() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_BOUNDS").is_none_or(|v| v != "0"))
 }
 
+/// Whether the ray-tracing node test answers "nothing hit" for every node
+/// (`VICTORY_RT_MISS=1`; off by default): a box node's four children are
+/// none and a triangle node is a miss, so every traversal ends at its root.
+///
+/// For runs without the structure builder, or while its structures are
+/// wrong: the title's local-light shadow rays then hit nothing (lit, as
+/// with no occluder, in place of black or speckled faces), its reflection
+/// and probe rays reach the sky, and the trace programs cost next to
+/// nothing on the card. The sun's near shadows are the title's cascades
+/// and stay. shortcut: no lamp casts a shadow; drop it once the structures
+/// are right.
+///
+/// Part of the translation: the shader cache keys on it (`victory-gpu`'s
+/// does).
+pub fn rt_miss() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RT_MISS").is_some_and(|v| v == "1"))
+}
+
 /// The clean-up passes that run over a translated program before it is
 /// written (`bitcode::opt`): a set of that module's pass bits. Every pass
 /// is exact, so the switch is for telling a translator fault from a
