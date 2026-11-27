@@ -61,3 +61,4 @@ Seen: the intro flickers before the loading screen (the author lists it as known
 - **Screenshots tell it:** luminance standard deviation of the game window ~72 for a real scene, ~1-4 for the grey screen (mean ~50), 0.7 for the white one (mean 247). The ~30 "bad" programs made alone (`bench/k-…-p4-trace`): **a perfect picture** (Jason on the porch, sea, light, HUD). What is grey: all 542 translatable made together (`p4-translatable`, `p4-uav-all`). The white one (call 169, `0f0039f000`) is real.
 - `VICTORY_PLACED_UAV=1` made no difference (its counter never showed); left off.
 - `p4-grow.sh` now judges by screenshots (std ≥ 15) and fps ≥ 5, from scratch.
+- p4-grow tightened after the user's point (many programs are bad for real: worse look, lower fps, flicker): good only if contrast ≥ 15 on three screenshots AND fps ≥ 14 (17-19 without native programs). Flicker still needs the user's eyes.
