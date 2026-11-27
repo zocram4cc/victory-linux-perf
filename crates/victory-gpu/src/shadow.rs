@@ -3668,7 +3668,11 @@ impl Shadow {
                 return to;
             }
             let at = from + (to - from) / threads * i;
-            (at - (start + at) % PIECE).max(from)
+            // Saturating: near the copy's start, the piece `at` lies in may
+            // begin before the copy does; the subtraction wrapped there and
+            // the first slice of a compare of 32 MiB or more was never
+            // compared (fxceless PR #1407; AnyXboxX 8d91ca9 is the same).
+            at.saturating_sub((start + at) % PIECE).max(from)
         };
         let scan = &scan;
         std::thread::scope(|s| {

@@ -6,12 +6,24 @@
 //! reads it through a table and finds the slot changed.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
+
+/// Whether the raw views made for root buffers ([`HostHeap::raw_at`],
+/// [`HostHeap::raw_uav_at`]) are kept inside their host buffer: a range past
+/// its end is shortened to the whole dwords that fit, and a start past it,
+/// or not on 16 bytes, is a null view (on by default;
+/// `VICTORY_RAW_VIEW_CLAMP=0`: the range as asked, without asking the
+/// buffer's width). Read once. From trustno1 aec85ef (fxceless PR #1266).
+fn raw_view_clamp() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RAW_VIEW_CLAMP").is_none_or(|v| v != "0"))
+}
 
 /// A set of a heap's slots, a bit for each: no lock (a pass that went through
 /// a set of 70,000 under its lock kept everyone who writes slots waiting for
@@ -1119,6 +1131,15 @@ fn tabled_out() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TABLED_TEXTURES").is_none_or(|v| v != "1"))
 }
 
+/// Whether, while the card has room, the queue of textures picked by index
+/// hands out one slot looked at before and one never looked at in turn
+/// ([`TextureQueue::due`]; on by default, `VICTORY_FAIR_DUE=0`: every slot
+/// looked at before first, as before). Read once.
+fn fair_due() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FAIR_DUE").is_none_or(|v| v != "0"))
+}
+
 /// What the queue of textures picked by index knows of a title slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Waiting {
@@ -1249,18 +1270,28 @@ impl TextureQueue {
     }
 
     /// Up to `max` slots due at `frame`, each with its write number, in
-    /// the order to serve them:
-    /// - first the ones looked at before (their memory was not mapped, or
-    ///   only part of it): the look is a query, and memory that has
+    /// the order to serve them; with `turns`, one of each kind in turn while
+    /// both last:
+    /// - the ones looked at before (their memory was not mapped, or only
+    ///   part of it), first: the look is a query, and memory that has
     ///   arrived since is what the title streamed in last;
-    /// - then the others, the newest write first and the oldest next, in
+    /// - the others, the newest write first and the oldest next, in
     ///   turns: slot order served the low slots of a backlog of
     ///   25,000-40,000 while the textures of the shot on screen waited
     ///   (run 52: 98% of the drawn pixels had no colour texture in the
     ///   first 3D frames).
+    ///
+    /// Without `turns`, all the looked-at ones come ahead of the rest, as
+    /// before: that gave none of the others a look while more than `max` of
+    /// them were due, or more than a pass reaches before it runs out of
+    /// time or bytes (a scene streaming in stayed dark: Legendary 70e4cba).
+    /// It is still the order for a full card ([`fair_due`]): the pass then
+    /// makes no new host texture and stops after the slots it cannot make
+    /// one for, so first looks taken in turns would spend that count before
+    /// it reached the looked-at slots it can still serve.
     #[cfg(test)]
-    fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
-        Self::in_order(self.all_due(frame), max)
+    fn due(&self, frame: u64, max: usize, turns: bool) -> Vec<(u32, u64)> {
+        Self::in_order(self.all_due(frame), max, turns)
     }
 
     /// The slots due at `frame`, for [`TextureQueue::in_order`].
@@ -1274,20 +1305,28 @@ impl TextureQueue {
 
     /// What [`TextureQueue::due`] says of `due` (with nothing held: some
     /// ten thousand slots are sorted).
-    fn in_order([mut again, mut fresh]: Due, max: usize) -> Vec<(u32, u64)> {
+    fn in_order([mut again, mut fresh]: Due, max: usize, turns: bool) -> Vec<(u32, u64)> {
         // By the number of the write, counted over the run.
         let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
         again.sort_unstable_by(newest_first);
         fresh.sort_unstable_by(newest_first);
-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
-        let (mut new, mut old) = (0, fresh.len());
-        while new < old && order.len() < max {
-            order.push((fresh[new].1, fresh[new].2));
-            new += 1;
-            if new < old && order.len() < max {
-                old -= 1;
-                order.push((fresh[old].1, fresh[old].2));
+        let mut again = again.iter().map(|&(_, index, write)| (index, write));
+        // The newest write and the oldest next, in turns.
+        let n = fresh.len();
+        let mut fresh = (0..n)
+            .map(|i| fresh[if i % 2 == 0 { i / 2 } else { n - 1 - i / 2 }])
+            .map(|(_, index, write)| (index, write));
+        if !turns {
+            return again.chain(fresh).take(max).collect();
+        }
+        let mut order = Vec::new();
+        while order.len() < max {
+            let (a, f) = (again.next(), fresh.next());
+            if a.is_none() && f.is_none() {
+                break;
             }
+            order.extend(a);
+            order.extend(f);
         }
         order.truncate(max);
         order
@@ -1418,6 +1457,86 @@ pub(crate) fn is_texture_view(view: &View) -> bool {
         View::Shader(r, _) => crate::resource::buffer_bytes(*r as crate::object::This).is_none(),
         _ => false,
     }
+}
+
+/// FirstElement is a 64-bit dword index. Only NumElements can be shortened.
+#[derive(Clone, Copy)]
+struct RawRange {
+    first: u64,
+    elements: u32,
+}
+
+/// Why a request lost part of its range, for the counters below.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cut {
+    /// The start is at a position with no complete dword left.
+    Past,
+    /// The buffer width or the 32-bit element count shortened the view.
+    Length,
+    /// The title named less than a dword: one element, as before this guard.
+    Short,
+    /// The start is not on the 16 bytes a raw view needs.
+    Unaligned,
+}
+
+fn raw_range(size: u64, offset: u64, len: u64) -> (Option<RawRange>, Option<Cut>) {
+    let words = size / 4;
+    if !offset.is_multiple_of(16) {
+        return (None, Some(Cut::Unaligned));
+    }
+    let asked = offset / 4;
+    if asked >= words {
+        return (None, Some(Cut::Past));
+    }
+    let avail = words - asked;
+    // A length under a dword made one element before this guard. The floor is
+    // kept because nothing was gathered about why the title would ask for less
+    // than a dword; the buffer's end still caps it.
+    let want = (len / 4).max(1);
+    let elements = want.min(avail).min(u64::from(u32::MAX));
+    let cut = if elements < want {
+        Some(Cut::Length)
+    } else if len < 4 {
+        Some(Cut::Short)
+    } else {
+        None
+    };
+    (
+        Some(RawRange {
+            first: asked,
+            elements: elements as u32,
+        }),
+        cut,
+    )
+}
+
+// Since launch, in Cut order: past the end, shortened, sub-dword, unaligned.
+static RAW_SRV_CUTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+static RAW_UAV_CUTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+pub(crate) fn raw_view_counts() -> [[u64; 4]; 2] {
+    [&RAW_SRV_CUTS, &RAW_UAV_CUTS].map(|cuts| cuts.each_ref().map(|n| n.load(Ordering::Relaxed)))
+}
+
+fn raw_view_range(
+    buffer: &ID3D12Resource,
+    offset: u64,
+    len: u64,
+    counts: &[AtomicU64; 4],
+) -> Option<RawRange> {
+    if !raw_view_clamp() {
+        return Some(RawRange {
+            first: offset / 4,
+            elements: (len / 4).clamp(1, u64::from(u32::MAX)) as u32,
+        });
+    }
+    // SAFETY: buffer is a live resource.
+    let size = unsafe { buffer.GetDesc() }.Width;
+    let (range, cut) = raw_range(size, offset, len);
+    if let Some(cut) = cut {
+        counts[cut as usize].fetch_add(1, Ordering::Relaxed);
+    }
+    range
 }
 
 /// Buffer views left null because the host would refuse them
@@ -2131,14 +2250,17 @@ impl HostHeap {
 
     /// Up to `max` title slots whose texture view is due at `frame`, each
     /// with its write number, in the order to serve them
-    /// ([`TextureQueue::due`]), and the queue's counts
+    /// ([`TextureQueue::due`]; `room`: whether the card has room for new
+    /// host textures, which is when first looks take turns with the slots
+    /// looked at before, [`fair_due`]), and the queue's counts
     /// ([`TextureQueue::census`]).
-    pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
+    pub(crate) fn texture_slots_due(&self, frame: u64, max: usize, room: bool) -> (Vec<(u32, u64)>, [u64; 5]) {
+        let turns = room && fair_due();
         let (due, census) = {
             let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
             (if max == 0 { Due::default() } else { textures.all_due(frame) }, textures.census(frame))
         };
-        (TextureQueue::in_order(due, max), census)
+        (TextureQueue::in_order(due, max, turns), census)
     }
 
     /// A number that changes when a slot is written or made due anew, and
@@ -3160,15 +3282,18 @@ impl HostHeap {
     /// the host placed after the buffer.
     pub(crate) fn raw_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
         let Some(host) = host() else { return };
-        let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
+        let Some(range) = raw_view_range(buffer, offset, len, &RAW_SRV_CUTS) else {
+            self.null_raw_at(index);
+            return;
+        };
         let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                 Buffer: D3D12_BUFFER_SRV {
-                    FirstElement: offset / 4,
-                    NumElements: elements,
+                    FirstElement: range.first,
+                    NumElements: range.elements,
                     StructureByteStride: 0,
                     Flags: D3D12_BUFFER_SRV_FLAG_RAW,
                 },
@@ -3200,14 +3325,17 @@ impl HostHeap {
     /// reaching whatever the host placed after the buffer.
     pub(crate) fn raw_uav_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
         let Some(host) = host() else { return };
-        let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
+        let Some(range) = raw_view_range(buffer, offset, len, &RAW_UAV_CUTS) else {
+            self.null_raw_uav_at(index);
+            return;
+        };
         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
             Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
                 Buffer: D3D12_BUFFER_UAV {
-                    FirstElement: offset / 4,
-                    NumElements: elements,
+                    FirstElement: range.first,
+                    NumElements: range.elements,
                     StructureByteStride: 0,
                     CounterOffsetInBytes: 0,
                     Flags: D3D12_BUFFER_UAV_FLAG_RAW,
@@ -4121,7 +4249,38 @@ fn buffer_view_ok(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw:
 /// Raw twins ([`raw_twins`]) made since the last frame line, and those of them that
 /// do not begin on 16 bytes, as a raw view must ([`move_raw`]), and those of
 /// these that could not be moved there (null).
-pub(crate) static TWINS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+pub(crate) static TWINS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Whether raw twins of buffer views that do not begin on 16 bytes begin at
+/// the view's own dword (on by default; `VICTORY_TWIN_EXACT=0`: a null view,
+/// as before, unless [`move_raw`] can move a staged one). Read once.
+///
+/// D3D12 asks raw views to begin on 16 bytes; AMD's hardware and RADV read a
+/// raw buffer from any dword. Null, such a twin read zeros: the tree culling
+/// (`InstanceCulling:CS_Tree_BatchCull`) runs in two dispatches a frame, and
+/// the second one's batch list begins right after the first one's 4-byte
+/// entries, so in every frame whose split left it off 16 bytes the second
+/// dispatch read a list of zeros and its trees were not drawn: whole trees
+/// and palms dropped out for single frames while the camera moved (up to
+/// 1,000 such twins a frame in play; avatarmanz PR #437, where the exact
+/// twins ended the flicker). Seen working on AMD (RADV) only there: whether
+/// NVIDIA under vkd3d-proton reads such a view is not yet known here, hence
+/// the switch.
+fn twin_exact() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TWIN_EXACT").is_none_or(|v| v != "0"))
+}
+
+/// The window ([`twin_window`]: first dword, dwords, bytes past it) begun at
+/// the view's own dword: first dword and dwords. None where it begins on 16
+/// bytes already, or between two dwords (a view of 16 bit values at an odd
+/// one: no raw view begins there; [`move_raw`] or null, as before).
+fn exact_window(first: u64, count: u32, by: u32) -> Option<(u64, u32)> {
+    if by == 0 || by % 4 != 0 {
+        return None;
+    }
+    Some((first + u64::from(by / 4), count.checked_sub(by / 4).filter(|&n| n > 0)?))
+}
 
 /// Moves the raw view at `at`, a slot of our heaps the card does not see,
 /// which shows `bytes` from `start` on (GPU address), `by` bytes on: for a
@@ -4273,7 +4432,15 @@ fn buffer_srv(
                     .CreateShaderResourceView(&shadow.buffer, Some(&desc), twin);
                 shadow.buffer.GetGPUVirtualAddress() + first * 4
             };
-            if by > 0 && !(staged(false, 1).is_some_and(|s| s.ptr == twin.ptr) && move_raw(twin, start, count.saturating_mul(4), by)) {
+            if let Some((first, count)) = exact_window(first, count, by).filter(|_| twin_exact()) {
+                // The raw twin from the view's own first dword (on 4 bytes, not
+                // 16), not a null view ([`twin_exact`]).
+                TWINS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                desc.Anonymous.Buffer.FirstElement = first;
+                desc.Anonymous.Buffer.NumElements = count;
+                // SAFETY: a live buffer and a slot of our heap.
+                unsafe { host.device.CreateShaderResourceView(&shadow.buffer, Some(&desc), twin) };
+            } else if by > 0 && !(staged(false, 1).is_some_and(|s| s.ptr == twin.ptr) && move_raw(twin, start, count.saturating_mul(4), by)) {
                 TWINS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 null_buffer_view(twin);
             }
@@ -4397,7 +4564,15 @@ fn buffer_uav(
                     .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), twin);
                 shadow.buffer.GetGPUVirtualAddress() + first * 4
             };
-            if by > 0 && !(staged(false, 1).is_some_and(|s| s.ptr == twin.ptr) && move_raw(twin, start, count.saturating_mul(4), by)) {
+            if let Some((first, count)) = exact_window(first, count, by).filter(|_| twin_exact()) {
+                // The raw twin from the view's own first dword (on 4 bytes, not
+                // 16), not a null view ([`twin_exact`]).
+                TWINS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                desc.Anonymous.Buffer.FirstElement = first;
+                desc.Anonymous.Buffer.NumElements = count;
+                // SAFETY: a live buffer and a slot of our heap.
+                unsafe { host.device.CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), twin) };
+            } else if by > 0 && !(staged(false, 1).is_some_and(|s| s.ptr == twin.ptr) && move_raw(twin, start, count.saturating_mul(4), by)) {
                 TWINS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 null_buffer_view(twin);
             }
@@ -4449,6 +4624,16 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         format.0 = linear as i32;
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
+    // A typed unordered view in a format the host cannot store to
+    // (B5G5R5A1_UNORM on NVIDIA) removes the device when it is made, in the
+    // texture's own format too: the slot stays null, its writes dropped
+    // (DoubleGhosty 32aceeb). The format asked about is the one the view is
+    // made in: a typed texture's own (below).
+    let typed = if view == 0 || !typeless { own } else { view };
+    if unordered && !(view == 0 && typeless) && !typed_store(typed) {
+        once!(view = typed, own, "an unordered view in a format the host cannot store");
+        return false;
+    }
     if view == 0 {
         return !typeless;
     }
@@ -4470,6 +4655,34 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         *format = d.Format;
     }
     true
+}
+
+/// Whether the host stores to typed unordered views of `format` (asked
+/// once for each).
+fn typed_store(format: u32) -> bool {
+    static KNOWN: Mutex<Vec<(u32, bool)>> = Mutex::new(Vec::new());
+    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, ok)) = known.iter().find(|(f, _)| *f == format) {
+        return ok;
+    }
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: DXGI_FORMAT(format as i32),
+        ..Default::default()
+    };
+    let ok = host().is_some_and(|h| {
+        // SAFETY: a plain query into a struct of its size.
+        unsafe {
+            h.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut support).cast(),
+                size_of_val(&support) as u32,
+            )
+        }
+        .is_ok()
+            && support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0
+    });
+    known.push((format, ok));
+    ok
 }
 
 /// The title's unordered access view of a depth texture, as a view of the
@@ -5555,6 +5768,98 @@ mod tests {
         assert!(!zeros_on(false, Some(OsStr::new("1"))));
     }
 
+    fn rr(size: u64, offset: u64, len: u64) -> (Option<(u64, u32)>, Option<Cut>) {
+        let (range, cut) = raw_range(size, offset, len);
+        (range.map(|v| (v.first, v.elements)), cut)
+    }
+
+    fn range(size: u64, offset: u64, len: u64) -> Option<(u64, u32)> {
+        rr(size, offset, len).0
+    }
+
+    /// The table of the first review, plus the counterexample it found: 100
+    /// bytes of buffer, an offset of 112 — the clamp this replaced viewed bytes
+    /// 96 to 99, which the request had asked nothing about.
+    #[test]
+    fn the_range_stays_inside_the_buffer() {
+        assert_eq!(range(1024, 0, 256), Some((0, 64)));
+        assert_eq!(range(1024, 768, 512), Some((192, 64)));
+        assert_eq!(range(1024, 1024, 16), None, "a start at the end");
+        assert_eq!(range(1024, 1040, 16), None, "a start past the end");
+        assert_eq!(range(100, 112, 16), None, "no intersection: never the tail");
+        assert_eq!(range(100, 96, 16), Some((24, 1)), "the last dword");
+        assert_eq!(range(100, 96, 4), Some((24, 1)));
+        assert_eq!(range(0, 0, 16), None, "an empty buffer");
+        assert_eq!(range(3, 0, 16), None, "no whole dword");
+        assert_eq!(range(1024, 0, 0), Some((0, 1)), "the floor of one element stands");
+        assert_eq!(range(1024, 0, 1), Some((0, 1)), "as does a length under a dword");
+        assert_eq!(range(1024, 3, 16), None, "not on 16 bytes");
+        assert_eq!(range(1024, u64::MAX, 16), None, "no wrap, no clamp back");
+        assert_eq!(range(1024, 0, u64::MAX), Some((0, 256)), "the length is cut");
+    }
+
+    /// Why a request was refused or cut, which is what the counters report.
+    #[test]
+    fn the_cause_is_the_one_the_counters_would_report() {
+        assert_eq!(rr(100, 112, 16), (None, Some(Cut::Past)));
+        assert_eq!(rr(1024, 3, 16), (None, Some(Cut::Unaligned)));
+        assert_eq!(rr(1024, 0, 0), (Some((0, 1)), Some(Cut::Short)));
+        assert_eq!(rr(1024, 768, 512), (Some((192, 64)), Some(Cut::Length)));
+        // Nothing cut, nothing refused: no counter is touched at all.
+        assert_eq!(rr(1024, 0, 256), (Some((0, 64)), None));
+        assert_eq!(rr(1024, 0, 1020), (Some((0, 255)), None), "255 of 256 dwords");
+    }
+
+    /// An aligned start far past a buffer is still refused: alignment is not a
+    /// reason to accept a request, and the check is not reached by the
+    /// unaligned case first.
+    #[test]
+    fn an_aligned_start_past_the_buffer_is_refused() {
+        let size = 1u64 << 40;
+        assert_eq!(rr(size, 1u64 << 60, 64), (None, Some(Cut::Past)));
+        assert_eq!(rr(size, size, 64), (None, Some(Cut::Past)));
+        assert_eq!(rr(size, size - 16, 64), (Some((size / 4 - 4, 4)), Some(Cut::Length)));
+    }
+
+    /// Every accepted range holds the four things the patch promises, and no
+    /// request that the input rules allow is turned away for no reason.
+    #[test]
+    fn accepted_ranges_hold_their_invariant() {
+        let sizes = [0u64, 1, 3, 4, 100, 1024, 4096, 1 << 30];
+        let offsets = [0u64, 4, 16, 48, 96, 112, 1024, 1040, 4096, u64::MAX];
+        let lens = [0u64, 1, 3, 4, 16, 512, 1 << 20, u64::MAX];
+        for size in sizes {
+            for offset in offsets {
+                for len in lens {
+                    let (range, _) = raw_range(size, offset, len);
+                    let aligned = offset.is_multiple_of(16);
+                    let inside = offset / 4 < size / 4;
+                    match range {
+                        Some(range) => {
+                            assert!(range.elements > 0, "{size} {offset} {len}");
+                            assert_eq!(
+                                range.first,
+                                offset / 4,
+                                "{size} {offset} {len}: the start moved"
+                            );
+                            assert_eq!(range.first % 4, 0, "a raw view starts on 16 bytes");
+                            assert!(
+                                range.first + u64::from(range.elements) <= size / 4,
+                                "{size} {offset} {len}: {} + {} past the buffer",
+                                range.first,
+                                range.elements
+                            );
+                        }
+                        None => assert!(
+                            !(aligned && inside),
+                            "{size} {offset} {len}: refused though the rules allow it"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
     /// A view of a host copy that begins at a later level shows the same
     /// levels of it.
     #[test]
@@ -6083,6 +6388,26 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert_eq!(constant_bytes(u32::MAX), 64 << 10);
     }
 
+    /// The host is asked which formats it stores to through typed unordered
+    /// views: the ones every card takes pass (their views are made as
+    /// before), one that is no format does not, and the answer for one a
+    /// card may refuse (B5G5R5A1_UNORM, 86: NVIDIA) stays the same.
+    #[test]
+    fn the_host_says_which_typed_unordered_views_it_stores_to() {
+        if host().is_none() {
+            return; // no host GPU
+        }
+        // R8G8B8A8_UNORM, R32_FLOAT, R32_UINT.
+        for format in [28, 41, 42] {
+            assert!(typed_store(format), "{format}");
+            assert!(typed_store(format), "{format} asked again");
+        }
+        assert!(!typed_store(0xffff));
+        let b5g5r5a1 = typed_store(86);
+        eprintln!("typed unordered views of B5G5R5A1_UNORM on this host: {b5g5r5a1}");
+        assert_eq!(typed_store(86), b5g5r5a1);
+    }
+
     /// A null 3D UAV made on the real device leaves it alive.
     #[test]
     fn null_3d_uav_is_accepted_by_the_device() {
@@ -6131,6 +6456,30 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert_eq!(twin_window(none, 1, 3, 24, false, 4096), Some((4, 20, 8)));
         assert_eq!(twin_window(u32s, 1, 10, 0, false, 4096), Some((0, 11, 4)));
         assert_eq!(twin_window(u32s, 1, 10, 0, false, 4), None);
+    }
+
+    /// A twin that does not begin on 16 bytes begins at the view's own dword
+    /// (`VICTORY_TWIN_EXACT`) and shows the dwords from there; one between
+    /// two dwords, or on 16 bytes already, is left to the older ways.
+    #[test]
+    fn exact_twins_begin_at_the_views_own_dword() {
+        let (u16s, u32s, none) = (DXGI_FORMAT(57), DXGI_FORMAT(42), DXGI_FORMAT_UNKNOWN);
+        // 10 dwords from dword 1: the window began 4 bytes early.
+        let (first, count, by) = twin_window(u32s, 1, 10, 0, false, 4096).unwrap();
+        assert_eq!(exact_window(first, count, by), Some((1, 10)));
+        // 24 byte elements from the second: dwords 6 to 24.
+        let (first, count, by) = twin_window(none, 1, 3, 24, false, 4096).unwrap();
+        assert_eq!(exact_window(first, count, by), Some((6, 18)));
+        // On 16 bytes: nothing to do.
+        let (first, count, by) = twin_window(u32s, 4, 10, 0, false, 4096).unwrap();
+        assert_eq!(exact_window(first, count, by), None);
+        // 16 bit values from an odd one: between two dwords.
+        let (first, count, by) = twin_window(u16s, 9, 7, 0, false, 4096).unwrap();
+        assert_eq!(by, 2);
+        assert_eq!(exact_window(first, count, by), None);
+        // Never an empty or wrapped window.
+        assert_eq!(exact_window(0, 1, 4), None);
+        assert_eq!(exact_window(0, 1, 8), None);
     }
 
     /// What a slot is made as is made beside the heap and copied in whole: the
@@ -6346,37 +6695,37 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
             q.written(10 + i, u64::from(i) + 1, 0, false);
         }
         q.written(5, 9, 0, false);
-        let order: Vec<u32> = q.due(9, 100).into_iter().map(|d| d.0).collect();
+        let order: Vec<u32> = q.due(9, 100, true).into_iter().map(|d| d.0).collect();
         // newest, oldest, newest, oldest, and so on
         assert_eq!(order, [5, 10, 17, 11, 16, 12, 15, 13, 14]);
-        assert_eq!(q.due(9, 2).len(), 2);
+        assert_eq!(q.due(9, 2, true).len(), 2);
         assert_eq!(q.census(9), [9, 9, 0, 0, 8]);
         // Slot 17's memory is not mapped: again next frame, then in 2, 4, 4.
-        let write = |q: &TextureQueue, index: u32| q.due(u64::MAX, 100).iter().find(|d| d.0 == index).unwrap().1;
+        let write = |q: &TextureQueue, index: u32| q.due(u64::MAX, 100, true).iter().find(|d| d.0 == index).unwrap().1;
         let w17 = write(&q, 17);
         let mut frame = 9;
         for wait in [1, 2, 4, 4] {
             q.later(17, w17, frame, 4);
-            assert!(!q.due(frame + wait - 1, 100).iter().any(|d| d.0 == 17));
+            assert!(!q.due(frame + wait - 1, 100, true).iter().any(|d| d.0 == 17));
             frame += wait;
             // Due again, and ahead of every slot never looked at.
-            assert_eq!(q.due(frame, 100)[0].0, 17);
+            assert_eq!(q.due(frame, 100, true)[0].0, 17);
         }
         assert_eq!(q.census(9)[2], 1);
         q.done(17, w17);
-        assert!(!q.due(u64::MAX, 100).iter().any(|d| d.0 == 17));
+        assert!(!q.due(u64::MAX, 100, true).iter().any(|d| d.0 == 17));
         // Uploaded with part of its memory there: kept, with what was there.
         let w16 = write(&q, 16);
         q.partly(16, w16, 12, 4096);
         assert_eq!(q.mapped(16), 4096);
-        assert_eq!(q.due(12, 100)[0].0, 16);
+        assert_eq!(q.due(12, 100, true)[0].0, 16);
         // The title writes slot 16 again while the pass works on it: what
         // the pass then says about the old write changes nothing.
         q.written(16, 13, 0, false);
         q.done(16, w16);
         q.later(16, w16, 13, 4);
         assert_eq!(q.mapped(16), 0);
-        assert_eq!(q.due(13, 100)[0].0, 16);
+        assert_eq!(q.due(13, 100, true)[0].0, 16);
         // A draw that makes the host slot (`seen`) keeps what the queue knows,
         let w15 = write(&q, 15);
         q.partly(15, w15, 20, 8192);
@@ -6384,11 +6733,57 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert_eq!(q.mapped(15), 8192);
         // and queues a slot the queue did not hold.
         q.written(99, 14, 0, true);
-        assert!(q.due(14, 100).iter().any(|d| d.0 == 99));
+        assert!(q.due(14, 100, true).iter().any(|d| d.0 == 99));
         // A write due later (a table's slot) is not handed out before.
         q.written(98, 14, 16, false);
-        assert!(!q.due(15, 100).iter().any(|d| d.0 == 98));
-        assert!(q.due(16, 100).iter().any(|d| d.0 == 98));
+        assert!(!q.due(15, 100, true).iter().any(|d| d.0 == 98));
+        assert!(q.due(16, 100, true).iter().any(|d| d.0 == 98));
+    }
+
+    /// Slots looked at before do not crowd out the first look at the
+    /// others while the card has room (`VICTORY_FAIR_DUE`): with more of
+    /// them due than a pass is handed, and with a pass that stops early on
+    /// its time or bytes, never-looked-at slots still come near the front,
+    /// newest and oldest in turns. With the card full they wait behind all
+    /// of those: the pass can make no host texture for them.
+    #[test]
+    fn slots_looked_at_before_leave_room_for_first_looks() {
+        let mut q = TextureQueue::default();
+        // 5000 slots of a scene's start, looked at in frame 1200 with
+        // nothing to upload, and due again from 1201.
+        for index in 0..5000u32 {
+            q.written(index, 1200, 0, false);
+        }
+        let writes: Vec<(u32, u64)> = q.due(1200, usize::MAX, true);
+        for &(index, write) in &writes {
+            q.later(index, write, 1200, 256);
+        }
+        // Three first-time slots, written after the 5000 looked at.
+        for (index, frame) in [(9000, 2150), (9001, 2151), (9002, 2152)] {
+            q.written(index, frame, frame, false);
+        }
+        let first = |i: &u32| *i >= 9000;
+        let order: Vec<u32> = q.due(2152, 4096, true).into_iter().map(|d| d.0).collect();
+        assert_eq!(order.len(), 4096);
+        // A pass that stops after four slots still reaches two first looks.
+        assert_eq!(order[..4].iter().filter(|i| first(i)).count(), 2, "{:?}", &order[..4]);
+        // Still one looked at before first, and newest, oldest, newest after.
+        assert!(!first(&order[0]));
+        let firsts: Vec<u32> = order.iter().copied().filter(first).collect();
+        assert_eq!(firsts, [9002, 9000, 9001]);
+
+        // The card full (or the switch off): the 4096 handed out are all
+        // looked at before, in the order they had with room, and the first
+        // looks come only after the last of them.
+        let full: Vec<u32> = q.due(2152, 4096, false).into_iter().map(|d| d.0).collect();
+        let again: Vec<u32> = order.iter().copied().filter(|i| !first(i)).collect();
+        assert_eq!(full.len(), 4096);
+        assert!(!full.iter().any(first));
+        assert_eq!(full[..again.len()], again[..]);
+        let all: Vec<u32> = q.due(2152, usize::MAX, false).into_iter().map(|d| d.0).collect();
+        assert_eq!(all.len(), 5003);
+        assert!(!all[..5000].iter().any(first));
+        assert_eq!(all[5000..], [9002, 9000, 9001]);
     }
 
     /// Slots held back for lack of room on the card are not handed out
@@ -6401,25 +6796,25 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         for i in 0..4u32 {
             q.written(20 + i, 1, 0, false);
         }
-        let due = q.due(1, 100);
+        let due = q.due(1, 100, false);
         assert_eq!(due.len(), 4);
         // The card is full: slots 20 and 21 are held back until frame 101.
         for &(index, write) in due.iter().filter(|d| d.0 < 22) {
             q.hold(index, write, 101);
         }
-        let now: Vec<u32> = q.due(2, 100).into_iter().map(|d| d.0).collect();
+        let now: Vec<u32> = q.due(2, 100, false).into_iter().map(|d| d.0).collect();
         assert!(!now.contains(&20) && !now.contains(&21));
         assert!(now.contains(&22) && now.contains(&23));
         assert_eq!(q.census(2)[2], 0, "held slots do not wait for their memory");
         // Due again at their frame, in the order they had.
-        assert_eq!(q.due(101, 100), due);
+        assert_eq!(q.due(101, 100, false), due);
         // Slot 21 is written again while held: due as written.
         q.written(21, 3, 0, false);
-        assert!(q.due(3, 100).iter().any(|d| d.0 == 21));
+        assert!(q.due(3, 100, false).iter().any(|d| d.0 == 21));
         // Room again at frame 5: slot 20 is due at once, and only it was
         // still held as it was.
         assert_eq!(q.room(5), 1);
-        assert!(q.due(5, 100).iter().any(|d| d.0 == 20));
+        assert!(q.due(5, 100, true).iter().any(|d| d.0 == 20));
         assert_eq!(q.room(6), 0);
     }
 
@@ -6548,7 +6943,7 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         let Some(heap) = HostHeap::new(false, 8) else {
             return; // no host GPU
         };
-        let slots = |at: u64| -> Vec<u32> { heap.texture_slots_due(at, 8).0.into_iter().map(|d| d.0).collect() };
+        let slots = |at: u64| -> Vec<u32> { heap.texture_slots_due(at, 8, true).0.into_iter().map(|d| d.0).collect() };
         // 64x64 BC7, one mip, at an address no test and no title uses.
         let at = 0x7fed_0000_0000u64;
         let mut desc = [0u32; 16];
@@ -6558,7 +6953,7 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         let written = [(at, at + 0x1000)];
         // Waiting for its first upload: held, not uploaded, nothing done.
         assert_eq!(heap.slots_written_under(&written, 50, true), [1, 0, 0]);
-        let (queued, write) = heap.texture_slots_due(u64::MAX, 8).0[0];
+        let (queued, write) = heap.texture_slots_due(u64::MAX, 8, true).0[0];
         assert_eq!(queued, 1);
         heap.texture_slot_done(1, write, None);
         assert_eq!(slots(u64::MAX), []);
@@ -6628,7 +7023,7 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         let Some(heap) = HostHeap::new(false, 8) else {
             return; // no host GPU
         };
-        let slots = |at: u64| -> Vec<u32> { heap.texture_slots_due(at, 8).0.into_iter().map(|d| d.0).collect() };
+        let slots = |at: u64| -> Vec<u32> { heap.texture_slots_due(at, 8, true).0.into_iter().map(|d| d.0).collect() };
         // 64x64 BC7, one mip, at an address no test and no title uses.
         let at = 0x7fee_0000_0000u64;
         let view = |address: u64, width: u32| {
@@ -6638,7 +7033,7 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         };
         let len = crate::resource::placed_bytes(&[3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0]).unwrap();
         assert!(heap.note_buffer(1, Some(&view(at, 64)), false).is_empty());
-        let (queued, write) = heap.texture_slots_due(u64::MAX, 8).0[0];
+        let (queued, write) = heap.texture_slots_due(u64::MAX, 8, true).0[0];
         assert_eq!(queued, 1);
         heap.texture_slot_done(1, write, None);
         assert_eq!(slots(u64::MAX), []);
@@ -6722,7 +7117,7 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
             return; // no host GPU
         };
         let frame = 100;
-        let slots = |at: u64| -> Vec<u32> { heap.texture_slots_due(at, 8).0.into_iter().map(|d| d.0).collect() };
+        let slots = |at: u64| -> Vec<u32> { heap.texture_slots_due(at, 8, true).0.into_iter().map(|d| d.0).collect() };
         let texture = View::Placed(false, [3, 0, 0, 0, 4, 0, 4, 0x1_0001, 28, 1, 0, 0x105, 0, 0], [0; 16]);
         assert!(is_texture_view(&texture));
         heap.queue_texture(2, true, false, frame);

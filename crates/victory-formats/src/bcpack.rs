@@ -129,8 +129,9 @@ impl Tables {
     /// alpha 64 B and colour 256 B, BC4 64 B, BC5 64 B), 512 u16 BC7 control
     /// words, then 255 dictionary entries per format in format order: BC1
     /// 6 + 16 B, BC3 8 + 32 B, BC4 2 + 16 B, BC5 4 + 32 B, BC6H (u8 mode,
-    /// 12 u16, u8 mode, 16 i16), BC7 (u16 control, 24 u16, 2 u8, 2 B,
-    /// 16 + 15 i16). Little-endian, no padding. Every model must tile 65536.
+    /// 12 u16, u8 mode, 16 i16), BC7 (u16 control, 24 u16, 2 u8, then for
+    /// entry 0 32 i16, for the others 2 B and 16 + 15 i16). Little-endian, no
+    /// padding. Every model must tile 65536.
     pub fn parse(bytes: &[u8]) -> Result<Tables, Error> {
         if bytes.len() != TABLES_SIZE {
             return Err(Error("table file has the wrong size"));
@@ -210,7 +211,7 @@ impl Tables {
             })
             .collect();
         let bc7 = (0..DICTIONARY)
-            .map(|_| {
+            .map(|k| {
                 let mut ep = Bc7Ep {
                     ctrl: r.u16(),
                     ..Default::default()
@@ -222,10 +223,20 @@ impl Tables {
                     bits: [r.u8(), r.u8()],
                     ..Default::default()
                 };
-                // Unused: the widths again in all entries but the first.
-                r.u16();
-                // Only 15 slots for set 1, which no entry uses (0 bits).
-                for v in &mut ix.ix.as_flattened_mut()[..31] {
+                // Entry 0 holds all 32 indices right after its widths; the
+                // others repeat the widths (unused) and hold 31, as set 1
+                // has only 15 slots, which no entry uses (0 bits). Reading
+                // the widths again for entry 0 too dropped its first index
+                // and shifted the rest: wrong 4x4 blocks wherever a texture
+                // used it (found by xcl-dev/xcl 7881dbc9; as in TaynanGT's
+                // Vice-Tay d15d8e7 and Neptune_VI 8a04d57).
+                let n = if k == 0 {
+                    32
+                } else {
+                    r.u16();
+                    31
+                };
+                for v in &mut ix.ix.as_flattened_mut()[..n] {
                     *v = r.u16() as i16;
                 }
                 (ep, ix)
@@ -744,10 +755,20 @@ fn pbits(mode: u16) -> bool {
     matches!(mode, 0 | 1 | 3 | 6 | 7)
 }
 
+/// Channel rotation bits; only BC7 modes 4 and 5 have a rotation field
+/// (upstream VIctory #3111, by way of DoubleGhosty/cool_fox e7a40a4).
+fn rotation(ctrl: u16) -> usize {
+    if matches!(ctrl & 7, 4 | 5) {
+        usize::from(ctrl >> 3 & 3)
+    } else {
+        0
+    }
+}
+
 /// Channel precisions: the p-bit is red's lowest bit; rotation swaps alpha
 /// with the rotated channel.
 fn bc7_precision(ctrl: u16) -> [u8; 4] {
-    let (mode, rot) = (ctrl & 7, usize::from(ctrl >> 3 & 3));
+    let (mode, rot) = (ctrl & 7, rotation(ctrl));
     let mut p = BC7_BITS[usize::from(mode)];
     if rot != 0 {
         p.swap(3, rot - 1);
@@ -852,7 +873,7 @@ fn bc7_pack(ep: &Bc7Ep, ix: &Bc7Ix, prec: [u8; 4], out: &mut [u8]) {
     let mode = ctrl & 7;
     let subsets = usize::from((ctrl & 0xff) >> 6);
     let part = usize::from(ctrl >> 8 & 63);
-    let rot = usize::from(ctrl >> 3 & 3);
+    let rot = rotation(ctrl);
     let mut w = Bits::default();
     w.put(1 << mode, u32::from(mode) + 1);
     match mode {
@@ -1342,6 +1363,102 @@ mod tests {
     }
 
     #[test]
+    fn bc7_rotation_applies_only_to_modes_4_and_5() {
+        const BC7_WIDTHS: [u8; 16] = [3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4];
+        const CTRL7_OFFSET: usize = MODELS * BUCKETS * 2 + 256 + 64 + 256 + 64 + 64;
+        let tables_for = |ctrl: u16| {
+            let mut raw = tables();
+            raw[CTRL7_OFFSET..CTRL7_OFFSET + 2].copy_from_slice(&ctrl.to_le_bytes());
+            let t = Tables::parse(&raw).unwrap();
+            assert_eq!(t.ctrl7[0], ctrl);
+            t
+        };
+
+        let mut record = vec![0u8; 32];
+        for (i, &val) in [11, 23, 5, 19, 13, 29, 7, 17, 3, 25, 9, 21, 15, 31, 1, 12]
+            .iter()
+            .enumerate()
+        {
+            record[4 + i] = zigzag(val);
+        }
+        record[20] = zigzag(6);
+        record[21] = zigzag(14);
+
+        // Modes without a BC7 rotation field must ignore ctrl bits 4:3 instead of
+        // panicking on shift overflow (modes 0/1/3 with rot=1) or corrupting channels.
+        for (mode, subsets) in [(0u16, 3u16), (1, 2), (2, 3), (3, 2), (6, 1), (7, 2)] {
+            let base_ctrl = (subsets << 6) | mode;
+            let base_tables = tables_for(base_ctrl);
+            let base_src = stream(&base_tables, &BC7_WIDTHS, 2, std::slice::from_ref(&record));
+            let mut want = [0u8; 16];
+            decode(7, &base_src, &mut want, &base_tables).unwrap();
+
+            for rot in 1..=3u16 {
+                let ctrl = base_ctrl | (rot << 3);
+                let t = tables_for(ctrl);
+                let src = stream(&t, &BC7_WIDTHS, 2, std::slice::from_ref(&record));
+                let mut got = [0u8; 16];
+                decode(7, &src, &mut got, &t).unwrap();
+                assert_eq!(got, want, "mode {mode} rot {rot}");
+                assert_eq!(
+                    bc7_precision(ctrl),
+                    bc7_precision(base_ctrl),
+                    "mode {mode} rot {rot}"
+                );
+            }
+        }
+
+        // Modes 4 and 5 do have a 2-bit rotation field: rotation swaps alpha with channel rot-1.
+        for (mode, base_bits) in [(4u16, [5u8, 5, 5, 6]), (5u16, [7u8, 7, 7, 8])] {
+            for rot in 1..=3usize {
+                let ctrl = (1 << 6) | ((rot as u16) << 3) | mode;
+                let mut expected_prec = base_bits;
+                expected_prec.swap(3, rot - 1);
+                assert_eq!(bc7_precision(ctrl), expected_prec, "mode {mode} rot {rot}");
+            }
+
+            // Decode mode 4/5 with rot=1 (swap R and A) and check the packed BC7 block.
+            let ctrl = (1 << 6) | (1 << 3) | mode;
+            let t = tables_for(ctrl);
+            let mut s = vec![0u8; 32];
+            s[4] = zigzag(0x21); // stored R0 (holds alpha precision after rot=1)
+            s[5] = zigzag(0x12); // stored R1
+            s[6] = zigzag(0x05); // stored G0
+            s[7] = zigzag(0x06); // stored G1
+            s[8] = zigzag(0x09); // stored B0
+            s[9] = zigzag(0x0a); // stored B1
+            s[10] = zigzag(0x0d); // stored A0 (holds color precision after rot=1)
+            s[11] = zigzag(0x0e); // stored A1
+            let src = stream(&t, &BC7_WIDTHS, 2, &[s]);
+            let mut dst = [0u8; 16];
+            decode(7, &src, &mut dst, &t).unwrap();
+
+            let color_bits = u32::from(base_bits[0]);
+            let alpha_bits = u32::from(base_bits[3]);
+            let mut w = Bits::default();
+            w.put(1 << mode, u32::from(mode) + 1);
+            w.put(1, 2); // rotation = 1
+            if mode == 4 {
+                w.put(0, 1); // indexSelectionBit = 0
+            }
+            // Endpoint order after rot=1 swaps indices 3 and 0: [3 (R), 1 (G), 2 (B), 0 (A)].
+            for (v, n) in [
+                (0x0d, color_bits),
+                (0x0e, color_bits),
+                (0x05, color_bits),
+                (0x06, color_bits),
+                (0x09, color_bits),
+                (0x0a, color_bits),
+                (0x21, alpha_bits),
+                (0x12, alpha_bits),
+            ] {
+                w.put(v, n);
+            }
+            assert_eq!(dst, w.v.to_le_bytes(), "mode {mode} rot 1");
+        }
+    }
+
+    #[test]
     fn malformed_input_is_an_error() {
         let t = Tables::parse(&tables()).unwrap();
         let records: Vec<Vec<u8>> = (0..64u8)
@@ -1599,10 +1716,44 @@ mod tests {
     #[test]
     fn bc7_dictionary_indices_line_up() {
         let t = Tables::builtin().unwrap();
+        // Entry 0 keeps its leading index (no repeated widths before it).
+        let (ep0, ix0) = &t.bc7[0];
+        assert_eq!(ep0.ctrl, 0);
+        assert_eq!(ix0.bits, [4, 0]);
+        assert_eq!(ix0.ix[0], [2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(ix0.ix[1], [0; 16]);
         for (k, (_, ix)) in t.bc7.iter().enumerate() {
             let anchor = 0..1 << (ix.bits[0] - 1);
             let ok = (ix.bits[1] != 0 || ix.ix[1] == [0; 16]) && anchor.contains(&ix.ix[0][0]);
             assert!(ok, "entry {k}: {:?}", ix.ix);
         }
+    }
+
+    /// BC7 dictionary entry 0, crafted: its 32 indices follow its widths
+    /// directly and all of them are read in order, set 1's last slot too;
+    /// entry 1 skips its repeated widths and reads 31.
+    #[test]
+    fn bc7_dictionary_entry_0_reads_its_32_indices() {
+        const ENTRY: usize = 2 + 48 + 2 + 2 + 62;
+        let mut bytes = include_bytes!("bcpack-tables.bin").to_vec();
+        let first = TABLES_SIZE - DICTIONARY * ENTRY;
+        // Entry 0: indices 1..=32 right after control, rows and widths.
+        for k in 0..32u16 {
+            let at = first + 2 + 48 + 2 + 2 * k as usize;
+            bytes[at..at + 2].copy_from_slice(&(k + 1).to_le_bytes());
+        }
+        // Entry 1: repeated widths (0xEEEE, skipped), then 101..=131.
+        let second = first + ENTRY;
+        bytes[second + 52..second + 54].copy_from_slice(&0xEEEEu16.to_le_bytes());
+        for k in 0..31u16 {
+            let at = second + 54 + 2 * k as usize;
+            bytes[at..at + 2].copy_from_slice(&(k + 101).to_le_bytes());
+        }
+        let t = Tables::parse(&bytes).unwrap();
+        let want0: Vec<i16> = (1..=32).collect();
+        assert_eq!(t.bc7[0].1.ix.as_flattened(), &want0[..]);
+        let mut want1: Vec<i16> = (101..=131).collect();
+        want1.push(0);
+        assert_eq!(t.bc7[1].1.ix.as_flattened(), &want1[..]);
     }
 }

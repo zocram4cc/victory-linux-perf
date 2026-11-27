@@ -1498,6 +1498,10 @@ pub(crate) struct HostList {
     /// depends on ([`HostList::changed_something`]); no two lists have the
     /// same.
     epoch: std::sync::atomic::AtomicU64,
+    /// Whether this recording has a copy at its place ([`place`]): only then
+    /// does a constant buffer look for one that wrote its bytes
+    /// ([`HostList::place_constant`]).
+    has_placed: std::sync::atomic::AtomicBool,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -2591,6 +2595,12 @@ struct Deferred {
     /// indirect arguments; 0 if none. It stays readable until the next
     /// clamp into it ([`HostList::indirect_state`]).
     indirect_readable: usize,
+    /// Ranges `[dst, dst + len)` written on the GPU by `Step::Placed` in
+    /// this recording, in order, with the destination host copy.
+    placed_written: Vec<(usize, usize, std::sync::Arc<crate::shadow::Shadow>)>,
+    /// Current per-recording GPU buffer `(buffer, capacity, used)` for
+    /// inline placed constant snapshots ([`place`]).
+    placed_cbv: Option<(ID3D12Resource, u64, u64)>,
 }
 
 impl Deferred {
@@ -4011,12 +4021,15 @@ fn late_line(frames: f64) {
     crate::land::log(frames);
     if place::on() {
         let t: Vec<f64> = place::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        let constants = place::CONSTANTS.swap(0, Ordering::Relaxed) as f64 / frames;
         tracing::info!(
-            "title buffer copies at their place in the lists, per frame (VICTORY_COPIES_IN_PLACE): {:.1} of {:.1} KB, {:.1} of them out              of what shaders wrote; {:.2} copies into textures out of what shaders wrote",
+            "title buffer copies at their place in the lists, per frame (VICTORY_COPIES_IN_PLACE): {:.1} of {:.1} KB, {:.1} of them out              of what shaders wrote; {:.2} copies into textures out of what shaders wrote; \
+             {:.1} constants copied on the card out of what such a copy wrote (VICTORY_PLACED_CONSTANTS)",
             t[0],
             t[1] / 1024.0,
             t[2],
             t[3],
+            constants,
         );
     }
     card_steps::log(frames);
@@ -4486,6 +4499,7 @@ impl Host {
                 batch_args: Mutex::default(),
                 coming: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
+                has_placed: std::sync::atomic::AtomicBool::new(false),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes,
@@ -6764,6 +6778,7 @@ impl HostList {
         self._alive.used();
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.deferred() = Deferred::default();
+        self.has_placed.store(false, Ordering::Relaxed);
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -7039,10 +7054,22 @@ impl HostList {
             return;
         }
         let mut deferred = self.deferred();
-        if !deferred.back_wanted.iter().any(|target| target.owner() == resource as usize)
-            && let Some(target) = crate::texback::Target::new(resource)
-        {
-            deferred.back_wanted.push(target);
+        // A target whose ticket went stale (the title reused or remapped the
+        // memory it tiles into) must be re-registered, or the read-back
+        // would be dropped as one of memory the texture no longer holds
+        // (fxceless 86d446b, PR #1376).
+        let existing = deferred
+            .back_wanted
+            .iter_mut()
+            .find(|target| target.owner() == resource as usize);
+        match existing {
+            Some(entry) if !entry.fresh() => {
+                if let Some(target) = crate::texback::Target::new(resource) {
+                    *entry = target;
+                }
+            }
+            None => deferred.back_wanted.extend(crate::texback::Target::new(resource)),
+            Some(_) => {}
         }
     }
 
@@ -7068,6 +7095,24 @@ impl HostList {
             u.behind[0] = Some(true);
             self.changed_something();
         }
+    }
+
+    /// For tests: whether the list's read-back wants a *fresh* target for
+    /// `resource` — one whose ticket has not gone stale. A stale target is
+    /// one the title's memory reuse invalidated, which the list must
+    /// re-register on the next write of `resource`.
+    #[cfg(test)]
+    pub(crate) fn back_wanted_fresh(&self, resource: crate::object::This) -> bool {
+        self.deferred()
+            .back_wanted
+            .iter()
+            .any(|t| t.owner() == resource as usize && t.fresh())
+    }
+
+    /// For tests: how many texture read-backs the list recorded at its close.
+    #[cfg(test)]
+    pub(crate) fn texture_back_count(&self) -> usize {
+        self.deferred().texture_backs.len()
     }
 
     /// At submission: the list that moves each texture this list uses from
@@ -7275,6 +7320,8 @@ impl HostList {
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
         let mut deferred = self.deferred();
+        let copy_dst = dst as usize;
+        deferred.placed_written.retain(|(a, b, _)| *b <= copy_dst || *a >= copy_dst.saturating_add(len));
         COPIES_JOINED[0].fetch_add(1, Ordering::Relaxed);
         // A copy that goes on where the one recorded just before it ended,
         // source and destination both: with `join_copies` the two are one
@@ -9833,6 +9880,19 @@ impl Meter {
                         crate::descriptor::host::STALE[4].load(Ordering::Relaxed)
                     );
                 }
+                {
+                    let [unchanged, changed] =
+                        [0, 1].map(|i| crate::draw::HEAP_TEXTURES_RECHECKED[i].load(Ordering::Relaxed));
+                    let [full, bytes, left] =
+                        [0, 1, 2].map(|i| crate::draw::HEAP_TEXTURES_FULL_RECHECK[i].load(Ordering::Relaxed));
+                    tracing::info!(
+                        "textures picked by index looked at again after their upload, since the start: {unchanged} looks found \
+                         the memory as it was, {changed} found it changed (uploaded again; five looks, then none, unless \
+                         VICTORY_HEAP_RECHECK_FOREVER=1); {full} whole looks read {} MB ({left} left for a later frame; three \
+                         windows unless VICTORY_TEXTURE_FULL_RECHECK=1)",
+                        bytes >> 20
+                    );
+                }
                 tracing::info!(
                     "slots of textures made while lists sent before them ran, shown once those had run (VICTORY_SHOW_NEW_LATER={}), since the start: {}",
                     u8::from(crate::descriptor::host::show_new_later()),
@@ -9916,6 +9976,15 @@ impl Meter {
                         per_frame(5),
                         per_frame(6) / 1e3
                     );
+                }
+                {
+                    let [srv, uav] = crate::descriptor::host::raw_view_counts();
+                    if srv != [0; 4] || uav != [0; 4] {
+                        tracing::info!(
+                            "raw views of root buffers kept inside their buffer (VICTORY_RAW_VIEW_CLAMP=0: as asked), since the \
+                             start, as [past the end: null, shortened, under a dword, not on 16 bytes: null]: SRV {srv:?}, UAV {uav:?}"
+                        );
+                    }
                 }
                 tracing::info!(
                     "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
