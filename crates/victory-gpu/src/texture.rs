@@ -1777,7 +1777,7 @@ pub(crate) fn unchanged(resource: This, first: u32) -> bool {
     // texture was written left there says nothing, and the look that found
     // it so left the view as it was (Legendary 65498fd copies at that look;
     // here the look is not made and the pass goes on to the copy).
-    if (uav_recheck() || alias_host_written()) && crate::resource::alias_of(resource).is_some() {
+    if (uav_recheck() || alias_host_written()) && crate::resource::is_aliased(resource) {
         return false;
     }
     let Some(copy) = crate::resource::made_copy(resource) else {

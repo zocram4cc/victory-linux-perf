@@ -1461,8 +1461,49 @@ static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
 /// into is found the same way, block-compressed ones too
 /// (`crate::texture::alias_host_written`, `VICTORY_ALIAS_HOST_WRITTEN=0`:
 /// not).
+///
+/// The texture is pinned under the table's lock and handed back held: once
+/// the lock is let go the title can drop its last reference, and the
+/// caller's alias copy still needs it (use-after-free, or a copy from the
+/// next texture at the same address). One already being released is not
+/// returned. (trustno1 PR #25, after fxceless PR #1336.)
 #[cfg(windows)]
-pub(crate) fn alias_of(this: This) -> Option<This> {
+pub(crate) fn alias_of(this: This) -> Option<Held> {
+    alias_with(this, |other| crate::object::add_ref_alive(other).then_some(Held(other))).flatten()
+}
+
+/// Whether [`alias_of`] would find a texture for `this`, for callers that
+/// only ask: nothing is pinned, so none of them can end up dropping the
+/// texture's last reference.
+#[cfg(windows)]
+pub(crate) fn is_aliased(this: This) -> bool {
+    alias_with(this, |_| ()).is_some()
+}
+
+/// A title texture held alive by a reference of its own ([`alias_of`]),
+/// let go when this is dropped.
+#[cfg(windows)]
+pub(crate) struct Held(This);
+
+#[cfg(windows)]
+impl Held {
+    /// The texture held.
+    pub(crate) fn get(&self) -> This {
+        self.0
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Held {
+    fn drop(&mut self) {
+        object::release_boxed::<Resource>(self.0);
+    }
+}
+
+/// The lookup behind [`alias_of`]: `found` runs on the texture while the
+/// lock of the table it was found in is still held.
+#[cfg(windows)]
+fn alias_with<R>(this: This, found: impl FnOnce(This) -> R) -> Option<R> {
     use std::sync::atomic::Ordering::Relaxed;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if this.is_null()
@@ -1542,7 +1583,8 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
             );
         }
     }
-    same.then_some(other)
+    // (Still under the lock: a texture leaves its table before it is freed.)
+    same.then(|| found(other))
 }
 
 /// Whether a texture the title placed at `this`'s address ([`texture_at`])
@@ -1564,7 +1606,7 @@ pub(crate) fn aliased_by_a_view(this: This) -> bool {
         let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
         map.range((at, [0; 14])..=(at, [u32::MAX; 14])).map(|(_, &view)| view).collect()
     };
-    views.into_iter().any(|view| view != this as usize && alias_of(view as This) == Some(this))
+    views.into_iter().any(|view| view != this as usize && alias_with(view as This, |other| other == this) == Some(true))
 }
 
 /// Whether host copies are made on first use. On by default;
@@ -1666,7 +1708,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         // The levels views show ([`held_only`]), those of the slots shaders
         // pick by index among them.
         let mut base = 0;
-        if shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
+        if shape_fits && r.host.placed.load(Relaxed) && held_only() && !is_aliased(this) {
             let wanted = r.host.wanted.load(Relaxed);
             let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
             let first = wanted.min(viewed);
@@ -3569,7 +3611,7 @@ mod tests {
         let srv = [3, 0, 0, 0, 4, 0, 4, 0x1_0001, 67, 1, 0, 0, 0, 0];
         let uav = uav_texture_at(address, &srv, 42).unwrap();
         let view = texture_at(address, &srv).unwrap();
-        assert_eq!(alias_of(view), Some(uav));
+        assert_eq!(alias_of(view).map(|held| held.get()), Some(uav));
 
         // The title uses the storage temporarily for a different shape.
         let mut other = texture(8, 4, 42, 1);
@@ -3592,7 +3634,7 @@ mod tests {
         let temporary_view = texture_at(address, &temporary_srv).unwrap();
         assert_eq!(uav_texture_at(address, &srv, 42), Some(uav));
         assert_eq!(
-            alias_of(temporary_view),
+            alias_of(temporary_view).map(|held| held.get()),
             Some(target),
             "keep the active target"
         );
@@ -3600,7 +3642,7 @@ mod tests {
 
         // Mirror the original placed UAV again, then resolve its paired SRV.
         assert_eq!(uav_texture_at(address, &srv, 42), Some(uav));
-        assert_eq!(alias_of(view), Some(uav), "restore the cached target");
+        assert_eq!(alias_of(view).map(|held| held.get()), Some(uav), "restore the cached target");
     }
 
     fn buffer(width: u64) -> ResourceDesc {
@@ -4106,7 +4148,7 @@ mod tests {
             S_OK
         );
         resource(view).host.placed.store(true, Relaxed);
-        assert_eq!(alias_of(view), Some(source));
+        assert_eq!(alias_of(view).map(|held| held.get()), Some(source));
         let written = host_resource(source).unwrap();
         let sampled = host_resource(view).unwrap();
         let (upload, data) = host.upload_buffer(1024).unwrap();
@@ -4193,18 +4235,18 @@ mod tests {
         let view = texture_at(at, &words(64, 77)).unwrap();
         let narrow = texture_at(at, &words(32, 77)).unwrap();
         let other_blocks = texture_at(at, &words(64, 71)).unwrap();
-        assert_eq!(alias_of(view), None, "title memory has all of it");
+        assert_eq!(alias_of(view).map(|held| held.get()), None, "title memory has all of it");
         assert!(!aliased_by_a_view(atlas));
         let told = crate::texture::GPU_WRITES[1].load(Relaxed);
         crate::texture::host_written(atlas);
-        assert_eq!(alias_of(view), Some(atlas));
-        assert_eq!(alias_of(narrow), None, "not as wide");
-        assert_eq!(alias_of(other_blocks), None, "blocks of 8 bytes over blocks of 16");
+        assert_eq!(alias_of(view).map(|held| held.get()), Some(atlas));
+        assert_eq!(alias_of(narrow).map(|held| held.get()), None, "not as wide");
+        assert_eq!(alias_of(other_blocks).map(|held| held.get()), None, "blocks of 8 bytes over blocks of 16");
         assert!(aliased_by_a_view(atlas));
         assert_eq!(crate::texture::GPU_WRITES[1].load(Relaxed), told + 1, "the copy is told for the view");
         assert!(!crate::texture::unchanged(view, 0), "no look at title memory for it");
         resource_release(atlas);
-        assert_eq!(alias_of(view), None, "the texture is gone");
+        assert_eq!(alias_of(view).map(|held| held.get()), None, "the texture is gone");
     }
 
     /// The blocks the host copied into a block-compressed texture reach the
@@ -4282,9 +4324,9 @@ mod tests {
         }
         seed.close();
         host.execute(&[&seed]);
-        assert_eq!(alias_of(view), None);
+        assert_eq!(alias_of(view).map(|held| held.get()), None);
         crate::texture::host_written(atlas);
-        assert_eq!(alias_of(view), Some(atlas));
+        assert_eq!(alias_of(view).map(|held| held.get()), Some(atlas));
 
         let list = host.new_list().unwrap();
         crate::texture::upload(&list, view, sampled);
@@ -5101,5 +5143,48 @@ float4 lit() : SV_Target { return 1.0; }
         let d = unsafe { more.texture.GetDesc() };
         assert_eq!((more.base, d.Width, d.MipLevels), (0, 256, 9));
         assert!(more.serial != copy.serial && more.grown.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// The texture a placed view is read from is held while the caller
+    /// copies from it: the title may let go of its own reference between
+    /// the lookup and the copy, and the copy still needs it. (trustno1
+    /// PR #25, after fxceless PR #1336.)
+    #[cfg(windows)]
+    #[test]
+    fn an_alias_source_is_held_after_the_title_releases_it() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let null = std::ptr::null();
+        let mut source = null;
+        let mut view = null;
+        let source_desc = ResourceDesc { flags: 4, ..texture(4, 4, 42, 1) };
+        assert_eq!(
+            create_committed(null, &PROPERTIES, 0, &source_desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut source),
+            S_OK
+        );
+        assert_eq!(
+            create_at_address(
+                null,
+                resource(source).data() as u64,
+                &texture(4, 4, 67, 1),
+                0,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut view,
+            ),
+            S_OK
+        );
+        resource(view).host.placed.store(true, Relaxed);
+        assert!(is_aliased(view), "the lookup alone finds it too");
+        let held = alias_of(view).expect("an alias source");
+        assert_eq!(held.get(), source);
+        // The title lets go: the pin, not the title's reference, keeps the
+        // source (and the copy about to be made from it) alive.
+        assert_eq!(resource_release(source), 1);
+        assert!(textures().contains(&(source as usize)), "the held source is not freed");
+        assert!(is_aliased(view), "and is still what the view is read from");
+        drop(held);
+        assert!(!textures().contains(&(source as usize)), "the last reference frees it");
+        assert!(!is_aliased(view) && alias_of(view).is_none());
+        resource_release(view);
     }
 }

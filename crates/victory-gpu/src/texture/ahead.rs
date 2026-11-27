@@ -114,7 +114,7 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
         || copy.holds.lock().unwrap_or_else(|e| e.into_inner()).is_some()
         || !crate::pool::fresh(&copy.texture)
         || super::host_wrote(resource as usize)
-        || crate::resource::alias_of(resource).is_some()
+        || crate::resource::is_aliased(resource)
     {
         return turned_down();
     }
