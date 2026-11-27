@@ -128,6 +128,14 @@ fi
   echo "No victory.exe for the $profile build. Build it: scripts/build-linux.sh$([[ $profile == diag ]] && echo ' --diag')" >&2
   exit 2
 }
+# A source newer than the exe means the run would not test what the
+# checkout says (the run folder records the commit, not the exe's build).
+if [[ "$exe" == "$target/"* ]]; then
+  newer=$(find "$repo/crates" "$repo/apps" -name '*.rs' -newer "$exe" -print -quit 2>/dev/null)
+  if [[ -n "$newer" ]]; then
+    echo "warning: ${newer#"$repo/"} is newer than $(basename "$(dirname "$exe")")/victory.exe; rebuild first: scripts/build-linux.sh$([[ $profile == diag ]] && echo ' --diag')" >&2
+  fi
+fi
 
 # Caches and data (saves, settings) live on the Linux side, not inside the
 # prefix, so a fresh prefix keeps them.
