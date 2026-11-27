@@ -1,4 +1,4 @@
-# breakwater
+# breakwater-victory-7900xtx
 
 A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
 that runs an Xbox Series title on a PC from files the user supplies. This fork
@@ -10,7 +10,7 @@ screenshots of the title, no binaries built from it.** You need your own copy of
 the title. The project is not affiliated with or endorsed by the title's
 developer or publisher, nor by Microsoft or AMD.
 
-> Working name. Everything below is measured on one machine, in one house and
+> Everything below is measured on one machine, in one house and
 > the street outside it. Read every number with that in mind.
 
 ## At a glance
