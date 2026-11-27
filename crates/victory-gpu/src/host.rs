@@ -2041,6 +2041,19 @@ fn card_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_CARD_BUDGET").is_none_or(|v| v != "0"))
 }
 
+/// Whether a piece of `bytes` of `shadow`, declared written over `declared`,
+/// is left on the card as write-combining title memory ([`crate::wcskip`]).
+/// A copy with a piece left there takes only what the title changes from
+/// then on: the CPU's side no longer has what shaders wrote, and a page sent
+/// whole would put older bytes over it.
+fn wc_left(shadow: &crate::shadow::Shadow, declared: (usize, usize), bytes: u64) -> bool {
+    let left = crate::wcskip::skip_back(shadow.span().1, declared, bytes);
+    if left {
+        shadow.leave_on_card();
+    }
+    left
+}
+
 /// Whether each list of a submission runs and is timed on its own, slow
 /// ones logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
 /// builds; the commands are noted with `VICTORY_D3D12_DRED` on).
@@ -5065,7 +5078,10 @@ impl Host {
                             continue;
                         }
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
-                        if lo < hi && !seen.contains(&(copy, lo, hi)) {
+                        if lo < hi
+                            && !wc_left(&r.shadow, r.declared, (hi - lo) as u64)
+                            && !seen.contains(&(copy, lo, hi))
+                        {
                             let key = (r.shadow.id(), r.shadow.span().0 as usize + lo, hi - lo);
                             if fetch.as_ref().is_some_and(|f| f.had.holds(behind, key)) {
                                 land::count(land::stat::HAD, 1);
@@ -5439,7 +5455,10 @@ impl Host {
                     continue;
                 }
                 let (lo, hi) = r.shadow.card_piece(&r.span, p);
-                if lo < hi && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi)) {
+                if lo < hi
+                    && !wc_left(&r.shadow, r.declared, (hi - lo) as u64)
+                    && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi))
+                {
                     pieces.push((i, lo, hi, total));
                     total += (hi - lo) as u64;
                 }

@@ -118,6 +118,7 @@ mod watch;
 mod texback;
 #[cfg(windows)]
 mod wine;
+mod wcskip; // VICTORY_SKIP_WC_BACK=1 (off), VICTORY_SKIP_WC_MIN_KB=1024
 
 #[cfg(windows)]
 pub use host::on_failure;
@@ -137,9 +138,17 @@ pub fn frame_phase() -> u32 {
     copystat::phase()
 }
 
+
 /// Frames the title has begun (its frame waits that ended), for logs.
 pub fn frames_begun() -> u64 {
     frame::current()
+}
+
+/// The title reserved `[at, at + size)` asking for protection `protect`,
+/// the console's bits included: for `VICTORY_SKIP_WC_BACK` (`wcskip`).
+#[cfg(windows)]
+pub fn title_memory_reserved(at: usize, size: usize, protect: u32) {
+    wcskip::reserved(at, size, protect);
 }
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
