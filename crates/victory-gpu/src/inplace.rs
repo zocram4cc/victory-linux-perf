@@ -150,6 +150,7 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
             let at = if window { 0 } else { 2 };
             STATS[at].fetch_add(1, Ordering::Relaxed);
             STATS[at + 1].fetch_add(len, Ordering::Relaxed);
+            pin(start, len, true);
             Some(placed)
         }
         Err(None) => {
@@ -165,11 +166,55 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     }
 }
 
-/// What [`place_for`] gave is gone.
-pub(crate) fn gone(window: bool, bytes: u64) {
+/// What [`place_for`] gave (title memory `[start, start + bytes)`) is gone.
+pub(crate) fn gone(window: bool, start: u64, bytes: u64) {
     let at = if window { 0 } else { 2 };
     STATS[at].fetch_sub(1, Ordering::Relaxed);
     STATS[at + 1].fetch_sub(bytes, Ordering::Relaxed);
+    pin(start, bytes, false);
+}
+
+/// The 64 KiB blocks of title memory that heaps opened in place hold, and
+/// how many heaps hold each.
+static PINNED: std::sync::Mutex<BTreeMap<u64, u32>> = std::sync::Mutex::new(BTreeMap::new());
+
+/// Notes the blocks of `[start, start + bytes)` held (or let go) by one
+/// more heap in place.
+fn pin(start: u64, bytes: u64, held: bool) {
+    let (first, last) = (start / K64 as u64, (start + bytes.max(1)).div_ceil(K64 as u64));
+    let mut pinned = PINNED.lock().unwrap_or_else(|e| e.into_inner());
+    for block in first..last {
+        if held {
+            *pinned.entry(block).or_insert(0) += 1;
+        } else if let std::collections::btree_map::Entry::Occupied(mut e) = pinned.entry(block) {
+            *e.get_mut() -= 1;
+            if *e.get() == 0 {
+                e.remove();
+            }
+        }
+    }
+}
+
+/// Whether a heap opened in place holds a page of title memory
+/// `[start, end)` ([`level`] is not 0).
+///
+/// Such memory must not be asked about with a reset of its write watch.
+/// Under Wine the reset write-protects the range's pages; the kernel then
+/// tells the card's driver that the range changes, and the driver lets go
+/// of every pinning of ours that touches it after waiting for the card to
+/// have done with it. With the small title buffers in place and the big
+/// ones still copies in the same heaps, the askings for those copies cost
+/// 276 ms a frame instead of 32, and a run stood still after 68 s with
+/// every thread waiting.
+pub(crate) fn pinned(start: usize, end: usize) -> bool {
+    if level() == 0 {
+        return false;
+    }
+    let (first, last) = ((start / K64) as u64, end.div_ceil(K64) as u64);
+    if first >= last {
+        return false;
+    }
+    PINNED.lock().unwrap_or_else(|e| e.into_inner()).range(first..last).next().is_some()
 }
 
 /// Title memory `[at, at + len)` is about to show something else, or the
@@ -623,11 +668,36 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
 /// the views that touch it are forgotten (the runtime tells again those it
 /// maps anew).
 pub(crate) fn views_gone(at: usize, len: usize) {
+    forget_views(&mut views_mut(), at, at.saturating_add(len));
+}
+
+/// [`views_gone`] of `[at, at + len)` and [`title_memory_view`] of `parts`
+/// (address, bytes, section, offset; those of no bytes are left out) for the
+/// census alone, in one step: `parts` show the pages their addresses showed
+/// before, in views of another extent (views joined into one, or what stays
+/// of a view unmapped in part). Nobody who asks where a page is shown finds
+/// it missing in between, and nothing else is told: what is new of the range
+/// is told by [`crate::title_memory_remapped`]
+/// ([`crate::title_memory_regrouped`]).
+pub(crate) fn views_regrouped(at: usize, len: usize, parts: &[(usize, usize, usize, u64)]) {
     let mut v = views_mut();
-    if v.views.is_empty() {
+    forget_views(&mut v, at, at.saturating_add(len));
+    for &(at, len, section, offset) in parts.iter().filter(|part| part.1 != 0) {
+        v.views.insert(at, (len, section, offset));
+        for k in 0..len.div_ceil(K64) {
+            let shown = v.pages.entry((section, offset + (k * K64) as u64)).or_default();
+            shown.push(at + k * K64);
+            let twice = shown.len() == 2;
+            v.pages_twice += usize::from(twice);
+        }
+    }
+}
+
+/// Forgets the views that touch `[at, end)`.
+fn forget_views(v: &mut Views, at: usize, end: usize) {
+    if v.views.is_empty() || at >= end {
         return;
     }
-    let end = at.saturating_add(len);
     let first = v.views.range(..=at).next_back().filter(|(base, view)| *base + view.0 > at).map(|(base, _)| *base);
     let gone: Vec<usize> = first.into_iter().chain(v.views.range(at.saturating_add(1)..end).map(|(base, _)| *base)).collect();
     for base in gone {

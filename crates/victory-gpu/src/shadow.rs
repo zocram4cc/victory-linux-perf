@@ -2487,7 +2487,7 @@ impl Drop for Shadow {
     fn drop(&mut self) {
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
-            crate::inplace::gone(self.window, self.len);
+            crate::inplace::gone(self.window, self.start, self.len);
             return;
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
