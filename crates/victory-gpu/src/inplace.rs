@@ -269,6 +269,76 @@ pub(crate) fn place(device: &ID3D12Device, heap: &ID3D12Heap, offset: u64, size:
     placed.ok_or_else(windows::core::Error::empty)
 }
 
+/// Whether a heap opened on a view of a section shows the card the view's
+/// bytes (renderer port 1's way): tried once, on a section of its own, with
+/// a queue of its own; a line says what was found.
+///
+/// Why: under Wine a section's views are shared mappings of a file the
+/// server made. vkd3d-proton imports the address with
+/// `VK_EXT_external_memory_host`; RADV hands it to the kernel as an amdgpu
+/// user pointer with `AMDGPU_GEM_USERPTR_ANONONLY`, which refuses pages
+/// with a file behind them (`amdgpu_ttm_tt_get_user_pages`: `-EPERM`).
+/// vkd3d-proton then says nothing to us and opens the heap on memory of
+/// its own (`vkd3d_import_host_memory`'s fallback): the heap and buffers in
+/// it are accepted, and the card reads zeros (#163: the world black). On
+/// Windows heaps on views work; the question is asked under Wine only.
+pub(crate) fn section_views_seen(device: &ID3D12Device) -> bool {
+    static SEEN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SEEN.get_or_init(|| {
+        let (seen, how) = try_section_view(device);
+        tracing::info!(
+            seen,
+            how,
+            "in place: a heap opened on a view of a section shows the card the view's bytes"
+        );
+        seen
+    })
+}
+
+/// [`section_views_seen`]'s try: whether the card read the bytes, and what
+/// happened.
+fn try_section_view(device: &ID3D12Device) -> (bool, String) {
+    const SIZE: usize = 2 * K64;
+    let invalid = windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    let flags = mem::PAGE_READWRITE | mem::SEC_COMMIT;
+    let (none, unnamed) = (std::ptr::null(), std::ptr::null());
+    // SAFETY: a section of our own, closed below.
+    let section = unsafe { mem::CreateFileMappingW(invalid, none, flags, 0, SIZE as u32, unnamed) };
+    if section.is_null() {
+        return (false, "no section to try with".to_owned());
+    }
+    // SAFETY: the whole of that section.
+    let view = unsafe { mem::MapViewOfFile(section, mem::FILE_MAP_WRITE, 0, 0, SIZE) };
+    let result = if view.Value.is_null() {
+        (false, "no view to try with".to_owned())
+    } else {
+        let at = view.Value.cast::<u8>();
+        fill(at, SIZE, 9);
+        let tried = (|| {
+            let mut rig = Rig::new(device)?;
+            let heap = open(device, From::Part(at as usize, SIZE))?;
+            let buffer = place(device, &heap, 0, SIZE as u64)?;
+            rig.fetch(&buffer, 0, SIZE)
+        })();
+        match tried {
+            Ok(got) if same(at, &got) => (true, "the card read the view's bytes".to_owned()),
+            Ok(got) if got.iter().all(|&b| b == 0) => {
+                (false, "accepted, but the card read zeros".to_owned())
+            }
+            Ok(_) => (false, "accepted, but the card read other bytes".to_owned()),
+            Err(e) => (false, format!("refused {:#010x}", e.code().0)),
+        }
+    };
+    // SAFETY: our own view and section; the heap and buffer are gone.
+    unsafe {
+        if !view.Value.is_null() {
+            mem::UnmapViewOfFile(view);
+        }
+        windows_sys::Win32::Foundation::CloseHandle(section);
+    }
+    result
+}
+
 // The title's views of its physical pages, as the runtime maps them: the
 // census needs them to say which view memory is one run of a section (one
 // placed buffer could show it) and which is scattered pages.

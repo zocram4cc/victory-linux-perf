@@ -43,6 +43,15 @@
 //! forgotten; the view of ours stays (shortcut: it is never unmapped, a
 //! few hundred MB of address space at most).
 //!
+//! Under Wine (vkd3d-proton on RADV, #163) a heap opened on a view is
+//! accepted but is memory of vkd3d-proton's own: the kernel takes only
+//! anonymous memory as a user pointer of the card, a section's views have a
+//! file behind them, and vkd3d-proton falls back without a word. The card
+//! then read zeros and the world was black. So under Wine a region is
+//! opened only if a heap on a view of a section of our own shows the card
+//! its bytes ([`crate::inplace::section_views_seen`]); else a copy as
+//! before, counted as refused by the host.
+//!
 //! What it assumes: the CPU steps of ours that read this memory at
 //! submission (fills of constant buffers, the title's buffer copies done on
 //! the CPU) read what the title's CPU wrote, not what a submission still in
@@ -167,9 +176,31 @@ pub(crate) fn place_in(device: &ID3D12Device, start: u64, len: u64) -> Result<Pl
     Ok(Placed { buffer, heap: region.heap.clone(), gpu, bias: start - at })
 }
 
+/// Whether we run under Wine (its ntdll exports `wine_get_version`), as
+/// `xmem` asks it.
+fn on_wine() -> bool {
+    static WINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WINE.get_or_init(|| {
+        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+        // SAFETY: plain lookups in ntdll, always loaded.
+        unsafe {
+            let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+            !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+        }
+    })
+}
+
 /// Opens the stretch around `[at, end)` (64 KiB aligned) as a heap through
 /// a view of ours of the same pages.
 fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usize, String)> {
+    // Under Wine (vkd3d-proton on RADV) such a heap is accepted but holds
+    // memory of the host's own, not the view's pages: the card would read
+    // zeros (#163). Asked once on a section of our own; a copy as before
+    // unless the card read the bytes there.
+    if on_wine() && !crate::inplace::section_views_seen(device) {
+        let why = "the host does not show the card a view's pages (a heap of its own memory)";
+        return Err((5, why.to_owned()));
+    }
     let Some((first, bytes, section, offset)) = stretch(at as usize, (end - at) as usize) else {
         return Err((3, format!("not one stretch of a section: {:?}", cover(at as usize, (end - at) as usize))));
     };
