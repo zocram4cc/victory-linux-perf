@@ -91,6 +91,8 @@ pub mod titlewrite;
 mod upload;
 #[cfg(windows)]
 mod watch;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod flightwatch;
 #[cfg(windows)]
 mod texback;
 

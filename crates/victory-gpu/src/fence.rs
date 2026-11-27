@@ -153,6 +153,8 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
 }
 /// Moves the fence to `value` and sets the events that waited for it.
 pub(crate) fn set(this: This, value: u64) {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::flightwatch::fence_set();
     let fence = fence(this);
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::timeline::told("a fence set", this as usize, value);

@@ -4798,6 +4798,8 @@ impl Shadow {
     /// sends it up before the next submission. `title` is scratch memory.
     /// Returns the bytes written to title memory.
     pub(crate) fn card_merge(&self, at: usize, gpu: &[u8], title: &mut Vec<u8>) -> usize {
+        #[cfg(feature = "diagnostics")]
+        crate::flightwatch::landing(self.start);
         let start = self.start as usize;
         if self.card.is_none() || at + gpu.len() > self.len as usize {
             return 0;
@@ -4861,6 +4863,8 @@ impl Shadow {
     /// `title` is scratch memory. Returns the bytes written to title
     /// memory.
     pub(crate) fn card_merge_relay(&self, at: usize, gpu: &[u8], fetched_after: u64, title: &mut Vec<u8>) -> usize {
+        #[cfg(feature = "diagnostics")]
+        crate::flightwatch::landing(self.start);
         let start = self.start as usize;
         let Some(card) = &self.card else {
             return 0;
@@ -4972,6 +4976,8 @@ impl Shadow {
     /// The third of each piece is the address of its bytes, which stay as
     /// they are during the call.
     pub(crate) unsafe fn land_card(&self, pieces: &[(usize, usize, usize)], fetched_after: u64, notes: &mut crate::land::Notes) -> u64 {
+        #[cfg(feature = "diagnostics")]
+        crate::flightwatch::landing(self.start);
         let Some(card) = &self.card else {
             return 0;
         };

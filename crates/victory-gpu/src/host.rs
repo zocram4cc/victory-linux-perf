@@ -4478,6 +4478,8 @@ impl Host {
     /// behind them, and an idle stretch of the card, if one was under way,
     /// ends here ([`CARD_CLOCK_US`]).
     fn card_sent(&self) {
+        #[cfg(feature = "diagnostics")]
+        crate::flightwatch::sent();
         let Some(clock) = self.card_clock() else {
             return;
         };
@@ -6086,6 +6088,15 @@ impl Host {
             shadow.writing(*at, *len);
         }
         let declared = declared_writes(runs);
+        // Diagnostics: the pages of watched copies these shaders may write,
+        // read-only from here until their landing (`crate::flightwatch`).
+        #[cfg(feature = "diagnostics")]
+        if crate::flightwatch::on() {
+            let by = crate::flightwatch::of_declared(declared.iter().map(|(s, r)| (s.span().0, r.as_slice())));
+            for (copy, ranges) in by {
+                crate::flightwatch::arm(copy, &ranges, this_submission);
+            }
+        }
         let card = self.card_before(&declared, &picked, flown);
         // The sends are taken: from here on the references hold what the
         // copies in the lists put.
