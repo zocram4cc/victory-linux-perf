@@ -155,7 +155,18 @@ The dump comes from one game run with `VICTORY_NATIVE_PSO_DUMP=Z:\…\pso-dump` 
 - **Shortcuts that rest on assumptions are listed, with their switches and how to verify them in game, in [docs/royale/p4-shortcuts.md](docs/royale/p4-shortcuts.md).** The user rightly asked that the programs get correct data: a program that translates is not proven right.
 - Next wall: "a descriptor's address or format read as data" (405 left). Census of where it is read (first 60 programs, by the instruction at the error): `s_and_b32 sX, sX, exec_lo` 27, `s_andn2_b32 exec_lo, sX, exec_lo` 5, `v_cmpx_ne_i32 -1, vX` 4, `s_mov_b32 exec_lo, sX` 4, a few real uses (`v_mul_f32`, `v_mul_lo_u32`, an `s_load` base).
 
-  The first kind is the same dead-register case as step 28, but read directly by the compiler's lane-mask merge (`s16 = (s16 & ~exec) | (s37 & exec)`) and not through a join. Taking it as 0 in `operand()` had no effect: these instructions go through the lane-mask simulation (`Val` of masks, `get()` → `Val::Missing`), which refuses first. **Next: apply the same rule there**: a dead descriptor dword read as a lane mask counts as no lanes, under `VICTORY_DEAD_DESCRIPTOR_JOINS`., then "an opaque lane mask" (209), "a lane mask holding lanes elsewhere read as data" (150), "lane conditions too large" (128).
+  The first kind is the same dead-register case as step 28, but read directly by the compiler's lane-mask merge (`s16 = (s16 & ~exec) | (s37 & exec)`) and not through a join. Taking it as 0 in `operand()` had no effect: these instructions go through the lane-mask simulation (`Val` of masks, `get()` → `Val::Missing`), which refuses first. **Next: apply the same rule there**: a dead descriptor dword read as a lane mask counts as no lanes, under `VICTORY_DEAD_DESCRIPTOR_JOINS`.
+- 29, **done**: in `atom()` (the lane-mask simulation's leaves), an opaque leaf whose value is a dead descriptor dword (`Val::Missing("a descriptor's address or format read as data")`) is *no lanes* (`false`).
+
+  Why it is right: the console compiler's lane-mask merge is `s16 = (s16 & ~exec) | (s37 & exec)`. On this path, the variable s37 stands for was never set (to the compiler it is undefined, any value goes), and the register still holds a dead descriptor dword. That falls under shortcut #2 in `p4-shortcuts.md`, with the same switch `VICTORY_DEAD_DESCRIPTOR_JOINS=0`.
+
+  The wall is gone from the top; **1,304 → 1,324**, none lost.
+- Next walls:
+  - "an image dimension (cube or MSAA)" (261, first);
+  - "a lane mask holding lanes elsewhere read as data" (224);
+  - "an opaque lane mask" (207);
+  - "lane conditions too large" (128);
+  - "a descriptor built around a table in the code" (80)., then "an opaque lane mask" (209), "a lane mask holding lanes elsewhere read as data" (150), "lane conditions too large" (128).
 
 ### Deferred on purpose (done 27 Nov, step 27): image stores of the alpha channel alone (69 programs then, 553 later)
 
