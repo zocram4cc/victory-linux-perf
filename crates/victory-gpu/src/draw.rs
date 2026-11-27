@@ -172,6 +172,10 @@ thread_local! {
     /// stopped before them, why it stopped, and gone from the queue
     /// between the draw's look and the pass.
     static PASS_SOURCED: std::cell::Cell<[u64; sourced::PLACES]> = const { std::cell::Cell::new([0; sourced::PLACES]) };
+    /// While a run of the texture pass completes a bake draw
+    /// ([`State::complete_bake`]): its sources go up whatever
+    /// `VICTORY_BAKE_SOURCES_MB` and the card's budget say.
+    static COMPLETING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The tables a pixel shader reads as a decoration bake does
     /// ([`bake_tables`]), by the shader's hash: asked at every draw.
     static BAKE_TABLES: std::cell::RefCell<std::collections::HashMap<String, Option<BakeTables>>> =
@@ -377,6 +381,119 @@ fn bake_sources_forced() -> (bool, u64) {
     })
 }
 
+/// Whether a bake draw is made complete before it runs
+/// (`VICTORY_BAKE_COMPLETE`, on; `=0`: as before), and the milliseconds a
+/// frame's bake draws may take for it (`VICTORY_BAKE_COMPLETE_MS`, 300).
+///
+/// The title bakes each character's skin once, while a scene loads, and
+/// never again: a source the bake samples wrong stays in the skin for the
+/// scene (block noise on faces, necks, arms and hands). The passes before
+/// a bake left some of its sources short (runs 20261127-151220, -160447,
+/// -162513: 2-5 bakes of 12-15 sampled 1-2 sources wrong). When those are
+/// done, what the draw would find is looked at again ([`State::bake_end`]):
+/// a source whose host slot shows nothing of the record it holds, or whose
+/// host copy holds other bytes than title memory now, is uploaded once
+/// more, past the queue's budget, read under the lock the runtime takes to
+/// remap title memory (`crate::texture` `BAKING`), and published when the
+/// upload has run; at most [`BAKE_COMPLETE_ROUNDS`] times, and within the
+/// frame's milliseconds. A bake still short after that is said, with why.
+fn bake_complete() -> (bool, u64) {
+    static ON: std::sync::OnceLock<(bool, u64)> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        (
+            std::env::var_os("VICTORY_BAKE_COMPLETE").is_none_or(|v| v != "0"),
+            std::env::var("VICTORY_BAKE_COMPLETE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(300),
+        )
+    })
+}
+
+/// Runs of the texture pass a bake draw is made complete with, at most.
+const BAKE_COMPLETE_ROUNDS: u32 = 2;
+
+/// Why making a bake draw complete ended ([`complete_next`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Halt {
+    /// Nothing was short (or nothing is any more).
+    #[default]
+    Complete,
+    /// [`BAKE_COMPLETE_ROUNDS`] runs were made.
+    Rounds,
+    /// The frame's milliseconds for it are spent.
+    Time,
+}
+
+impl Halt {
+    fn name(self) -> &'static str {
+        match self {
+            Halt::Complete => "complete",
+            Halt::Rounds => "rounds",
+            Halt::Time => "time",
+        }
+    }
+}
+
+/// Whether another run makes a bake draw complete: `None` if so, else
+/// why not. `short`: its sources still short; `rounds`: runs made;
+/// `spent` of `left` milliseconds.
+fn complete_next(short: usize, rounds: u32, spent: u64, left: u64) -> Option<Halt> {
+    if short == 0 {
+        Some(Halt::Complete)
+    } else if rounds >= BAKE_COMPLETE_ROUNDS {
+        Some(Halt::Rounds)
+    } else if spent >= left {
+        Some(Halt::Time)
+    } else {
+        None
+    }
+}
+
+/// The milliseconds a frame's bake draws have taken to be made complete
+/// ([`bake_complete`]).
+#[derive(Debug, PartialEq, Eq)]
+struct FrameMs {
+    frame: u64,
+    spent: u64,
+}
+
+impl FrameMs {
+    /// What is left of `per_frame` in `frame` (a new frame starts at 0).
+    fn left(&mut self, frame: u64, per_frame: u64) -> u64 {
+        if self.frame != frame {
+            (self.frame, self.spent) = (frame, 0);
+        }
+        per_frame.saturating_sub(self.spent)
+    }
+
+    /// `ms` more taken in `frame`.
+    fn spend(&mut self, frame: u64, ms: u64) {
+        if self.frame != frame {
+            (self.frame, self.spent) = (frame, 0);
+        }
+        self.spent = self.spent.saturating_add(ms);
+    }
+}
+
+static COMPLETE_MS: std::sync::Mutex<FrameMs> = std::sync::Mutex::new(FrameMs { frame: u64::MAX, spent: 0 });
+
+/// What making a bake draw complete did ([`State::complete_bake`]).
+#[derive(Debug, Default)]
+struct BakeCompletion {
+    /// Its sources short when the passes before it were done.
+    found: u64,
+    /// Runs of the texture pass made for them.
+    rounds: u32,
+    /// What those runs did with them (`sourced`), added up, but why the
+    /// last stopped.
+    done: [u64; sourced::PLACES],
+    /// Of the slots they published, the draw's own left unmade.
+    unpublished: u64,
+    /// Why it ended, and the milliseconds it took.
+    halt: Halt,
+    ms: u64,
+    /// The draw's textures as it will find them, by the last look.
+    end: BakeEnd,
+}
+
 /// What a bake draw samples ([`State::bake_sources`]).
 #[derive(Default, Debug)]
 struct BakeSources {
@@ -420,6 +537,16 @@ struct BakeEnd {
     /// Of `missing`: the title wrote another record into the slot since
     /// that look.
     rewritten: u64,
+}
+
+impl BakeEnd {
+    /// The slots a bake would sample wrong or out of date, each once.
+    fn short(&self) -> Vec<u32> {
+        let mut slots: Vec<u32> = self.missing.iter().chain(&self.behind).copied().collect();
+        slots.sort_unstable();
+        slots.dedup();
+        slots
+    }
 }
 
 
@@ -2754,13 +2881,25 @@ impl State {
                 PASS_SOURCES.set(Some((slots, only)));
             }
         };
-        let finish = |armed: bool, synced: bool, unpublished: u64| {
+        // `upload`: the host and the list of synchronous bake uploads, if
+        // the draw has them (else what completes it goes into `list`,
+        // ahead of the draw).
+        let finish = |armed: bool, synced: bool, unpublished: u64, upload: Option<(&crate::host::Host, &HostList)>| {
             PASS_SOURCES.set(None);
             if let Some(s) = &sources {
                 let done = if armed { PASS_SOURCED.get() } else { [0; sourced::PLACES] };
                 BAKE_SOURCED_BYTES.fetch_add(done[sourced::BYTES], Ordering::Relaxed);
-                let end = Self::bake_end(s, host, true);
-                Self::log_bake_sources(p, s, done, &end, force && armed, synced, unpublished);
+                let completion = if bake_complete().0 {
+                    self.complete_bake(s, heap, host, upload, list, frame)
+                } else {
+                    BakeCompletion { end: Self::bake_end(s, host, true), ..Default::default() }
+                };
+                BAKE_SOURCED_BYTES.fetch_add(completion.done[sourced::BYTES], Ordering::Relaxed);
+                let end = &completion.end;
+                Self::log_bake_sources(p, s, done, end, force && armed, synced, unpublished, &completion);
+                if !end.short().is_empty() {
+                    Self::log_bake_short(p, frame, end, &completion, done);
+                }
             }
         };
         // Of the slots published after a synchronous run, the draw's own
@@ -2850,7 +2989,7 @@ impl State {
                 }
                 // (After the uploads are published: what the draw will
                 // sample wrong is known only then.)
-                finish(run_pass || force, true, unpublished(&published));
+                finish(run_pass || force, true, unpublished(&published), Some((gpu, bake_list)));
                 BAKED_MS.fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
                 return;
             }
@@ -2865,7 +3004,7 @@ impl State {
                     !noted && BAKE_SERVED.load(Ordering::Relaxed) == writes + 1
                 });
             if skip && !force {
-                finish(false, false, 0);
+                finish(false, false, 0, None);
                 return;
             }
             if skip {
@@ -2880,7 +3019,7 @@ impl State {
             let _ = self.heap_textures(list, heap, host, None);
             crate::texture::BAKING.set(false);
             PASS_BUDGET.set(None);
-            finish(true, false, 0);
+            finish(true, false, 0, None);
             BAKED_MS.fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
             return;
         }
@@ -2890,7 +3029,7 @@ impl State {
         // frame's early pass is not due.
         let budget = if first && early_ms > 0 { Some((early_ms, 64 << 20)) } else { None };
         if budget.is_none() && !force {
-            finish(false, false, 0);
+            finish(false, false, 0, None);
             return;
         }
         match budget {
@@ -2906,7 +3045,133 @@ impl State {
         }
         let _ = self.heap_textures(list, heap, host, None);
         PASS_BUDGET.set(None);
-        finish(true, false, 0);
+        finish(true, false, 0, None);
+    }
+
+    /// Makes the bake draw that samples `sources` complete
+    /// ([`bake_complete`]): runs of the texture pass for its sources that
+    /// are still short ([`BakeEnd::short`]), and for those alone, until
+    /// none is, [`BAKE_COMPLETE_ROUNDS`] runs were made or the frame's
+    /// milliseconds for it are spent. Each run reads title memory under
+    /// the runtime's remap lock (`crate::texture` `BAKING`) and uploads
+    /// past the queue's budget; with `upload` (the synchronous bake
+    /// uploads' host and list, whose lock the caller holds) on that list,
+    /// run and waited for, then published; else into `list`, which the
+    /// draw follows. No lock is taken here that the runtime's remapping
+    /// waits for.
+    fn complete_bake(
+        &self,
+        sources: &BakeSources,
+        heap: &crate::descriptor::Heap,
+        host: &crate::descriptor::host::HostHeap,
+        upload: Option<(&crate::host::Host, &HostList)>,
+        list: &HostList,
+        frame: u64,
+    ) -> BakeCompletion {
+        let began = std::time::Instant::now();
+        let left = COMPLETE_MS.lock().unwrap_or_else(|e| e.into_inner()).left(frame, bake_complete().1);
+        let kept = PASS_SOURCED.get();
+        let mut out = BakeCompletion::default();
+        loop {
+            let end = Self::bake_end(sources, host, true);
+            let short = end.short();
+            if out.rounds == 0 {
+                out.found = short.len() as u64;
+            }
+            if let Some(halt) = complete_next(short.len(), out.rounds, began.elapsed().as_millis() as u64, left) {
+                (out.halt, out.end) = (halt, end);
+                break;
+            }
+            out.rounds += 1;
+            // Back in the queue (those out of it), and first in a run for
+            // them alone.
+            host.texture_slots_requeue(&short, frame);
+            PASS_SOURCED.set([0; sourced::PLACES]);
+            PASS_SOURCES.set(Some((short, true)));
+            PASS_BUDGET.set(Some((0, 0, true)));
+            COMPLETING.set(true);
+            crate::texture::BAKING.set(true);
+            match upload {
+                Some((gpu, bake_list)) => {
+                    let mut sync = BakeSync { publish: Vec::new(), keep: Vec::new() };
+                    let _ = self.heap_textures(bake_list, heap, host, Some(&mut sync));
+                    crate::texture::BAKING.set(false);
+                    if bake_list.has_recorded_work() {
+                        bake_list.close();
+                        gpu.execute_sync_internal(bake_list);
+                        bake_list.reset();
+                    } else if !sync.publish.is_empty() {
+                        crate::host::settle_for_fence();
+                    }
+                    for (index, handle, key) in sync.publish {
+                        if !host.publish_uploaded_slot(index, handle, key)
+                            && !host.texture_slot_made_from(index, handle)
+                            && sources.textures.iter().any(|t| t.0 == index)
+                        {
+                            out.unpublished += 1;
+                        }
+                    }
+                    host.texture_views_remade();
+                    host.texture_slots_flip();
+                    drop(sync.keep);
+                }
+                None => {
+                    let _ = self.heap_textures(list, heap, host, None);
+                }
+            }
+            crate::texture::BAKING.set(false);
+            COMPLETING.set(false);
+            PASS_BUDGET.set(None);
+            PASS_SOURCES.set(None);
+            let done = PASS_SOURCED.get();
+            for (total, now) in out.done.iter_mut().zip(done) {
+                *total += now;
+            }
+            out.done[sourced::STOPPED_BY] = done[sourced::STOPPED_BY];
+        }
+        PASS_SOURCED.set(kept);
+        out.ms = began.elapsed().as_millis() as u64;
+        COMPLETE_MS.lock().unwrap_or_else(|e| e.into_inner()).spend(frame, out.ms);
+        out
+    }
+
+    /// A line for a bake draw that runs short all the same: which of its
+    /// sources, and why (for the first 64 such draws, then at counts that
+    /// double).
+    fn log_bake_short(
+        p: &HostPipeline,
+        frame: u64,
+        end: &BakeEnd,
+        completion: &BakeCompletion,
+        before: [u64; sourced::PLACES],
+    ) {
+        static SHORT: AtomicU64 = AtomicU64::new(0);
+        let n = SHORT.fetch_add(1, Ordering::Relaxed) + 1;
+        if n > 64 && !n.is_power_of_two() {
+            return;
+        }
+        let pixel = p.stages.iter().find(|s| s.shader.stage == "pixel").map_or("", |s| s.shader.hash.as_str());
+        let done = &completion.done;
+        tracing::warn!(
+            frame,
+            short_bakes = n,
+            pixel,
+            sampled_wrong = end.missing.len(),
+            behind_title_memory = end.behind.len(),
+            slots = ?end.short(),
+            wrong_rewritten_by_the_title = end.rewritten,
+            completing = bake_complete().0,
+            rounds = completion.rounds,
+            halt = completion.halt.name(),
+            ms = completion.ms,
+            not_mapped = before[sourced::NOT_MAPPED] + done[sourced::NOT_MAPPED],
+            as_far_as_mapped_already = before[sourced::AS_BEFORE] + done[sourced::AS_BEFORE],
+            no_host_texture = before[sourced::NOT_MADE] + done[sourced::NOT_MADE],
+            not_reached = before[sourced::NOT_REACHED] + done[sourced::NOT_REACHED],
+            stopped_by = sourced::why(done[sourced::STOPPED_BY].max(before[sourced::STOPPED_BY])),
+            unpublished = completion.unpublished,
+            "a decoration bake draw runs with some of its textures short: what it bakes of them stays for the scene (VICTORY_BAKE_COMPLETE=0: not made complete)"
+        );
     }
 
     /// The textures a draw of the title's decoration bake samples
@@ -3032,6 +3297,7 @@ impl State {
         forced: bool,
         synced: bool,
         unpublished: u64,
+        completion: &BakeCompletion,
     ) {
         static DRAWS: AtomicU64 = AtomicU64::new(0);
         static SHORT: AtomicU64 = AtomicU64::new(0);
@@ -3057,7 +3323,9 @@ impl State {
         ]) {
             total.fetch_add(now, Ordering::Relaxed);
         }
-        if !(n.is_power_of_two() || ((missing > 0 || behind > 0) && SHORT.fetch_add(1, Ordering::Relaxed) < 256)) {
+        if !(n.is_power_of_two()
+            || ((missing > 0 || behind > 0 || completion.found > 0) && SHORT.fetch_add(1, Ordering::Relaxed) < 256))
+        {
             return;
         }
         let pixel = p.stages.iter().find(|s| s.shader.stage == "pixel").map_or("", |s| s.shader.hash.as_str());
@@ -3096,6 +3364,11 @@ impl State {
             left_the_queue = done[sourced::LEFT_QUEUE],
             unpublished,
             synchronous = synced,
+            completed_short = completion.found,
+            completion_rounds = completion.rounds,
+            completion_uploaded = completion.done[sourced::UPLOADED],
+            completion_ms = completion.ms,
+            completion_halt = completion.halt.name(),
             sampled_wrong = missing,
             wrong_were_on_the_card = end.were_ready,
             wrong_rewritten_by_the_title = end.rewritten,
@@ -3398,6 +3671,7 @@ impl State {
             BAKE_SERVED.store(0, Ordering::Relaxed);
         }
         let mut served = true;
+        let completing = COMPLETING.get();
         // How far the loop came, and why it stopped (`sourced`): for the
         // bake draw's own, which come first.
         let (mut reached, mut stopped) = (0usize, 0u64);
@@ -3405,7 +3679,7 @@ impl State {
             reached = n + 1;
             // One of a bake draw's own: now, whatever the budget and the
             // card's room, up to bytes of its own.
-            let source = n < sourced && sourced_bytes < sourced_at_most && source_room;
+            let source = n < sourced && (completing || (sourced_bytes < sourced_at_most && source_room));
             if n < sourced && !source {
                 if source_room {
                     once!("a decoration bake draw samples more than VICTORY_BAKE_SOURCES_MB megabytes of textures not on the card yet: the rest take their turn");
@@ -5786,7 +6060,46 @@ impl<T, const N: usize> std::ops::DerefMut for Few<T, N> {
 
 #[cfg(test)]
 mod bake_tests {
-    use super::{BAKE_CONSTANT_INDICES, BAKE_RECORD_INDICES, bake_named};
+    use super::{BAKE_COMPLETE_ROUNDS, BAKE_CONSTANT_INDICES, BAKE_RECORD_INDICES, BakeEnd, FrameMs, Halt, bake_named, complete_next};
+
+    /// A bake is made complete while some of its sources are short, for
+    /// at most so many runs and within the frame's milliseconds; nothing
+    /// short ends it at once, whatever is left.
+    #[test]
+    fn a_bake_is_made_complete_within_its_rounds_and_milliseconds() {
+        assert_eq!(complete_next(0, 0, 0, 300), Some(Halt::Complete));
+        assert_eq!(complete_next(0, BAKE_COMPLETE_ROUNDS, 999, 0), Some(Halt::Complete));
+        assert_eq!(complete_next(3, 0, 0, 300), None);
+        assert_eq!(complete_next(3, BAKE_COMPLETE_ROUNDS - 1, 299, 300), None);
+        assert_eq!(complete_next(3, BAKE_COMPLETE_ROUNDS, 0, 300), Some(Halt::Rounds));
+        assert_eq!(complete_next(3, 1, 300, 300), Some(Halt::Time));
+        // The frame's milliseconds already spent: not even one run.
+        assert_eq!(complete_next(1, 0, 0, 0), Some(Halt::Time));
+    }
+
+    /// The frame's milliseconds for making bakes complete are shared by
+    /// its bakes, and start again with the next frame.
+    #[test]
+    fn a_frame_s_bakes_share_its_milliseconds() {
+        let mut ms = FrameMs { frame: u64::MAX, spent: 0 };
+        assert_eq!(ms.left(7, 300), 300);
+        ms.spend(7, 120);
+        assert_eq!(ms.left(7, 300), 180);
+        ms.spend(7, 400);
+        assert_eq!(ms.left(7, 300), 0);
+        assert_eq!(ms.left(8, 300), 300, "a new frame");
+        // Spent in a frame nothing asked about yet counts for that frame.
+        ms.spend(9, 50);
+        assert_eq!(ms.left(9, 300), 250);
+    }
+
+    /// What a bake would sample wrong or out of date, each slot once.
+    #[test]
+    fn a_bake_s_short_sources_are_its_missing_and_its_behind_ones() {
+        let end = BakeEnd { missing: vec![12, 3], behind: vec![3, 40], ..Default::default() };
+        assert_eq!(end.short(), vec![3, 12, 40]);
+        assert!(BakeEnd::default().short().is_empty());
+    }
 
     /// A bake draw names the indices in its constants, and those in the
     /// records its constants give and in the one after them; not those of
