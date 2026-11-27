@@ -154,3 +154,16 @@ Before step 17 that stopped translation ("a descriptor outside the heaps"). **St
   1. Resolve `0x10e` in the layer to the host resource it names (the view's resource object).
   2. Log which dispatch or draw writes that resource each frame (a UAV or render-target binding of it).
   3. If no pass we run writes it, find its builder among the untranslated programs (by its UAV) and make that translate, or keep the culling off until it does.
+
+## The pyramid's resource and its writers (27 Nov, 18:20-18:35)
+
+- **The record `vVIE 0x10e 1`** is the layer's own view record: entry 0x10e of the view table, generation 1 (`descriptor::VIEW_TAG`, `Views`). The trace now resolves records to their views: **entry [2] is an SRV of one resource for the whole run** (`0x5d641170` in one run, `0x5ccb09e0` in the next; addresses differ per run). A few bindings have a placed SRV there instead (`PLACED(SRV, 0xc57fda0)` …), most likely the other pass that uses this code (a2e600's).
+- **`VICTORY_WATCH_RESOURCE=<hex>|pyramid`** (in `draw::bind`) logs each compute pipeline whose tables name that resource as unordered access in their first 64 entries. Result (`bench/k-…-cull-watch`): ~50 pipelines, **all non-native** (made by the normal compute path). This does not say who writes it: this title's tables are large bindless heaps, so naming a view is not using it. What it does say: **the pyramid is a host resource that our normal path's passes can write; it is not left unbuilt.**
+- **A run closed by itself** (`cull-resolve`): the title's crash reporter tried to upload (blocked). Once in this series; possibly the occasional crash zeex64 reported with the wineserver patch. Watch for a repeat with these traces.
+- **Working hypothesis now: two-phase occlusion culling.**
+  1. Phase 1 tests against the previous frame's pyramid.
+  2. Phase 2 re-tests what phase 1 culled against this frame's pyramid.
+
+  If a piece of that chain is not native yet (the phase-2 re-test, the copy or reprojection of the pyramid between frames, the indirect arguments built from the visible lists), what phase 1 culls is never drawn. That matches "forced 0 → correct" and "the read itself looks right". a2d400 and a2e600 being one program used twice fits it too.
+- **Decision (with the user): back to translating.** As more of the culling chain translates (its other families: `0x2996b5a0`, `0x1cd48770`, …), test this family again together with them. Until then 0x33cb3490 stays out (`bench/p4-bad-families.txt`).
+- Switches kept for that: `VICTORY_NATIVE_DESC_TRACE=N`, `VICTORY_WATCH_RESOURCE`, `VICTORY_GATHER_LEVEL_CONST` (translator, experiment only; never in play).

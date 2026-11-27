@@ -805,6 +805,9 @@ fn dropped(pipeline: usize) {
 /// Dispatches run on the host so far.
 static DISPATCHED: AtomicU64 = AtomicU64::new(0);
 
+/// P.4: the resource the culling reads as its depth pyramid (`VICTORY_NATIVE_DESC_TRACE`).
+static PYRAMID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 pub(crate) fn dispatched() -> u64 {
     DISPATCHED.load(Ordering::Relaxed)
 }
@@ -1573,12 +1576,67 @@ impl State {
                             // SAFETY: inside the bound heap's descriptors.
                             let d = unsafe { std::slice::from_raw_parts(a as *const u32, 8) };
                             text += &format!(" [{k}]{:08x}.{:08x}.{:08x}.{:08x}", d[0], d[1], d[2], d[3]);
+                            // A view record: the view it names (its resource).
+                            if let Some(v) = crate::descriptor::view(a) {
+                                text += &match v {
+                                    crate::descriptor::View::Shader(r, _) => {
+                                        // The culling's depth pyramid (entry 2): watched below.
+                                        if k == 2 {
+                                            PYRAMID.store(r, Ordering::Relaxed);
+                                        }
+                                        format!("=SRV(res {r:#x})")
+                                    }
+                                    crate::descriptor::View::Unordered(r, _, _) => format!("=UAV(res {r:#x})"),
+                                    crate::descriptor::View::Constant(at, n) => format!("=CBV({at:#x},{n})"),
+                                    crate::descriptor::View::Placed(u, _, w) => format!("=PLACED({}, {:#x})", if u { "UAV" } else { "SRV" }, u64::from(w[10]) | u64::from(w[11]) << 32),
+                                    _ => "=other".into(),
+                                };
+                            }
                         }
                     } else if let Root::Constants(c) = root {
                         text += &format!(" c{slot}:{c:x?}");
                     }
                 }
                 tracing::info!(pipeline = format_args!("{:#x}", self.pipeline), "P.4 desc trace:{text}");
+            }
+        }
+        // P.4 (`VICTORY_WATCH_RESOURCE=<hex>`): every compute binding whose
+        // tables name that resource as unordered access (who writes the
+        // depth pyramid the culling reads), first 64 entries of each table.
+        if compute
+            && let Some(watch) = std::env::var("VICTORY_WATCH_RESOURCE").ok().and_then(|v| {
+                // `pyramid`: the resource the culling's trace saw at its entry 2.
+                if v == "pyramid" {
+                    Some(PYRAMID.load(Ordering::Relaxed)).filter(|&r| r != 0)
+                } else {
+                    usize::from_str_radix(v.trim_start_matches("0x"), 16).ok()
+                }
+            })
+            && self.heaps[0] != 0
+        {
+            let heap = crate::descriptor::heap(self.heaps[0] as This);
+            let (lo, hi) = (heap.start, heap.start + u64::from(heap.desc.count) * 32);
+            for (slot, root) in self.compute.iter().enumerate() {
+                if let Root::Table(at) = *root {
+                    for k in 0..64u64 {
+                        let a = at + 32 * k;
+                        if a < lo || a + 32 > hi {
+                            break;
+                        }
+                        if let Some(crate::descriptor::View::Unordered(r, _, _)) = crate::descriptor::view(a)
+                            && r == watch
+                        {
+                            static SEEN: std::sync::Mutex<std::collections::BTreeSet<usize>> = std::sync::Mutex::new(std::collections::BTreeSet::new());
+                            if SEEN.lock().unwrap_or_else(|e| e.into_inner()).insert(self.pipeline) {
+                                tracing::info!(
+                                    pipeline = format_args!("{:#x}", self.pipeline),
+                                    native = crate::pipeline::is_native(self.pipeline),
+                                    "P.4 watch: a compute pipeline writes the watched resource (table {slot}, entry {k})"
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
         // Textures picked by index, before anything asks for them.
