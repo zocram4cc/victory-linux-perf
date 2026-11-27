@@ -3169,7 +3169,12 @@ impl State {
     /// The stand-in for the indirect light after a dispatch of `p`
     /// (`crate::ambient`). Whether it recorded anything.
     fn ambient(&self, list: &HostList, p: &HostPipeline, role: crate::ambient::Role) -> bool {
-        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, Role, Views};
+        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, REFLECTIONS, Role, Views};
+        // Every `CS_UpdateHistory` has this role; only those with the
+        // reflections at their place are held, and only when asked for.
+        if role == Role::Reflect && !crate::ambient::holding() {
+            return false;
+        }
         let Some(t) = p.stages.first().map(|s| s.translated()) else {
             return false;
         };
@@ -3202,11 +3207,24 @@ impl State {
             Role::Resolve => LIGHT,
             Role::Radiance => RADIANCE,
             Role::Air => AIR,
+            Role::Reflect => REFLECTIONS,
         };
         let Some((of, image)) = entry(ResourceType::Uav, at) else {
-            once!(?role, "no stand-in for the indirect light: missing image UAV");
+            // (Other programs of that name write other histories.)
+            if role != Role::Reflect {
+                once!(?role, "no stand-in for the indirect light: missing image UAV");
+            }
             return false;
         };
+        if role == Role::Reflect {
+            // A 2-D image of R9G9B9E5 in 32-bit integers, or another history
+            // left alone.
+            if of.Format.0 != 42 || of.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+                once!(format = of.Format.0, dimension = of.Dimension.0, "reflections not held: another image at their place");
+                return false;
+            }
+            once!(width = of.Width, height = of.Height, "reflections held to the light around (VICTORY_AMBIENT_REFLECT)");
+        }
         let depth = match role {
             Role::Resolve => {
                 let Some((seen, depth)) = entry(ResourceType::Srv, DEPTH) else {
@@ -3219,10 +3237,10 @@ impl State {
                 }
                 Some(depth)
             }
-            Role::Radiance | Role::Air => None,
+            Role::Radiance | Role::Air | Role::Reflect => None,
         };
         // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT.)
-        let format = if role == Role::Resolve { 42 } else { 26 };
+        let format = if matches!(role, Role::Resolve | Role::Reflect) { 42 } else { 26 };
         let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         if of.Format.0 != format || volume != (role == Role::Air) {
             once!(?role, format = of.Format.0, "no stand-in for the indirect light: another image");

@@ -44,6 +44,13 @@
 //! The air of a room is lit by the same probes: without rays they hold the
 //! sky's light indoors too, a brown veil at sunset. `VICTORY_AMBIENT_AIR`
 //! bounds what the air scatters by a multiple of the light around.
+//!
+//! So are the reflections: without rays a glossy surface indoors mirrors the
+//! sky, unoccluded (a floor with a noisy pink and purple glaze, eyes lit with
+//! sky indoors). `VICTORY_AMBIENT_REFLECT=<part>` holds what the title's
+//! `CS_UpdateHistory` leaves of them to that part of the light around
+//! (Neptune_VI (zm0kiemedia), Belobug's pass: there a part of its constant
+//! light, here of this estimate). Off unless set; 0.5 is Neptune's.
 
 use std::sync::{Mutex, OnceLock};
 
@@ -62,6 +69,9 @@ pub(crate) enum Role {
     /// Adds the lamps' light to what the air scatters (the last program
     /// that writes that volume before it is summed up along the view).
     Air,
+    /// Writes the title's reflections (`CS_UpdateHistory`), which the
+    /// lighting programs read next.
+    Reflect,
 }
 
 /// The program's part in this, by its name in the container.
@@ -73,6 +83,8 @@ pub(crate) fn role(container: &[u8]) -> Option<Role> {
         Some(Role::Radiance)
     } else if has(b"CS_AccumulateLocalLightInscatteringVolume") {
         Some(Role::Air)
+    } else if has(b"CS_UpdateHistory") {
+        Some(Role::Reflect)
     } else {
         None
     }
@@ -86,6 +98,9 @@ pub(crate) const DEPTH: (u8, u32) = (0, 464);
 pub(crate) const RADIANCE: (u8, u32) = (1, 16);
 /// Where the light the air scatters is.
 pub(crate) const AIR: (u8, u32) = (1, 32);
+/// Where `CS_UpdateHistory` writes the reflections (R9G9B9E5 as 32-bit
+/// integers), as in Neptune_VI.
+pub(crate) const REFLECTIONS: (u8, u32) = (1, 40);
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Set {
@@ -123,6 +138,24 @@ fn air() -> f32 {
     })
 }
 
+/// The most a reflection may hold, as a part of the light around
+/// (`VICTORY_AMBIENT_REFLECT=<part>`; unset or 0: the title's reflections as
+/// they are).
+fn reflect() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| reflect_part(std::env::var("VICTORY_AMBIENT_REFLECT").ok().as_deref()))
+}
+
+/// Whether reflections are held at all ([`reflect`]).
+pub(crate) fn holding() -> bool {
+    reflect() > 0.0
+}
+
+/// [`reflect`] for a value of `VICTORY_AMBIENT_REFLECT`.
+fn reflect_part(set: Option<&str>) -> f32 {
+    set.and_then(|v| v.trim().parse::<f32>().ok()).filter(|v| v.is_finite() && *v > 0.0).map_or(0.0, |v| v.min(16.0))
+}
+
 /// Frames after a camera cut in which the estimate, which is of the shot
 /// before, is not trusted (`VICTORY_AMBIENT_CUT=<frames>`; 2 unset, 0 off).
 fn cut() -> f32 {
@@ -154,7 +187,7 @@ fn shade() -> [f32; 2] {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=12, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
+#define RS "RootConstants(num32BitConstants=13, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -168,6 +201,7 @@ cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
     float follow; float most; float air; float cut;
+    float held;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -177,6 +211,20 @@ RWStructuredBuffer<float4> cells : register(u1);
 // Three a point: red, green and blue, each a mean and a direction.
 RWStructuredBuffer<float4> points : register(u2);
 static const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
+
+// R9G9B9E5, as the title keeps light in 32-bit integers.
+float3 unpack(uint v) {
+    return float3(v & 511, (v >> 9) & 511, (v >> 18) & 511) * exp2(float(v >> 27) - 24.0);
+}
+uint pack(float3 c) {
+    c = clamp(c, 0.0, 65408.0);
+    float top = max(c.r, max(c.g, c.b));
+    int e = clamp(int(floor(log2(max(top, 1e-9)))) + 16, 0, 31);
+    float scale = exp2(float(24 - e));
+    if (top * scale >= 511.5) { e = min(e + 1, 31); scale = exp2(float(24 - e)); }
+    uint3 m = min(uint3(c * scale + 0.5), 511u);
+    return m.r | (m.g << 9) | (m.b << 18) | (uint(e) << 27);
+}
 
 // The point seen at a texel, in metres from the eye (x right, y up, z away).
 float3 seen(int2 p, float2 size) {
@@ -300,18 +348,6 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
 
 #ifdef RAISE
 RWTexture2D<uint> light : register(u0);
-float3 unpack(uint v) {
-    return float3(v & 511, (v >> 9) & 511, (v >> 18) & 511) * exp2(float(v >> 27) - 24.0);
-}
-uint pack(float3 c) {
-    c = clamp(c, 0.0, 65408.0);
-    float top = max(c.r, max(c.g, c.b));
-    int e = clamp(int(floor(log2(max(top, 1e-9)))) + 16, 0, 31);
-    float scale = exp2(float(24 - e));
-    if (top * scale >= 511.5) { e = min(e + 1, 31); scale = exp2(float(24 - e)); }
-    uint3 m = min(uint3(c * scale + 0.5), 511u);
-    return m.r | (m.g << 9) | (m.b << 18) | (uint(e) << 27);
-}
 [RootSignature(RS)]
 [numthreads(8, 8, 1)]
 void raise(uint3 at : SV_DispatchThreadID) {
@@ -387,6 +423,34 @@ void raise(uint3 at : SV_DispatchThreadID) {
     light[p] = pack(max(was, found));
 }
 #endif
+
+#ifdef HOLD
+RWTexture2D<uint> reflected : register(u0);
+// No brighter than a part of the light around: of the room as the last
+// seconds showed it, or of the surfaces seen this way, whichever is more
+// (Neptune_VI, Belobug's pass, holds them to a part of its constant light).
+// Not in the frames after a cut, whose estimate is of the shot before.
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void hold(uint3 at : SV_DispatchThreadID) {
+    uint w, h;
+    reflected.GetDimensions(w, h);
+    if (at.x >= w || at.y >= h || cells[CUT_STATE].x > 0.0) return;
+    float around;
+    if (constant > 0.0) {
+        around = constant;
+    } else {
+        uint2 q = min(uint2((float2(at.xy) + 0.5) / float2(w, h) * float2(PX, PY)), uint2(PX - 1, PY - 1));
+        uint at0 = (q.y * PX + q.x) * 3;
+        float3 seen_there = float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
+        around = max(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA)) * level;
+    }
+    float top = held * around;
+    float3 c = unpack(reflected[at.xy]);
+    float has = dot(c, LUMA);
+    if (has > top) reflected[at.xy] = pack(c * (top / max(has, 1e-9)));
+}
+#endif
 "#;
 
 /// Bytes of the cells' buffer and of the points'.
@@ -402,6 +466,7 @@ struct Pass {
     gather: ID3D12PipelineState,
     raise: ID3D12PipelineState,
     air: ID3D12PipelineState,
+    hold: ID3D12PipelineState,
     cells: ID3D12Resource,
     points: ID3D12Resource,
 }
@@ -433,6 +498,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     let gather = pipeline("GATHER", s!("gather"))?;
     let raise = pipeline("RAISE", s!("raise"))?;
     let air = pipeline("AIR", s!("clear_air"))?;
+    let hold = pipeline("HOLD", s!("hold"))?;
     let made = |bytes| buffer(bytes).ok_or_else(windows::core::Error::empty);
     Ok(Pass {
         root: root.ok_or_else(windows::core::Error::empty)?,
@@ -442,6 +508,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
         gather,
         raise,
         air,
+        hold,
         cells: made(CELL_BYTES)?,
         points: made(POINT_BYTES)?,
     })
@@ -498,6 +565,9 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     if role == Role::Air && (constant > 0.0 || air() == 0.0) {
         return false;
     }
+    if role == Role::Reflect && reflect() == 0.0 {
+        return false;
+    }
     static SAID: Mutex<u32> = Mutex::new(0);
     {
         let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
@@ -510,7 +580,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     list.keep(&pass.points);
     let [strength, radius] = shade();
     let floats = [level, constant, strength, radius, 0.1, 0.45];
-    let mut words = [0u32; 12];
+    let mut words = [0u32; 13];
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
@@ -520,6 +590,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[9] = 4.0f32.to_bits();
     words[10] = air().to_bits();
     words[11] = cut().to_bits();
+    words[12] = reflect().to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -527,7 +598,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     unsafe {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 12, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, 13, words.as_ptr().cast(), 0);
         if let Some(depth) = views.depth {
             l.SetComputeRootDescriptorTable(1, depth);
         }
@@ -546,6 +617,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                 KEPT.store(true, Ordering::Relaxed);
             }
             Role::Air => run(&pass.air, views.size[0].div_ceil(8), views.size[1].div_ceil(8), views.slices.div_ceil(2)),
+            Role::Reflect => run(&pass.hold, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1),
             Role::Resolve => {
                 if constant == 0.0 {
                     run(&pass.place, 8, 9, 1);
@@ -590,6 +662,20 @@ mod tests {
         assert_eq!(role(b"..CS_CacheScreenSpaceRadiance_eed2fc35.."), Some(Role::Radiance));
         assert_eq!(role(b"CS_AccumulateLocalLightInscatteringVolume_7e2f5eef"), Some(Role::Air));
         assert_eq!(role(b"CS_TemporalResolve"), None);
+        assert_eq!(role(b"..CS_UpdateHistory_1f2e3d4c.."), Some(Role::Reflect));
+    }
+
+    #[test]
+    fn reflections_held() {
+        assert_eq!(reflect_part(None), 0.0);
+        assert_eq!(reflect_part(Some("")), 0.0);
+        assert_eq!(reflect_part(Some("0")), 0.0);
+        assert_eq!(reflect_part(Some("0.5")), 0.5);
+        assert_eq!(reflect_part(Some(" 2 ")), 2.0);
+        assert_eq!(reflect_part(Some("100")), 16.0);
+        assert_eq!(reflect_part(Some("-1")), 0.0);
+        assert_eq!(reflect_part(Some("nan")), 0.0);
+        assert_eq!(reflect_part(Some("x")), 0.0);
     }
 
     /// The passes compile with the system's compiler and the host takes them.
