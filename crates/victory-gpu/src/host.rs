@@ -9388,6 +9388,32 @@ impl Meter {
                     d[8]
                 );
             }
+            {
+                let c = crate::descriptor::host::WATCH_CENSUS.each_ref().map(|c| c.load(Ordering::Relaxed));
+                let cost = crate::descriptor::host::WATCH_CENSUS_COST.each_ref().map(|c| c.load(Ordering::Relaxed));
+                // One sweep of the write watch over the watched spans
+                // joined at 1 MB: about 17 us an asking and 3 us a MB
+                // (run 20261127-224639).
+                let sweep_ms = c[5] as f64 * 0.017 + (c[7] >> 20) as f64 * 0.003;
+                tracing::info!(
+                    "uploaded textures picked by index, where they lie: {} slots ({} MB) in views of physical pages, \
+                     which the guards cover; {} slots ({} MB) in memory the kernel's write watch tracks, where no fault \
+                     tells of a write; those make {} spans joined under 64 KiB apart, {} under 1 MB ({} MB covered), \
+                     {} under 16 MB; one ask of the write watch over the 1 MB spans would take about {sweep_ms:.1} ms \
+                     (this count: {} spans walked, {:.2} ms with the texture locks held, {:.2} ms in all)",
+                    c[0],
+                    c[1] >> 20,
+                    c[2],
+                    c[3] >> 20,
+                    c[4],
+                    c[5],
+                    c[7] >> 20,
+                    c[6],
+                    cost[2],
+                    cost[0] as f64 / 1e3,
+                    cost[1] as f64 / 1e3
+                );
+            }
             if crate::resource::held_only() {
                 let [copies, bytes, grown, whole] = [0, 1, 2, 3].map(|i| crate::resource::HELD[i].load(Ordering::Relaxed));
                 let [flipped, missed] = [0, 1].map(|i| crate::descriptor::host::FLIPPED[i].load(Ordering::Relaxed));

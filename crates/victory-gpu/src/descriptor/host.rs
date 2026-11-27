@@ -1078,6 +1078,72 @@ pub(crate) fn guard_upload_seen(index: u32, resource: crate::object::This, frame
     );
 }
 
+/// Where the uploaded textures picked by index lie, counted every
+/// [`WATCH_CENSUS_EVERY`] frames: slots and bytes in views of physical
+/// pages (the guards cover them: [`guard_written`] hears of the title's
+/// writes there); slots and bytes elsewhere in title memory (the kernel's
+/// write watch tracks it, and no fault tells of a write: a texture filled
+/// there after its upload keeps its first bytes); and the spans those make
+/// when spans less than 64 KiB, 1 MB and 16 MB apart are joined, with the
+/// bytes the 1 MB spans cover. What asking the write watch over them now
+/// and then would cost (about 17 us an asking and 3 us a MB, run
+/// 20261127-224639) is read from these.
+pub(crate) static WATCH_CENSUS: [std::sync::atomic::AtomicU64; 8] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
+/// Frames between two counts of [`WATCH_CENSUS`].
+const WATCH_CENSUS_EVERY: u64 = 150;
+
+/// What the last count of [`WATCH_CENSUS`] took: microseconds with the
+/// span and queue locks held, and in all; and the spans walked.
+pub(crate) static WATCH_CENSUS_COST: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// How many spans `spans` (sorted by start) make when those less than `gap`
+/// bytes apart are joined, and the bytes the joined spans cover.
+fn coalesced(spans: &[(u64, u64)], gap: u64) -> (u64, u64) {
+    let (mut n, mut covered) = (0u64, 0u64);
+    let mut cur: Option<(u64, u64)> = None;
+    for &(start, end) in spans {
+        cur = match cur {
+            Some((s, e)) if start <= e.saturating_add(gap) => Some((s, e.max(end))),
+            Some((s, e)) => {
+                n += 1;
+                covered += e - s;
+                Some((start, end))
+            }
+            None => Some((start, end)),
+        };
+    }
+    if let Some((s, e)) = cur {
+        n += 1;
+        covered += e - s;
+    }
+    (n, covered)
+}
+
+/// [`WATCH_CENSUS`] of the spans of uploaded textures (sorted by start, with
+/// the number of slots each holds), `shown` telling whether views of
+/// physical pages show a span.
+fn watch_census(spans: &[(u64, u64, u64)], shown: impl Fn(u64, u64) -> bool) -> [u64; 8] {
+    let mut c = [0u64; 8];
+    let mut watched = Vec::new();
+    for &(start, end, slots) in spans {
+        if shown(start, end) {
+            c[0] += slots;
+            c[1] += end - start;
+        } else {
+            c[2] += slots;
+            c[3] += end - start;
+            watched.push((start, end));
+        }
+    }
+    c[4] = coalesced(&watched, 64 << 10).0;
+    (c[5], c[7]) = coalesced(&watched, 1 << 20);
+    c[6] = coalesced(&watched, 16 << 20).0;
+    c
+}
+
 /// Title memory the runtime mapped, unmapped or is about to write since a
 /// texture pass last took the ranges ([`remapped`]).
 static REMAPPED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
@@ -2337,6 +2403,7 @@ impl HostHeap {
         use std::sync::atomic::Ordering::Relaxed;
         self.texture_slots_page_written(frame);
         self.texture_slots_guard_written(frame);
+        self.texture_watch_census(frame);
         let mut ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
         if ranges.is_empty() {
             return 0;
@@ -2468,6 +2535,46 @@ impl HostHeap {
             textures.changed(slot, frame, frame + PAGE_WRITE_AFTER);
         }
         [held, slots.len(), slots.len()]
+    }
+
+    /// Counts, every [`WATCH_CENSUS_EVERY`] frames, where the uploaded
+    /// textures picked by index lie ([`WATCH_CENSUS`]). A walk over the
+    /// spans of placed textures and a look at the runtime's record of views
+    /// for each: no question to the host.
+    fn texture_watch_census(&self, frame: u64) {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        let last = LAST.load(Relaxed);
+        if frame < last + WATCH_CENSUS_EVERY || LAST.compare_exchange(last, frame, Relaxed, Relaxed).is_err() {
+            return;
+        }
+        let began = std::time::Instant::now();
+        let (walked, spans): (u64, Vec<(u64, u64, u64)>) = {
+            let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+            let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            let spans: Vec<(u64, u64, u64)> = placed
+                .by_start
+                .iter()
+                .filter_map(|(&start, (end, slots))| {
+                    let uploaded = slots
+                        .iter()
+                        .filter(|slot| textures.slots.get(slot).is_none_or(|w| w.mapped > 0 || w.checked.2 != 0))
+                        .count() as u64;
+                    (uploaded > 0).then_some((start, *end, uploaded))
+                })
+                .collect();
+            (placed.by_start.len() as u64, spans)
+        };
+        let held = began.elapsed().as_micros() as u64;
+        let c = watch_census(&spans, |start, end| {
+            crate::inplace::shown_bytes(start as usize, (end - start) as usize).is_some_and(|n| n > 0)
+        });
+        for (counter, value) in WATCH_CENSUS.iter().zip(c) {
+            counter.store(value, Relaxed);
+        }
+        WATCH_CENSUS_COST[0].store(held, Relaxed);
+        WATCH_CENSUS_COST[1].store(began.elapsed().as_micros() as u64, Relaxed);
+        WATCH_CENSUS_COST[2].store(walked, Relaxed);
     }
 
     /// Takes the blocks the title wrote that the guards saw since the last
@@ -6883,6 +6990,27 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(heap.slots_written_under(&written, 60, true), [1, 1, 1]);
         assert_eq!(slots(61), []);
         assert_eq!(slots(62), [1]);
+    }
+
+    /// Where uploaded textures lie: in views (the guards cover them) or
+    /// elsewhere, and the spans the others make when near ones are joined.
+    #[test]
+    fn the_watch_census_counts_views_and_joins_near_spans() {
+        assert_eq!(coalesced(&[], 1 << 20), (0, 0));
+        let spans = [(0x1000, 0x2000), (0x3000, 0x4000), (0x20_0000, 0x20_1000), (0x400_0000, 0x400_1000)];
+        // Under 64 KiB apart: the first two are one.
+        assert_eq!(coalesced(&spans, 64 << 10), (3, 0x3000 + 0x1000 + 0x1000));
+        // Under 4 MB apart: the third joins them; the fourth is 62 MB on.
+        assert_eq!(coalesced(&spans, 4 << 20).0, 2);
+        // A span inside another adds nothing.
+        assert_eq!(coalesced(&[(0, 0x10_0000), (0x1000, 0x2000)], 0), (1, 0x10_0000));
+        // Spans at 0x1000.. are views: two slots there; the rest watched.
+        let with_slots = [(0x1000, 0x2000, 2), (0x3000, 0x4000, 1), (0x20_0000, 0x20_1000, 1)];
+        let c = watch_census(&with_slots, |start, _| start < 0x2000);
+        assert_eq!(c[..4], [2, 0x1000, 2, 0x2000]);
+        // Watched: 0x3000 and 0x200000 are 2 MB apart.
+        assert_eq!((c[4], c[5], c[6]), (2, 2, 1));
+        assert_eq!(c[7], 0x2000);
     }
 
     /// Guard writes make at most a pass's share of slots due, none again
