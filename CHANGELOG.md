@@ -11,6 +11,16 @@ branch `xtx-2026-11-27`.
 
 ## 2026-11-27
 
+### Descriptor-table memo, ported (`VICTORY_TABLE_MEMO=1|verify`, off)
+From [Op-lite/victory-scarlett](https://github.com/Op-lite/victory-scarlett) (their "Fox T"): a
+descriptor-table entry, root view or root buffer made ready earlier in the same list with nothing
+changed since is not made ready again. Here the list threads are the frame's limit (about 200 ms of
+CPU a frame across six threads, ~45,000 list calls). Verify: 85.8 % of ~128,000 entries a frame
+are hits, every must-be-zero count 0. Same binary, same settings, `-FrameGen`: off 24.6 rendered
+median (27.2 standing, 23.9 walking), on 27.9 (28.0 / 27.9), shown median 48.9 against 54.5. The
+on run's view had fewer draws and the list threads' total time barely moved, and runs of one
+setup differ by about 2 fps: likely 1-3 fps, not proven. Off until an in-run A/B settles it.
+
 ### Tried, not kept: eight list threads
 `VICTORY_THIN_THREADS=8` fell to about 3.5 rendered fps for long stretches (shown 30+ in 57 % of
 seconds): the threads that translate list calls crowd out the title's own on 8 cores. Six stay.

@@ -6650,6 +6650,12 @@ impl HostList {
         self.epoch.store(next_epoch(), Ordering::Relaxed);
     }
 
+    /// (`VICTORY_TABLE_MEMO=verify`) How many deferred steps the list has
+    /// queued.
+    pub(crate) fn deferred_steps(&self) -> usize {
+        self.deferred().copies.len()
+    }
+
     /// See [`HostList::changed_something`].
     pub(crate) fn epoch(&self) -> u64 {
         self.epoch.load(Ordering::Relaxed)
@@ -9433,6 +9439,7 @@ impl Meter {
             crate::descriptor::sync_line(frames);
             late_line(frames);
             crate::queue::behind_line(frames);
+        crate::draw::table_memo_line(frames);
             card_clock_line(frames, ms);
             upq::line(frames);
             rec::line(frames);
