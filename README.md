@@ -42,6 +42,35 @@ Measured on **Ryzen 5 5600 (6C/12T), Radeon RX 9060 XT 16 GB, 16 GB DDR4, Window
 - Native 30 FPS (`<= 33.3 ms`) is actively being pushed further on `dev`: `victory-submit` is down to `34.4 ms/frame` while 4-thread command list recording (`victory-list-0..3`) and CBV copies remain the next optimization target.
 - Prologue-to-open-world transition can spike Commit on tightly constrained pagefiles; proactive `emergency_reclaim()` and NVMe `VICTORY_FILE_PHYSICAL=auto` mitigate it on `dev`.
 
+## Verified Hardware & Community Results (Wave 4)
+
+### Verified Hardware Matrix
+
+| Hardware / OS | Reporter / Bench | Status & Measured Results |
+|---|---|---|
+| **AMD Ryzen 7 7800X3D + Radeon RX 9060 XT (RDNA 4)** — Windows | Main dev bench | Stable. Wave 4: **~14–24 native FPS** (`14.0 FPS` Open World mean, `15–19 FPS` typical scenes) + 2× smoothness with native **AMD FSR 3.1.6 FG (`HUDLessColor`)**; local VRAM `~11.9 GB`. After latest update: **35 native FPS (FG off)** / **60+ FPS with FG**. |
+| **AMD Ryzen 5 5600 + 16 GB RAM** — Windows | 16 GB RAM verification bench | Stable Open World gameplay without multi-second stutters or freezes after Wave 4/5 fixes. |
+| **AMD Ryzen 7 7700X + Radeon RX 7800 XT (16 GB) + 64 GB RAM** — Windows | `@LynxarAD` | Working: **31–37 FPS with FSR FG** (`15.7×2`–`18.6×2`, `~16–19` native FPS), local VRAM `~12.3 GiB`, GPU `46%` / CPU `75%`. Second launch is much smoother after PSO cache warm-up; cutscenes and new-zone streaming can dip to `~7 FPS`. |
+| **AMD Radeon RX 6600 (8 GB) + 16 GB RAM** — Windows | `@TriguerosZoe99` | Working at **14–20 native FPS** (FG off) **only with `Preset 1 (Low-Commit NVMe)` or `Preset 4 (Safe Mode 8–12GB VRAM)`** + NVMe pagefile. Without those presets on 8 GB VRAM, hangs on a black screen after the main menu. |
+| **Intel Core i7-8700 + NVIDIA RTX 2070 (8 GB) + 16 GB DDR4** — Linux | `@supimcinnamon` | Boots at **~10 native FPS** only on a modified fork over `RAZDA4A-XEN` with a patched `wineserver`. |
+| **AMD Ryzen 5 5500 + NVIDIA RTX 5060 (8 GB) + 16 GB RAM** — Windows | `@Golden_L2` | Does not work (`0 FPS` in 3D, black screen, RAM exhaustion `15.3/15.9 GiB` before first scene). This branch supports AMD RDNA GPUs only; RTX users should use community NVIDIA forks (e.g. `trustno1-coder/VIctory-NVIDIA`). |
+
+### Known Behavior & Tips
+
+- **No build/compilation needed:** Download the ready-to-run files from `main` (or Releases) and copy them directly into the root folder alongside your unpacked files (or keep them in their own folder and point `config.bat` to it):
+  ```text
+  YourUnpackedFolder\
+  ├── RAZDA4A XEN.bat          <-- run this
+  ├── RAZDA4A_XEN.exe
+  ├── config.bat               <-- set GAME_DIR and GAME_EXE
+  ├── launcher_ui.ps1
+  ├── D3D12\D3D12Core.dll
+  ├── fidelityfx\*.dll
+  └── presets\*.bat
+  ```
+- **First launch vs. second launch:** The first launch may freeze or stutter while compiling initial compute PSOs. From the second launch onward, the shader/PSO cache is warm and frame pacing becomes noticeably smoother.
+- **Known Wave 4 limitations (addressed across Wave 5+):** Flickering/rough edges on thin geometry, meshes, and foliage/trees (both native and with FG), sawtooth frame times from descriptor lock contention (`~76.6 ms`), and high CPU thread utilization.
+
 ## Quick start
 
 1. Download `main` (**Code -> Download ZIP** or `git clone --branch main https://github.com/crossducking/RAZDA4A-XEN.git`) and extract (e.g. `D:\RAZDA4A-XEN\`). Required DLLs (`D3D12\D3D12Core.dll`, `fidelityfx\*.dll`) are included.
