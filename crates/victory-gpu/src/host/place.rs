@@ -50,6 +50,26 @@ const MOST: usize = 8 << 20;
 /// out of a host copy, and texture copies out of one.
 pub(super) static STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Since the last frame-rate line: constant buffers copied on the card out of
+/// the host copy a copy at its place wrote ([`HostList::place_constant`]).
+pub(super) static CONSTANTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether a constant buffer whose bytes a copy at its place wrote earlier in
+/// the same list ([`HostList::place_copy`]) is copied on the card, at its
+/// place, out of that copy's destination (on by default with the copies at
+/// their place; `VICTORY_PLACED_CONSTANTS=0`: filled on the CPU at submission,
+/// as before). Read once. From trustno1 PR #34.
+///
+/// Filled at submission it read title memory, where the copy's bytes are only
+/// if no flight in the air kept them out (else the submission waited for the
+/// flights, [`Placed::waits`]); of two copies to the same bytes it read the
+/// second; and under `VICTORY_CARD_STEPS` the fill behind the copy had the
+/// whole submission refused (`card_steps::BEHIND_PLACED`).
+fn placed_constants() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| on() && std::env::var_os("VICTORY_PLACED_CONSTANTS").is_none_or(|v| v != "0"))
+}
+
 /// What the CPU does at submission for a copy at its place in a list.
 pub(super) struct Placed {
     pub(super) dst: usize,
@@ -249,6 +269,7 @@ impl HostList {
         STATS[1].fetch_add(len as u64, Ordering::Relaxed);
         to.gpu_writes(self, dst as u64, len as u64);
         let mut deferred = self.deferred();
+        deferred.placed_written.push((dst, dst + len, to.clone()));
         deferred.copies.push(Step::Placed(Placed {
             dst,
             src,
@@ -257,8 +278,105 @@ impl HostList {
             from: scratch.map(|s| s.2 as usize),
         }));
         deferred.title_written();
+        self.has_placed.store(true, Ordering::Relaxed);
         self.changed_something();
         true
+    }
+
+    /// For a constant buffer of title memory `[src, src + len)`: if the last
+    /// thing this recording did to those bytes is a [`HostList::place_copy`]
+    /// that covers all of them, a copy of them made on the card at this place
+    /// of the list, out of that copy's destination: the buffer and the
+    /// address in it (on 256 bytes, readable as constants). `None`: filled as
+    /// any other ([`placed_constants`]).
+    ///
+    /// No step is recorded for it: nothing of it is read on the CPU. So the
+    /// steps done on the card in front of the lists (`card_steps`) do not see
+    /// it, and neither does their check for places the title writes after
+    /// sending (`card_steps::late`), on purpose: these bytes are what the
+    /// list's own copy put there when it ran, as on the console, whatever
+    /// the title's CPU writes at that address before the flight lands. What
+    /// the title may still write late is the copy's source, which was no
+    /// fill before this either.
+    pub(crate) fn place_constant(&self, src: usize, len: usize) -> Option<(ID3D12Resource, u64)> {
+        if !placed_constants() || len == 0 || !self.has_placed.load(Ordering::Relaxed) {
+            return None;
+        }
+        let end = src.checked_add(len)?;
+        let host = host()?;
+        let alloc = (len as u64).next_multiple_of(256);
+        let (from, mut cbv_slot) = {
+            let mut deferred = self.deferred();
+            let mut matched = None;
+            for (p_dst, p_end, shadow) in deferred.placed_written.iter().rev() {
+                if *p_end <= src || *p_dst >= end {
+                    continue;
+                }
+                if *p_dst <= src && end <= *p_end {
+                    let (start, shadow_len) = shadow.span();
+                    if !shadow.in_place() && (src as u64) >= start && (end as u64) <= start + shadow_len {
+                        matched = Some(shadow.clone());
+                    }
+                }
+                break;
+            }
+            let from = matched?;
+            let slot = match deferred.placed_cbv.as_mut() {
+                Some((buf, cap, used)) if *used + alloc <= *cap => {
+                    let at = *used;
+                    *used += alloc;
+                    Some((buf.clone(), at, true))
+                }
+                _ => None,
+            };
+            (from, slot)
+        };
+        if cbv_slot.is_none() {
+            let cap = alloc.max(64 << 10);
+            let buf = host.uav_buffer(cap)?;
+            name(&buf, || "placed constants on the card".into());
+            let old = {
+                let mut deferred = self.deferred();
+                match deferred.placed_cbv.as_mut() {
+                    Some((existing, existing_cap, used)) if *used + alloc <= *existing_cap => {
+                        let at = *used;
+                        *used += alloc;
+                        cbv_slot = Some((existing.clone(), at, true));
+                        None
+                    }
+                    _ => {
+                        cbv_slot = Some((buf.clone(), 0, false));
+                        deferred.placed_cbv.replace((buf, cap, alloc)).map(|(b, _, _)| b)
+                    }
+                }
+            };
+            if let Some(old) = old {
+                self.keep(&old);
+            }
+        }
+        let (cbv_buf, at, was_used) = cbv_slot?;
+        // SAFETY: `self.list` is open; `cbv_buf` is kept alive in `Deferred`
+        // until reset, `from` is a live host copy covering `[src, end)`, and
+        // `at..at + len` fits in `cbv_buf`.
+        unsafe {
+            if was_used {
+                self.list.ResourceBarrier(&[transition(
+                    &cbv_buf,
+                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                )]);
+            }
+            wait_for_all(host, &self.list);
+            self.list.CopyBufferRegion(&cbv_buf, at, &from.buffer, from.offset(src as u64), len as u64);
+            self.list.ResourceBarrier(&[transition(
+                &cbv_buf,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+            )]);
+            let gpu = cbv_buf.GetGPUVirtualAddress() + at;
+            CONSTANTS.fetch_add(1, Ordering::Relaxed);
+            Some((cbv_buf, gpu))
+        }
     }
 
     /// For a copy of `[src, src + len)` into a texture: a buffer (readable by
@@ -318,5 +436,60 @@ mod tests {
             after.saturating_sub(before)
         );
         drop((card, pc));
+    }
+
+    #[test]
+    fn place_constant_reads_what_place_copy_wrote() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        let Some(host) = super::host() else {
+            return;
+        };
+        const LEN: usize = 64 << 10;
+        // SAFETY: fresh 64 KiB page-aligned allocation for the test.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert!(base != 0);
+        // Initialize source bytes outside the destination range.
+        let src = base + 4096;
+        let dst = base + 8192;
+        // SAFETY: `base..base + LEN` is committed read-write memory.
+        unsafe {
+            for i in 0..512 {
+                ((src + i) as *mut u8).write((i.wrapping_mul(37) ^ 0xa5) as u8);
+            }
+        }
+        crate::shadow::register(0x501a_ce01, base as u64, LEN as u64);
+        let _shadow = crate::shadow::find(dst as u64, 512).expect("shadow for registered range");
+        let list = host.new_list().unwrap();
+        assert!(list.place_copy(dst, src, 512));
+        // Partial overlap or disjoint ranges must bail out cleanly.
+        assert!(list.place_constant(dst - 16, 64).is_none());
+        assert!(list.place_constant(dst + 480, 64).is_none());
+        assert!(list.place_constant(base + 16384, 64).is_none());
+        let (buf1, gpu1) = list.place_constant(dst, 256).expect("first slice inside placed copy");
+        let (buf2, gpu2) = list.place_constant(dst + 256, 256).expect("second slice inside placed copy");
+        assert_eq!(gpu1 % 256, 0);
+        assert_eq!(gpu2 % 256, 0);
+        assert!(!list.deferred().copies.iter().any(|s| matches!(s, super::Step::Fill(..))));
+
+        let (out, out_ptr) = host.shared_buffer(512).unwrap();
+        // SAFETY: `list` is open; offsets match `gpu1`/`gpu2` inside `buf1`/`buf2`.
+        unsafe {
+            let off1 = gpu1 - buf1.GetGPUVirtualAddress();
+            let off2 = gpu2 - buf2.GetGPUVirtualAddress();
+            list.list.CopyBufferRegion(&out, 0, &buf1, off1, 256);
+            list.list.CopyBufferRegion(&out, 256, &buf2, off2, 256);
+        }
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(host.log_messages(), None);
+        // SAFETY: `out_ptr` is a 512-byte shared buffer mapping, and `src` is inside `base..base + LEN`.
+        let got = unsafe { std::slice::from_raw_parts(out_ptr, 512) };
+        let expected = unsafe { std::slice::from_raw_parts(src as *const u8, 512) };
+        assert_eq!(got, expected);
+        crate::shadow::unregister(0x501a_ce01, base as u64);
+        // SAFETY: `base` was allocated with `VirtualAlloc` and `list` has finished.
+        unsafe {
+            VirtualFree(base as *mut _, 0, MEM_RELEASE);
+        }
     }
 }
