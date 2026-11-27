@@ -2269,6 +2269,21 @@ fn sends_runs(card: bool, changes_only: bool, send_changed: bool, landed: bool, 
     card && (changes_only || send_changed || landed && runs)
 }
 
+/// The 4 KiB pages of title memory (their addresses) that hold a byte of
+/// `runs` (offsets from title address `at`, and bytes), each once, in order.
+fn run_pages(at: usize, runs: &[(usize, usize)]) -> Vec<usize> {
+    let mut pages: Vec<usize> = Vec::new();
+    for &(a, n) in runs.iter().filter(|r| r.1 > 0) {
+        let (first, last) = ((at + a) / KERNEL_PAGE, (at + a + n - 1) / KERNEL_PAGE);
+        for page in first..=last {
+            if pages.last() != Some(&(page * KERNEL_PAGE)) {
+                pages.push(page * KERNEL_PAGE);
+            }
+        }
+    }
+    pages
+}
+
 /// Since the last frame-rate line, of pages taken into copies in the
 /// card's memory ([`send_changed`]): bytes compared, those of pages that
 /// held the same, bytes to go up, and the runs they are.
@@ -2941,6 +2956,18 @@ mod landing_tests {
         copy.take(title, title + PAGES * KERNEL_PAGE, true);
         assert_eq!(copy.take_dirty(), []);
         drop(room);
+    }
+
+    /// The counters count 4 KiB pages of the runs a refresh sends, not the
+    /// 64 KiB it takes at a time.
+    #[test]
+    fn runs_are_counted_by_the_pages_they_lie_in() {
+        let at = 5 * KERNEL_PAGE;
+        let p = |k: usize| at + k * KERNEL_PAGE;
+        assert_eq!(super::run_pages(at, &[]), Vec::<usize>::new());
+        assert_eq!(super::run_pages(at, &[(4, 4), (100, 8)]), [p(0)]);
+        assert_eq!(super::run_pages(at, &[(KERNEL_PAGE - 4, 8), (3 * KERNEL_PAGE, 4)]), [p(0), p(1), p(3)]);
+        assert_eq!(super::run_pages(at + 8, &[(0, 2 * KERNEL_PAGE)]), [p(0), p(1), p(2)]);
     }
 
     /// Which copies a refresh sends changed dwords of.
@@ -4497,20 +4524,27 @@ impl Shadow {
                 }
                 self.card_changed_runs(runs.iter().map(|&(a, len)| (at - start + a, at - start + a + len)));
                 // (The landings noted are looked at here: done with.)
-                let noted = landed_into && self.landing_taken(at, at + n);
                 if !runs.is_empty() && landed_into {
+                    // By 4 KiB page that holds a run (`at` takes up to 64 KiB).
+                    let pages = run_pages(at, &runs);
+                    let noted = pages.iter().filter(|&&page| self.landing_noted(page)).count() as u64;
+                    let all = pages.len() as u64;
                     resent::note(
                         self.start,
                         self.len,
                         resent::Resent {
-                            title: u64::from(!noted),
-                            landed: u64::from(noted),
-                            whole: u64::from(whole),
-                            runs: u64::from(!whole),
+                            title: all - noted,
+                            landed: noted,
+                            whole: if whole { all } else { 0 },
+                            runs: if whole { 0 } else { all },
                             bytes: runs.iter().map(|r| r.1 as u64).sum(),
                             ..Default::default()
                         },
                     );
+                }
+                // (The landings noted are looked at here: done with.)
+                if landed_into {
+                    self.landing_taken(at, at + n);
                 }
                 if let Some(was) = was {
                     crate::host::upcheck::note(self.id, at - start, &was, held);
