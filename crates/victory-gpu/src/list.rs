@@ -1437,6 +1437,93 @@ extern "system" fn clear_dsv(
     let _ = (this, handle, flags, depth, stencil, count, rects);
 }
 
+/// `ClearUnorderedAccessViewUint(view in the heap, view, resource, values,
+/// count, rects)` by the slot after the two other clears (as on PC, where
+/// it follows ClearRenderTargetView; the title calls 0x1a8 from one place).
+/// Not carried out yet: the host clear needs the view in the list's bound
+/// heap and in a CPU heap both, made from the title's view. Told about,
+/// so that a run shows what it clears and when (a clear the host leaves
+/// out keeps what was there, e.g. the shot before's after a camera cut).
+/// shortcut: until a run shows the clears matter, they are only logged.
+extern "system" fn clear_uav_uint(
+    this: This,
+    gpu: u64,
+    cpu: u64,
+    resource: This,
+    values: *const u32,
+    count: u32,
+    rects: *const Rect,
+) {
+    let values = (!values.is_null()).then(|| {
+        // SAFETY: the title passes four values.
+        let v = unsafe { std::slice::from_raw_parts(values, 4) };
+        [v[0], v[1], v[2], v[3]]
+    });
+    uav_clear_seen("uint", this, gpu, cpu, resource, values.map(|v| v.map(|x| x as f64)), count, rects);
+}
+
+/// `ClearUnorderedAccessViewFloat(...)`, 0x1b0: as [`clear_uav_uint`].
+extern "system" fn clear_uav_float(
+    this: This,
+    gpu: u64,
+    cpu: u64,
+    resource: This,
+    values: *const f32,
+    count: u32,
+    rects: *const Rect,
+) {
+    let values = (!values.is_null()).then(|| {
+        // SAFETY: the title passes four values.
+        let v = unsafe { std::slice::from_raw_parts(values, 4) };
+        [v[0], v[1], v[2], v[3]]
+    });
+    uav_clear_seen("float", this, gpu, cpu, resource, values.map(|v| v.map(f64::from)), count, rects);
+}
+
+/// UAV clears seen, since the start.
+static UAV_CLEARS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Tells of a UAV clear the host leaves out: the first 48 each with what
+/// they clear and in which frame (to see whether they come at cuts), then
+/// a count every 1000.
+#[allow(clippy::too_many_arguments)]
+fn uav_clear_seen(
+    kind: &'static str,
+    _list: This,
+    gpu: u64,
+    cpu: u64,
+    resource: This,
+    values: Option<[f64; 4]>,
+    count: u32,
+    _rects: *const Rect,
+) {
+    let n = UAV_CLEARS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n <= 48 {
+        #[cfg(windows)]
+        let what = crate::resource::host_resource(resource).map(|r| {
+            // SAFETY: a live host resource.
+            let d = unsafe { r.GetDesc() };
+            format!("dimension {} {}x{}x{} format {} levels {}", d.Dimension.0, d.Width, d.Height, d.DepthOrArraySize, d.Format.0, d.MipLevels)
+        });
+        #[cfg(not(windows))]
+        let what: Option<String> = None;
+        tracing::info!(
+            kind,
+            n,
+            frame = crate::frame::current(),
+            gpu = format_args!("{gpu:#x}"),
+            cpu = format_args!("{cpu:#x}"),
+            resource = ?resource,
+            what = what.as_deref().unwrap_or("no host resource"),
+            ?values,
+            rects = count,
+            "a UAV clear the host does not carry out (yet)"
+        );
+    } else if n.is_multiple_of(1000) {
+        tracing::info!(kind, n, frame = crate::frame::current(), "UAV clears not carried out, since the start");
+    }
+}
+
 /// `CopyMemoryToMemoryX(destination, source, size, flags)`: GPU addresses
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
@@ -2257,7 +2344,7 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
 /// layout): IUnknown 3, object 4, device child 1, list 1, graphics list 96
 /// (59 as on PC, then console ones), then versions 1-6 (6 + 1 + 1 + 11 + 3
 /// + 13): 140 slots.
-const METHODS: [(usize, *const ()); 52] = [
+const METHODS: [(usize, *const ()); 54] = [
     (0, list_query as *const ()),
     (2, list_release as *const ()),
     (7, object::parent_device as *const ()),      // 0x38
@@ -2298,6 +2385,8 @@ const METHODS: [(usize, *const ()); 52] = [
     (50, state::targets as *const ()),            // 0x190
     (51, clear_dsv as *const ()),                 // 0x198
     (52, clear_rtv as *const ()),                 // 0x1a0
+    (53, clear_uav_uint as *const ()),            // 0x1a8
+    (54, clear_uav_float as *const ()),           // 0x1b0
     (59, execute_indirect as *const ()),          // 0x1d8 indirect
     (60, copy_memory as *const ()),               // 0x1e0
     (68, state::depth_bounds as *const ()),       // 0x220 depth bounds

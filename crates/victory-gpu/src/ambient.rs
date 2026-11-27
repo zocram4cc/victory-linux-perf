@@ -30,6 +30,17 @@
 //!
 //! `VICTORY_AMBIENT_SHADE=<strength>,<radius in metres>` sets the creases.
 //!
+//! At a camera cut everything the estimate has is of the shot before: the
+//! light the surfaces sent out is the frame before's, and the probes'
+//! memory still holds that shot in blocks of tiles. Raised to the old
+//! estimate, the first frames of the new shot showed the old one's colours:
+//! a sunset's warm veil over a night street, hard pale and orange blocks in
+//! the sky, gone two or three frames later. A cut shows as most of the
+//! scene's depth changing at once; for the frames after it
+//! (`VICTORY_AMBIENT_CUT=<frames>`, 2; 0: not looked for) nothing is raised
+//! and what the program left is held to the old estimate's brightness, in
+//! grey, and the slow mean starts again from the new shot.
+//!
 //! The air of a room is lit by the same probes: without rays they hold the
 //! sky's light indoors too, a brown veil at sunset. `VICTORY_AMBIENT_AIR`
 //! bounds what the air scatters by a multiple of the light around.
@@ -112,6 +123,21 @@ fn air() -> f32 {
     })
 }
 
+/// Frames after a camera cut in which the estimate, which is of the shot
+/// before, is not trusted (`VICTORY_AMBIENT_CUT=<frames>`; 2 unset, 0 off).
+fn cut() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| cut_frames(std::env::var("VICTORY_AMBIENT_CUT").ok().as_deref()))
+}
+
+/// [`cut`] for a value of `VICTORY_AMBIENT_CUT`.
+fn cut_frames(set: Option<&str>) -> f32 {
+    match set.map(str::trim) {
+        None | Some("") => 2.0,
+        Some(v) => v.parse::<f32>().ok().filter(|v| v.is_finite() && *v >= 0.0).map_or(2.0, |v| v.min(30.0).floor()),
+    }
+}
+
 /// Strength and radius of the creases' shade.
 fn shade() -> [f32; 2] {
     static SET: OnceLock<[f32; 2]> = OnceLock::new();
@@ -134,14 +160,19 @@ const SOURCE: &str = r#"
 #define CELLS (CX * CY)
 #define PX 160
 #define PY 90
+// The cells' positions the frame before, then the cut's state: frames of
+// the cut's window left, and the share of cells whose depth changed.
+#define PREV (2 * CELLS + 1)
+#define CUT_STATE (3 * CELLS + 1)
 cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
-    float follow; float most; float air; float unused;
+    float follow; float most; float air; float cut;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
-// CELLS + 1 on where they are.
+// CELLS + 1 on where they are, from PREV on where they were the frame
+// before, and at CUT_STATE the cut's state.
 RWStructuredBuffer<float4> cells : register(u1);
 // Three a point: red, green and blue, each a mean and a direction.
 RWStructuredBuffer<float4> points : register(u2);
@@ -179,7 +210,9 @@ void mean() {
     for (uint i = 0; i < CELLS; i++) sum += cells[i].rgb;
     float4 was = cells[CELLS];
     float3 now = sum / CELLS;
-    cells[CELLS] = float4(was.a > 0.0 ? lerp(was.rgb, now, follow) : now, 1.0);
+    // After a cut the shot before's mean counts for nothing.
+    bool again = was.a <= 0.0 || cells[CUT_STATE].x > 0.0;
+    cells[CELLS] = float4(again ? now : lerp(was.rgb, now, follow), 1.0);
 }
 #endif
 
@@ -189,7 +222,9 @@ void mean() {
 void place(uint3 at : SV_DispatchThreadID) {
     float2 size = float2(width, height);
     float3 p = seen(int2((float2(at.xy) + 0.5) * size / float2(CX, CY)), size);
-    cells[CELLS + 1 + at.y * CX + at.x] = float4(p, p.z * p.z);
+    uint i = at.y * CX + at.x;
+    cells[PREV + i] = cells[CELLS + 1 + i];
+    cells[CELLS + 1 + i] = float4(p, p.z * p.z);
 }
 #endif
 
@@ -198,6 +233,21 @@ void place(uint3 at : SV_DispatchThreadID) {
 [numthreads(8, 2, 1)]
 void gather(uint3 at : SV_DispatchThreadID) {
     float2 size = float2(width, height);
+    // A cut: most cells' depth changed by more than a third since the frame
+    // before (a pan moves some, a cut all). One thread decides for all.
+    if (cut > 0.0 && at.x == 0 && at.y == 0) {
+        float moved = 0, valid = 0;
+        for (uint i = 0; i < CELLS; i++) {
+            float4 n = cells[CELLS + 1 + i], o = cells[PREV + i];
+            if (n.w > 0.0 && o.w > 0.0) {
+                valid += 1;
+                moved += abs(n.z - o.z) > 0.33 * max(n.z, o.z) ? 1 : 0;
+            }
+        }
+        float share = moved / max(valid, 1.0);
+        float left = cells[CUT_STATE].x;
+        cells[CUT_STATE] = float4(share > 0.5 ? cut : max(left - 1.0, 0.0), share, 0, 0);
+    }
     float3 p = seen(int2((float2(at.xy) + 0.5) * size / float2(PX, PY)), size);
     float r2 = 0.25 + 0.0025 * p.z * p.z;
     float whole = 0;
@@ -321,6 +371,14 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
     float3 was = unpack(light[p]);
+    // Right after a cut the estimate is of the shot before: nothing is
+    // raised to it, and what the program left (the probes' memory of that
+    // shot, in blocks) is held to its brightness, in grey.
+    if (cells[CUT_STATE].x > 0.0) {
+        float g = dot(found, LUMA);
+        light[p] = pack(min(was, float3(g, g, g)));
+        return;
+    }
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.
     float top = max(dot(found, LUMA) * most, 1e-6);
@@ -333,7 +391,7 @@ void raise(uint3 at : SV_DispatchThreadID) {
 
 /// Bytes of the cells' buffer and of the points'.
 const CELLS: u64 = 64 * 36;
-const CELL_BYTES: u64 = (2 * CELLS + 1) * 16;
+const CELL_BYTES: u64 = (3 * CELLS + 2) * 16;
 const POINT_BYTES: u64 = 160 * 90 * 48;
 
 struct Pass {
@@ -461,6 +519,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[8] = 0.04f32.to_bits();
     words[9] = 4.0f32.to_bits();
     words[10] = air().to_bits();
+    words[11] = cut().to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -511,6 +570,18 @@ mod tests {
         assert_eq!(parse("0.8"), Set::Estimate(0.8));
         assert_eq!(parse("constant:0.3"), Set::Constant(0.3));
         assert_eq!(parse("constant:nan"), Set::Off);
+    }
+
+    #[test]
+    fn cut_window() {
+        assert_eq!(cut_frames(None), 2.0);
+        assert_eq!(cut_frames(Some("")), 2.0);
+        assert_eq!(cut_frames(Some("0")), 0.0);
+        assert_eq!(cut_frames(Some("3")), 3.0);
+        assert_eq!(cut_frames(Some("2.7")), 2.0);
+        assert_eq!(cut_frames(Some("100")), 30.0);
+        assert_eq!(cut_frames(Some("-1")), 2.0);
+        assert_eq!(cut_frames(Some("x")), 2.0);
     }
 
     #[test]
