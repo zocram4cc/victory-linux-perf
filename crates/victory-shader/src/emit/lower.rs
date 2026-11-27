@@ -7124,6 +7124,44 @@ impl<'a> Lower<'a> {
         x
     }
 
+    /// Extracts an 8- or 16-bit value at `byte` from 4-byte-aligned dwords
+    /// loaded by `read_dword`, combining the adjacent dword when a 16-bit read
+    /// straddles a dword boundary and sign-extending when `signed`.
+    fn narrow_load(
+        &mut self,
+        byte: V,
+        bits: u32,
+        signed: bool,
+        mut read_dword: impl FnMut(&mut Self, V) -> V,
+    ) -> V {
+        let c = self.cur;
+        let k3 = self.s.m.i32(3);
+        let within = self.s.m.bin(c, Bin::And, byte, k3);
+        let aligned = self.s.m.bin(c, Bin::Sub, byte, within);
+        let shift = self.s.m.bin(c, Bin::Shl, within, k3);
+        let low = read_dword(self, aligned);
+        let mut x = self.s.m.bin(c, Bin::LShr, low, shift);
+        if bits == 16 {
+            let four = self.s.m.i32(4);
+            let next = self.s.m.bin(c, Bin::Add, aligned, four);
+            let high = read_dword(self, next);
+            let k8 = self.s.m.i32(8);
+            let high = self.s.m.bin(c, Bin::Shl, high, k8);
+            let zero = self.s.m.i32(0);
+            let straddles = self.s.m.cmp(c, pred::EQ, within, k3);
+            let high = self.s.m.select(c, straddles, high, zero);
+            x = self.s.m.bin(c, Bin::Or, x, high);
+        }
+        let ones = self.s.m.i32(if bits == 8 { 0xff } else { 0xffff });
+        x = self.s.m.bin(c, Bin::And, x, ones);
+        if signed {
+            let up = self.s.m.i32(32 - bits);
+            x = self.s.m.bin(c, Bin::Shl, x, up);
+            x = self.s.m.bin(c, Bin::AShr, x, up);
+        }
+        x
+    }
+
     /// `channels` channels of the element at byte `off` of raw buffer `h`,
     /// converted from the GFX10 buffer format `format` as the hardware's
     /// typed loads do (channels past the format's read 0, 0, 0, 1).
@@ -12149,7 +12187,7 @@ impl<'a> Lower<'a> {
             off = self.s.m.bin(c, Bin::Add, at, off);
             index = None;
         }
-        if used.is_some_and(|u| u.kind == ResourceType::Cbv) && !typed {
+        if used.is_some_and(|u| u.kind == ResourceType::Cbv) && !typed && !store && atomic.is_none() {
             // A constant buffer read per lane (a dynamically indexed array).
             // shortcut: the console's CBV descriptor is taken to have a 16-byte
             // stride, as the vector loads of whole rows suggest.
@@ -12165,6 +12203,11 @@ impl<'a> Lower<'a> {
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
+            if let Some((bits, signed)) = narrow {
+                let x = self.narrow_load(byte, bits, signed, |l, at| l.cbuffer_dword(h, at));
+                self.write(inst, Reg::V(reg), x, guard);
+                return Ok(());
+            }
             for k in 0..count {
                 let four = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, byte, four);
@@ -12208,20 +12251,10 @@ impl<'a> Lower<'a> {
                 Some(_) => return Err("a byte or 16-bit buffer access by index"),
             };
             let h = self.handle(site, src, false, (11 | u, 0))?;
-            let k3 = self.s.m.i32(3);
-            let within = self.s.m.bin(c, Bin::And, byte, k3);
-            let aligned = self.s.m.bin(c, Bin::Sub, byte, within);
-            let shift = self.s.m.bin(c, Bin::Shl, within, k3);
-            let four = self.s.m.i32(4);
-            let next = self.s.m.bin(c, Bin::Add, aligned, four);
-            let ones = self.s.m.i32(if bits == 8 { 0xff } else { 0xffff });
-            let zero = self.s.m.i32(0);
-            let k8 = self.s.m.i32(8);
-            let straddles = self.s.m.cmp(c, pred::EQ, within, k3);
             if !store {
                 let mask = self.s.m.i8(1);
                 let align = self.s.m.i32(4);
-                let dword = |l: &mut Self, at: V| {
+                let x = self.narrow_load(byte, bits, signed, |l, at| {
                     let r = l.s.op(
                         c,
                         "rawBufferLoad.f32",
@@ -12232,27 +12265,22 @@ impl<'a> Lower<'a> {
                     );
                     let f = l.s.m.extract(c, r, 0);
                     l.as_int(f)
-                };
-                let low = dword(self, aligned);
-                let mut x = self.s.m.bin(c, Bin::LShr, low, shift);
-                if bits == 16 {
-                    let high = dword(self, next);
-                    let high = self.s.m.bin(c, Bin::Shl, high, k8);
-                    let high = self.s.m.select(c, straddles, high, zero);
-                    x = self.s.m.bin(c, Bin::Or, x, high);
-                }
-                x = self.s.m.bin(c, Bin::And, x, ones);
-                if signed {
-                    let up = self.s.m.i32(32 - bits);
-                    x = self.s.m.bin(c, Bin::Shl, x, up);
-                    x = self.s.m.bin(c, Bin::AShr, x, up);
-                }
+                });
                 let Some(Operand::Vector { reg, .. }) = *data else {
                     return Err("a buffer result");
                 };
                 self.write(inst, Reg::V(reg), x, guard);
                 return Ok(());
             }
+            let k3 = self.s.m.i32(3);
+            let within = self.s.m.bin(c, Bin::And, byte, k3);
+            let aligned = self.s.m.bin(c, Bin::Sub, byte, within);
+            let shift = self.s.m.bin(c, Bin::Shl, within, k3);
+            let four = self.s.m.i32(4);
+            let next = self.s.m.bin(c, Bin::Add, aligned, four);
+            let ones = self.s.m.i32(if bits == 8 { 0xff } else { 0xffff });
+            let k8 = self.s.m.i32(8);
+            let straddles = self.s.m.cmp(c, pred::EQ, within, k3);
             let d = data.as_ref().ok_or("buffer store data")?;
             let v = self.vgprs(inst, d, 1)?[0];
             let v = self.s.m.bin(c, Bin::And, v, ones);
