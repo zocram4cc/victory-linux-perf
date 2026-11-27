@@ -217,7 +217,16 @@ fn instruction(code: &[u8], offset: usize) -> Result<Instruction, ShaderError> {
         // Literal constant, SDWA, DPP16, DPP8, DPP8 with fetch-inactive.
         let extra = usize::from(matches!(src0, 0xFF | 0xF9 | 0xFA | 0xE9 | 0xEA));
         match w >> 25 {
-            0x3F => (Encoding::Vop1, (w >> 9) & 0xFF, 1 + extra),
+            0x3F => {
+                let opcode = (w >> 9) & 0xFF;
+                // These VOP1s take no source, so the field is not a literal:
+                // the console's compiler stores a shader hash there, and where
+                // it fell on 0xFF/0xF9/0xFA/0xE9/0xEA the next instruction was
+                // taken for its literal and lost (ZigZagBoi1/ScarlettPort
+                // bc71157, PR #19).
+                let no_source = matches!(opcode, 0x000 | 0x01B | 0x041);
+                (Encoding::Vop1, opcode, if no_source { 1 } else { 1 + extra })
+            }
             0x3E => (Encoding::Vopc, (w >> 17) & 0xFF, 1 + extra),
             op => {
                 let mk_ak = name(Encoding::Vop2, op as u16).is_some_and(|n| {
@@ -376,6 +385,12 @@ mod tests {
         // unsigned, so bit 11 is ignored (0x800 -> 0, 0xfff -> 0x7ff).
         assert_eq!(offset(0xDC30_0800), 0);
         assert_eq!(offset(0xDC30_0FFF), 0x7FF);
+    }
+
+    #[test]
+    fn vop1_without_operands_has_no_extension_word() {
+        assert_eq!(summary(&[0x7E00_00FF, S_ENDPGM]), [(0, 1, "v_nop"), (4, 1, "s_endpgm")]);
+        assert_eq!(summary(&[0x7E00_36FF, S_ENDPGM]), [(0, 1, "v_pipeflush"), (4, 1, "s_endpgm")]);
     }
 
     #[test]
