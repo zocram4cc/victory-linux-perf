@@ -62,3 +62,7 @@ Seen: the intro flickers before the loading screen (the author lists it as known
 - `VICTORY_PLACED_UAV=1` made no difference (its counter never showed); left off.
 - `p4-grow.sh` now judges by screenshots (std ≥ 15) and fps ≥ 5, from scratch.
 - p4-grow tightened after the user's point (many programs are bad for real: worse look, lower fps, flicker): good only if contrast ≥ 15 on three screenshots AND fps ≥ 14 (17-19 without native programs). Flicker still needs the user's eyes.
+
+**P.4: one program turns the picture grey; the other 508 run at 20 fps (27 Nov, ~02:00)**
+- All 542 translatable minus the 33 earlier suspects (509): grey, 19.9 fps. Hunting by screenshot contrast (`p4-hunt.sh`, 9 steps): **`0f01a73b00` alone turns it grey**. With the other 508 made: contrast 69 (a real picture), **20.3 fps** (17-19 without native programs).
+- Still wrong (the user, live): flicker in the intro before the loading screen, half the house missing and artifacts in the first, outdoor view of the house (fine once the view cuts to Jason), and some sets slow there (63 programs: 10 fps). Screenshots after settling miss it: next, compare the world-entry (outdoor) screenshot against plain runs. User notes per run with their program sets: `bench/p4-user-notes.txt`.
