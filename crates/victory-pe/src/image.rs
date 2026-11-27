@@ -416,10 +416,13 @@ fn parse_tls(
         let array = sections
             .pe_data_at(data, array_rva)
             .ok_or_else(|| PeError::Malformed("TLS callback array outside of sections".into()))?;
-        for slot in array.as_chunks::<8>().0.iter().take(MAX_TLS_CALLBACKS) {
+        for slot in array.as_chunks::<8>().0.iter().take(MAX_TLS_CALLBACKS + 1) {
             let va = u64::from_le_bytes(*slot);
             if va == 0 {
                 break;
+            }
+            if callback_rvas.len() == MAX_TLS_CALLBACKS {
+                return Err(PeError::Unsupported("more than 1024 TLS callbacks".into()));
             }
             callback_rvas.push(va_to_rva(va, image_base)?);
         }
@@ -607,6 +610,35 @@ mod tests {
             info.is_ok(),
             "section with zero raw size should be accepted"
         );
+    }
+
+    #[test]
+    fn rejects_tls_callback_array_over_the_limit() {
+        let base = 0x1_8000_0000u64;
+        let mut body = vec![0u8; 0x2200];
+        body[24..32].copy_from_slice(&(base + 0x1100).to_le_bytes());
+        for i in 0..=MAX_TLS_CALLBACKS {
+            let at = 0x100 + i * 8;
+            body[at..at + 8].copy_from_slice(&(base + 0x1080).to_le_bytes());
+        }
+        let mut data = synthetic_image(&body);
+        data.resize(0x2400, 0);
+        data[0x200..0x2400].copy_from_slice(&body);
+        let opt = 0x58;
+        data[opt + 56..opt + 60].copy_from_slice(&0x4000u32.to_le_bytes());
+        let section = opt + 240;
+        data[section + 8..section + 12].copy_from_slice(&0x2200u32.to_le_bytes());
+        data[section + 16..section + 20].copy_from_slice(&0x2200u32.to_le_bytes());
+        let dirs = 0x58 + layout::OPT_DATA_DIRECTORY;
+        data[dirs..dirs + 8].fill(0);
+        let tls = dirs + 9 * layout::DATA_DIRECTORY_SIZE;
+        data[tls..tls + 4].copy_from_slice(&0x1000u32.to_le_bytes());
+        data[tls + 4..tls + 8].copy_from_slice(&40u32.to_le_bytes());
+        assert!(matches!(ImageInfo::parse(&data), Err(PeError::Unsupported(_))));
+        // A terminator immediately after the maximum is valid.
+        let terminator = 0x200 + 0x100 + MAX_TLS_CALLBACKS * 8;
+        data[terminator..terminator + 8].fill(0);
+        assert_eq!(ImageInfo::parse(&data).unwrap().tls.unwrap().callback_rvas.len(), MAX_TLS_CALLBACKS);
     }
 
     #[test]
