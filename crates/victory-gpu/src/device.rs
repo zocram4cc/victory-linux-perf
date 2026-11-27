@@ -400,7 +400,98 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
     if let Some(dir) = std::env::var_os("VICTORY_NATIVE_PSO_DUMP") {
         dump_native(SLOT, desc as usize, std::path::Path::new(&dir));
     }
+    #[cfg(windows)]
+    if SLOT == 0x218 && native_compute_on() {
+        if let Some(container) = native_compute(desc as usize) {
+            let hr = crate::pipeline::create_compute_from(&container, _iid, out);
+            NATIVE_COMPUTE[usize::from(hr < 0)].fetch_add(1, Ordering::Relaxed);
+            if NATIVE_COMPUTE[0].load(Ordering::Relaxed) == 1 && hr >= 0 {
+                tracing::info!("P.4: a 0x218 compute pipeline made from its pieces (VICTORY_NATIVE_COMPUTE)");
+            }
+            return hr;
+        }
+        NATIVE_COMPUTE[2].fetch_add(1, Ordering::Relaxed);
+    }
     E_NOTIMPL
+}
+
+/// P.4 (`VICTORY_NATIVE_COMPUTE=1`): 0x218 pipelines made, refused by the
+/// host, and descriptions not understood.
+pub(crate) static NATIVE_COMPUTE: [std::sync::atomic::AtomicU32; 3] = [const { std::sync::atomic::AtomicU32::new(0) }; 3];
+
+fn native_compute_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NATIVE_COMPUTE").is_some_and(|v| v == "1"))
+}
+
+/// P.4: device method 0x218 describes a compute program the console's
+/// compiler made, as the pieces of an `FSPX` program (the format of an
+/// `ACCC` part, `victory_shader::native::fspx_program`): words (1, 2) the
+/// pipeline registers (0x1c bytes: thread-group size, RSRC1, RSRC2), (3, 4)
+/// the pipeline metadata (0x14: a hash), (5, 6) the GFX10 code (in title
+/// GPU memory), (7, 8) the program metadata (0x403 ...: the resources the
+/// code reads). Put back together as an `FSPX` blob in a container with one
+/// `ACCC` part, it goes the way of any compute container. `None`: a piece
+/// missing, unreadable or of another shape.
+#[cfg(windows)]
+fn native_compute(desc: usize) -> Option<Vec<u8>> {
+    let read = |at: usize, n: usize| -> Option<Vec<u8>> {
+        let mut b = vec![0u8; n];
+        (at != 0 && n > 0 && n <= 1 << 20 && crate::host::read_into(at as *const u8, &mut b)).then_some(b)
+    };
+    let d = read(desc, 0x48)?;
+    let w = |i: usize| u64::from_le_bytes(d[8 * i..8 * i + 8].try_into().unwrap_or([0; 8])) as usize;
+    let packet = read(w(1), w(2))?;
+    let hash = read(w(3), w(4))?;
+    let code = read(w(5), w(6))?;
+    let meta = read(w(7), w(8))?;
+    if packet.len() != 0x1c || meta.get(0..4) != Some(&0x403u32.to_le_bytes()[..]) {
+        return None;
+    }
+    // FSPX: "FSPX", u32 1, u32 entries, u32 size; entries of 16 B (kind,
+    // offset, size, 0); then the pieces, 16-byte aligned.
+    let pieces: [(u32, &[u8]); 4] = [(0, &packet), (1, &hash), (6, &code), (7, &meta)];
+    let mut fspx = vec![0u8; 0x10 + 16 * pieces.len()];
+    let mut table = Vec::new();
+    for (kind, bytes) in pieces {
+        while fspx.len() % 16 != 0 {
+            fspx.push(0);
+        }
+        table.push((kind, fspx.len() as u32, bytes.len() as u32));
+        fspx.extend_from_slice(bytes);
+    }
+    let size = fspx.len() as u32;
+    fspx[0..4].copy_from_slice(b"FSPX");
+    fspx[4..8].copy_from_slice(&1u32.to_le_bytes());
+    fspx[8..12].copy_from_slice(&(pieces.len() as u32).to_le_bytes());
+    fspx[12..16].copy_from_slice(&size.to_le_bytes());
+    for (i, (kind, offset, len)) in table.into_iter().enumerate() {
+        let at = 0x10 + 16 * i;
+        fspx[at..at + 4].copy_from_slice(&kind.to_le_bytes());
+        fspx[at + 4..at + 8].copy_from_slice(&offset.to_le_bytes());
+        fspx[at + 8..at + 12].copy_from_slice(&len.to_le_bytes());
+    }
+    // DXBC: "DXBC", a 16-byte digest (here: the code's FNV-1a, twice), u16
+    // 1, u16 0, u32 total size, u32 1 part, u32 its offset; the part: "ACCC",
+    // u32 size, data.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in code.iter().chain(meta.iter()).chain(packet.iter()) {
+        h = (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3);
+    }
+    let total = 0x24 + 8 + fspx.len();
+    let mut c = Vec::with_capacity(total);
+    c.extend_from_slice(b"DXBC");
+    c.extend_from_slice(&h.to_le_bytes());
+    c.extend_from_slice(&(!h).to_le_bytes());
+    c.extend_from_slice(&1u16.to_le_bytes());
+    c.extend_from_slice(&0u16.to_le_bytes());
+    c.extend_from_slice(&(total as u32).to_le_bytes());
+    c.extend_from_slice(&1u32.to_le_bytes());
+    c.extend_from_slice(&0x24u32.to_le_bytes());
+    c.extend_from_slice(b"ACCC");
+    c.extend_from_slice(&(fspx.len() as u32).to_le_bytes());
+    c.extend_from_slice(&fspx);
+    Some(c)
 }
 
 /// From fxceless/victory-fork (`52ac4ec`), for P.4. `VICTORY_NATIVE_PSO_DUMP=<dir>` (off unless set): the blobs
