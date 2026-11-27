@@ -1525,7 +1525,7 @@ static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
 /// returned. (trustno1 PR #25, after fxceless PR #1336.)
 #[cfg(windows)]
 pub(crate) fn alias_of(this: This) -> Option<Held> {
-    alias_with(this, |other| crate::object::add_ref_alive(other).then_some(Held(other))).flatten()
+    alias_with(this, |other| crate::object::add_ref_alive(other).then(|| Held(other))).flatten()
 }
 
 /// Whether [`alias_of`] would find a texture for `this`, for callers that
@@ -1561,7 +1561,7 @@ impl Drop for Held {
 #[cfg(windows)]
 pub(crate) fn hold(this: This) -> Option<Held> {
     let all = textures();
-    (all.contains(&(this as usize)) && object::add_ref_alive(this)).then_some(Held(this))
+    (all.contains(&(this as usize)) && object::add_ref_alive(this)).then(|| Held(this))
 }
 
 /// The lookup behind [`alias_of`]: `found` runs on the texture while the
