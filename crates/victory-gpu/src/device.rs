@@ -455,12 +455,24 @@ fn native_compute_skipped(desc: usize) -> bool {
             .filter_map(|h| u64::from_str_radix(h.trim().trim_start_matches("0x"), 16).ok())
             .collect()
     });
-    if skip.is_empty() {
+    // `VICTORY_NATIVE_COMPUTE_ONLY=<file>`: only the programs whose code
+    // address is in that file (one hex address a line) are made
+    // (`scripts/p4-hunt.sh` halves the list).
+    static ONLY: std::sync::OnceLock<Option<Vec<u64>>> = std::sync::OnceLock::new();
+    let only = ONLY.get_or_init(|| {
+        let path = std::env::var_os("VICTORY_NATIVE_COMPUTE_ONLY")?;
+        let text = std::fs::read_to_string(path).ok()?;
+        Some(text.lines().filter_map(|h| u64::from_str_radix(h.trim().trim_start_matches("0x"), 16).ok()).collect())
+    });
+    if skip.is_empty() && only.is_none() {
         return false;
     }
     let mut w = [0u8; 0x30];
-    crate::host::read_into(desc as *const u8, &mut w)
-        && skip.contains(&u64::from_le_bytes(w[0x28..0x30].try_into().unwrap_or([0; 8])))
+    if !crate::host::read_into(desc as *const u8, &mut w) {
+        return true;
+    }
+    let code = u64::from_le_bytes(w[0x28..0x30].try_into().unwrap_or([0; 8]));
+    skip.contains(&code) || only.as_ref().is_some_and(|only| !only.contains(&code))
 }
 
 fn native_compute_on() -> bool {
