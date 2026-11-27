@@ -48,7 +48,10 @@ fn documented_switches_are_read() {
     let read = |path: &String| std::fs::read_to_string(root.join(path)).ok();
     let mut documented = BTreeSet::new();
     let mut doc_of = Vec::new();
-    for path in files.iter().filter(|p| p.ends_with(".md")) {
+    // (Not `docs/notes/`: a log of the work, which names switches of builds
+    // long gone; nor `linux/`, whose launcher has switches of its own; nor
+    // the other forks' READMEs kept as they were.)
+    for path in files.iter().filter(|p| p.ends_with(".md") && !p.starts_with("docs/notes/") && !p.starts_with("linux/") && !p.starts_with("docs/README-")) {
         for name in names(&read(path).unwrap_or_default()) {
             doc_of.push((name.clone(), path.clone()));
             documented.insert(name);
