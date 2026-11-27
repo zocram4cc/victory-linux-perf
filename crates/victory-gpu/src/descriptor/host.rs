@@ -4074,9 +4074,10 @@ pub(crate) static TWINS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync:
 /// dispatch read a list of zeros and its trees were not drawn: whole trees
 /// and palms dropped out for single frames while the camera moved (up to
 /// 1,000 such twins a frame in play; avatarmanz PR #437, where the exact
-/// twins ended the flicker). Seen working on AMD (RADV) only there: whether
-/// NVIDIA under vkd3d-proton reads such a view is not yet known here, hence
-/// the switch.
+/// twins ended the flicker). Seen working on AMD (RADV) there; NVIDIA under
+/// vkd3d-proton reads such views from their own dword too, shader and
+/// unordered views alike (`raw_views_off_16_bytes_read_from_their_own_dword`
+/// on the host card). The switch stays for a card that does not.
 fn twin_exact() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_TWIN_EXACT").is_none_or(|v| v != "0"))
@@ -6013,6 +6014,128 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         // Never an empty or wrapped window.
         assert_eq!(exact_window(0, 1, 4), None);
         assert_eq!(exact_window(0, 1, 8), None);
+    }
+
+    /// The host card reads a raw view that begins at a dword not on 16 bytes
+    /// (what `VICTORY_TWIN_EXACT` makes) from that dword, through a shader
+    /// view and an unordered one alike: each of 64 threads reads its dword
+    /// at byte `4 * i` of both views, beginning at dwords 1, 2, 3 and 5 of a
+    /// buffer (4: on 16 bytes, for comparison). D3D12 asks raw views to
+    /// begin on 16 bytes; upstream saw such views read right on AMD only.
+    #[test]
+    fn raw_views_off_16_bytes_read_from_their_own_dword() {
+        const READS: &str = r#"
+#define RS "DescriptorTable(SRV(t0), UAV(u0, numDescriptors=2))"
+ByteAddressBuffer shown : register(t0);
+RWByteAddressBuffer open : register(u0);
+RWByteAddressBuffer written : register(u1);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    written.Store(id.x * 8, shown.Load(id.x * 4));
+    written.Store(id.x * 8 + 4, open.Load(id.x * 4));
+}
+"#;
+        const DWORDS: usize = 1024;
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let code = crate::host::compile(READS, windows::core::s!("main"), windows::core::s!("cs_5_1"))
+            .expect("the test's shader");
+        let (source, filled) = host.shared_buffer(DWORDS as u64 * 4).expect("a buffer");
+        // SAFETY: a mapping of `DWORDS` dwords.
+        unsafe {
+            let filled = std::slice::from_raw_parts_mut(filled.cast::<u32>(), DWORDS);
+            for (i, dword) in filled.iter_mut().enumerate() {
+                *dword = 0x5eed_0000 | i as u32;
+            }
+        }
+        // SAFETY: the shader's own root signature and plain creation calls.
+        let (root, pso) = unsafe {
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &code).expect("a root signature");
+            let pso: ID3D12PipelineState = host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr().cast(), BytecodeLength: code.len() },
+                    ..Default::default()
+                })
+                .expect("a pipeline");
+            (root, pso)
+        };
+        // What the 64 threads read through views beginning at dword `first`:
+        // (shader view, unordered view) each.
+        let read = |first: u64| -> Vec<(u32, u32)> {
+            let heap: ID3D12DescriptorHeap = {
+                let desc = D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 3,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                };
+                // SAFETY: plain heap creation.
+                unsafe { host.device.CreateDescriptorHeap(&desc) }.expect("a view heap")
+            };
+            let (out, result) = host.shared_buffer(64 * 8).expect("a buffer");
+            // SAFETY: views of live buffers in slots of the heap made above;
+            // an open list; `result` maps 64 * 8 bytes.
+            unsafe {
+                std::ptr::write_bytes(result, 0xee, 64 * 8);
+                let start = heap.GetCPUDescriptorHandleForHeapStart();
+                let step = host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
+                let at = |i: usize| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: start.ptr + i * step };
+                let shown = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                    Format: DXGI_FORMAT_R32_TYPELESS,
+                    ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                        Buffer: D3D12_BUFFER_SRV {
+                            FirstElement: first,
+                            NumElements: 64,
+                            StructureByteStride: 0,
+                            Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                        },
+                    },
+                };
+                host.device.CreateShaderResourceView(&source, Some(&shown), at(0));
+                let raw = |first: u64, n: u32| D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                    Format: DXGI_FORMAT_R32_TYPELESS,
+                    ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                    Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                        Buffer: D3D12_BUFFER_UAV {
+                            FirstElement: first,
+                            NumElements: n,
+                            StructureByteStride: 0,
+                            CounterOffsetInBytes: 0,
+                            Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                        },
+                    },
+                };
+                host.device.CreateUnorderedAccessView(&source, None::<&ID3D12Resource>, Some(&raw(first, 64)), at(1));
+                host.device.CreateUnorderedAccessView(&out, None::<&ID3D12Resource>, Some(&raw(0, 128)), at(2));
+                let list = host.new_list().expect("a host list");
+                list.list.SetDescriptorHeaps(&[Some(heap.clone())]);
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetPipelineState(&pso);
+                list.list.SetComputeRootDescriptorTable(0, heap.GetGPUDescriptorHandleForHeapStart());
+                list.list.Dispatch(1, 1, 1);
+                list.close();
+                host.execute(&[&list]);
+                assert!(host.device.GetDeviceRemovedReason().is_ok(), "the device, after views from dword {first}");
+                let result = std::slice::from_raw_parts(result.cast::<u32>(), 128);
+                result.chunks(2).map(|pair| (pair[0], pair[1])).collect()
+            }
+        };
+        let mut wrong = Vec::new();
+        for first in [4u64, 1, 2, 3, 5] {
+            let got = read(first);
+            let want: Vec<(u32, u32)> = (0..64).map(|i| (0x5eed_0000 | (first as u32 + i), 0x5eed_0000 | (first as u32 + i))).collect();
+            eprintln!("raw views from dword {first}: thread 0 read {:#x} (shader view), {:#x} (unordered view)", got[0].0, got[0].1);
+            if got != want {
+                wrong.push(first);
+            }
+        }
+        assert!(wrong.is_empty(), "raw views not read from their own dword, beginning at dwords {wrong:?}");
     }
 
     /// What a slot is made as is made beside the heap and copied in whole: the
