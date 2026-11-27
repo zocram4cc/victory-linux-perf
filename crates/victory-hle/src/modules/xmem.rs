@@ -296,10 +296,13 @@ static WATCHED: Mutex<std::collections::BTreeSet<usize>> = Mutex::new(std::colle
 /// last copy (decision 0007). From the host heap it was memory the GPU side
 /// cannot watch, copied whole at every submission that used it. `None` for
 /// other blocks, an alignment past what a reservation gives, or a refusal:
-/// they come from the host heap.
+/// they come from the host heap. `VICTORY_GRAPHICS_WATCH=0`: every block from
+/// the host heap, as before (to compare the copies and the write-watch
+/// askings with and without).
 fn graphics_block(size: usize, attributes: u64) -> Option<*mut c_void> {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_GRAPHICS_WATCH").is_none_or(|v| v != "0"));
     let align = 1usize << (attributes >> ALIGNMENT_SHIFT & 0x1f).max(4);
-    if attributes >> 16 & 0xff != D3D_ALLOCATOR || size < WATCHED_FROM || align > WATCHED_FROM {
+    if !*ON || attributes >> 16 & 0xff != D3D_ALLOCATOR || size < WATCHED_FROM || align > WATCHED_FROM {
         return None;
     }
     let at = XMemVirtualAlloc(std::ptr::null_mut(), size, MEM_RESERVE | MEM_COMMIT, GRAPHICS, PAGE_READWRITE);
