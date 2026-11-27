@@ -42,6 +42,21 @@ if ($FrameGen) {
     # Measured with frame generation: steadier with the windows in the card's memory through
     # Resizable BAR (99.4 % of seconds at 30+ shown); VICTORY_SKIP_WC_BACK is on by default.
     $settings.VICTORY_WINDOWS_BAR_MB = '4096'
+    # The RX 7900 XT settings every measured frame-generation run used (RYUKI-7900XT's -RX7900XT),
+    # with six list threads (26.7 rendered fps median against 21-23 with four).
+    $ryuki = @{
+        VICTORY_CARD_REHASH_RUNS = '1'; VICTORY_JOIN_COPIES = '1'; VICTORY_INDIRECT_WINDOW = '1'; VICTORY_RELAY_COPY = '1'
+        VICTORY_CARD_STEPS = '2'; VICTORY_INDIRECT_BATCH = '2'; VICTORY_MAP_THREADS = '1'; VICTORY_TITLE_PRIORITIES = '1'
+        VICTORY_CARD_AWAKE = '1'; VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_THIN = '1'; VICTORY_JOIN_PARTS = '16'
+        VICTORY_UPLOAD_AHEAD = '1'; VICTORY_CARD_BUFFERS_MIN_MB = '1'; VICTORY_CARD_BUFFERS_MB = '1536'
+        VICTORY_ROOT_WINDOW_MB = '12'; VICTORY_WINDOW_KB = '1024'; VICTORY_TEXTURE_STAGE_MS = '80'
+        VICTORY_INPLACE = '1'; VICTORY_INPLACE_MB = '3072'; VICTORY_PIPELINE_BOOK = '1'
+        VICTORY_ASK_EARLY = '2'; VICTORY_HEAP_SYNC_EARLY = '1'; VICTORY_JOIN_LISTS = '96'
+        VICTORY_THIN_THREADS = '6'; VICTORY_UNDER_THREADS = '3'; VICTORY_LAND_THREADS = '3'
+        VICTORY_POOL_DISCARD = '1'; VICTORY_FILL_TITLE = '1'; VICTORY_PARTIAL_DELTA = '1'
+        VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_WIDE_BACK = '1'
+    }
+    foreach ($k in $ryuki.Keys) { $settings[$k] = $ryuki[$k] }
     $console = @('--console', 'series-s')
 }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
