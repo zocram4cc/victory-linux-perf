@@ -985,10 +985,10 @@ fn emit_kept_skip(native: &NativeProgram, p: &ir::Program, last: bool) -> (Resul
     let io = io::raise(p, native).expect("io");
     let c = crate::Container { digest: [0; 16], version: (1, 0), parts: Vec::new() };
     let was = lower::TEST_HOST_WAVE.replace(Some(32));
-    super::NO_WIDE_LAST.set(!last);
+    super::TEST_WIDE_LAST.set(Some(last));
     let exact = super::emit_forms(&c, native, p, &st, &io, &res);
     let shader = super::emit(&c, native, p, &st, &io, &res);
-    super::NO_WIDE_LAST.set(false);
+    super::TEST_WIDE_LAST.set(None);
     lower::TEST_HOST_WAVE.set(was);
     (exact, shader)
 }
@@ -1000,8 +1000,8 @@ fn emit_kept_skip(native: &NativeProgram, p: &ir::Program, last: bool) -> (Resul
 /// skipped code set once some lane ran it.
 #[test]
 fn a_program_no_other_form_takes_is_taken_wave_wide_last_of_all() {
-    if !structure::wave_scc() || !super::wave_wide_last() || std::env::var_os("VICTORY_WAVE_WIDE").is_some() {
-        eprintln!("VICTORY_WAVE_SCC=0, VICTORY_WAVE_WIDE_LAST=0 or VICTORY_WAVE_WIDE set; skipped");
+    if !structure::wave_scc() || std::env::var_os("VICTORY_WAVE_WIDE").is_some() {
+        eprintln!("VICTORY_WAVE_SCC=0 or VICTORY_WAVE_WIDE set; skipped");
         return;
     }
     let native = mask_scc_behind_a_kept_skip();
