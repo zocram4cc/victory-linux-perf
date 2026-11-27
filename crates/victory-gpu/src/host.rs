@@ -3953,6 +3953,13 @@ fn late_line(frames: f64) {
 pub(crate) mod aside;
 pub(crate) mod awake;
 mod card_steps;
+
+/// Whether card steps found the title writing a page of `[from, to)` after
+/// the submission that reads it was sent (`VICTORY_CARD_STEPS_LEARN`), for
+/// `crate::shadow`'s `VICTORY_LEARNED_IN_PLACE`.
+pub(crate) fn learned_late(from: usize, to: usize) -> bool {
+    card_steps::learned(from, to)
+}
 #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) mod indirects;
 #[cfg(feature = "diagnostics")]

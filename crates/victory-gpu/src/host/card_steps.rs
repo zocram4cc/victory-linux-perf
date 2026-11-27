@@ -83,6 +83,14 @@ pub(super) fn stage() -> u32 {
     })
 }
 
+/// `VICTORY_LEARNED_ON_CARD=1` (off by default): fills of learned places
+/// ([`late`]) done on the card from the title's memory in place, not waited
+/// for (see [`Host::take_steps`]).
+fn learned_on_card() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LEARNED_ON_CARD").is_some_and(|v| v == "1"))
+}
+
 /// Whether a copy at its place in a list ([`place`]) is only in the way of
 /// what is done on the card in front of the lists if that stands behind it in
 /// them (`VICTORY_PLACED_ORDER=1`; off: wherever it stands), and a
@@ -774,21 +782,41 @@ mod late {
     }
 
     fn learn(from: usize, to: usize, by: &str) {
-        let mut pages = PAGES.lock().unwrap_or_else(|e| e.into_inner());
-        let pages = pages.get_or_insert_with(Default::default);
-        for page in from / PAGE..to.div_ceil(PAGE) {
-            if pages.insert(page) {
-                COUNTS[3].fetch_add(1, Ordering::Relaxed);
-                tracing::info!(
-                    page = format_args!("{:#x}", page * PAGE),
-                    fill = format_args!("{from:#x}+{:#x}", to - from),
-                    by,
-                    "card steps: the title wrote a constant buffer after the submission that reads it was sent; fills \
-                     there wait from now on"
-                );
+        let mut new = false;
+        {
+            let mut pages = PAGES.lock().unwrap_or_else(|e| e.into_inner());
+            let pages = pages.get_or_insert_with(Default::default);
+            for page in from / PAGE..to.div_ceil(PAGE) {
+                if pages.insert(page) {
+                    new = true;
+                    COUNTS[3].fetch_add(1, Ordering::Relaxed);
+                    tracing::info!(
+                        page = format_args!("{:#x}", page * PAGE),
+                        fill = format_args!("{from:#x}+{:#x}", to - from),
+                        by,
+                        "card steps: the title wrote a constant buffer after the submission that reads it was sent; fills \
+                         there wait from now on"
+                    );
+                }
+            }
+        }
+        // `VICTORY_LEARNED_IN_PLACE`: the host copies over the place go, and
+        // the next ask makes them in place (the card then reads the title's
+        // bytes when the draws run: no fill, no wait). After the pages' lock:
+        // making a copy asks `written` under the buffers' lock.
+        if new {
+            let gone = crate::shadow::learned_retire(from as u64, to as u64);
+            if gone > 0 {
+                tracing::info!(fill = format_args!("{from:#x}+{:#x}", to - from), gone, "card steps: host copies over a learned place let go, to be made in place (VICTORY_LEARNED_IN_PLACE)");
             }
         }
     }
+}
+
+/// Whether the title was found writing a page of `[from, to)` after sending
+/// ([`late`]), for `crate::host::learned_late`.
+pub(super) fn learned(from: usize, to: usize) -> bool {
+    late::written(from, to)
 }
 
 /// A submission that reads places the title writes after sending ([`late`])
@@ -1149,11 +1177,23 @@ impl Host {
         // done now too, not after the wait ([`late`]). With the gate such a
         // fill stays on the CPU and is done again when the gate opens.
         let mut gated: Vec<gate::Fill> = Vec::new();
+        // `VICTORY_LEARNED_ON_CARD=1` (off by default): a fill of a learned
+        // place is done on the card all the same, reading the title's memory
+        // through a view of ours in place (`crate::shadow::in_place_block`):
+        // the copy runs when the card reaches the submission, after the
+        // title's late write, as the console's draws read it then. No wait,
+        // and only those few hundred bytes cross the bus. Its bytes are still
+        // read back and compared at landing (`late`: "found written again").
+        let mut learned: std::collections::HashSet<usize> = std::collections::HashSet::new();
         if late::on() {
             let gate = gate::on();
             for (k, d) in does.iter_mut().enumerate() {
                 let Does::Fill { src, len, asked, to } = d else { continue };
                 if !late::written(*src, *src + *len) {
+                    continue;
+                }
+                if learned_on_card() && *to && crate::shadow::in_place_block(*src as u64, *len as u64).is_some() {
+                    learned.insert(k);
                     continue;
                 }
                 if !gate {
@@ -1221,12 +1261,17 @@ impl Host {
             if len == 0 {
                 return Err("nothing to read");
             }
-            let from = match held.get(&(src, len)) {
-                Some(from) => from.clone(),
-                None => {
-                    let from = holder(&writers, src, src + len)?;
-                    held.insert((src, len), from.clone());
-                    from
+            let from = if learned.contains(&i) {
+                // `VICTORY_LEARNED_ON_CARD`: the title's memory itself.
+                crate::shadow::in_place_block(src as u64, len as u64).ok_or("no view in place of a learned place")?
+            } else {
+                match held.get(&(src, len)) {
+                    Some(from) => from.clone(),
+                    None => {
+                        let from = holder(&writers, src, src + len)?;
+                        held.insert((src, len), from.clone());
+                        from
+                    }
                 }
             };
             let place = (Arc::as_ptr(&from) as usize, src, len, level);

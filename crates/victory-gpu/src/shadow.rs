@@ -5154,8 +5154,150 @@ pub(crate) fn extent(address: u64) -> Option<(u64, u64)> {
 /// given up: what is in place there (`crate::inplace`) is taken out of the
 /// tables, so that the next ask makes a copy or opens the memory anew, and
 /// goes when no list and no slot holds it any more. Returns how many.
+/// `VICTORY_LEARNED_IN_PLACE=1` (off by default): title buffers and windows
+/// over a place card steps found the title writing after the submission that
+/// reads it was sent (`VICTORY_CARD_STEPS_LEARN`) are made in place, when
+/// their memory is private memory committed whole. The card then reads the
+/// title's bytes when the draws run, as the console does, and renderer port
+/// 5 reads such constant buffers in place: no fill on the CPU, and no wait
+/// for the flights ahead before it (some 18 ms a frame in the opening cell,
+/// 2026-11-27: four constant buffers of 0xb0 to 0x340 bytes in a 2.4 GB
+/// private block).
+pub(crate) fn learned_in_place() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LEARNED_IN_PLACE").is_some_and(|v| v == "1"))
+}
+
+/// [`learned_in_place`]: card steps just learned `[from, to)`. The host
+/// copies of the buffers and windows over it are taken out of the tables
+/// (they go when no list and no slot holds them), so the next ask makes
+/// them anew, in place ([`placed_learned`]). Returns how many.
+pub(crate) fn learned_retire(from: u64, to: u64) -> u64 {
+    if !learned_in_place() {
+        return 0;
+    }
+    let mut gone: Vec<Arc<Shadow>> = Vec::new();
+    {
+        let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        let keys: Vec<(u64, u64)> = map
+            .range((from.saturating_sub(WINDOW), 0)..(to, 0))
+            .filter(|(key, shadow)| shadow.place.is_none() && key.0 + key.1 > from)
+            .map(|(key, _)| *key)
+            .collect();
+        gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
+    }
+    {
+        let mut map = buffers();
+        for (_, entry) in map.range_mut(..(to, 0)).rev().take(256) {
+            if entry.end > from && entry.shadow.as_ref().is_some_and(|s| s.place.is_none()) {
+                gone.extend(entry.shadow.take());
+            }
+        }
+    }
+    let n = gone.len() as u64;
+    for shadow in gone {
+        crate::host::retire(shadow);
+    }
+    n
+}
+
+/// [`learned_in_place`]: `[start, start + len)` in place if it holds a
+/// learned page and is private memory committed whole.
+fn placed_learned(start: u64, len: u64) -> Option<crate::inplace::Placed> {
+    if !learned_in_place() || !crate::host::learned_late(start as usize, start.saturating_add(len) as usize) {
+        return None;
+    }
+    let host = host()?;
+    match crate::inplace::place_part(&host.device, start, len) {
+        Ok(placed) => {
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 32 || n.is_power_of_two() {
+                tracing::info!(start = format_args!("{start:#x}"), len, n, "learned place in place: the card reads the title's bytes when the draws run (VICTORY_LEARNED_IN_PLACE)");
+            }
+            Some(placed)
+        }
+        Err(e) => {
+            static N: AtomicU64 = AtomicU64::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 8 {
+                tracing::warn!(start = format_args!("{start:#x}"), len, error = ?e.map(|e| e.to_string()), "learned place not in place (not private memory committed whole, or the host refused): a copy as before");
+            }
+            None
+        }
+    }
+}
+
+/// Views in place of the 64 KiB blocks of learned places
+/// (`VICTORY_LEARNED_ON_CARD`), by block start and end.
+static BLOCKS: std::sync::Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = std::sync::Mutex::new(BTreeMap::new());
+/// How many [`BLOCKS`] there are, read without the lock.
+static BLOCK_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Whether any learned block is in place.
+pub(crate) fn any_in_place_blocks() -> bool {
+    BLOCK_COUNT.load(Ordering::Relaxed) > 0
+}
+
+/// The learned blocks in place that meet `[from, to)`, in order (bytes).
+pub(crate) fn learned_blocks_in(from: usize, to: usize) -> Vec<(usize, usize)> {
+    let blocks = BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    blocks
+        .keys()
+        .filter(|(s, e)| (*s as usize) < to && (*e as usize) > from)
+        .map(|&(s, e)| (s as usize, e as usize))
+        .collect()
+}
+
+/// Whether `at` lies in a learned block in place.
+pub(crate) fn in_learned_block(at: usize) -> bool {
+    let at = at as u64;
+    let blocks = BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    blocks.range(..=(at, u64::MAX)).next_back().is_some_and(|((s, e), _)| *s <= at && at < *e)
+}
+
+/// A view in place of the 64 KiB blocks holding `[src, src + len)`, made
+/// once, if that memory is private memory committed whole (card steps read
+/// a learned place's bytes through it when the card runs the copy). `None`
+/// if it cannot be opened.
+pub(crate) fn in_place_block(src: u64, len: u64) -> Option<Arc<Shadow>> {
+    let start = src & !0xffff;
+    let end = src.saturating_add(len.max(1)).next_multiple_of(0x1_0000);
+    let mut blocks = BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, shadow)) = blocks.range(..=(start, u64::MAX)).next_back().filter(|((s, e), _)| *s <= start && end <= *e) {
+        return Some(shadow.clone());
+    }
+    let host = host()?;
+    match crate::inplace::place_part(&host.device, start, end - start) {
+        Ok(placed) => {
+            let shadow = Arc::new(Shadow::placed(placed, start, end - start, true));
+            tracing::info!(start = format_args!("{start:#x}"), bytes = end - start, "a learned place's block in place: card steps read the title's bytes when the card runs them (VICTORY_LEARNED_ON_CARD)");
+            blocks.insert((start, end), shadow.clone());
+            BLOCK_COUNT.store(blocks.len() as u64, Ordering::Relaxed);
+            Some(shadow)
+        }
+        Err(e) => {
+            static N: AtomicU64 = AtomicU64::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 8 {
+                tracing::warn!(start = format_args!("{start:#x}"), error = ?e.map(|e| e.to_string()), "a learned place's block not in place: its fills wait as before");
+            }
+            None
+        }
+    }
+}
+
 pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     let end = at.saturating_add(len);
+    // Views in place of learned blocks over the memory go too.
+    {
+        let mut blocks = BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
+        let keys: Vec<(u64, u64)> = blocks.keys().filter(|(s, e)| *s < end && *e > at).copied().collect();
+        for key in keys {
+            if let Some(shadow) = blocks.remove(&key) {
+                crate::host::retire(shadow);
+            }
+        }
+        BLOCK_COUNT.store(blocks.len() as u64, Ordering::Relaxed);
+    }
     let mut gone: Vec<Arc<Shadow>> = Vec::new();
     {
         let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
@@ -5278,7 +5420,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         let big = cards() && (size >= card_limits().0 || card_all());
         // Renderer port 1 (`crate::port`, `VICTORY_PORT_CONSTANTS=1`): the
         // title's 32-bit graphics heap in place, big or not.
-        if let Some(placed) = crate::port::place_for(key.0, len, false) {
+        if let Some(placed) = crate::port::place_for(key.0, len, false).or_else(|| placed_learned(key.0, len)) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
@@ -5703,7 +5845,10 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     }
     // In place, if asked for and the window's memory can be opened: the
     // window is the title's own memory, with nothing to copy.
-    if let Some(placed) = crate::port::place_for(start, len, true).or_else(|| crate::inplace::place_for(start, len, true)) {
+    if let Some(placed) = crate::port::place_for(start, len, true)
+        .or_else(|| placed_learned(start, len))
+        .or_else(|| crate::inplace::place_for(start, len, true))
+    {
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
         note(&shadow);
         map.insert((start, len), shadow.clone());

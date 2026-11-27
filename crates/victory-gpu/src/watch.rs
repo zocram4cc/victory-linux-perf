@@ -667,6 +667,19 @@ fn no_reset() -> bool {
 /// neighbours at a time.
 fn reset_found(found: &[usize]) {
     use windows_sys::Win32::System::Memory::ResetWriteWatch;
+    // Pages of learned places read in place by the card
+    // (`crate::shadow::in_place_block`, `VICTORY_LEARNED_ON_CARD`) are never
+    // reset: under Wine a reset write-protects them again, and the driver,
+    // which holds them as a user pointer, then waits for the card and checks
+    // them again at every submission (6-7 fps, 2026-11-27). They stay
+    // "written" at every asking (64 KiB each: copied again each time).
+    let kept: Vec<usize>;
+    let found = if crate::shadow::any_in_place_blocks() {
+        kept = found.iter().copied().filter(|&at| !crate::shadow::in_learned_block(at)).collect();
+        &kept[..]
+    } else {
+        found
+    };
     let mut i = 0;
     while i < found.len() {
         let mut k = i + 1;
@@ -706,10 +719,40 @@ fn spread_each<T: Send>(n: usize, each: impl Fn(usize) -> T + Sync) -> Vec<T> {
     out.into_iter().filter_map(|m| m.into_inner().unwrap_or_else(|e| e.into_inner())).collect()
 }
 
+/// [`kernel_written_range`], asked around the blocks of learned places in
+/// place (`crate::shadow::in_place_block`, `VICTORY_LEARNED_ON_CARD`): those
+/// are never asked with a reset, which under Wine write-protects them again
+/// and makes the driver, holding them as a user pointer, wait for the card
+/// and check them at every submission (6-7 fps, 2026-11-27). They are
+/// answered as written, every page part of them, at every asking.
+fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
+    if !crate::shadow::any_in_place_blocks() {
+        return kernel_written_range(first, last);
+    }
+    let holes = crate::shadow::learned_blocks_in(first * PAGE, last * PAGE);
+    if holes.is_empty() {
+        return kernel_written_range(first, last);
+    }
+    let mut pages: Vec<(usize, u16)> = Vec::new();
+    let mut at = first;
+    for (from, to) in holes {
+        let (from, to) = ((from / PAGE).max(at), to.div_ceil(PAGE).min(last));
+        if at < from {
+            pages.extend(kernel_written_range(at, from)?);
+        }
+        pages.extend((from..to).map(|page| (page, u16::MAX)));
+        at = at.max(to);
+    }
+    if at < last {
+        pages.extend(kernel_written_range(at, last)?);
+    }
+    Some(pages)
+}
+
 /// The pages of `[first, last)` the kernel says were written since it was
 /// last asked, in order, each once, with their written parts; `None` if the range is not write-watched
 /// memory of one reservation. The caller holds the range ([`Asking`]).
-fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
+fn kernel_written_range(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     FOUND.with(|found| {
