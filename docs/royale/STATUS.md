@@ -72,7 +72,7 @@ Moving into new areas: 2-6 fps for a few seconds while the title streams (its ma
 
 ## 8. Open threads, in order
 
-1. **P.4 0x218**: find the systematic binding fault offline (compare with a regular container holding the same code, or check one small program by hand); then the translator's "two computed terms" (1,366 programs).
+1. **P.4 0x218**: translator coverage of whole families (30 families by root signature, 2 translate whole); first "an address with two computed terms" (1,366 programs). Offline with `p4_fspx`; in game only whole families. (Programs that translate run fine; partial chains break the picture.)
 2. **P.4 0x1c8** (graphics): decode the header and per-stage metadata against FSSM's records; same approach (rebuild a container the existing path takes).
 3. **Streaming flicker**: Belobug's texture uploads in the submission prelude (`5d6bd84`, "fix frame-order & flickering") are a candidate to port and measure.
 4. **The author's three fixes** (known_holes under Wine, PORT_DESCRIPTORS with port 1, COPY_COMPARE on BAR) once he pushes them: merge and measure.
