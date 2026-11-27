@@ -7,6 +7,13 @@
 //! submission declares shader writes to such a copy, the pages of the
 //! declared ranges are made read-only right after the submission's refreshes
 //! took title memory, and stay so until the first landing of the copy begins.
+//! Pages the write watch's guards hold (memory the kernel cannot write-watch:
+//! a copy leaves each 64 KiB block it took read-only, and their handler takes
+//! the first write) are not touched: their faults are looked at instead, a
+//! block at a time ([`guard_fault`]). The line of each flight says how many
+//! pages were made read-only, how many blocks were left to the guards, and
+//! why any others were left (not committed, another protection, held by
+//! another flight): a watch that watches nothing says so.
 //! The first write of the title's into each such page faults here: the thread,
 //! the code address (module and offset), the address written and the 16 bytes
 //! there before are noted, the page is made writable again, and the thread goes
@@ -115,9 +122,78 @@ struct Armed {
     fences: u64,
     sent: bool,
     pages: std::collections::BTreeSet<usize>,
-    /// Pages left writable: another protection than read-write was found.
-    skipped: usize,
+    /// The 64 KiB blocks of the declared ranges the guards of `crate::watch`
+    /// hold: their faults tell the title's first write after a refresh took
+    /// the block ([`guard_fault`]). Each block is told once.
+    guarded: std::collections::BTreeSet<usize>,
+    /// Pages left alone, and why.
+    left: Left,
     caught: Vec<Caught>,
+}
+
+/// What a page of a declared range is to the watch.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PageIs {
+    /// Read-write and not the guards': made read-only here.
+    Ours,
+    /// The guards': their fault is looked at.
+    Guarded,
+    /// Not committed.
+    Absent,
+    /// Committed with another protection than read-write, and not the
+    /// guards' (a protection of someone else's).
+    Other,
+}
+
+/// Pages left alone, by why.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) struct Left {
+    pub(crate) absent: usize,
+    pub(crate) other: usize,
+    /// Held by another flight of the copy already.
+    pub(crate) held: usize,
+}
+
+/// The pages of `ranges` (title addresses) the watch makes read-only, the
+/// 64 KiB blocks it looks at the guards' faults for, and the pages left, by
+/// `is`, which says what a page is.
+pub(crate) fn plan(
+    ranges: &[(usize, usize)],
+    is: impl Fn(usize) -> PageIs,
+) -> (std::collections::BTreeSet<usize>, std::collections::BTreeSet<usize>, Left) {
+    let (mut ours, mut guarded, mut left) = (std::collections::BTreeSet::new(), std::collections::BTreeSet::new(), Left::default());
+    for &(from, to) in ranges {
+        let mut at = from / PAGE * PAGE;
+        while at < to {
+            match is(at) {
+                PageIs::Ours => drop(ours.insert(at)),
+                PageIs::Guarded => drop(guarded.insert(at / crate::watch::PAGE)),
+                PageIs::Absent => left.absent += 1,
+                PageIs::Other => left.other += 1,
+            }
+            at += PAGE;
+        }
+    }
+    (ours, guarded, left)
+}
+
+/// What the page at `at` is now.
+fn page_is(at: usize) -> PageIs {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQuery};
+    if crate::watch::guards_any(at, PAGE) {
+        return PageIs::Guarded;
+    }
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    if n == 0 || info.State != MEM_COMMIT {
+        PageIs::Absent
+    } else if info.Protect == PAGE_READWRITE {
+        PageIs::Ours
+    } else {
+        PageIs::Other
+    }
 }
 
 static ARMED: Mutex<Vec<Armed>> = Mutex::new(Vec::new());
@@ -141,15 +217,6 @@ fn protect(at: usize, len: usize, readonly: bool) -> bool {
     unsafe { VirtualProtect(at as *const _, len, if readonly { PAGE_READONLY } else { PAGE_READWRITE }, &mut old) != 0 }
 }
 
-fn read_write(at: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQuery};
-    // SAFETY: plain data filled in by the query.
-    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: a valid out pointer of the right size.
-    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
-    n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE
-}
-
 /// After a submission's refreshes, before its lists go to the card: of the
 /// copies watched, the declared ranges (title addresses) are made read-only.
 pub(crate) fn arm(copy: u64, ranges: &[(usize, usize)], submission: u64) {
@@ -157,19 +224,7 @@ pub(crate) fn arm(copy: u64, ranges: &[(usize, usize)], submission: u64) {
         return;
     }
     install();
-    let mut pages = std::collections::BTreeSet::new();
-    let mut skipped = 0;
-    for &(from, to) in ranges {
-        let mut at = from / PAGE * PAGE;
-        while at < to {
-            if crate::watch::guards_any(at, PAGE) || !read_write(at) {
-                skipped += 1;
-            } else if protect(at, PAGE, true) {
-                pages.insert(at);
-            }
-            at += PAGE;
-        }
-    }
+    let (mut pages, guarded, mut left) = plan(ranges, page_is);
     let mut armed = ARMED.lock().unwrap_or_else(|e| e.into_inner());
     // A flight of the copy that never landed (its shaders changed nothing)
     // gives its pages back after two seconds.
@@ -184,8 +239,11 @@ pub(crate) fn arm(copy: u64, ranges: &[(usize, usize)], submission: u64) {
     }
     // Pages another flight of the copy holds already stay with it.
     for a in armed.iter().filter(|a| a.copy == copy) {
+        let before = pages.len();
         pages.retain(|p| !a.pages.contains(p));
+        left.held += before - pages.len();
     }
+    pages.retain(|&p| protect(p, PAGE, true));
     armed.push(Armed {
         copy,
         submission,
@@ -193,7 +251,8 @@ pub(crate) fn arm(copy: u64, ranges: &[(usize, usize)], submission: u64) {
         fences: FENCES.load(Ordering::Relaxed),
         sent: false,
         pages,
-        skipped,
+        guarded,
+        left,
         caught: Vec::new(),
     });
     ANY.store(true, Ordering::Release);
@@ -249,8 +308,12 @@ fn say(a: Armed) {
     tracing::info!(
         copy = format_args!("{:#x}", a.copy),
         submission = a.submission,
-        pages_read_only = a.pages.len(),
-        pages_left = a.skipped,
+        watching = if a.pages.is_empty() && a.guarded.is_empty() { "NOTHING: every page left" } else { "yes" },
+        pages_read_only_here = a.pages.len(),
+        blocks_by_the_guards = a.guarded.len(),
+        left_not_committed = a.left.absent,
+        left_other_protection = a.left.other,
+        left_held_by_another_flight = a.left.held,
         caught = a.caught.len(),
         before_lists_sent = before_sent,
         after_a_fence_set = after_fence,
@@ -349,6 +412,38 @@ fn caught(at: usize, rip: usize) -> bool {
     true
 }
 
+/// The guards of `crate::watch` took a write of the title's at `at` from
+/// code at `rip` to a block they held, and opened it (the write has not
+/// happened yet). Noted if a flight of a watched copy declared that block:
+/// once a block and flight.
+pub(crate) fn guard_fault(at: usize, rip: usize) {
+    if !ANY.load(Ordering::Acquire) {
+        return;
+    }
+    let block = at / crate::watch::PAGE;
+    let mut armed = ARMED.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(a) = armed.iter_mut().find(|a| a.guarded.contains(&block)) else {
+        return;
+    };
+    a.guarded.remove(&block);
+    let page = at / PAGE * PAGE;
+    let from = at.min(page + PAGE - 16);
+    let mut before = [0u8; 16];
+    crate::host::read_into(from as *const u8, &mut before);
+    if a.caught.len() < 256 {
+        a.caught.push(Caught {
+            // SAFETY: no arguments.
+            thread: unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() },
+            rip,
+            at: from,
+            before,
+            sent: a.sent,
+            fences: FENCES.load(Ordering::Relaxed) - a.fences,
+            after_us: a.since.elapsed().as_micros() as u64,
+        });
+    }
+}
+
 fn install() {
     use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
     use windows_sys::Win32::System::Diagnostics::Debug::{
@@ -412,6 +507,31 @@ mod tests {
         // A new window: the first line says how many were left out.
         assert_eq!(l.may(t + std::time::Duration::from_secs(6)), Some(2));
         assert_eq!(l.may(t + std::time::Duration::from_secs(6)), Some(0));
+    }
+
+    /// A copy the write watch's guards hold whole is still watched: through
+    /// their faults, a block at a time (the first run of the watch left
+    /// every page of 0xbffa40000 alone and caught nothing).
+    #[test]
+    fn a_copy_the_guards_hold_is_watched_through_their_faults() {
+        let block = crate::watch::PAGE;
+        let from = 0xbffa40000usize;
+        let to = from + 0x1900000;
+        let (ours, guarded, left) = plan(&[(from, to)], |_| PageIs::Guarded);
+        assert!(ours.is_empty());
+        assert_eq!(guarded.len(), 0x1900000 / block, "every block of the range");
+        assert_eq!(left, Left::default());
+        assert!(!guarded.is_empty(), "a dead watch: nothing armed on a copy the guards hold");
+        // Mixed: ours, the guards', absent, another protection.
+        let (ours, guarded, left) = plan(&[(from + 100, from + 4 * PAGE)], |at| match (at - from) / PAGE {
+            0 => PageIs::Ours,
+            1 => PageIs::Guarded,
+            2 => PageIs::Absent,
+            _ => PageIs::Other,
+        });
+        assert_eq!(ours.into_iter().collect::<Vec<_>>(), [from]);
+        assert_eq!(guarded.into_iter().collect::<Vec<_>>(), [(from + PAGE) / block]);
+        assert_eq!((left.absent, left.other), (1, 1));
     }
 
     #[test]

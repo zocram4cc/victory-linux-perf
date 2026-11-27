@@ -4134,6 +4134,12 @@ pub(crate) fn install() {
                     }
                 }
                 drop(g);
+                // Diagnostics: a write of the title's a flight watch may be
+                // looking for (`crate::flightwatch`); it has not happened yet.
+                #[cfg(feature = "diagnostics")]
+                if ours.is_none() {
+                    crate::flightwatch::guard_fault(at, r.ExceptionAddress as usize);
+                }
                 #[cfg(feature = "diagnostics")]
                 {
                     crate::copystat::add(crate::copystat::C::GuardFaults, 1);
