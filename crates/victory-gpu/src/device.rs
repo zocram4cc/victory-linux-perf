@@ -434,6 +434,11 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
                 return E_NOTIMPL;
             }
             let hr = crate::pipeline::create_compute_from(&container, _iid, out);
+            if hr >= 0 && !out.is_null() && std::env::var_os("VICTORY_NATIVE_DESC_TRACE").is_some() {
+                // SAFETY: the description's word 5 (the code address, the dump's name).
+                let code = unsafe { *(desc as *const u64).add(5) };
+                tracing::info!(pipeline = format_args!("{:#x}", unsafe { *out } as usize), "P.4 made program {code:016x}");
+            }
             NATIVE_COMPUTE[usize::from(hr < 0)].fetch_add(1, Ordering::Relaxed);
             if NATIVE_COMPUTE[0].load(Ordering::Relaxed) == 1 && hr >= 0 {
                 tracing::info!("P.4: a 0x218 compute pipeline made from its pieces (VICTORY_NATIVE_COMPUTE)");

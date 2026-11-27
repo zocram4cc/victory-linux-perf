@@ -1548,6 +1548,39 @@ impl State {
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
+        // P.4 (`VICTORY_NATIVE_DESC_TRACE=N`): for the first N bindings of
+        // pipelines made from 0x218's pieces, the first descriptors of each
+        // table they are given, read from the heap (dwords 0-1: the base
+        // address of a texture or buffer). Which texture the culling reads
+        // and which the depth-pyramid builders write (docs/royale/p4-house-bug.md).
+        if compute && crate::pipeline::is_native(self.pipeline) {
+            static LEFT: std::sync::OnceLock<std::sync::atomic::AtomicU32> = std::sync::OnceLock::new();
+            let left = LEFT.get_or_init(|| {
+                std::sync::atomic::AtomicU32::new(std::env::var("VICTORY_NATIVE_DESC_TRACE").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+            });
+            if left.load(Ordering::Relaxed) > 0 && left.fetch_sub(1, Ordering::Relaxed) > 0 && self.heaps[0] != 0 {
+                let heap = crate::descriptor::heap(self.heaps[0] as This);
+                let (lo, hi) = (heap.start, heap.start + u64::from(heap.desc.count) * 32);
+                let mut text = String::new();
+                for (slot, root) in self.compute.iter().enumerate() {
+                    if let Root::Table(at) = *root {
+                        text += &format!(" t{slot}@{at:#x}:");
+                        for k in 0..12u64 {
+                            let a = at + 32 * k;
+                            if a < lo || a + 32 > hi {
+                                break;
+                            }
+                            // SAFETY: inside the bound heap's descriptors.
+                            let d = unsafe { std::slice::from_raw_parts(a as *const u32, 8) };
+                            text += &format!(" [{k}]{:08x}.{:08x}.{:08x}.{:08x}", d[0], d[1], d[2], d[3]);
+                        }
+                    } else if let Root::Constants(c) = root {
+                        text += &format!(" c{slot}:{c:x?}");
+                    }
+                }
+                tracing::info!(pipeline = format_args!("{:#x}", self.pipeline), "P.4 desc trace:{text}");
+            }
+        }
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
         if crate::host::walls_trace() {

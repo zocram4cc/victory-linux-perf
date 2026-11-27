@@ -134,3 +134,23 @@ Before step 17 that stopped translation ("a descriptor outside the heaps"). **St
   3. **The culling reads a different texture** (not the one these build). To be settled by the descriptor: log the console address of the culling's table + 0x40 view and of the builders' UAVs in one frame (a trace in the layer's binding of native pipelines).
   4. **Our read is wrong after all**, for a case the analysis missed (the view's first mip, array slice, or the level rounding when `v21` is not an integer).
 - What the forced reads already tell: **0 → correct picture**. The pyramid's real contents make things "occluded" that are not, i.e. they hold nearer depths than the real scene: stale (an earlier camera), a buffer cleared to near, or a wrong texture.
+
+## Descriptor trace (27 Nov, 18:10): `VICTORY_NATIVE_DESC_TRACE=N`
+
+- **New switches in the layer:**
+  - `draw::bind` logs, for the first N bindings of native compute pipelines, the first 12 32-byte entries of each table root and the root constants;
+  - `device.rs` logs `P.4 made program <code address> pipeline=<object>` for each native pipeline, so trace lines can be matched to programs.
+
+  Run: `bench/k-…-cull-desc-trace` (the culling + the two builders).
+- **The two builders (`226300` → `0x1d15a3c0`, `226600` → `0x1d259290`) were made but never bound in that scene.** So they are not this pass's pyramid builder; the pyramid is built by something else (a program we do not run, or a graphics pass).
+- **The culling's table** (s4, e.g. `t0@0xd989ce0`) holds, at its first entries:
+  - [0] and [1]: `45495676.<address in the heap>.…`
+  - **[2] (table + 0x40, the pyramid the culling gathers from): `45495676.0000010e.00000001` in every binding**
+  - [3] `….00000054/56`, [4] `….00000057/58/59`
+  - from [5] on, plain data (floats, constants)
+
+  So the table is title memory mixing descriptor records and data. Entry [2] is the same record every frame (`0x10e`): **the pyramid is one fixed view, heap slot or object id 0x10e**.
+- **Next:**
+  1. Resolve `0x10e` in the layer to the host resource it names (the view's resource object).
+  2. Log which dispatch or draw writes that resource each frame (a UAV or render-target binding of it).
+  3. If no pass we run writes it, find its builder among the untranslated programs (by its UAV) and make that translate, or keep the culling off until it does.
