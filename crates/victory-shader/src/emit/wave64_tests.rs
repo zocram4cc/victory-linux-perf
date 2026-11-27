@@ -1507,3 +1507,33 @@ fn a_dpp_row_mask_of_a_wave64_program_tests_the_console_rows() {
         eprintln!("ran on the hardware device (crossing {crossing}): the row mask over the console rows");
     }
 }
+
+/// On the card, a console wave64 program of 64 threads whose only cross-lane code stays in
+/// 32-lane halves (a quad DPP) and which reads the first lane of t + 5: every thread stores
+/// 5, the value of console lane 0 (the ISA's definition of `v_readfirstlane_b32`: the lowest
+/// lane in EXEC, here all 64; this project's model of the console, not a measurement). Run as
+/// two host waves that do not exchange, lanes 32..63 read their host wave's first lane, 37
+/// (`VICTORY_FIRSTLANE_CROSSES=0`).
+#[test]
+fn a_first_lane_read_of_a_wave64_program_reads_console_lane_0() {
+    let native = native(&[
+        0x7E0C_02FA, // v_mov_b32 v6, v0 quad_perm:[0,1,2,3]
+        0xFF00_E400,
+        0x4A02_0085, // v_add_nc_u32 v1, 5, v0
+        0x7E28_0501, // v_readfirstlane_b32 s20, v1
+        0x7E06_0214, // v_mov_b32 v3, s20
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0xE070_1000,
+        0x8002_0302, // buffer_store_dword v3, v2, s[8:11], 0 offen
+    ]);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(got) = words_on_the_card(&shader, 0, 64, 1) else { return };
+    let wrong = got.iter().filter(|&&w| w != 5).count();
+    assert_eq!(got, vec![5; 64], "{wrong} of 64 threads read another first lane");
+    eprintln!("ran on the hardware device: console lane 0's value in all 64 threads");
+}

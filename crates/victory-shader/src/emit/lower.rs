@@ -1613,7 +1613,26 @@ impl<'a> Lower<'a> {
             // masks), nor when LDS may be shared within the console wave without barriers (a
             // group over 32 threads with LDS): those still need 64-lane waves.
             if wave == 64 && host_max_wave() == 32 && (console_lanes || one_wave && s.lds_dwords > 0) {
-                let crosses = insts().any(|i| {
+                // A first-lane read of a value the lanes may hold differently: the console's
+                // first lane may be in the other host wave (not a waterfall loop's read, whose
+                // dword is each lane's own; bonaza's audit D3, VIctory PR #192).
+                let varying_first = super::firstlane_crosses() && {
+                    let same = all_lane_blocks(x.st).map(|all| lane_uniform(p, x.st, &all, false));
+                    insts().any(|i| {
+                        i.name() == "v_readfirstlane_b32"
+                            && !i.writes.first().is_some_and(|w| x.res.waterfall.reads.contains(&w.1))
+                            && match i.fields {
+                                Fields::Valu(ref v) => match v.src.first() {
+                                    Some(&Operand::Vector { reg, .. }) => i
+                                        .read(Reg::V(reg))
+                                        .is_none_or(|r| !same.as_ref().is_some_and(|s| s.contains(&r))),
+                                    _ => false,
+                                },
+                                _ => false,
+                            }
+                    })
+                };
+                let crosses = varying_first || insts().any(|i| {
                     let n = i.name();
                     n.starts_with("v_mbcnt")
                         || matches!(n, "v_readlane_b32" | "v_writelane_b32")

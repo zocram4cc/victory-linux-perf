@@ -209,6 +209,16 @@ pub fn dpp_console_rows() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_DPP_CONSOLE_ROWS").is_none_or(|v| v != "0"))
 }
 
+/// Whether a first-lane read (`v_readfirstlane_b32`) of a value the lanes may hold
+/// differently makes a console wave64 compute program on host waves of 32 one whose lanes
+/// cross halves (the exchange form), so that lanes 32..63 read the console wave's first lane,
+/// not their host wave's; on unless `VICTORY_FIRSTLANE_CROSSES=0` (the halves form, each host
+/// wave its own first lane, as before). Part of the translation: the shader cache keys on it.
+pub fn firstlane_crosses() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FIRSTLANE_CROSSES").is_none_or(|v| v != "0"))
+}
+
 /// Whether a console wave64 compute program that no other form takes off 64-lane waves is
 /// tried, last of all, with its branches taken wave-wide ([`widen`]: two host waves of 32
 /// exchanging, with group barriers inside those branches) instead of being refused; off
