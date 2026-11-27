@@ -41,6 +41,10 @@ pub(crate) struct Pending {
     /// whether a draw or dispatch has requested it yet.
     key: String,
     used: AtomicBool,
+    /// When a worker took it to make (unset until then), and whether
+    /// draws have been told to stop waiting for that worker ([`stall_bound`]).
+    claimed: OnceLock<Instant>,
+    stall_noted: AtomicBool,
     /// How long draws have waited for it so far, in microseconds
     /// ([`wait_once`]).
     waited_us: AtomicU64,
@@ -133,12 +137,36 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            claimed: OnceLock::new(),
+            stall_noted: AtomicBool::new(false),
             waited_us: AtomicU64::new(0),
         }
     }
 
     pub(super) fn key(&self) -> &str {
         &self.key
+    }
+
+    /// Whether a worker has held it for `bound` or longer at `now`, longer
+    /// than any compile should take ([`stall_bound`]). Said once. The worker
+    /// is left to finish: a pipeline it makes later is used as any other.
+    fn stalled(&self, now: Instant, bound: Option<Duration>) -> bool {
+        let (Some(bound), Some(&claimed)) = (bound, self.claimed.get()) else {
+            return false;
+        };
+        let held = now.saturating_duration_since(claimed);
+        if held < bound || self.made.get().is_some() {
+            return false;
+        }
+        if !self.stall_noted.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                shaders = ?self.shaders,
+                key = %self.key,
+                held_s = held.as_secs(),
+                "a host pipeline worker has not returned from making a pipeline: its draws and dispatches no longer wait for it (VICTORY_PIPELINE_STALL_S, 0: waited for as any other)"
+            );
+        }
+        true
     }
 
     fn make(&self) {
@@ -214,6 +242,25 @@ fn screens_first() -> bool {
     !screen_budget().is_zero()
 }
 
+/// How long a worker may hold a pipeline before its draws and dispatches
+/// stop waiting for it: `VICTORY_PIPELINE_STALL_S` seconds, 15 if unset,
+/// well past the longest compile measured (3.4 s); `None` for 0, no such
+/// bound. Under Wine a worker can stay inside the host's compile of a
+/// compute pipeline for good (Legendary a1058fa: NVIDIA's compiler hangs on
+/// one compute shader), and a wait for it is time the frame never gets
+/// back. With [`wait_once`] a draw waits for such a pipeline one budget in
+/// all anyway; this ends the waits that have no such end, those of
+/// `VICTORY_PIPELINE_WAIT_ONCE=0` and those of
+/// `VICTORY_PIPELINE_COMPUTE_WAIT=1` begun after the bound, and names the
+/// pipeline in the log.
+fn stall_bound() -> Option<Duration> {
+    static BOUND: OnceLock<Option<Duration>> = OnceLock::new();
+    *BOUND.get_or_init(|| {
+        let secs = std::env::var("VICTORY_PIPELINE_STALL_S").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(15);
+        (secs != 0).then(|| Duration::from_secs(secs))
+    })
+}
+
 /// Pipelines queued and not made yet.
 static WAITING: AtomicU64 = AtomicU64::new(0);
 
@@ -235,7 +282,9 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
-        if p.graphics.is_none() && compute_waits() {
+        if p.stalled(Instant::now(), stall_bound()) {
+            // Its worker has not come back: nothing is waited for.
+        } else if p.graphics.is_none() && compute_waits() {
             // Made here, or waited for while a worker makes it.
             p.make();
         } else {
@@ -491,6 +540,7 @@ impl Queue {
         }
         let p = p?;
         p.queue_state.store(MAKING, Ordering::Relaxed);
+        let _ = p.claimed.set(Instant::now());
         Some(p)
     }
 }
@@ -681,6 +731,49 @@ mod tests {
             .unwrap()
             .join();
         assert_eq!(made.ok(), Some(4096));
+    }
+
+    /// A worker that never returns from the host's compile (seen under
+    /// Wine) is no longer waited for once it has held the pipeline past the
+    /// bound; it is not given up on, and what it makes is used.
+    #[test]
+    fn draws_stop_waiting_for_a_worker_that_does_not_return() {
+        let bound = Duration::from_secs(15);
+        let p = Arc::new(Pending::new(Vec::new(), None));
+        let later = Instant::now() + bound + Duration::from_secs(1);
+        let mut queue = Queue::new();
+        assert_eq!(queue.push(&p, REQUESTED), Some(true));
+        assert!(!p.stalled(later, Some(bound)), "queued, not claimed");
+        let p = queue.pop(false, 1).unwrap();
+        assert!(!p.stalled(Instant::now(), Some(bound)), "a compile under the limit");
+        assert!(!p.stalled(later, None), "the switch at 0: no bound");
+        assert!(!p.stall_noted.load(Ordering::Relaxed));
+        assert!(p.stalled(later, Some(bound)));
+        assert!(p.stall_noted.load(Ordering::Relaxed));
+        assert!(p.stalled(later, Some(bound)), "said once, still not waited for");
+        assert_eq!(p.queue_state.load(Ordering::Relaxed), MAKING);
+
+        // ready() returns without spending the frame's budget on it (timed
+        // only with a budget long enough to tell, and the bound on).
+        let stuck = Arc::new(Pending::new(Vec::new(), None));
+        stuck.queue_state.store(MAKING, Ordering::Relaxed);
+        if let (Some(bound), Some(long_ago)) = (stall_bound(), stall_bound().and_then(|b| Instant::now().checked_sub(b * 2))) {
+            stuck.claimed.set(long_ago).unwrap();
+            assert!(stuck.stalled(Instant::now(), Some(bound)));
+            let started = Instant::now();
+            assert!(ready(&stuck).is_none());
+            let budget = wait_budget();
+            if budget >= Duration::from_millis(100) {
+                assert!(started.elapsed() < budget / 2, "{:?}", started.elapsed());
+            }
+            assert_eq!(stuck.waited_us.load(Ordering::Relaxed), 0);
+        }
+
+        // The worker returns at last: its answer is the pipeline's, and
+        // nothing calls it stalled any more.
+        p.make();
+        assert!(matches!(p.made.get(), Some(None)));
+        assert!(!p.stalled(later, Some(bound)));
     }
 
     /// A first use queues the pipeline and, within the budget, gets the
