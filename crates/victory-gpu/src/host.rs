@@ -9222,6 +9222,8 @@ struct Presenter {
     /// Composes a second presented plane over the first ([`crate::compose`]).
     composer: Option<crate::compose::Composer>,
     panel: panel::Panel,
+    /// The swap chain is AMD's frame generation one ([`crate::framegen`]).
+    framegen: bool,
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -9719,6 +9721,11 @@ impl Host {
                         frame,
                         "the swap chain's buffers were made again for another size or format"
                     );
+                    if p.framegen {
+                        // A frame generation context is made for one size: let
+                        // go, made again at the next prepare.
+                        crate::framegen::display(width, height, format.0);
+                    }
                     self.log_video_memory("right after the swap chain's buffers were made again");
                 }
                 Err(e) => {
@@ -9919,7 +9926,15 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
+            // Frame generation: the frame is interpolated from the one
+            // before it when an upscale prepared it.
+            if p.framegen {
+                crate::framegen::before_present();
+            }
             let status = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            if p.framegen {
+                crate::framegen::after_present(p.swap_chain.GetLastPresentCount().ok());
+            }
             showing.next("the frame meter");
             if status == windows::Win32::Foundation::S_OK {
                 p.panel.frame(p.meter.line_due());
@@ -9961,9 +9976,23 @@ impl Host {
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
                 ..Default::default()
             };
-            let swap_chain = factory
-                .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
-                .cast::<IDXGISwapChain3>()?;
+            // AMD's frame generation swap chain in place of the window's,
+            // when asked for (VICTORY_FRAMEGEN=1).
+            let made = if crate::framegen::on() {
+                crate::framegen::swap_chain(hwnd, &desc, &factory, &self.queue)
+            } else {
+                None
+            };
+            let framegen = made.is_some();
+            let swap_chain = match made {
+                Some(chain) => chain,
+                None => factory
+                    .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
+                    .cast::<IDXGISwapChain3>()?,
+            };
+            if framegen {
+                crate::framegen::display(width, height, format.0);
+            }
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
@@ -9979,6 +10008,7 @@ impl Host {
                 meter: Meter::new(),
                 composer: None,
                 panel: panel::Panel::new(),
+                framegen,
             })
         }
     }

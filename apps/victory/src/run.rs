@@ -84,6 +84,16 @@ pub fn run(
         let cache = cfg.cache_subdir(&format!("images/fsr-{}-4k-sdr", preset.name()))?;
         victory_loader::load(&prepared, &cache)?
     } else {
+        // Frame generation (`VICTORY_FRAMEGEN=1`) is fed by the host's
+        // upscaler serving the title's own: the PC build answers it in any
+        // profile, without the 4K patch.
+        if std::env::var_os("VICTORY_FRAMEGEN").is_some_and(|v| v == "1")
+            && let Some(dir) = cfg.fidelityfx_dir.as_deref()
+        {
+            if let Err(e) = victory_hle::modules::fidelityfx::use_host_dir(dir) {
+                tracing::warn!(error = %e, "frame generation: the PC upscaler did not load; the title's own runs");
+            }
+        }
         victory_loader::load(&prepared, &images)?
     };
     // The program is mapped from the copy `load` wrote: the file's bytes

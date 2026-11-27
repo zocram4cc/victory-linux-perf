@@ -498,6 +498,10 @@ extern "C" fn ffxCreateContext(
         flags = format_args!("{:#x}", upscale.flags),
         "FidelityFX: upscaler context on the host"
     );
+    // Frame generation (`VICTORY_FRAMEGEN=1`, ported from gleaf-6's fork) is
+    // made from the upscaler's: its flags carry the depth and motion-vector
+    // bits, its largest render size is the frame generation one.
+    victory_gpu::framegen::upscale_context(upscale.flags, upscale.max_render);
     CONTEXTS.lock().unwrap_or_else(|e| e.into_inner()).insert(
         unsafe { *context } as usize,
         Arc::new(Context {
@@ -735,6 +739,29 @@ fn record_dispatch(
     let code = unsafe { (host.dispatch)(context, &raw mut dispatch.header) };
     if code == OK {
         victory_gpu::external::output_written(output);
+        // The frame generation prepare (`VICTORY_FRAMEGEN=1`), after the
+        // upscale on the same list: the depth and the motion vectors it read,
+        // at the size it rendered. The settings: sharpening, sharpness, frame
+        // time, pre-exposure, reset, then the camera's near, far, vertical
+        // field of view and metres per unit.
+        if victory_gpu::framegen::on() {
+            let slot = |i: usize| {
+                let r = &dispatch.resources[i];
+                victory_gpu::framegen::Resource { resource: r.resource, description: r.description, state: r.state }
+            };
+            let s = &dispatch.settings;
+            victory_gpu::framegen::prepare(
+                dispatch.list,
+                slot(1),
+                slot(2),
+                dispatch.jitter,
+                dispatch.motion_scale,
+                dispatch.render_size,
+                f32::from_bits(s[2]),
+                s[4] != 0,
+                [f32::from_bits(s[5]), f32::from_bits(s[6]), f32::from_bits(s[7]), f32::from_bits(s[8])],
+            );
+        }
         ctx.first_dispatch.call_once(|| {
             tracing::info!(render = ?dispatch.render_size, output = ?output_size, ?backing_extents,
                 jitter = ?dispatch.jitter, motion_vector_scale = ?dispatch.motion_scale,
