@@ -173,16 +173,19 @@ export VKD3D_DISABLE_EXTENSIONS=VK_EXT_descriptor_heap VKD3D_VIEW_HEAP_DESCRIPTO
 # missing from then on).
 # export VICTORY_NO_POOL_TRAP=1
 
-# The fast set (scripts\play.ps1's settings, the five renderer patches and
+# The fast set (scripts\play.ps1's settings, the five renderer patches,
 # VICTORY_WC_NO_BACK: shaders' writes into write-combined title memory stay on
-# the card, 66 -> 57 ms a frame on an RX 6800 XT; VICTORY_PORT_CONSTANTS needs
-# our Proton build, see above). Leave it out for Belobug's defaults.
+# the card, 66 -> 57 ms a frame on an RX 6800 XT, and
+# VICTORY_CARD_BUFFERS_MIN_MB=1: shader-written copies of title buffers from
+# 1 MiB up live on the card, not only from 4 MiB, 57.7 -> 48.6 ms;
+# VICTORY_PORT_CONSTANTS needs our Proton build, see above). Leave it out for
+# Belobug's defaults.
 export VICTORY_TEXTURE_NO_WAIT=1 VICTORY_RELAY=2 VICTORY_WIDE_BACK=1 VICTORY_CARD_REHASH_RUNS=1 \
   VICTORY_JOIN_COPIES=1 VICTORY_INDIRECT_WINDOW=1 VICTORY_RELAY_COPY=1 VICTORY_CARD_STEPS=2 \
   VICTORY_INDIRECT_BATCH=2 VICTORY_MAP_THREADS=1 VICTORY_CARD_AWAKE=1 VICTORY_SHOW_AFTER=1 \
   VICTORY_THIN=1 VICTORY_JOIN_PARTS=8 VICTORY_UPLOAD_AHEAD=1 \
   VICTORY_PORT_CONSTANTS=1 VICTORY_PORT_DESCRIPTORS=1 VICTORY_PORT_CBV=1 VICTORY_PORT_GUARD=1 \
-  VICTORY_PORT_JOURNAL=1 VICTORY_WC_NO_BACK=1
+  VICTORY_PORT_JOURNAL=1 VICTORY_WC_NO_BACK=1 VICTORY_CARD_BUFFERS_MIN_MB=1
 # Optional, PC FSR (see "PC FSR" above):
 # export VICTORY_FIDELITYFX_DIR='Z:\path\to\fidelityfx' VICTORY_FSR_4K=performance
 
