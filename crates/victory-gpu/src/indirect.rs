@@ -1061,6 +1061,82 @@ void main() {
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
     }
 
+    /// The compare with the landing ring (`crate::host::ring`), on the
+    /// software adapter or the first one: it flags as the compare without the ring does,
+    /// and told `| 4` it copies a piece that differs, whole, into the ring
+    /// and says where (+1) at its dword of `copied`; a piece the ring has
+    /// no room for is flagged and not copied (0).
+    #[test]
+    fn warp_card_compare_copies_what_differs_into_the_ring() {
+        // (Else on the first adapter: under Proton there is no WARP.)
+        let Some(mut warp) = WarpHarness::new().or_else(|| WarpHarness::on(false)) else {
+            return;
+        };
+        let compare = compile_cs(&warp.device, crate::host::ring::CARD_COMPARE_RING).expect("the ring compare must compile on WARP");
+        const PIECE: usize = 64 << 10;
+        const PIECES: u32 = 3;
+        let size = PIECE * PIECES as usize;
+        let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
+        let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES));
+        let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
+        let (_ring, ring_ptr, ring_gpu) = warp.shared_buffer(4 * PIECE as u64);
+        let (_copied, copied_ptr, copied_gpu) = warp.shared_buffer(64);
+        let (_head, head_ptr, head_gpu) = warp.shared_buffer(64);
+        let content: Vec<u8> = (0..size).map(|i| (i * 31 + i / 251) as u8).collect();
+        // SAFETY: the mapping holds `size` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
+        // One pass; the flags and the places (7s where it stored nothing).
+        let run = |warp: &mut WarpHarness, mode: u32, ring_size: u32| -> ([u32; 3], [u32; 3]) {
+            // SAFETY: our open list, live buffers, the compare's own root
+            // signature; the mappings hold what is read and written.
+            unsafe {
+                for piece in 0..PIECES as usize {
+                    differs_ptr.cast::<u32>().add(piece).write_volatile(7);
+                    copied_ptr.cast::<u32>().add(piece).write_volatile(7);
+                }
+                head_ptr.cast::<u32>().write_volatile(0);
+                warp.list.SetComputeRootSignature(&compare.root);
+                warp.list.SetPipelineState(&compare.pso);
+                let constants = [0u32, 0, size as u32, PIECES, 0, mode, ring_size];
+                warp.list.SetComputeRoot32BitConstants(0, 7, constants.as_ptr().cast(), 0);
+                warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(4, ring_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(5, copied_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(6, head_gpu);
+                warp.list.Dispatch(PIECES, 1, 1);
+            }
+            warp.submit_and_wait();
+            // SAFETY: as above.
+            let read = |p: *mut u8, piece: usize| unsafe { p.cast::<u32>().add(piece).read_volatile() };
+            let flags = [0, 1, 2].map(|piece| read(differs_ptr, piece));
+            let flags = if mode & 3 == 0 { flags } else { flags.map(|d| d & 1) };
+            (flags, [0, 1, 2].map(|piece| read(copied_ptr, piece)))
+        };
+        let at = PIECE + 1234;
+        // SAFETY (each): inside the mapping.
+        let set = |value: u8| unsafe { now_ptr.add(at).write_volatile(value) };
+        let ring = 4 * PIECE as u32;
+        // 0: hashes stored, nothing flagged or copied.
+        assert_eq!(run(&mut warp, 0, ring), ([7, 7, 7], [7, 7, 7]));
+        // Without `| 4` nothing is said of the ring.
+        set(content[at] ^ 0x40);
+        assert_eq!(run(&mut warp, 1, ring), ([0, 1, 0], [7, 7, 7]));
+        // With it: the piece that differs is copied, at the ring's start.
+        assert_eq!(run(&mut warp, 1 | 4, ring), ([0, 1, 0], [0, 1, 0]));
+        // SAFETY: the ring's mapping, which the card has written.
+        let copy = unsafe { std::slice::from_raw_parts(ring_ptr.cast_const(), PIECE) };
+        // SAFETY: the copy's mapping.
+        let now = unsafe { std::slice::from_raw_parts(now_ptr.add(PIECE).cast_const(), PIECE) };
+        assert!(copy == now, "the ring holds the piece as the card had it");
+        // No room: flagged, not copied.
+        assert_eq!(run(&mut warp, 1 | 4, PIECE as u32 - 16), ([0, 1, 0], [0, 0, 0]));
+        // With 2 the hash is stored as without the ring: flagged once.
+        assert_eq!(run(&mut warp, 2 | 4, ring), ([0, 1, 0], [0, 1, 0]));
+        assert_eq!(run(&mut warp, 2 | 4, ring), ([0, 0, 0], [0, 0, 0]));
+    }
+
     /// What the passes over copies in the card's memory cost on the card
     /// (ignored: a measurement): rounds of a few passes of some pieces and a
     /// wait, as a frame has them. `VICTORY_BENCH_CS=<file>` times another
