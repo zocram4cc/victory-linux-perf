@@ -2,7 +2,7 @@
 setlocal
 
 REM ============================================================================
-REM  RAZDA4A XEN — Budget & 16 GB RAM Edition (Wave 4)
+REM  RAZDA4A XEN — Budget & 16 GB RAM Edition (Wave 5)
 REM  Pure --release Zen 3 build | Win10 Agility SDK | FSR 4.1.2 ML + HUDLess FG
 REM  Run with --no-gui to skip the Frame Generation / profile dialog.
 REM ============================================================================
@@ -68,6 +68,7 @@ set "VICTORY_FRAME_INTERVAL_MS=16.667"
 
 REM === FACE FIX + MAX CPU FPS (6-core friendly) ===
 set "VICTORY_COMPUTE_WAIT_MS=5000"
+set "VICTORY_COMPUTE_LATE_WAIT_MS=400"
 set "VICTORY_HELPER_PRIORITY=1"
 set "VICTORY_SUBMIT_FRAMES=2"
 set "VICTORY_CARD_STEPS=2"
