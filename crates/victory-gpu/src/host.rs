@@ -10142,6 +10142,25 @@ impl Meter {
                     placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                     objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
                 );
+                {
+                    let [unset, unmade] = [0, 1].map(|i| crate::draw::NO_PIPELINE[i].swap(0, Ordering::Relaxed) as f64 / frames);
+                    let placed_uav = crate::descriptor::host::PLACED_UAV.load(Ordering::Relaxed);
+                    if placed_uav > 0 {
+                        tracing::info!("P.4: placed unordered texture views made on their host texture so far (VICTORY_PLACED_UAV): {placed_uav}");
+                    }
+                    let native = [0, 1, 2].map(|i| crate::device::NATIVE_COMPUTE[i].load(Ordering::Relaxed));
+                    if native.iter().any(|&n| n > 0) {
+                        tracing::info!(
+                            "P.4: 0x218 compute pipelines from their pieces so far (VICTORY_NATIVE_COMPUTE): {} made, {} refused, {} left without (not understood or not translating)",
+                            native[0], native[1], native[2]
+                        );
+                    }
+                    if unset + unmade > 0.0 {
+                        tracing::info!(
+                            "P.4: work without a host pipeline per frame: {unset:.0} with no pipeline set (slots 0x1c8/0x218), {unmade:.0} with a pipeline not made"
+                        );
+                    }
+                }
                 #[cfg(feature = "diagnostics")]
                 {
                     let put = [0, 1, 2, 3].map(|i| crate::shadow::PUT[i].swap(0, Ordering::Relaxed) as f64 / frames);

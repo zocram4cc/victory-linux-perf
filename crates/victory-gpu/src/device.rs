@@ -396,8 +396,230 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
             "a pipeline creation method that is not implemented: the title goes without this pipeline"
         );
     }
+    #[cfg(windows)]
+    if let Some(dir) = std::env::var_os("VICTORY_NATIVE_PSO_DUMP") {
+        dump_native(SLOT, desc as usize, std::path::Path::new(&dir));
+    }
+    #[cfg(windows)]
+    if SLOT == 0x218 && native_compute_on() && calls <= native_compute_max() {
+        // `VICTORY_NATIVE_COMPUTE_LOG=a-b`: which program calls a to b are
+        // (their code address: the dump's directory name, `218_<address>`).
+        if let Some((a, b)) = std::env::var("VICTORY_NATIVE_COMPUTE_LOG").ok().and_then(|v| {
+            let (a, b) = v.split_once('-')?;
+            Some((a.parse::<u32>().ok()?, b.parse::<u32>().ok()?))
+        }) && (a..=b).contains(&calls)
+        {
+            let mut w = [0u8; 0x30];
+            if crate::host::read_into(desc as *const u8, &mut w) {
+                let code = u64::from_le_bytes(w[0x28..0x30].try_into().unwrap_or([0; 8]));
+                tracing::info!(call = calls, code = format_args!("{code:016x}"), "P.4: 0x218 call");
+            }
+        }
+        if native_compute_skipped(desc as usize) {
+            return E_NOTIMPL;
+        }
+        if let Some(container) = native_compute(desc as usize) {
+            // Only a program that translates gets a pipeline: one whose
+            // dispatches are then dropped makes the title believe the pass
+            // ran and use what it did not write (the picture went white or
+            // black with untranslatable programs made, 26 Nov). Without a
+            // pipeline the title goes its own way round, as before.
+            // (A translator panic, a bug of ours on a program it gets this far
+            // in, is a program that does not translate: not a crash. The
+            // translation is deterministic, so one that passes here does not
+            // panic when the pipeline is made.)
+            let translates = std::panic::catch_unwind(|| victory_shader::emit::translate(&container).is_ok());
+            if !matches!(translates, Ok(true)) {
+                NATIVE_COMPUTE[2].fetch_add(1, Ordering::Relaxed);
+                return E_NOTIMPL;
+            }
+            let hr = crate::pipeline::create_compute_from(&container, _iid, out);
+            NATIVE_COMPUTE[usize::from(hr < 0)].fetch_add(1, Ordering::Relaxed);
+            if NATIVE_COMPUTE[0].load(Ordering::Relaxed) == 1 && hr >= 0 {
+                tracing::info!("P.4: a 0x218 compute pipeline made from its pieces (VICTORY_NATIVE_COMPUTE)");
+            }
+            return hr;
+        }
+        NATIVE_COMPUTE[2].fetch_add(1, Ordering::Relaxed);
+    }
     E_NOTIMPL
 }
+
+/// P.4 (`VICTORY_NATIVE_COMPUTE=1`): 0x218 pipelines made, refused by the
+/// host, and left without one (not understood or not translating).
+pub(crate) static NATIVE_COMPUTE: [std::sync::atomic::AtomicU32; 3] = [const { std::sync::atomic::AtomicU32::new(0) }; 3];
+
+/// `VICTORY_NATIVE_COMPUTE_MAX=N`: only the first N calls of 0x218 are made
+/// (to find, by halves, a program that breaks the picture).
+fn native_compute_max() -> u32 {
+    static MAX: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| std::env::var("VICTORY_NATIVE_COMPUTE_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(u32::MAX))
+}
+
+/// `VICTORY_NATIVE_COMPUTE_SKIP=<hex>,<hex>,…`: programs left out by their
+/// code address (the dump's `218_<address>`): those found to break the
+/// picture (`scripts/p4-hunt.sh`).
+#[cfg(windows)]
+fn native_compute_skipped(desc: usize) -> bool {
+    static SKIP: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    let skip = SKIP.get_or_init(|| {
+        std::env::var("VICTORY_NATIVE_COMPUTE_SKIP")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|h| u64::from_str_radix(h.trim().trim_start_matches("0x"), 16).ok())
+            .collect()
+    });
+    // `VICTORY_NATIVE_COMPUTE_ONLY=<file>`: only the programs whose code
+    // address is in that file (one hex address a line) are made
+    // (`scripts/p4-hunt.sh` halves the list).
+    static ONLY: std::sync::OnceLock<Option<Vec<u64>>> = std::sync::OnceLock::new();
+    let only = ONLY.get_or_init(|| {
+        let path = std::env::var_os("VICTORY_NATIVE_COMPUTE_ONLY")?;
+        let text = std::fs::read_to_string(path).ok()?;
+        Some(text.lines().filter_map(|h| u64::from_str_radix(h.trim().trim_start_matches("0x"), 16).ok()).collect())
+    });
+    if skip.is_empty() && only.is_none() {
+        return false;
+    }
+    let mut w = [0u8; 0x30];
+    if !crate::host::read_into(desc as *const u8, &mut w) {
+        return true;
+    }
+    let code = u64::from_le_bytes(w[0x28..0x30].try_into().unwrap_or([0; 8]));
+    skip.contains(&code) || only.as_ref().is_some_and(|only| !only.contains(&code))
+}
+
+fn native_compute_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NATIVE_COMPUTE").is_some_and(|v| v == "1"))
+}
+
+/// P.4: device method 0x218 describes a compute program the console's
+/// compiler made, as the pieces of an `FSPX` program (the format of an
+/// `ACCC` part, `victory_shader::native::fspx_program`): words (1, 2) the
+/// pipeline registers (0x1c bytes: thread-group size, RSRC1, RSRC2), (3, 4)
+/// the pipeline metadata (0x14: a hash), (5, 6) the GFX10 code (in title
+/// GPU memory), (7, 8) the program metadata (0x403 ...: the resources the
+/// code reads). Put back together as an `FSPX` blob in a container with one
+/// `ACCC` part, it goes the way of any compute container. `None`: a piece
+/// missing, unreadable or of another shape.
+#[cfg(windows)]
+fn native_compute(desc: usize) -> Option<Vec<u8>> {
+    let read = |at: usize, n: usize| -> Option<Vec<u8>> {
+        let mut b = vec![0u8; n];
+        (at != 0 && n > 0 && n <= 1 << 20 && crate::host::read_into(at as *const u8, &mut b)).then_some(b)
+    };
+    let d = read(desc, 0x48)?;
+    let w = |i: usize| u64::from_le_bytes(d[8 * i..8 * i + 8].try_into().unwrap_or([0; 8])) as usize;
+    let packet = read(w(1), w(2))?;
+    let hash = read(w(3), w(4))?;
+    let code = read(w(5), w(6))?;
+    let meta = read(w(7), w(8))?;
+    if packet.len() != 0x1c || meta.get(0..4) != Some(&0x403u32.to_le_bytes()[..]) {
+        return None;
+    }
+    // FSPX: "FSPX", u32 1, u32 entries, u32 size; entries of 16 B (kind,
+    // offset, size, 0); then the pieces, 16-byte aligned.
+    let pieces: [(u32, &[u8]); 4] = [(0, &packet), (1, &hash), (6, &code), (7, &meta)];
+    let mut fspx = vec![0u8; 0x10 + 16 * pieces.len()];
+    let mut table = Vec::new();
+    for (kind, bytes) in pieces {
+        while fspx.len() % 16 != 0 {
+            fspx.push(0);
+        }
+        table.push((kind, fspx.len() as u32, bytes.len() as u32));
+        fspx.extend_from_slice(bytes);
+    }
+    let size = fspx.len() as u32;
+    fspx[0..4].copy_from_slice(b"FSPX");
+    fspx[4..8].copy_from_slice(&1u32.to_le_bytes());
+    fspx[8..12].copy_from_slice(&(pieces.len() as u32).to_le_bytes());
+    fspx[12..16].copy_from_slice(&size.to_le_bytes());
+    for (i, (kind, offset, len)) in table.into_iter().enumerate() {
+        let at = 0x10 + 16 * i;
+        fspx[at..at + 4].copy_from_slice(&kind.to_le_bytes());
+        fspx[at + 4..at + 8].copy_from_slice(&offset.to_le_bytes());
+        fspx[at + 8..at + 12].copy_from_slice(&len.to_le_bytes());
+    }
+    // DXBC: "DXBC", a 16-byte digest (here: the code's FNV-1a, twice), u16
+    // 1, u16 0, u32 total size, u32 1 part, u32 its offset; the part: "ACCC",
+    // u32 size, data.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in code.iter().chain(meta.iter()).chain(packet.iter()) {
+        h = (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3);
+    }
+    let total = 0x24 + 8 + fspx.len();
+    let mut c = Vec::with_capacity(total);
+    c.extend_from_slice(b"DXBC");
+    c.extend_from_slice(&h.to_le_bytes());
+    c.extend_from_slice(&(!h).to_le_bytes());
+    c.extend_from_slice(&1u16.to_le_bytes());
+    c.extend_from_slice(&0u16.to_le_bytes());
+    c.extend_from_slice(&(total as u32).to_le_bytes());
+    c.extend_from_slice(&1u32.to_le_bytes());
+    c.extend_from_slice(&0x24u32.to_le_bytes());
+    c.extend_from_slice(b"ACCC");
+    c.extend_from_slice(&(fspx.len() as u32).to_le_bytes());
+    c.extend_from_slice(&fspx);
+    Some(c)
+}
+
+/// From fxceless/victory-fork (`52ac4ec`), for P.4. `VICTORY_NATIVE_PSO_DUMP=<dir>` (off unless set): the blobs
+/// a 0x1c8 / 0x218 description names, once per description key (0x218: its
+/// word 11, a 64-bit hash; 0x1c8: the code pointers of words 5 and 9).
+/// Files: `<dir>/<slot>_<key>/desc.bin` (the first 0x80 bytes), `root.bin`
+/// (0x80 bytes at word 0), `w<i>_<size>.bin` for each (pointer, size) pair
+/// at words (1,2) (3,4) (5,6) (7,8) (9,10) (11,12), and `p9.bin` /
+/// `p10.bin` (0x100 bytes at 0x218's two unsized pointers). Everything is
+/// read through the kernel (`host::read_into`): an unmapped pointer is
+/// skipped, never touched.
+#[cfg(windows)]
+fn dump_native(slot: usize, desc: usize, dir: &std::path::Path) {
+    use std::sync::Mutex;
+    static SEEN: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
+    let read = |at: usize, n: usize| -> Option<Vec<u8>> {
+        let mut b = vec![0u8; n];
+        (at != 0 && n <= 1 << 20 && crate::host::read_into(at as *const u8, &mut b)).then_some(b)
+    };
+    let Some(d) = read(desc, 0x100) else {
+        return;
+    };
+    let w = |i: usize| u64::from_le_bytes(d[8 * i..8 * i + 8].try_into().unwrap_or([0; 8]));
+    // 0x218: its code pointer (word 11 is not a key: gfx41); 0x1c8: the
+    // code pointers of words 5 and 9.
+    let key = if slot == 0x218 { w(5) } else { w(5) ^ (w(9) << 1) };
+    {
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.contains(&(slot, key)) || seen.len() >= 16384 {
+            return;
+        }
+        seen.push((slot, key));
+    }
+    let sub = dir.join(format!("{slot:x}_{key:016x}"));
+    let _ = std::fs::create_dir_all(&sub);
+    let _ = std::fs::write(sub.join("desc.bin"), &d);
+    if let Some(r) = read(w(0) as usize, 0x80) {
+        let _ = std::fs::write(sub.join("root.bin"), r);
+    }
+    let pairs: &[usize] = if slot == 0x218 { &[1, 3, 5, 7] } else { &[1, 3, 5, 7, 9, 11, 13, 15] };
+    for &i in pairs {
+        let (at, size) = (w(i) as usize, w(i + 1) as usize);
+        if at == 0 || size == 0 || size > 1 << 20 {
+            continue;
+        }
+        if let Some(b) = read(at, size) {
+            let _ = std::fs::write(sub.join(format!("w{i}_{size:x}.bin")), b);
+        }
+    }
+    if slot == 0x218 {
+        for i in [9usize, 10] {
+            if let Some(b) = read(w(i) as usize, 0x100) {
+                let _ = std::fs::write(sub.join(format!("p{i}.bin")), b);
+            }
+        }
+    }
+}
+
 
 /// The host device's state: the console's device is removed when the host's is
 /// (VIctory 13185f5: the default answer, E_NOTIMPL, reads as a lost device).

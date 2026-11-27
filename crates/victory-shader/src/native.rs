@@ -103,6 +103,8 @@ const RECORD_LAYOUT: usize = 0x28;
 const RECORD_USED: usize = 0x30;
 const RECORD_COUNTS: usize = 0x38;
 const ENTRY_SIZE: u64 = 20;
+/// `s0`-`s105`: the SGPRs a program can address (106 on is VCC).
+const SGPRS: u32 = 106;
 const MAX_SEMANTICS: u32 = 32;
 const PS_INPUTS: usize = 0x24;
 const PS_INPUT_COUNT: usize = 0x124;
@@ -480,6 +482,89 @@ pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
 ///         u8 resource kind (DXIL's), u8 0, u32 register
 ///   0x43  the shader hash (16 B); the last record
 /// ```
+/// The user SGPR a program uses as its view heap's 32-bit base, if its
+/// first straight-line instructions show it: a scalar load of 4 or 8 dwords
+/// from the pair (that SGPR, 0) at an offset shifted left by 5.
+fn view_heap_sgpr(code: &[u8], user_sgprs: u8) -> Option<u8> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum S {
+        User(u8),
+        Zero,
+        Times32,
+        Other,
+    }
+    let insts = crate::gfx10::decode(code).ok()?;
+    let mut st = [S::Other; 106];
+    for (i, s) in st.iter_mut().enumerate().take(usize::from(user_sgprs)) {
+        *s = S::User(i as u8);
+    }
+    // In code order over the whole program (the base can be used first
+    // deep inside branches, e.g. `218_0000000f005f3e00` at 0x8a0); only the
+    // last two user SGPRs count, the only places the census found.
+    for inst in insts.iter() {
+        let w = inst.words[0];
+        let sdst = ((w >> 16) & 0x7f) as usize;
+        match inst.name() {
+            Some("s_mov_b32") => {
+                let src = (w & 0xff) as usize;
+                let v = match src {
+                    0..=105 => st[src],
+                    128 => S::Zero,
+                    _ => S::Other,
+                };
+                if sdst < st.len() {
+                    st[sdst] = v;
+                }
+            }
+            Some("s_lshl_b32") if (w >> 8) & 0xff == 133 => {
+                if sdst < st.len() {
+                    st[sdst] = S::Times32;
+                }
+            }
+            Some("s_load_dwordx4" | "s_load_dwordx8") if inst.words.len() >= 2 => {
+                let base = ((w & 0x3f) * 2) as usize;
+                let soffset = (inst.words[1] >> 25) as usize;
+                if base + 1 < st.len()
+                    && let (S::User(x), S::Zero) = (st[base], st[base + 1])
+                    && soffset < st.len()
+                    && st[soffset] == S::Times32
+                    && x + 2 >= user_sgprs
+                {
+                    return Some(x);
+                }
+                let sdata = ((w >> 6) & 0x7f) as usize;
+                let n = if inst.name() == Some("s_load_dwordx8") { 8 } else { 4 };
+                for s in st.iter_mut().skip(sdata).take(n) {
+                    *s = S::Other;
+                }
+            }
+            Some(name) if name.starts_with("s_") && !name.starts_with("s_waitcnt") && !name.starts_with("s_clause") => {
+                // Another scalar instruction: whatever it writes is no
+                // longer what was tracked (SOP1/SOP2/SOPK keep sdst there).
+                if sdst < st.len() && !name.starts_with("s_cmp") && !name.starts_with("s_buffer") && !name.starts_with("s_load") {
+                    st[sdst] = S::Other;
+                }
+                if name.starts_with("s_load") || name.starts_with("s_buffer_load") {
+                    let sdata = ((w >> 6) & 0x7f) as usize;
+                    for s in st.iter_mut().skip(sdata).take(16) {
+                        *s = S::Other;
+                    }
+                }
+            }
+            Some(name) if name.starts_with("v_readlane") || name.starts_with("v_readfirstlane") || (name.starts_with("v_cmp") && inst.words.len() >= 2) => {
+                // VOP3 writes its SGPR result in bits 0-7.
+                let d = (w & 0xff) as usize;
+                if d + 1 < st.len() {
+                    st[d] = S::Other;
+                    st[d + 1] = S::Other;
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
     if u32_at(part, 4)? != FSPX_VERSION {
         return Err(Malformed("unknown FSPX version"));
@@ -536,7 +621,16 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
             root,
             table_offset_dwords: le32(e, 8),
             lower_bound: le32(e, 12),
-            stride: 0,
+            // For a buffer (a 4-dword descriptor read as SRV or UAV) the word
+            // after the register is its element size: a multiple of 4, or 1
+            // for a raw buffer (always so over 0x218's 2,680 programs, P.4);
+            // for a texture it is its view dimension.
+            stride: if e[20] == 4 && matches!(e[4], 0 | 3) {
+                let stride = le32(e, 16);
+                if stride == 1 || (stride >= 4 && stride.is_multiple_of(4)) { stride } else { 0 }
+            } else {
+                0
+            },
             dwords: e[20],
             user_data: e[21],
             slot: e[22],
@@ -544,6 +638,10 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
         let sgprs = match root {
             RootType::Table => 1,
             RootType::Descriptor => 2,
+            // Root constants (a constant buffer the root signature holds in
+            // place; device method 0x218's programs, P.4): as many user
+            // SGPRs as the record's descriptor dwords say.
+            RootType::Constants => u32::from(e[20]),
             // The code holds its words; no user data.
             RootType::ImmediateSampler => 0,
             _ => return Err(Malformed("an FSPX resource of an unknown root type")),
@@ -559,6 +657,61 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
             });
         }
         used.push(u);
+    }
+    // The title's own programs (device method 0x218, P.4) also get the
+    // resource and sampler heaps' 32-bit bases in the last two user SGPRs,
+    // which the metadata does not list: they fetch descriptors from the heap
+    // by index (`s_add_u32 addr, s[n-2], index * 32`). Taken as such where
+    // no listed parameter covers them.
+    let user_sgprs = ((u32_at(packet, PACKET_RSRC2)? >> 1) & 0x1F) as u8;
+    let covered = |layout: &[RootParam], r: u8| {
+        layout
+            .iter()
+            .any(|p| (p.user_data..p.user_data.saturating_add(p.sgprs as u8)).contains(&r))
+    };
+    // Where the code shows it, the view heap's place: the user SGPR it uses
+    // as a 32-bit base with an index times 32 (`s_mov sA, sX; s_mov sA+1, 0;
+    // s_lshl sI, sJ, 5; s_load_dwordx4/x8 …, s[A:A+1], sI`). It is s[n-1] in
+    // 187 of the 2,680 programs and s[n-2] in 59: the fixed rule below got
+    // the first kind wrong, and a root-constants record sized by its
+    // descriptor dwords (`e[20]`) could cover it (family 0x33cb3490: half of
+    // Jason's house culled, `docs/royale/p4-house-bug.md`).
+    let view_heap = view_heap_sgpr(code, user_sgprs);
+    if let Some(x) = view_heap
+        && !layout.iter().any(|p| matches!(p.root, RootType::Table | RootType::Descriptor) && p.user_data == x)
+    {
+        for p in layout.iter_mut() {
+            if p.root == RootType::Constants && p.user_data < x && u32::from(p.user_data) + p.sgprs > u32::from(x) {
+                p.sgprs = u32::from(x - p.user_data);
+            }
+        }
+        layout.push(RootParam {
+            root: RootType::ResourceHeap,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: x,
+            slot: 0xFE,
+        });
+    }
+    for (root, at, slot) in [(RootType::ResourceHeap, 2, 0xFE), (RootType::SamplerHeap, 1, 0xFF)] {
+        if root == RootType::ResourceHeap && view_heap.is_some() {
+            continue;
+        }
+        if let Some(r) = user_sgprs.checked_sub(at)
+            && Some(r) != view_heap
+            && !covered(&layout, r)
+            && layout.iter().any(|p| p.user_data < r)
+        {
+            layout.push(RootParam {
+                root,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: r,
+                slot,
+            });
+        }
     }
     Ok(NativeProgram {
         stage: HwStage::Cs,
@@ -699,7 +852,15 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
                 user_data: e[16],
                 slot: e[17],
             })
-            .collect();
+            .collect::<Vec<RootParam>>();
+        // A parameter's SGPRs must exist: `user_sgpr` and the high half of a
+        // root descriptor are computed from these bytes.
+        if layout.iter().any(|p| {
+            let first = u32::from(p.user_data) + u32::from(stage.user_sgpr(0));
+            u64::from(first) + u64::from(p.sgprs.max(1)) > u64::from(SGPRS)
+        }) {
+            return Err(Malformed("root parameter outside the SGPRs"));
+        }
         let used = table(RECORD_USED, RECORD_COUNTS + 4)?
             .as_chunks::<{ ENTRY_SIZE as usize }>()
             .0
@@ -1053,6 +1214,20 @@ mod tests {
                 slot: 1
             }]
         );
+
+        // Parameters must sit in SGPRs the program can address: s9 plus 97
+        // dwords ends at s105, one more is past it, and so is a user-data
+        // byte past the SGPR file.
+        let entry = FSSM_HEADER + tables as usize;
+        let layout = |blob: &[u8]| native_programs(&part(&[(KIND_NATIVE, &xbch(blob))]));
+        let mut wide = blob.clone();
+        wide[entry + 8..entry + 12].copy_from_slice(&97u32.to_le_bytes());
+        assert_eq!(layout(&wide).unwrap()[0].layout[0].sgprs, 97);
+        wide[entry + 8..entry + 12].copy_from_slice(&98u32.to_le_bytes());
+        assert!(layout(&wide).is_err());
+        let mut far = blob.clone();
+        far[entry + 16] = 0xFF;
+        assert!(layout(&far).is_err());
 
         blob[record + RECORD_COUNTS] = 9;
         assert!(native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).is_err());

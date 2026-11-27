@@ -674,6 +674,8 @@ impl Ctx<'_> {
                     || name.contains("lane")
                     || matches!(&inst.fields, Fields::Valu(v) if v.dpp.is_some())
                     || super::lower::reads_mask_as_data(st, inst)
+                    // (a branch the wave takes together on a mask operation's SCC)
+                    || st.wave_scc.contains(&b) && i + 1 == p.blocks[b].insts.len()
                     || self.sections[b].iter().any(|(&s, sec)| i >= s && i <= sec.end);
                 if cross {
                     return Err((self.at(u), CROSS));

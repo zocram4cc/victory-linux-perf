@@ -1040,6 +1040,15 @@ pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 5] = [const { AtomicU64::new(
 pub(crate) static HEAP_TEXTURES_PARTLY: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
+/// P.4 census (release builds too): work dropped for want of a host
+/// pipeline, [no pipeline set (what the title has after slot 0x1c8/0x218
+/// failed), a pipeline set but no host pipeline for it].
+pub(crate) static NO_PIPELINE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+fn no_pipeline_census(pipeline: usize) {
+    NO_PIPELINE[usize::from(pipeline != 0)].fetch_add(1, Ordering::Relaxed);
+}
+
 /// Marks the last traced draw as not run on the host.
 #[cfg(feature = "diagnostics")]
 fn dropped(pipeline: usize) {
@@ -1737,6 +1746,16 @@ impl State {
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
         }
+        // The console address of the bound view (sampler) heap's first
+        // descriptor: descriptors a shader loads through an address it read
+        // from memory are at (address - this) / size there (P.4).
+        if kind == victory_shader::emit::USER_VIEW_HEAP_START || kind == victory_shader::emit::USER_SAMPLER_HEAP_START {
+            let which = usize::from(kind == victory_shader::emit::USER_SAMPLER_HEAP_START);
+            return match self.heaps[which] {
+                0 => 0,
+                h => crate::descriptor::heap(h as This).start as u32,
+            };
+        }
         // All of every group, unless the dispatch says otherwise.
         if kind == victory_shader::emit::USER_DISPATCH_THREADS_X {
             return 0;
@@ -1861,6 +1880,7 @@ impl State {
             return false;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            no_pipeline_census(self.pipeline);
             return false;
         };
         if p.compute || p.mesh != mesh {
@@ -3320,6 +3340,7 @@ impl State {
             return;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            no_pipeline_census(self.pipeline);
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
@@ -3335,6 +3356,46 @@ impl State {
         if !p.compute {
             once!("a dispatch with a graphics pipeline");
             return;
+        }
+        // P.4 (`VICTORY_HEAP_TRACE=N`): the first N dispatches of any
+        // pipeline: the view heap's console address range beside the table
+        // values the list holds (are tables console addresses in that range?).
+        {
+            static LEFT: std::sync::OnceLock<std::sync::atomic::AtomicU32> = std::sync::OnceLock::new();
+            let left = LEFT.get_or_init(|| {
+                std::sync::atomic::AtomicU32::new(std::env::var("VICTORY_HEAP_TRACE").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+            });
+            if left.load(Ordering::Relaxed) > 0 && left.fetch_sub(1, Ordering::Relaxed) > 0 && self.heaps[0] != 0 {
+                let heap = crate::descriptor::heap(self.heaps[0] as This);
+                tracing::info!(
+                    start = format_args!("{:#x}", heap.start),
+                    count = heap.desc.count,
+                    end = format_args!("{:#x}", heap.start + u64::from(heap.desc.count) * 32),
+                    roots = format_args!("{:x?}", self.compute),
+                    "P.4 heap trace"
+                );
+            }
+        }
+        // P.4 (`VICTORY_NATIVE_TRACE=N`): the first N dispatches of pipelines
+        // made from 0x218's pieces: the root values the title's list holds,
+        // its heaps, the groups.
+        {
+            static LEFT: std::sync::OnceLock<std::sync::atomic::AtomicU32> = std::sync::OnceLock::new();
+            let left = LEFT.get_or_init(|| {
+                std::sync::atomic::AtomicU32::new(std::env::var("VICTORY_NATIVE_TRACE").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+            });
+            if left.load(Ordering::Relaxed) > 0
+                && crate::pipeline::is_native(self.pipeline)
+                && left.fetch_sub(1, Ordering::Relaxed) > 0
+            {
+                tracing::info!(
+                    pipeline = format_args!("{:#x}", self.pipeline),
+                    groups = format_args!("{x}x{y}x{z}"),
+                    heaps = format_args!("{:x?}", self.heaps),
+                    roots = format_args!("{:x?}", self.compute),
+                    "P.4 trace: a dispatch of a native pipeline"
+                );
+            }
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -3716,6 +3777,7 @@ impl State {
     fn op_text(&self, kind: String, compute: bool) -> String {
         use std::fmt::Write;
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            no_pipeline_census(self.pipeline);
             return kind;
         };
         let mut text = format!("{kind} {}", p.name);
@@ -3800,6 +3862,7 @@ impl State {
         const DRAW_CONSTANTS: u32 = 56;
         let wanted = list_slots();
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            no_pipeline_census(self.pipeline);
             return String::new();
         };
         let Some(stage) = p.stages.iter().find(|s| wanted.iter().any(|w| s.shader.hash.starts_with(w.as_str())))
@@ -4642,6 +4705,7 @@ impl State {
     #[cfg(feature = "diagnostics")]
     fn reads(&self, compute: bool) -> Vec<String> {
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            no_pipeline_census(self.pipeline);
             return vec!["no host pipeline".into()];
         };
         let mut out = Vec::new();
@@ -4716,6 +4780,7 @@ impl State {
         // The expansion sets vertex buffers slot by slot, and may stop short.
         self.sets.forget_vertex();
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            no_pipeline_census(self.pipeline);
             return false;
         };
         let rects = u64::from(count / 3);
@@ -4919,6 +4984,7 @@ impl State {
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            no_pipeline_census(self.pipeline);
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             return false;

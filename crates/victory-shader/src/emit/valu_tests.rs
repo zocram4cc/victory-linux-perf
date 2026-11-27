@@ -301,6 +301,30 @@ fn scalar_quad_masks_pack_nibbles_and_set_scc() {
     });
 }
 
+#[test]
+fn scalar_min_max_pass_the_comparison_to_conditional_select() {
+    // The expected flags are in signed-min, unsigned-min, signed-max, unsigned-max order.
+    let cases = [
+        ([0, 5, 0, 0], [1, 1, 0, 0]),
+        ([5, 0, 0, 0], [0, 0, 1, 1]),
+        ([7, 7, 0, 0], [0, 0, 0, 0]),
+        ([u32::MAX, 1, 0, 0], [1, 0, 0, 1]),
+        ([1, 0x8000_0000, 0, 0], [0, 1, 1, 0]),
+        ([0x8000_0000, 0, 0, 0], [1, 0, 0, 1]),
+    ];
+    let inputs = cases.map(|(input, _)| input);
+    for (column, opcode) in (0x06..=0x09).enumerate() {
+        let shader = build_valu_cs(&[
+            sop2(opcode, 2, 0, 1),    // s_min/max s2, s0, s1
+            sop2(0x0a, 3, 129, 128), // s_cselect_b32 s3, 1, 0
+            vop1(1, 0, sgpr(3)),     // v_mov_b32 v0, s3
+        ]);
+        run_cases(&shader, &inputs, |backend, i, _, got| {
+            assert_eq!(got, cases[i].1[column], "{backend}, opcode {opcode:#x}, case {i}");
+        });
+    }
+}
+
 fn is_f16_nan(bits: u16) -> bool {
     (bits & 0x7FFF) > 0x7C00
 }
@@ -2301,6 +2325,10 @@ fn rdna_forms_give_what_the_spelled_out_ones_give() {
         }
     }
     for (name, body, exact) in bodies {
+        if name == "mad_legacy" && super::legacy_fma() {
+            // Fused, it is written the same for every host (`legacy_fmad`).
+            continue;
+        }
         let mut got: Vec<Vec<u32>> = Vec::new();
         let mut written = Vec::new();
         for bits in [0, super::rdna::ALL] {
@@ -2318,5 +2346,176 @@ fn rdna_forms_give_what_the_spelled_out_ones_give() {
             let same = was == is || x.is_nan() && y.is_nan() || !exact && x == 0.0 && y == 0.0;
             assert!(same, "{name} of {:?}: {x} ({was:#x}), now {y} ({is:#x})", case.map(f32::from_bits));
         }
+    }
+}
+
+/// MUBUF `buffer_load_*` with `offen = 1`, `soffset = 0`, `offset = 0`.
+const fn mubuf_load_offen(op: u8, vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2] {
+    [
+        0x38 << 26 | (op as u32 & 0x7F) << 18 | 1 << 12,
+        0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8 | vaddr as u32,
+    ]
+}
+
+/// `buffer_load_ubyte/sbyte/ushort/sshort` on a constant buffer give the byte or the 16
+/// bits at the address, zero- or sign-extended (they gave the whole dword there: no shift,
+/// no mask, no sign). (fxceless PR #352.)
+#[test]
+fn cbv_narrow_buffer_loads_extract_and_sign_extend() {
+    // CBV contents (64 bytes = 16 dwords, 16-byte rows):
+    //   dword 0 (bytes 0..4):   [0x05, 0xFE, 0x7F, 0x81]
+    //   dword 1 (bytes 4..8):   [0x01, 0x80, 0xAB, 0xCD]
+    //   dword 2 (bytes 8..12):  [0x00, 0x00, 0x00, 0x00]
+    //   dword 3 (bytes 12..16): [0x00, 0x00, 0x00, 0x80]
+    //   dword 4 (bytes 16..20): [0xDE, 0xAD, 0xBE, 0xEF] (cross-16-byte-row straddle at 15)
+    let cbv_data: [u32; 16] = [0x817F_FE05, 0xCDAB_8001, 0x0000_0000, 0x8000_0000, 0xEFBE_ADDE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let bytes: Vec<u8> = cbv_data.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let offsets: &[u32] = &[0, 1, 2, 3, 4, 5, 7, 15, 16, 19];
+
+    // MUBUF opcodes: ubyte=0x08, sbyte=0x09, ushort=0x0a, sshort=0x0b.
+    let ops: &[(u8, u32, bool, &str)] = &[
+        (0x08, 8, false, "buffer_load_ubyte"),
+        (0x09, 8, true, "buffer_load_sbyte"),
+        (0x0A, 16, false, "buffer_load_ushort"),
+        (0x0B, 16, true, "buffer_load_sshort"),
+    ];
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for &(op, bits, signed, name) in ops {
+        let mut words = Vec::new();
+        words.push(s_mov_b32(5, 0x80)); // s5 = 0
+        words.extend_from_slice(&s_load_dwordx4(8, 4)); // s[8:11] = CBV at offset 0
+        // s_load_dwordx4 s[12:15], s[4:5], 0x20 (UAV at table offset 8 dwords)
+        words.extend_from_slice(&[0xF408_0302, 0xFA00_0020]);
+        words.push(vop1(0x001, 1, sgpr(0))); // v1 = byte offset from root constant s0
+        words.extend_from_slice(&mubuf_load_offen(op, 0, 1, 8)); // v0 = narrow load from CBV
+        words.extend_from_slice(&buffer_store_dword(0, 12, 0));
+        words.push(S_ENDPGM);
+
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![
+                RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![
+                UsedResource {
+                    kind: ResourceType::Cbv,
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 4,
+                    user_data: 4,
+                    slot: 1,
+                },
+                UsedResource {
+                    kind: ResourceType::Uav,
+                    root: RootType::Table,
+                    table_offset_dwords: 8,
+                    lower_bound: 0,
+                    stride: 4,
+                    dwords: 4,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [1, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let l = lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .unwrap();
+        let mut dxil = l.dxil;
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            v.validate(&mut dxil).unwrap();
+        }
+        let shader = HostShader {
+            half_views: l.half_views,
+            stage: HwStage::Cs,
+            dxil,
+            user_data: l.user_data,
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: l.root_cbvs,
+            root_srvs: l.root_srvs,
+            root_uavs: l.root_uavs,
+            root_indexed_views: Vec::new(),
+        };
+        for (backend, warp) in [("hardware", false), ("WARP", true)] {
+            let Ok(host) = Host::new(warp) else {
+                continue;
+            };
+            let (root, pso) = host.compute_pipeline(&shader).unwrap();
+            for &off in offsets {
+                let want = match (bits, signed) {
+                    (8, false) => u32::from(bytes[off as usize]),
+                    (8, true) => (bytes[off as usize] as i8) as i32 as u32,
+                    (16, false) => u32::from(u16::from_le_bytes([bytes[off as usize], bytes[off as usize + 1]])),
+                    (16, true) => (i16::from_le_bytes([bytes[off as usize], bytes[off as usize + 1]])) as i32 as u32,
+                    _ => unreachable!(),
+                };
+                let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+                for u in &shader.user_data {
+                    if let (RootType::Constants, 0, 0) = (u.root, u.slot, u.dword) {
+                        ud[u.index as usize] = off;
+                    }
+                }
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(ud))],
+                            views: &[View::Cbv(&cbv_data), View::RawUav(16)],
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(
+                    out[0][0], want,
+                    "{backend}: {name} at CBV byte offset {off} = {:#010x}, want {want:#010x}",
+                    out[0][0],
+                );
+            }
+            ran += 1;
+        }
+    }
+    if ran == 0 {
+        eprintln!("no SM 6.6 device; lowered and validated only");
     }
 }

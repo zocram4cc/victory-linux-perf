@@ -5117,6 +5117,19 @@ fn make_twinned(
                 return make(&view, at);
             }
             const BUFFER: u32 = 1;
+            // P.4 (`VICTORY_PLACED_UAV=1`): unordered access to a texture the
+            // title placed, on the host texture at that address, as shader
+            // views of placed textures get ([`placed_texture`]). Without it
+            // what device method 0x218's programs write there (mip chains,
+            // per-layer copies) is lost and what reads it later gets nothing.
+            if *unordered && resource[0] != BUFFER && placed_uav_on() {
+                let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                if let Some(texture) = crate::resource::texture_at(address, resource) {
+                    PLACED_UAV.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let view = View::Unordered(texture as usize, 0, desc[..10].try_into().ok());
+                    return make(&view, at);
+                }
+            }
             if resource[0] != BUFFER {
                 // shortcut: unordered access to a texture the title placed
                 // itself is not mirrored; give it a resource as shader
@@ -5509,6 +5522,15 @@ fn same_placed_texture(a: &View, b: &View) -> bool {
 
 /// A shader view of a texture the title placed in memory itself, as a view
 /// of the resource made for that memory (on first use).
+/// Placed unordered texture views made on their host texture
+/// (`VICTORY_PLACED_UAV=1`), since the start.
+pub(crate) static PLACED_UAV: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn placed_uav_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PLACED_UAV").is_some_and(|v| v == "1"))
+}
+
 pub(crate) fn placed_texture(view: &View) -> Option<View> {
     const BUFFER: u32 = 1;
     let View::Placed(false, resource, desc) = view else {

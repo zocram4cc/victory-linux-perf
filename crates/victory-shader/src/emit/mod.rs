@@ -126,7 +126,7 @@ pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
     SLOT_COUNTS_AT, SLOT_STRIDES_BYTES, SLOT_STRIDES_COUNT, VIEW_ADDRESSES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     constants_raw, raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
-};
+USER_VIEW_HEAP_START, USER_SAMPLER_HEAP_START, };
 
 /// The stack for threads that make host pipelines from translated shaders.
 /// vkd3d-proton converts DXIL on the calling thread, recursively over its
@@ -165,6 +165,47 @@ pub fn loop_limit() -> u32 {
 pub fn helper_own() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_HELPER_OWN").is_none_or(|v| v != "0"))
+}
+
+/// Whether `v_mad_legacy_f32` and `v_mac_legacy_f32` are one fused
+/// multiply-add of flushed sources, as the console's card runs them
+/// (`lower.rs` `legacy_fmad`); on unless `VICTORY_LEGACY_FMA=0` (the legacy
+/// product rounded, then the sum, as before). Part of the translation: the
+/// shader cache keys on it.
+pub fn legacy_fma() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LEGACY_FMA").is_none_or(|v| v != "0"))
+}
+
+/// Whether a compute program's per-lane branches around a scalar that a join after them
+/// reads are taken by the whole wave, as the console takes them (`lower::scalar_splits`);
+/// on unless `VICTORY_SCALAR_SPLITS=0` (per lane, as before: the lanes that skipped the
+/// branch keep the old value). Part of the translation: the shader cache keys on it.
+pub fn scalar_splits() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SCALAR_SPLITS").is_none_or(|v| v != "0"))
+}
+
+/// Whether a console wave64 compute program that no other form takes off 64-lane waves is
+/// tried, last of all, with its branches taken wave-wide ([`widen`]: two host waves of 32
+/// exchanging, with group barriers inside those branches) instead of being refused; off
+/// unless `VICTORY_WAVE_WIDE_LAST=1` (`VICTORY_WAVE_WIDE=0` keeps it off). Off by default:
+/// it is the form that lost the card in runs 121-124, and the programs it would take (two
+/// refused wave64 compute programs in the club runs) are not known not to be the ones that
+/// did. Part of the translation: the shader cache keys on it.
+pub fn wave_wide_last() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_WIDE_LAST.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_WIDE_LAST").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice of the last form ([`wave_wide_last`]), on its thread only.
+    pub(crate) static TEST_WIDE_LAST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// Which of a translated program's group barriers wait for the whole
@@ -549,9 +590,74 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    let exact = emit_forms(c, native, p, st, io, res);
+    // A branch on a mask operation's SCC is the wave's ([`structure::Structured::wave_scc`],
+    // DoubleGhosty issue #66) and needs the console's wave, with every lane where it stands.
+    // A program none of whose forms gives it that (and every program of a stage whose host
+    // waves are not the console's) is taken with those branches split per lane, as before:
+    // inexact where an arm runs lanes whose own bit went the other way, but drawn. Dropped,
+    // its dispatch leaves what it writes unwritten (DoubleGhosty #80: the title read that
+    // back as a pointer). `VICTORY_LANE_SPLIT=exact` refuses such a program instead.
+    if !matches!(exact, Err(ShaderError::Unsupported { .. }))
+        || st.wave_scc.is_empty()
+        || std::env::var_os("VICTORY_LANE_SPLIT").is_some_and(|v| v == "exact")
+    {
+        return exact;
+    }
+    let again = structure::with_per_lane(|| {
+        let st = structure::structure(p)?;
+        let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
+        emit_forms(c, native, p, &st, io, &res)
+    });
+    if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+        let was = exact.as_ref().err().map(ToString::to_string).unwrap_or_default();
+        match &again {
+            Ok(_) => eprintln!("WAVE64-RETRY branches on a mask's SCC split per lane (inexact): translated (wave-wide: {was})"),
+            Err(e) => eprintln!("WAVE64-RETRY branches on a mask's SCC split per lane: {e} (wave-wide: {was})"),
+        }
+    }
+    // the exact form's refusal says more than the inexact one's
+    if again.is_err() { exact } else { again }
+}
+
+/// [`emit`] of the program as it is structured: itself, then its other forms.
+fn emit_forms(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
     let original = emit_program(c, native, p, st, io, res);
+    // A scalar a per-lane branch's region writes and a join after it reads
+    // (`lower::scalar_splits`): the console's wave runs that region once for every lane, so
+    // those branches are taken wave-wide, as the console takes them. A console wave run as
+    // two host waves needs group barriers inside them (`VICTORY_WAVE_WIDE=1`, see below);
+    // without it, and wherever the branches cannot be widened, the per-lane form stays.
+    // `VICTORY_SCALAR_SPLITS=0`: not looked for. (avatarmanz PR #405.)
+    if native.stage == HwStage::Cs && scalar_splits() {
+        let splits = lower::scalar_splits(p, st).unwrap_or_default();
+        let halves = native.wave64 && lower::host_max_wave() == 32;
+        if !splits.is_empty() && (!halves || lower::wave_wide_on()) {
+            let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
+            match widen(c, native, p, &splits, why) {
+                Ok((shader, wave)) if !(wave == Some(64) && lower::host_max_wave() == 32) => {
+                    if why {
+                        eprintln!("SCALAR-SPLITS {} branches taken wave-wide", splits.len());
+                    }
+                    return Ok(shader);
+                }
+                other => {
+                    if why {
+                        eprintln!("SCALAR-SPLITS not widened: {:?}", other.err());
+                    }
+                }
+            }
+        }
+    }
     // A console wave64 compute program on a host of 32-lane waves that
     // still needs 64 lanes, or whose cross-lane code sits where not every
     // lane runs: once more with its early-outs left out
@@ -652,7 +758,7 @@ pub fn emit(
                         Some(p),
                     ];
                     if let Some(base) = bases.into_iter().flatten().next() {
-                        let again = widen(c, native, base, why);
+                        let again = widen(c, native, base, &[], why);
                         report("wave-wide branches", &again);
                         if done(&again) {
                             return again.map(|(shader, _)| shader);
@@ -704,6 +810,31 @@ pub fn emit(
                 }
             }
         }
+        // Last of all, with the wave-wide form not asked for: a program that no other form
+        // takes off 64-lane waves is refused by a 32-lane host, and its dispatches are
+        // dropped (`sr_tracing:CS_Tiling_Generate_Opaque` and `GpuParticleUpdate:CS_Visibility`
+        // on an RTX 5060 Ti in fxceless PR #1176). The wave-wide form is exact, so it is tried
+        // here, where the only other outcome is the pass not running at all (or, for a branch
+        // on a mask's SCC, running split per lane, `emit`). The programs that lost a card with
+        // it had another form and never reach this point, upstream says; not shown for this
+        // title, so only with `VICTORY_WAVE_WIDE_LAST=1` (`VICTORY_WAVE_WIDE=0` refuses).
+        if !wide_on && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") && wave_wide_last() {
+            let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
+            let deep = if deep_on { form(ir::without_skips(p, true)) } else { None };
+            let bases = [
+                deep.as_ref().map(|f| &f.0),
+                forms[1].1.as_ref().map(|f| &f.0),
+                forms[0].1.as_ref().map(|f| &f.0),
+                Some(p),
+            ];
+            if let Some(base) = bases.into_iter().flatten().next() {
+                let again = widen(c, native, base, &[], why);
+                report("wave-wide branches (last resort)", &again);
+                if done(&again) {
+                    return again.map(|(shader, _)| shader);
+                }
+            }
+        }
     }
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
     // trace programs): right once the wave takes that skip together ([`widen`]; the
@@ -714,7 +845,7 @@ pub fn emit(
                 && what == lower::LANE_MASK
                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
         {
-            let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some());
+            let again = widen(c, native, p, &[], std::env::var_os("VICTORY_WAVE_WHY").is_some());
             match again {
                 Ok(_) => again,
                 Err(_) => emit_program(c, native, p, st, io, res),
@@ -750,6 +881,7 @@ fn widen(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,
+    seed: &[usize],
     why: bool,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
     const NOT: ShaderError = ShaderError::Unsupported {
@@ -768,9 +900,21 @@ fn widen(
         }
         _ => return Err(NOT),
     }
-    let mut wide = std::collections::HashSet::new();
+    let mut wide: std::collections::HashSet<usize> = seed.iter().copied().collect();
     loop {
         let st = structure::structure_wide(p, &wide)?;
+        // Branches around scalars the wave writes once (`lower::scalar_splits`) that this
+        // round's structure still has per lane: wave-wide too. (For a console wave run as two
+        // host waves, where each such branch costs group barriers, only with `VICTORY_WAVE_WIDE=1`,
+        // as in `emit_forms`: the archived kernels and the lane-mask retry reach `widen` without it.)
+        if scalar_splits() && (!(native.wave64 && lower::host_max_wave() == 32) || lower::wave_wide_on()) {
+            let scalars: Vec<usize> =
+                lower::scalar_splits(p, &st).unwrap_or_default().into_iter().filter(|b| !wide.contains(b)).collect();
+            if !scalars.is_empty() {
+                wide.extend(scalars);
+                continue;
+            }
+        }
         let io = io::raise(p, native)?;
         let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
         lower::take_needs();

@@ -21,8 +21,9 @@ use crate::structure::{Bool, LaneExit, Meets, Structured};
 /// An instruction: block and index in [`crate::ir::Block::insts`].
 pub type Site = (usize, usize);
 
-/// A byte address: a root parameter's, plus a constant and at most one
-/// value the program computes (an index times a stride, say).
+/// A byte address: a root parameter's, plus a constant and at most two
+/// values the program computes (an index times a stride, say; a second in
+/// the instruction's offset register, P.4's programs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Address {
     /// Index into the layout, or [`CODE`].
@@ -31,6 +32,10 @@ pub struct Address {
     /// descriptor's address).
     pub offset: u32,
     pub dynamic: Option<Value>,
+    /// A second computed term, added to [`Address::dynamic`]'s (only with
+    /// it set): the code added an offset register to an address that had
+    /// one already.
+    pub dynamic2: Option<Value>,
 }
 
 /// [`Address::param`] of the program's own code: a constant table the
@@ -55,6 +60,13 @@ const RAW: [&str; 5] = [
     "an address loaded from memory",
     "an address from a phi",
 ];
+
+/// [`Address::offset`] of a [`MEMORY`] address that was loaded from memory
+/// (a table address the title keeps in its data), as opposed to one in an
+/// SGPR no root parameter fills (0 in game: a descriptor "loaded" there
+/// read near address 0 and its culling program dropped half of Jason's
+/// house, 27 Nov).
+pub const MEMORY_LOADED: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
@@ -617,6 +629,9 @@ impl<'a> Tracer<'a> {
         if base.root != RootType::Table {
             return None;
         }
+        if address.dynamic2.is_some() {
+            return None;
+        }
         let dynamic = address.dynamic?;
         let (input, shift) = match self.sop2(dynamic, &["s_lshl_b32"]) {
             Some((_, [Term::Value(input), Term::Const(shift)])) => (input, (shift & 31) as u8),
@@ -879,8 +894,12 @@ impl<'a> Tracer<'a> {
         if self.stage == HwStage::Cs && RAW.contains(&why) {
             Ok(Address {
                 param: MEMORY,
-                offset: 0,
+                // Not an offset here: which of `RAW` it was (descriptors
+                // are taken from memory only through an address that was
+                // itself loaded, [`MEMORY_LOADED`]).
+                offset: RAW.iter().position(|r| *r == why).unwrap_or(0) as u32,
                 dynamic: None,
+                dynamic2: None,
             })
         } else {
             Err(why)
@@ -945,9 +964,9 @@ impl<'a> Tracer<'a> {
             _ => hi,
         };
         let s = self.sum(lo);
-        if s.dynamic.is_some() && extra.dynamic.is_some() {
-            return Err("an address with two computed terms");
-        }
+        // Two computed terms (one in the address registers, one in the
+        // offset register): both kept, added where the address is used.
+        let second = if s.dynamic.is_some() { extra.dynamic } else { None };
         let base = s.base.ok_or_else(|| self.why_no_base(s.dynamic))?;
         if let Some(pc) = self.getpc(base) {
             // A table in the code: the base is the next instruction's offset.
@@ -963,12 +982,25 @@ impl<'a> Tracer<'a> {
                 param: CODE,
                 offset: first.wrapping_add(s.offset).wrapping_add(extra.offset),
                 dynamic: s.dynamic.or(extra.dynamic),
+                dynamic2: second,
             });
         }
-        let reg = self.inputs[base.0 as usize].ok_or("an address not from a root parameter")?;
-        let (param, _) = self
-            .param_of(reg)
-            .ok_or("an address not from a root parameter")?;
+        let why = std::env::var_os("VICTORY_WHY_ADDRESS").is_some();
+        let Some(reg) = self.inputs[base.0 as usize] else {
+            if why {
+                eprintln!(
+                    "WHY-ADDRESS base made by {}",
+                    self.def(base).map_or("?".to_owned(), |i| i.name().to_owned())
+                );
+            }
+            return Err("an address not from a root parameter");
+        };
+        let Some((param, _)) = self.param_of(reg) else {
+            if why {
+                eprintln!("WHY-ADDRESS input register {reg:?} is no root parameter's");
+            }
+            return Err("an address not from a root parameter");
+        };
         let high = match self.layout[param].root {
             RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap => None,
             RootType::Descriptor => {
@@ -990,6 +1022,7 @@ impl<'a> Tracer<'a> {
             param,
             offset: s.offset.wrapping_add(extra.offset),
             dynamic: s.dynamic.or(extra.dynamic),
+            dynamic2: second,
         })
     }
 
@@ -1000,6 +1033,27 @@ impl<'a> Tracer<'a> {
             || matches!(hi, Term::Value(v) if self.sop2(v, &["s_addc_u32"]).is_some_and(
                 |(_, [a, b])| a == want && b == Term::Const(0) || b == want && a == Term::Const(0)
             ))
+            || matches!(hi, Term::Value(v) if self.plus_scc(v).is_some_and(|t| t == want))
+    }
+
+    /// `x` where `v` is `s_add_u32 v, x, src_scc` (either way round): the
+    /// carry of the low half's add written out (P.4's programs build a
+    /// heap address so).
+    fn plus_scc(&self, v: Value) -> Option<Term> {
+        let inst = self.def(v)?;
+        if inst.name() != "s_add_u32" || inst.writes.first()?.1 != v {
+            return None;
+        }
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return None;
+        };
+        let (a, b) = (src.first()?, src.get(1)?);
+        let scc = |o: &Operand| matches!(o, Operand::Const(253));
+        match (scc(a), scc(b)) {
+            (false, true) => self.term(inst, a),
+            (true, false) => self.term(inst, b),
+            _ => None,
+        }
     }
 
     /// `hi` adds something (with carry) to `high`: `s_addc_u32` or
@@ -1073,7 +1127,42 @@ impl<'a> Tracer<'a> {
         match self.def(v).map(|i| i.name()) {
             Some(n) if n.starts_with("s_load_") => "an address loaded from memory",
             None => "an address from a phi",
-            _ => "an address not from a root parameter",
+            _ => {
+                if std::env::var_os("VICTORY_WHY_ADDRESS").is_some() {
+                    let inst = self.def(v);
+                    let leaves: Vec<String> = self
+                        .leaves(v)
+                        .map(|l| match (self.def(l), self.inputs[l.0 as usize]) {
+                            (_, Some(r)) => format!("input {r:?}"),
+                            (Some(i), None) => i.name().to_owned(),
+                            (None, None) => "phi".to_owned(),
+                        })
+                        .collect();
+                    let ops = |v: Value| -> String {
+                        match self.sop2(v, &["s_or_b32", "s_add_u32", "s_lshl_b32", "s_and_b32"]) {
+                            Some((i, [a, b])) => {
+                                let t = |t: Term| match t {
+                                    Term::Const(c) => format!("{c:#x}"),
+                                    Term::Value(x) => match (self.def(x), self.inputs[x.0 as usize]) {
+                                        (_, Some(r)) => format!("in{r:?}"),
+                                        (Some(d), None) => d.name().to_owned(),
+                                        (None, None) => "phi".to_owned(),
+                                    },
+                                };
+                                format!("{}({}, {})", i.name(), t(a), t(b))
+                            }
+                            None => String::new(),
+                        }
+                    };
+                    eprintln!(
+                        "WHY-ADDRESS made by {} from leaves [{}] {}",
+                        inst.map_or("?", |i| i.name()),
+                        leaves.join(", "),
+                        ops(v)
+                    );
+                }
+                "an address not from a root parameter"
+            }
         }
     }
 
@@ -1142,6 +1231,11 @@ impl<'a> Tracer<'a> {
         joins: &mut Vec<usize>,
         known: &mut Known,
     ) -> Result<Source, &'static str> {
+        // Words that went through XOR chains that cancel out (the console
+        // compiler swaps registers with `s_xor_b32` three times): the word
+        // they come back to.
+        let unxored: Vec<Term> = words.iter().map(|&w| self.bfm_folded(self.xor_cancelled(w))).collect();
+        let words = &unxored[..];
         if let Some(source) = self.phi(words, joins, known)? {
             return Ok(source);
         }
@@ -1178,6 +1272,9 @@ impl<'a> Tracer<'a> {
         if let Some(source) = self.loaded(words) {
             return Ok(source);
         }
+        if let Some(source) = self.raw_view_of_loaded(words) {
+            return Ok(source);
+        }
         if let [lo, hi, Term::Const(w2), Term::Const(w3)] = *words {
             let (mut hi, mut bits) = (hi, 0);
             while let Term::Value(v) = hi
@@ -1204,6 +1301,30 @@ impl<'a> Tracer<'a> {
             matches!(*w, Term::Value(v)
                 if self.def(v).is_some_and(|i| i.name().starts_with("s_load_")))
         };
+        // P.4 census (`VICTORY_WHY_DESCRIPTOR=1`): what made each word.
+        if std::env::var_os("VICTORY_WHY_DESCRIPTOR").is_some() {
+            let what: Vec<String> = words
+                .iter()
+                .map(|w| match *w {
+                    Term::Const(c) => format!("const {c:#x}"),
+                    Term::Value(v) => match self.sop2(v, &["s_and_b32", "s_or_b32", "s_mul_i32", "s_lshl_b32", "s_add_u32", "s_xor_b32", "s_xor_b64"]) {
+                        Some((i, [a, b])) => {
+                            let t = |t: Term| match t {
+                                Term::Const(c) => format!("{c:#x}"),
+                                Term::Value(x) => self.def(x).map_or("input".to_owned(), |i| i.name().to_owned()),
+                            };
+                            format!("{}({}, {})", i.name(), t(a), t(b))
+                        }
+                        None => self.def(v).map_or("input".to_owned(), |i| i.name().to_owned()),
+                    },
+                })
+                .collect();
+            eprintln!(
+                "WHY-DESCRIPTOR {} {}",
+                if words.iter().any(loaded) { "changed" } else { "neither" },
+                what.join(" | ")
+            );
+        }
         Err(if words.iter().any(loaded) {
             "a descriptor changed after loading"
         } else {
@@ -1542,7 +1663,11 @@ impl<'a> Tracer<'a> {
         self.read_first_lane.set(true);
         let address = self.smem_address(inst, base, *offset, soffset);
         self.read_first_lane.set(false);
-        match self.origin(address.ok()?.dynamic?) {
+        let address = address.ok()?;
+        if address.dynamic2.is_some() {
+            return None;
+        }
+        match self.origin(address.dynamic?) {
             Term::Value(v) if self.first_lane_source(v).is_some() => Some(v),
             _ => None,
         }
@@ -1752,7 +1877,7 @@ impl<'a> Tracer<'a> {
             self.runs(site, known)?;
             let a = address(site)?;
             let want = a0.offset.wrapping_add(4 * (first + k) as u32);
-            if (a.param, a.dynamic) != (a0.param, a0.dynamic)
+            if (a.param, a.dynamic, a.dynamic2) != (a0.param, a0.dynamic, a0.dynamic2)
                 || a.offset.wrapping_add(4 * dword as u32) != want
             {
                 return Err("a descriptor read from the first lane of loads that do not line up");
@@ -2114,6 +2239,156 @@ impl<'a> Tracer<'a> {
     }
 
     /// Consecutive dwords of one scalar load.
+    /// `w` with the XOR chains it went through cancelled: when the leaves of
+    /// its `s_xor_b32` tree (values not made by `s_xor_b32`, and constants)
+    /// leave one value an odd number of times and constants that XOR to 0,
+    /// that value; otherwise `w` itself.
+    fn xor_cancelled(&self, w: Term) -> Term {
+        let Term::Value(v) = w else {
+            return w;
+        };
+        if self.xor_operands(v).is_none() {
+            return w;
+        }
+        let mut odd: Vec<Value> = Vec::new();
+        let mut constant = 0u32;
+        let mut stack = vec![(Term::Value(v), 0u8)];
+        while let Some((t, depth)) = stack.pop() {
+            match t {
+                Term::Const(c) => constant ^= c,
+                Term::Value(x) => match self.xor_operands(x) {
+                    Some([a, b]) if depth < 32 => {
+                        stack.push((a, depth + 1));
+                        stack.push((b, depth + 1));
+                    }
+                    Some(_) => return w,
+                    None => match odd.iter().position(|&y| y == x) {
+                        Some(i) => {
+                            odd.swap_remove(i);
+                        }
+                        None => odd.push(x),
+                    },
+                },
+            }
+        }
+        match (odd.as_slice(), constant) {
+            ([one], 0) => Term::Value(*one),
+            _ => {
+                if std::env::var_os("VICTORY_WHY_XOR").is_some() {
+                    let names: Vec<String> = odd
+                        .iter()
+                        .map(|&x| match (self.def(x), self.inputs[x.0 as usize]) {
+                            (_, Some(r)) => format!("in{r:?}"),
+                            (Some(d), None) => format!("{}#{}", d.name(), x.0),
+                            (None, None) => format!("phi#{}", x.0),
+                        })
+                        .collect();
+                    eprintln!("WHY-XOR left [{}] const {constant:#x}", names.join(", "));
+                }
+                w
+            }
+        }
+    }
+
+    /// `w` as a constant when `s_bfm_b32` / `s_bfm_b64` made it from
+    /// constants (`((1 << width) - 1) << offset`; for the 64-bit form, the
+    /// half `w` is): the console compiler builds immediate samplers' words so
+    /// (`s_bfm_b64 s[88:89], 2, 54`). Otherwise `w`.
+    fn bfm_folded(&self, w: Term) -> Term {
+        let Term::Value(v) = w else {
+            return w;
+        };
+        let Some(inst) = self.def(v) else {
+            return w;
+        };
+        let wide = match inst.name() {
+            "s_bfm_b32" => false,
+            "s_bfm_b64" => true,
+            _ => return w,
+        };
+        let Some(half) = inst.writes.iter().position(|x| x.1 == v) else {
+            return w;
+        };
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return w;
+        };
+        let k = |o: Option<&Operand>| match o.and_then(|o| self.term(inst, o)) {
+            Some(Term::Const(c)) => Some(c),
+            _ => None,
+        };
+        let (Some(width), Some(offset)) = (k(src.first()), k(src.get(1))) else {
+            return w;
+        };
+        let value: u64 = if wide {
+            let (width, offset) = (width & 63, offset & 63);
+            let mask = if width == 0 { 0 } else { u64::MAX >> (64 - width) };
+            mask << offset
+        } else {
+            let (width, offset) = (width & 31, offset & 31);
+            let mask = if width == 0 { 0 } else { u32::MAX >> (32 - width) };
+            u64::from(mask << offset)
+        };
+        Term::Const(if half == 0 { value as u32 } else { (value >> 32) as u32 })
+    }
+
+    /// The operands of the XOR that made `v`: an `s_xor_b32`'s, or for each
+    /// half of an `s_xor_b64` the same half of its two operands.
+    fn xor_operands(&self, v: Value) -> Option<[Term; 2]> {
+        if let Some((_, ops)) = self.sop2(v, &["s_xor_b32"]) {
+            return Some(ops);
+        }
+        let inst = self.def(v)?;
+        if inst.name() != "s_xor_b64" {
+            return None;
+        }
+        let half = inst.writes.iter().position(|w| w.1 == v)? as u8;
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return None;
+        };
+        let op = |o: &Operand| match *o {
+            Operand::Scalar { code, .. } if code != NULL => Some(self.origin(inst.read(Reg::S(code + half))?)),
+            Operand::Scalar { .. } => Some(Term::Const(0)),
+            // A 64-bit constant: its low dword, 0 (or all ones, sign) above.
+            Operand::Const(c) => inline(c).map(|k| Term::Const(if half == 0 { k } else if (k as i32) < 0 { u32::MAX } else { 0 })),
+            Operand::Literal(x) => Some(Term::Const(if half == 0 { x } else { 0 })),
+            _ => None,
+        };
+        Some([op(src.first()?)?, op(src.get(1)?)?])
+    }
+
+    /// A loaded buffer descriptor made into a byte-address (raw) view of the
+    /// same buffer: `[d0, d1 & 0xc000ffff, d2 * n, (d3 & m) | 0x30000000]`
+    /// (the stride cleared, the record count in bytes, OOB_SELECT raw), all
+    /// from one scalar load `d0..d3`. The title's own compute programs (P.4,
+    /// device method 0x218: 975 of them) read structured buffers so. The
+    /// source is the loaded descriptor: accesses without an index are raw
+    /// already, at the byte offset, whatever the stride (the record count
+    /// only bounds them).
+    fn raw_view_of_loaded(&self, words: &[Term]) -> Option<Source> {
+        let [Term::Value(d0), Term::Value(w1), Term::Value(w2), Term::Value(w3)] = *words else {
+            return None;
+        };
+        // `op(value, constant)` either way round: the value.
+        let with = |v: Value, name: &str, k: Option<u32>| -> Option<Value> {
+            let (_, [a, b]) = self.sop2(v, &[name])?;
+            match (a, b, k) {
+                (Term::Value(x), Term::Const(c), Some(k)) | (Term::Const(c), Term::Value(x), Some(k)) if c == k => Some(x),
+                (Term::Value(x), _, None) | (_, Term::Value(x), None) => Some(x),
+                _ => None,
+            }
+        };
+        let d1 = with(w1, "s_and_b32", Some(0xc000_ffff))?;
+        let d3_masked = with(w3, "s_or_b32", Some(0x3000_0000))?;
+        let d3 = with(d3_masked, "s_and_b32", None).unwrap_or(d3_masked);
+        // The record count: one factor is dword 2 of the same load.
+        let (_, [a, b]) = self.sop2(w2, &["s_mul_i32"])?;
+        let source = |d2: Value| self.loaded(&[Term::Value(d0), Term::Value(d1), Term::Value(d2), Term::Value(d3)]);
+        [a, b].into_iter().find_map(|t| match t {
+            Term::Value(d2) => source(d2),
+            Term::Const(_) => None,
+        })
+    }
+
     fn loaded(&self, words: &[Term]) -> Option<Source> {
         let Term::Value(v0) = words[0] else {
             return None;
@@ -2499,6 +2774,7 @@ pub(crate) mod tests {
             param,
             offset,
             dynamic: None,
+            dynamic2: None,
         }
     }
 

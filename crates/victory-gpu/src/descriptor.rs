@@ -29,7 +29,7 @@ const HEAP_IIDS: [Iid; 4] = [
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct HeapDesc {
     kind: u32,
-    count: u32,
+    pub(crate) count: u32,
     flags: u32,
     nodes: u32,
 }
@@ -48,7 +48,7 @@ struct Placement {
 #[repr(C)]
 pub(crate) struct Heap {
     object: Object,
-    desc: HeapDesc,
+    pub(crate) desc: HeapDesc,
     /// The first descriptor: in `memory`, or in the title's own memory.
     pub(crate) start: u64,
     memory: Option<Memory>,

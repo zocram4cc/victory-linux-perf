@@ -285,10 +285,17 @@ fn unspill(
             _ => None,
         };
         match (inst.name()?, v.dst?, v.src.as_slice()) {
-            ("v_writelane_b32", Operand::Vector { reg, .. }, [Operand::Scalar { code, .. }, k]) if *code < 105 => {
+            // SGPRs s0-s105 (s105 was left out: `< 105`) and VCC (106/107: a scalar pair like any other; the
+            // console compiler parks it beside the rest, and one such save
+            // used to keep the whole VGPR from being unspilled).
+            ("v_writelane_b32", Operand::Vector { reg, .. }, [Operand::Scalar { code, .. }, k])
+                if *code <= 105 || matches!(*code, VCC | 107) =>
+            {
                 Some((true, reg, *code, lane(k)?))
             }
-            ("v_readlane_b32", Operand::Scalar { code, .. }, [Operand::Vector { reg, .. }, k]) if code < 105 => {
+            ("v_readlane_b32", Operand::Scalar { code, .. }, [Operand::Vector { reg, .. }, k])
+                if code <= 105 || matches!(code, VCC | 107) =>
+            {
                 Some((false, *reg, code, lane(k)?))
             }
             _ => None,
@@ -298,7 +305,7 @@ fn unspill(
     // per instruction the scalar codes it writes.
     let mut stores = [false; 256];
     let mut other: [Option<usize>; 256] = [None; 256]; // the last such use
-    let mut used = [false; 128];
+    let mut used = [false; 256];
     let mut parks: Vec<Option<(bool, u8, u8, u32)>> = Vec::with_capacity(list.len());
     let mut written: Vec<Vec<u8>> = Vec::with_capacity(list.len());
     let mut read: Vec<Vec<u8>> = Vec::with_capacity(list.len());
@@ -307,6 +314,9 @@ fn unspill(
         let fields = inst.fields(wave64);
         let park = parked(inst, &fields);
         let Ok(effects) = effects(inst, &fields, name, lanes, vgprs) else {
+            if std::env::var_os("VICTORY_WHY_UNSPILL").is_some() {
+                eprintln!("WHY-UNSPILL none: effects unknown for {name}");
+            }
             return Vec::new();
         };
         let mut codes = Vec::new();
@@ -362,6 +372,14 @@ fn unspill(
                 })
         });
         let from = if late { first.unwrap_or(0) } else { parks.len() };
+        if std::env::var_os("VICTORY_WHY_UNSPILL").is_some() && stores[reg] {
+            let first_name = first.and_then(|f| list[f].name()).unwrap_or("-");
+            let other_name = list[last].name().unwrap_or("?");
+            eprintln!(
+                "WHY-UNSPILL v{reg}: other use {other_name} at {last}, first save at {first:?} ({first_name}): {}",
+                if late { "from the first save on" } else { "not parked" }
+            );
+        }
         for park in &mut parks[..from] {
             if of(park).is_some() {
                 *park = None;
@@ -1783,6 +1801,25 @@ mod tests {
     fn build_words(words: &[u32], wave64: bool) -> Program {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         build(&code, wave64, 256).unwrap()
+    }
+
+    /// A scalar destination field of 128 or more (a constant's code, not a
+    /// register) is refused or ignored, never an index past the scalar
+    /// codes the parking search keeps (found by fuzzing the translator).
+    #[test]
+    fn scalar_codes_past_the_registers_do_not_panic() {
+        // v_writelane_b32 v1, s0, 0: a program that parks a scalar, so the
+        // parking search runs.
+        const PARK: [u32; 2] = [0xD761_0001, 0x0001_0000];
+        for (words, wave64) in [
+            ([0xD4C5_A8D7, 0x9342_BFA0], true),
+            ([0xD401_53FF, 0x0509_8D04], false),
+            ([0xD4EC_FE8B, 0x1234_5678], false),
+        ] {
+            let words = [&PARK[..], &words[..], &[S_ENDPGM]].concat();
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let _ = build(&code, wave64, 256);
+        }
     }
 
     fn input(p: &Program, reg: Reg) -> Value {
