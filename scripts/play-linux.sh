@@ -17,6 +17,7 @@
 #   --proton-log    Wine's own log into the run folder (large)
 #   --headless      in gamescope's headless backend (1920x1080, no window or monitor
 #                   needed): for unattended runs; the picture is only in captures
+#   VICTORY_CONSOLE=series-x  the Series X device instead of Series S (the default)
 #   --new-game      start at the opening scene: the story save and player record are
 #                   moved to ~/.local/share/victory/save-backups/<time> first (settings stay),
 #                   then ~/.local/share/victory/save-templates/new-game is copied in (a player
@@ -380,9 +381,12 @@ disown $!
 echo "run folder: $run"
 wrap=()
 if (( headless )); then
-  wrap=(gamescope --backend headless -W 1920 -H 1080 -w 1920 -h 1080 --)
+  # VICTORY_HEADLESS_OUT=WxH: gamescope's output size (the title still
+  # renders 1920x1080): smaller makes its screenshots cheaper.
+  out="${VICTORY_HEADLESS_OUT:-1920x1080}"
+  wrap=(gamescope --backend headless -W "${out%x*}" -H "${out#*x}" -w 1920 -h 1080 --)
 fi
-setsid "${wrap[@]}" umu-run "$win_exe" run "$(winpath "$game/game_scarlett_master.exe")" --console series-s --execute \
+setsid "${wrap[@]}" umu-run "$win_exe" run "$(winpath "$game/game_scarlett_master.exe")" --console "${VICTORY_CONSOLE:-series-s}" --execute \
   > >(python3 -I -u -c 'import re, signal, sys, time
 # Runs until the title closes its output: Ctrl-C and a closed terminal are
 # for the script above, which stops the title.

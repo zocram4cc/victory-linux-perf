@@ -1,0 +1,12 @@
+# Resume a save (no --new-game) and stand there: past the start screens, the
+# Continue/Resume button, then nothing pressed. For runs in the place the
+# save is (the prison, where character geometry spikes were seen often).
+duration=300
+12:Enter
+16:Enter
+20:A
+25:Enter
+30:A
+35:Enter
+40:A
+50:Enter

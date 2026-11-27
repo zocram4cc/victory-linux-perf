@@ -1,11 +1,11 @@
-# The opening from a new game: past the start screens, then the cutscenes
+# The opening from a new game (600 s): past the start screens, then the cutscenes
 # play by themselves (the police stop, the drive, the quick-cut montage,
 # the beach and the prison), where the geometry spikes on characters and
 # the other faults reported on 2026-11-27 show. Run it with --new-game and
 # a data folder of its own, so a player's save is left alone:
 #   VICTORY_DATA_DIR=~/.local/share/victory/data-auto \
 #     scripts/play-linux.sh --bench intro --new-game [--headless]
-duration=360
+duration=600
 12:Enter
 16:Enter
 20:A
