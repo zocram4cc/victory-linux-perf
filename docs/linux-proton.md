@@ -56,15 +56,24 @@ Measured in the jail scene with our Proton build, one run each (2026-11-26/27):
   four patches and all of `play.ps1`'s settings render with any Proton build.
 - `VICTORY_THIN` (eight threads of ours translating the title's lists) is
   most of the gain: without it 133-152 ms.
-- Known issues: audio crackles in the world with the full set (clean in the
-  menus; under investigation); frame pacing is uneven; video memory peaks
-  near 15 GB (Belobug's texture budget fills up to nine tenths of what the
-  system grants, plus up to 4 GiB of card copies, `VICTORY_MEMORY_CARD_MB`).
+- Known issues: at normal priority the game's ~150 busy threads made the
+  desktop's audio crackle (`scripts/play-linux.sh` runs it at nice 10, at the
+  same frame times); the game's own sound is still choppy at times (under
+  investigation); frame pacing is uneven; video memory peaks near 15 GB
+  (Belobug's texture budget fills up to nine tenths of what the system grants,
+  plus up to 4 GiB of card copies, `VICTORY_MEMORY_CARD_MB`).
 - The pipeline-library fix above is needed for pipelines to be kept between
   runs under Proton at all.
-- Ray tracing is off by Belobug's default (`VICTORY_BVH_BUILDER` turns the
-  title's builder on, as `play.ps1 -RayTracing` does); `VICTORY_AMBIENT=0.8`
-  (in `play.ps1`'s set) paints an estimate of the missing indirect light.
+- Lighting: ray tracing is off by Belobug's default (`VICTORY_BVH_BUILDER`
+  turns the title's builder on, as `play.ps1 -RayTracing` does; here it costs
+  50-80 ms of GPU time a frame). With the builder off the title still traces
+  into an empty structure: eyes glow blue-white (their reflections find the
+  sky) and rooms go grey. We play the title's own path for no ray tracing
+  instead (`VICTORY_RT_FALLBACK_NO_BVH=1`: natural eyes, the console's warmth)
+  with Belobug's estimate of the missing bounce light at 0.35 and its crease
+  shading off (`VICTORY_AMBIENT=0.35 VICTORY_AMBIENT_SHADE=0`). Cell scene:
+  brightness 67 and red/blue 1.74 against the console's 68-71 and 1.86-2.12
+  (`play.ps1`'s `VICTORY_AMBIENT=0.8` without the fallback: 77 and 1.55).
 
 ### PC FSR
 
@@ -136,8 +145,9 @@ once with `run` (`"$PROTON" run cmd /c exit`) before using `runinprefix`.
 ## Running
 
 Use a Proton prefix of its own and Proton's vkd3d-proton (`d3d12` native).
-`scripts\play.ps1` is PowerShell for Windows; under Proton set the variables
-yourself:
+`scripts/play-linux.sh <game folder>` does all of the below (the fast set,
+the lighting, the shader store once per build, the game at nice 10;
+`--safe` for Belobug's defaults, `--fsr` for the PC upscaler). By hand:
 
 ```sh
 PROTON=~/.steam/steam/compatibilitytools.d/GE-Proton11-14-victory5/proton
@@ -145,6 +155,8 @@ export STEAM_COMPAT_DATA_PATH=~/victory-prefix STEAM_COMPAT_CLIENT_INSTALL_PATH=
 export WINEDLLOVERRIDES="d3d12=n;d3d12core=n;dxgi=n;d3d11=n;d3d10core=n;d3d9=n"
 export VICTORY_GAME_DIR='Z:\path\to\GTA6.Xbox.v1.0.2.1'
 export VICTORY_NO_WATCHDOG=1
+# Lighting (see "Lighting" above).
+export VICTORY_RT_FALLBACK_NO_BVH=1 VICTORY_AMBIENT=0.35 VICTORY_AMBIENT_SHADE=0
 # Optional: go on past the instance-list pool stop in the intro (things go
 # missing from then on).
 # export VICTORY_NO_POOL_TRAP=1
@@ -155,7 +167,7 @@ export VICTORY_NO_WATCHDOG=1
 export VICTORY_TEXTURE_NO_WAIT=1 VICTORY_RELAY=2 VICTORY_WIDE_BACK=1 VICTORY_CARD_REHASH_RUNS=1 \
   VICTORY_JOIN_COPIES=1 VICTORY_INDIRECT_WINDOW=1 VICTORY_RELAY_COPY=1 VICTORY_CARD_STEPS=2 \
   VICTORY_INDIRECT_BATCH=2 VICTORY_MAP_THREADS=1 VICTORY_CARD_AWAKE=1 VICTORY_SHOW_AFTER=1 \
-  VICTORY_AMBIENT=0.8 VICTORY_THIN=1 VICTORY_JOIN_PARTS=8 VICTORY_UPLOAD_AHEAD=1 \
+  VICTORY_THIN=1 VICTORY_JOIN_PARTS=8 VICTORY_UPLOAD_AHEAD=1 \
   VICTORY_PORT_CONSTANTS=1 VICTORY_PORT_DESCRIPTORS=1 VICTORY_PORT_CBV=1 VICTORY_PORT_GUARD=1 \
   VICTORY_PORT_JOURNAL=1
 # Optional, PC FSR (see "PC FSR" above):
@@ -165,7 +177,7 @@ export VICTORY_TEXTURE_NO_WAIT=1 VICTORY_RELAY=2 VICTORY_WIDE_BACK=1 VICTORY_CAR
 # shader store (minutes; it goes on where it was stopped).
 "$PROTON" runinprefix victory.exe shaders "$VICTORY_GAME_DIR"
 
-"$PROTON" runinprefix victory.exe run "$VICTORY_GAME_DIR\game_scarlett_master.exe" --execute
+prlimit --nice=10:10 -- nice -n 10 "$PROTON" runinprefix victory.exe run "$VICTORY_GAME_DIR\game_scarlett_master.exe" --execute
 ```
 
 Paths given to `victory.exe` are Windows paths (`Z:` is `/`).

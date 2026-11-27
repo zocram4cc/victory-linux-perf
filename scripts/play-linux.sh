@@ -2,7 +2,7 @@
 # Starts the title under our Proton build with the settings this branch is played with on Linux: the counterpart of
 # scripts/play.ps1 (docs/linux-proton.md, "Running").
 #   scripts/play-linux.sh <game folder> [--safe] [--fsr quality|balanced|performance <fidelityfx folder>]
-#   --safe   Belobug's defaults: none of play.ps1's settings or the renderer patches
+#   --safe   Belobug's defaults: none of play.ps1's settings or the renderer patches (the lighting below stays)
 #   --fsr    AMD's PC upscaler from <fidelityfx folder> (FSR 3.1, or FSR 4 on RDNA3/4 with PROTON_FSR4_UPGRADE=1)
 # Environment: PROTON (default ~/.steam/steam/compatibilitytools.d/GE-Proton11-14-victory5/proton), STEAM_COMPAT_DATA_PATH
 # (default ~/victory-prefix), VICTORY_EXE (default target/x86_64-pc-windows-msvc/diag/victory.exe in this checkout).
@@ -33,11 +33,14 @@ mkdir -p "$STEAM_COMPAT_DATA_PATH"
 export WINEDLLOVERRIDES="d3d12=n;d3d12core=n;dxgi=n;d3d11=n;d3d10core=n;d3d9=n"
 VICTORY_GAME_DIR=$(win "$GAME"); export VICTORY_GAME_DIR
 export VICTORY_NO_WATCHDOG=1
+# Lighting: the title's own path for no ray tracing (without it the title traces into an empty structure: eyes glow
+# blue-white, rooms go grey), with Belobug's stand-in for the missing bounce light at 0.35, no crease shading.
+export VICTORY_RT_FALLBACK_NO_BVH=1 VICTORY_AMBIENT=0.35 VICTORY_AMBIENT_SHADE=0
 if [ "$SAFE" = 0 ]; then
   export VICTORY_TEXTURE_NO_WAIT=1 VICTORY_RELAY=2 VICTORY_WIDE_BACK=1 VICTORY_CARD_REHASH_RUNS=1 \
     VICTORY_JOIN_COPIES=1 VICTORY_INDIRECT_WINDOW=1 VICTORY_RELAY_COPY=1 VICTORY_CARD_STEPS=2 \
     VICTORY_INDIRECT_BATCH=2 VICTORY_MAP_THREADS=1 VICTORY_CARD_AWAKE=1 VICTORY_SHOW_AFTER=1 \
-    VICTORY_AMBIENT=0.8 VICTORY_THIN=1 VICTORY_JOIN_PARTS=8 VICTORY_UPLOAD_AHEAD=1 \
+    VICTORY_THIN=1 VICTORY_JOIN_PARTS=8 VICTORY_UPLOAD_AHEAD=1 \
     VICTORY_PORT_CONSTANTS=1 VICTORY_PORT_DESCRIPTORS=1 VICTORY_PORT_CBV=1 VICTORY_PORT_GUARD=1 \
     VICTORY_PORT_JOURNAL=1
 fi
