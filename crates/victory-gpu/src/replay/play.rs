@@ -33,6 +33,7 @@ pub mod diverge;
 pub mod look;
 mod merge;
 pub mod pixel;
+pub mod reach;
 mod upcopies;
 
 /// The name of the argument clamp's pipeline, by which its passes are

@@ -157,6 +157,19 @@ pub(crate) struct Replay {
     /// Only write the frame's buffers and the commands of these lists (`3..7`).
     #[arg(long)]
     listing: Option<String>,
+    /// For the draws of these lists (`3..7`) whose pipeline names one of
+    /// --reach-shader: how far the streams their root SRV's header names
+    /// reach, against the view the runtime gave it (from the capture alone).
+    #[arg(long)]
+    root_reach: Option<String>,
+    /// With --root-reach: a program hash (repeatable; default the two
+    /// pre-skinned character mesh programs).
+    #[arg(long)]
+    reach_shader: Vec<String>,
+    /// With --root-reach: the host graphics root parameter of the root SRV's
+    /// one-view table.
+    #[arg(long, default_value_t = 2)]
+    reach_param: u32,
     /// Only write what the dispatches of these lists have bound (`3..7`).
     #[arg(long)]
     flow: Option<String>,
@@ -254,6 +267,15 @@ pub(crate) fn run(r: Replay) -> Result<()> {
     if let Some(text) = &r.listing {
         let lists = range(text).with_context(|| format!("--listing {text}"))?;
         return play::listing(&r.folder, lists, &mut |line| println!("{line}"));
+    }
+    if let Some(text) = &r.root_reach {
+        let lists = range(text).with_context(|| format!("--root-reach {text}"))?;
+        let shaders = if r.reach_shader.is_empty() {
+            vec!["093c64546c55554e".to_owned(), "5bd95fdec765c0d6".to_owned()]
+        } else {
+            r.reach_shader.clone()
+        };
+        return play::reach::root_reach(&r.folder, lists, &shaders, r.reach_param, &mut |line| println!("{line}"));
     }
     if let Some(text) = &r.flow {
         let lists = range(text).with_context(|| format!("--flow {text}"))?;
