@@ -1008,15 +1008,74 @@ pub(crate) fn guard_due_same(index: u32) {
 
 /// A slot of a texture picked by index was uploaded with `bytes`: counted
 /// if a guard write made it due ([`GUARD_WRITES`] 6 and 7).
-pub(crate) fn guard_due_uploaded(index: u32, bytes: u64) {
+/// Returns whether it was.
+pub(crate) fn guard_due_uploaded(index: u32, bytes: u64) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     if !guard_writes() {
-        return;
+        return false;
     }
-    if GUARD_DUE.lock().unwrap_or_else(|e| e.into_inner()).uploaded(index) {
+    let again = GUARD_DUE.lock().unwrap_or_else(|e| e.into_inner()).uploaded(index);
+    if again {
         GUARD_WRITES[6].fetch_add(1, Relaxed);
         GUARD_WRITES[7].fetch_add(bytes, Relaxed);
     }
+    again
+}
+
+/// Diagnostics: what the first upload of each slot of a texture picked by
+/// index found at the start of its memory, to tell, when a guard write has
+/// it uploaded again ([`guard_due_uploaded`]), what was repaired: a line
+/// with the slot, the texture's shape, the frames since its first upload,
+/// and the first 16 bytes then and now (data that is no texture, such as
+/// compressed bytes or 16-bit numbers, shows there). For the first 256
+/// such uploads, then at counts that double.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn guard_upload_seen(index: u32, resource: crate::object::This, frame: u64, again: bool) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    /// Slots remembered at most; past it all are let go and the count goes on.
+    const MOST: usize = 1 << 18;
+    static FIRST: std::sync::LazyLock<Mutex<std::collections::HashMap<(u32, u64), (u64, [u8; 16])>>> =
+        std::sync::LazyLock::new(Mutex::default);
+    static LINES: AtomicU64 = AtomicU64::new(0);
+    if !guard_writes() {
+        return;
+    }
+    let Some((at, _)) = crate::texture::title_span(resource, 0) else {
+        return;
+    };
+    let mut now = [0u8; 16];
+    if !crate::host::read_into(at as *const u8, &mut now) {
+        return;
+    }
+    let mut first = FIRST.lock().unwrap_or_else(|e| e.into_inner());
+    if !again {
+        if first.len() >= MOST {
+            first.clear();
+        }
+        first.entry((index, at)).or_insert((frame, now));
+        return;
+    }
+    let before = first.get(&(index, at)).copied();
+    drop(first);
+    let n = LINES.fetch_add(1, Relaxed) + 1;
+    if n > 256 && !n.is_power_of_two() {
+        return;
+    }
+    let (w, h, levels, format) = crate::resource::texture_shape(resource).unwrap_or_default();
+    let hex = |b: &[u8; 16]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    tracing::info!(
+        uploads = n,
+        slot = index,
+        address = format_args!("{at:#x}"),
+        width = w,
+        height = h,
+        levels,
+        format,
+        frames_since_first_upload = before.map_or(-1, |(f, _)| frame.saturating_sub(f) as i64),
+        first_bytes_then = before.map_or_else(|| "unknown".to_string(), |(_, b)| hex(&b)),
+        first_bytes_now = hex(&now),
+        "a texture picked by index uploaded again after a write the guards saw (VICTORY_GUARD_WRITES)"
+    );
 }
 
 /// Title memory the runtime mapped, unmapped or is about to write since a

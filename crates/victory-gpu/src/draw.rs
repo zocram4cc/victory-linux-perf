@@ -4163,7 +4163,9 @@ impl State {
                 return false;
             }
             let (bytes, whole) = crate::texture::staged(resource, there.is_none()).unwrap_or((0, true));
-            crate::descriptor::host::guard_due_uploaded(index, bytes);
+            let _again = crate::descriptor::host::guard_due_uploaded(index, bytes);
+            #[cfg(feature = "diagnostics")]
+            crate::descriptor::host::guard_upload_seen(index, resource, frame, _again);
             // Not all of it there: looked at again next frame, and from
             // then on as a slot with nothing new (a placed texture: until
             // more of it is mapped; a texture object at an address the

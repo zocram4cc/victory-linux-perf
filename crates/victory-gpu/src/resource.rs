@@ -2943,6 +2943,13 @@ impl OnDemand {
     }
 }
 
+/// A texture's width, height, levels and DXGI format, for log lines;
+/// `None` for buffers.
+pub(crate) fn texture_shape(this: This) -> Option<(u64, u32, u16, u32)> {
+    let (_, d) = texture_memory(this)?;
+    Some((d.width, d.height, d.mip_levels, d.format))
+}
+
 /// A texture's console memory and description; `None` for buffers.
 pub(crate) fn texture_memory(this: This) -> Option<(*const u8, ResourceDesc)> {
     if this.is_null() {
