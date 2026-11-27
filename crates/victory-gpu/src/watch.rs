@@ -2412,6 +2412,20 @@ const SETTING: usize = 3;
 /// `VirtualProtect` of `n` blocks from `block` on, counted in [`PROTECTS`].
 fn change(kind: usize, block: usize, n: usize, protect: u32, old: &mut u32) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
+    // Diagnostic: under Proton the main thread's stack (0x10000..0x110000) was
+    // made read-only as "block 2" and a fault there recursed. Say who once.
+    if kind == SETTING && block * BLOCK < 0x0100_0000 {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            tracing::error!(
+                block = format_args!("{:#x}", block * BLOCK),
+                n,
+                backtrace = %std::backtrace::Backtrace::force_capture(),
+                "LOW-PROTECT: a guard asked for memory below 16 MiB"
+            );
+        });
+        return false;
+    }
     // SAFETY: title view memory (or what the caller found in its place); only
     // its protection changes.
     let done =
