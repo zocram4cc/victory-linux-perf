@@ -72,6 +72,9 @@ pub(crate) struct Pending {
     lost: AtomicBool,
     /// Said once that a worker has held it past the stall bound ([`stall_bound`]).
     stall_noted: AtomicBool,
+    /// Made again on a thread with a larger stack after its worker ended
+    /// ([`worker_ended`]): not again.
+    rescued: AtomicBool,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -106,6 +109,7 @@ impl Pending {
             used: AtomicBool::new(false),
             lost: AtomicBool::new(false),
             stall_noted: AtomicBool::new(false),
+            rescued: AtomicBool::new(false),
         }
     }
 
@@ -143,13 +147,16 @@ impl Pending {
     }
 
     fn make(&self) {
-        self.make_with(|| {
-            let _building = crate::timeline::span("pipeline: build a host pipeline");
-            let began = Instant::now();
-            let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
-            super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
-            made
-        });
+        self.make_with(|| self.build());
+    }
+
+    /// The host pipeline, made here and now.
+    fn build(&self) -> Option<HostPipeline> {
+        let _building = crate::timeline::span("pipeline: build a host pipeline");
+        let began = Instant::now();
+        let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+        super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
+        made
     }
 
     /// Makes it with `build`, outside the `OnceLock` (no other caller waits
@@ -878,33 +885,46 @@ fn watch(mut workers: Vec<(usize, bool, std::thread::JoinHandle<()>)>, stack: us
     use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
     use windows::Win32::System::Threading::{INFINITE, WaitForMultipleObjects};
     let watching = std::thread::Builder::new().name("victory-pipelines-watch".into()).spawn(move || {
-        while !workers.is_empty() {
-            let handles: Vec<HANDLE> = workers.iter().map(|w| HANDLE(w.2.as_raw_handle())).collect();
+        // Pipelines made again on a thread of their own ([`worker_ended`]).
+        let mut rescues: Vec<(Arc<Pending>, std::thread::JoinHandle<()>)> = Vec::new();
+        while !workers.is_empty() || !rescues.is_empty() {
+            let handles: Vec<HANDLE> =
+                workers.iter().map(|w| HANDLE(w.2.as_raw_handle())).chain(rescues.iter().map(|r| HANDLE(r.1.as_raw_handle()))).collect();
             // SAFETY: the handles of threads we hold, which stay open while we do.
             let ended = unsafe { WaitForMultipleObjects(&handles, false, INFINITE) };
             let k = ended.0.wrapping_sub(WAIT_OBJECT_0.0) as usize;
-            if k >= workers.len() {
+            if k >= handles.len() {
                 tracing::warn!(?ended, "the pipeline workers are watched no more");
                 return;
+            }
+            if k >= workers.len() {
+                let (p, _gone) = rescues.swap_remove(k - workers.len());
+                rescue_ended(&p);
+                continue;
             }
             let (i, screens_only, _gone) = workers.swap_remove(k);
             let was = NOW.lock().unwrap_or_else(|e| e.into_inner()).get_mut(i).and_then(Option::take);
             if let Some(p) = was {
-                p.lost.store(true, Ordering::Relaxed);
-                if p.was_slow.load(Ordering::Relaxed) {
+                {
                     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-                    queue.slow_now -= 1;
+                    if p.was_slow.load(Ordering::Relaxed) {
+                        queue.slow_now -= 1;
+                    }
+                    // (Its worker is started again below: not one taken.)
+                    queue.taken.retain(|q| !Arc::ptr_eq(q, &p));
                     AVAILABLE.notify_all();
                 }
                 WAITING.fetch_sub(1, Ordering::Relaxed);
+                let rescue = worker_ended(&p, rescue_stack_now());
                 tracing::warn!(
                     worker = i,
                     shaders = ?p.shaders,
-                    "a host pipeline's making ended its worker (under Wine: the host ran out of stack?): the title goes without this pipeline"
+                    again = rescue.is_some(),
+                    "a host pipeline's making ended its worker (under Wine: the host ran out of stack?): made again on a thread with a larger stack if `again` (VICTORY_PIPELINE_RESCUE_MB), else the title goes without this pipeline"
                 );
-                let (lock, done) = &DONE;
-                let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
-                done.notify_all();
+                if let Some(thread) = rescue {
+                    rescues.push((p, thread));
+                }
             } else {
                 tracing::warn!(worker = i, "a pipeline worker ended with no pipeline in the making");
             }
@@ -917,6 +937,71 @@ fn watch(mut workers: Vec<(usize, bool, std::thread::JoinHandle<()>)>, stack: us
     if let Err(e) = watching {
         tracing::warn!(error = %e, "the pipeline workers are not watched");
     }
+}
+
+/// The stack of the thread that makes a pipeline again after its worker
+/// ended ([`worker_ended`]), in bytes: `asked` MiB
+/// (`VICTORY_PIPELINE_RESCUE_MB`, at most 4,096); `None` unset or 0, not made
+/// again (here off by default; upstream 1 GiB). Reserved only, its pages
+/// committed as they are used.
+fn rescue_stack(asked: Option<usize>) -> Option<usize> {
+    match asked {
+        None | Some(0) => None,
+        Some(mib) => Some(mib.min(4096) << 20),
+    }
+}
+
+/// [`rescue_stack`] of this run.
+fn rescue_stack_now() -> Option<usize> {
+    static STACK: LazyLock<Option<usize>> =
+        LazyLock::new(|| rescue_stack(std::env::var("VICTORY_PIPELINE_RESCUE_MB").ok().and_then(|v| v.trim().parse().ok())));
+    *STACK
+}
+
+/// The worker making `p` ended (a stack overflow in the host's compiler ends
+/// a thread under Wine without an exception anyone can catch): `p` is made
+/// once more on a thread with `stack` bytes if given and it was not made
+/// again before; else given up. The rescue's thread, if it started.
+fn worker_ended(p: &Arc<Pending>, stack: Option<usize>) -> Option<std::thread::JoinHandle<()>> {
+    let again = match stack {
+        Some(stack) if !p.rescued.swap(true, Ordering::AcqRel) => rescue_with(p.clone(), stack, |p| p.build()),
+        _ => None,
+    };
+    if again.is_none() {
+        give_up(p);
+    }
+    again
+}
+
+/// Makes `p` again with `build` on a thread with a `stack` of its own.
+fn rescue_with(
+    p: Arc<Pending>,
+    stack: usize,
+    build: impl FnOnce(&Pending) -> Option<HostPipeline> + Send + 'static,
+) -> Option<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("victory-pipeline-rescue".to_owned())
+        .stack_size(stack)
+        .spawn(move || p.make_with(|| build(&p)))
+        .ok()
+}
+
+/// A rescue's thread ended: if `p` is not made (its making ended that thread
+/// too), its draws and dispatches go without it for the run.
+fn rescue_ended(p: &Pending) {
+    if p.made.get().is_none() {
+        tracing::warn!(shaders = ?p.shaders, "making a pipeline ended its thread again, on the larger stack: its draws and dispatches go without it");
+        give_up(p);
+    }
+}
+
+/// `p` is not made: its draws and dispatches go without it, and nothing
+/// waits for it.
+fn give_up(p: &Pending) {
+    p.lost.store(true, Ordering::Relaxed);
+    let (lock, done) = &DONE;
+    let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    done.notify_all();
 }
 
 /// Starts the workers ([`worker_count`]) on first use.
@@ -1278,6 +1363,44 @@ mod tests {
         assert!(ready(&p).is_none());
         assert!(started.elapsed() <= wait_budget() + Duration::from_millis(500));
         COMPUTE_MS_IN_TEST.set(None);
+    }
+
+    #[test]
+    fn the_rescue_stack_is_what_the_switch_says_and_none_unset() {
+        assert_eq!(rescue_stack(None), None);
+        assert_eq!(rescue_stack(Some(0)), None);
+        assert_eq!(rescue_stack(Some(256)), Some(256 << 20));
+        assert_eq!(rescue_stack(Some(1 << 20)), Some(4 << 30));
+    }
+
+    /// A pipeline whose worker ended is made again on a thread with a rescue
+    /// stack of its own, and given up without one, on a second end of its
+    /// making, or when the rescue's thread ends too (ExitThread: what a stack
+    /// overflow in vkd3d-proton does under Wine).
+    #[test]
+    fn a_pipeline_whose_worker_ended_is_made_again_or_given_up() {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Threading::{ExitThread, INFINITE, WaitForSingleObject};
+        let new = || Arc::new(Pending::new(Vec::new(), None));
+        let p = new();
+        assert!(worker_ended(&p, None).is_none());
+        assert!(p.lost.load(Ordering::Relaxed) && p.made.get().is_none());
+        // Made again (here: no host pipeline for no shaders).
+        let p = new();
+        let rescue = worker_ended(&p, Some(64 << 20)).expect("a rescue thread");
+        rescue.join().unwrap();
+        assert!(matches!(p.made.get(), Some(None)) && !p.lost.load(Ordering::Relaxed));
+        let p = new();
+        p.rescued.store(true, Ordering::Relaxed);
+        assert!(worker_ended(&p, Some(64 << 20)).is_none());
+        assert!(p.lost.load(Ordering::Relaxed));
+        let p = new();
+        // SAFETY: ends the rescue thread, which holds nothing but `p`.
+        let rescue = rescue_with(p.clone(), 64 << 20, |_| unsafe { ExitThread(0) }).expect("a rescue thread");
+        // SAFETY: the handle of a thread we hold.
+        unsafe { WaitForSingleObject(rescue.as_raw_handle() as _, INFINITE) };
+        rescue_ended(&p);
+        assert!(p.lost.load(Ordering::Relaxed) && p.made.get().is_none());
     }
 
     /// (Filip Michalski, fxceless/victory-fork#1353) A build that panics is
