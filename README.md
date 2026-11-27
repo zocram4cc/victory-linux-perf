@@ -88,8 +88,10 @@ the translation, so run them with the switches you play with.
 
 Every setting is an environment variable read at start. The ones that matter
 are under [Modes](#modes); `scripts/play.ps1` lists the play settings the base
-fork ships, and the doc comment where each switch is read says what it does. The launcher scripts used for the measurements are specific
-to one machine and are not in this tree yet.
+fork ships, and the doc comment where each switch is read says what it does.
+`linux/launch-ports.sh` is the launcher the measurements were made with, every
+switch with its reason beside it; its paths are tokens to replace first
+(`linux/README.md`).
 
 ## Modes
 
@@ -148,9 +150,10 @@ Findings that cost time and are worth knowing before repeating them:
 
 A change without a measurement is not done. What has worked:
 
-- **One scripted start, labelled.** Same keys, same seed, captures at fixed
-  seconds in the world, frame times from the layer's own five-second lines.
-- **A blink measure.** Twelve captures in quick succession while nothing
+- **One scripted start, labelled** (`linux/leg.sh`). Same keys, same seed,
+  captures at fixed seconds in the world, frame times from the layer's own
+  five-second lines, and a page of all legs (`linux/leg-index.py`).
+- **A blink measure** (`linux/flicker.py`). Twelve captures in quick succession while nothing
   moves; the mean difference between neighbours is about 1 for a still picture
   and has been as high as 32. Flicker does not show in single screenshots.
 - **A short recording** of every leg, for the same reason.
@@ -213,6 +216,9 @@ Read this section before changing anything.
 | `docs/findings.md` | What the base fork learned: faults found, what was measured and dropped |
 | `scripts/play.ps1` | The base fork's play settings (Windows launcher) |
 | `docs/fork-ray-tracing.md` | How ray tracing and its stand-in work |
+| `docs/notes/NOTES.md` | The running log: every measurement, also the ones that led nowhere |
+| `linux/` | The launcher and the measuring scripts as used (paths are tokens) |
+| `tools/userptr-thp/` | The preloaded helper that collapses renderer port 1's heap into huge pages |
 | `docs/README-avatarmanz.md` | The base fork's README, as it was |
 
 ## Credits
