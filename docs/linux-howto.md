@@ -45,7 +45,8 @@ The tree's `rust-toolchain.toml` pins the compiler; rustup fetches it on the fir
 ## 3. Get and build the runtime
 
 ```sh
-git clone <the VIctory tree you use> victory && cd victory
+# Name the branch: a repository's default branch can be an older line of the runtime.
+git clone -b <branch> <the VIctory tree you use> victory && cd victory
 # Play build (the 'scripted' feature only adds VICTORY_STEP_OVER):
 cargo xwin build --profile release -p victory --features scripted --target x86_64-pc-windows-msvc
 # Diagnostics build (frame captures, VICTORY_AB, profiling; ~3 % slower):
@@ -116,7 +117,13 @@ if [ $# -eq 0 ]; then
     { [ -d "$DATA/ffx" ] && export VICTORY_FFX_DIR="$(win "$DATA/ffx")"; true; }
   set -- "${args[@]}" "$(win "$GAME/game_scarlett_master.exe")" --execute
 elif [ "$1" = prebuild ]; then
-  set -- shaders "$(win "$GAME/shaders.rpf")"
+  # Current trees: `shaders`. Older (klbf-line) trees have no `shaders` subcommand
+  # ("unrecognized subcommand 'shaders'"): PREBUILD=translate uses their form.
+  if [ "${PREBUILD:-shaders}" = translate ]; then
+    set -- translate --cache --pipelines --jobs "$(nproc)" "$(win "$GAME/shaders.rpf")"
+  else
+    set -- shaders "$(win "$GAME/shaders.rpf")"
+  fi
 fi
 # runinprefix keeps the console output (proton run goes through steam.exe, which swallows it):
 exec "$PROTON_DIR/proton" runinprefix "$EXE" "$@"
@@ -133,6 +140,10 @@ VICTORY_PORT_CBV=1 ./run.sh warm --used     # makes the host pipelines the run d
 VICTORY_PORT_CBV=1 ./run.sh warm            # optional: every pipeline any run met (long; needs the 16G cache)
 ```
 After a runtime update that changes the shader translator, repeat the steps (the old entries are ignored).
+If `prebuild` answers `unrecognized subcommand 'shaders'`, the executable is from an older line of the
+runtime (check `git branch --show-current` and rebuild from the intended branch), or run
+`PREBUILD=translate ./run.sh prebuild` for that line's form. `warm` likewise only exists in current
+trees; run `./run.sh --help` (through the launcher) to see what your build has.
 
 ## 8. Settings that helped on RDNA 2 under Proton
 
