@@ -148,7 +148,10 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
-                let done = translate(&self.container);
+                // On a large stack: the first use is often on a thread the title
+                // made (1 MiB), and a shader that is not in the cache is translated
+                // here, deep in recursion (`make::on_a_large_stack`).
+                let done = make::on_a_large_stack(|| translate(&self.container));
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
                 if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
