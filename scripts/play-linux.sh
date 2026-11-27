@@ -215,7 +215,18 @@ win_exe="$(winpath "$exe")"
 
 case "${1:-}" in
   shaders|warm) exec umu-run "$win_exe" "$@" ;;
-  exe) shift; exec umu-run "$win_exe" "$@" ;;
+  exe)
+    shift
+    # Replays make a captured frame's pipelines, a thousand or so a replay,
+    # each lane's from its own build: in the game's cache folder they took
+    # its room, and the driver let the game's and the prebuild's entries go
+    # (the folder sits at its cap). Unless told otherwise, a cache of
+    # their own beside it.
+    if [[ "${1:-}" == replay && -z "${__GL_SHADER_DISK_CACHE_PATH:-}" ]]; then
+      export __GL_SHADER_DISK_CACHE_PATH="$HOME/.cache/victory/nvidia-replays"
+      mkdir -p "$__GL_SHADER_DISK_CACHE_PATH"
+    fi
+    exec umu-run "$win_exe" "$@" ;;
 esac
 for a in "$@"; do
   [[ "$a" == pareto-residency ]] || usage
