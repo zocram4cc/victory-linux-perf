@@ -818,7 +818,7 @@ fn a_first_lane_read_of_a_wave_alike_sum_under_a_wave_alike_loop() {
             .flat_map(|b| &b.insts)
             .any(|i| i.name() == "v_readfirstlane_b32")
     );
-    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+    let shader = structure::with_per_lane(|| lowered(&native, &p, &HashSet::new())).expect("lower");
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
         v.validate(&mut copy).expect("DXIL validation failed");
@@ -870,7 +870,7 @@ fn a_first_lane_read_of_a_wave_alike_sum_under_a_wave_alike_loop() {
 fn a_lane_dependent_prefix_cannot_take_its_own_first_lane() {
     let native = wave_prefix_program(true);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let Err(error) = lowered(&native, &p, &HashSet::new()) else {
+    let Err(error) = structure::with_per_lane(|| lowered(&native, &p, &HashSet::new())) else {
         panic!("the two host waves may read different subtotals");
     };
     assert!(error.to_string().contains("a first-lane read where not every lane runs"), "{error}");
