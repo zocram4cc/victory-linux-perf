@@ -625,6 +625,8 @@ pub(super) fn wave_wide_on() -> bool {
 
 thread_local! {
     pub(super) static THREAD_WAVE_WIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// [`super::with_sheet_watch`].
+    pub(super) static SHEET_WATCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Whether a refusal is of code that needs every lane of the wave where it stands (two host
@@ -12925,6 +12927,9 @@ impl<'a> Lower<'a> {
         } else {
             None
         };
+        if mesh && e.target == Target::Position(0) && SHEET_WATCH.get() {
+            self.watch_sheet(&e)?;
+        }
         let (name, opcode) = match (mesh, primitive) {
             (false, _) => ("storeOutput", 5),
             (true, false) => ("storeVertexOutput", 171),
@@ -12981,6 +12986,110 @@ impl<'a> Lower<'a> {
                 &args,
             );
         }
+        self.end_guarded(at, &[]);
+        Ok(())
+    }
+
+    /// Mesh, with [`SHEET_WATCH`]: in the lanes that write a vertex, the
+    /// span of this host wave's vertices on the screen (x/w and y/w of those
+    /// in front, finite); over `SHEET_SPANS[0]`, the first lane stores 1 into
+    /// the row of the largest span passed, at a slot of its group and wave
+    /// (`shader::SLOT_SHEETS`). Plain stores, as the memory faults' are:
+    /// nothing the program outputs changes.
+    fn watch_sheet(&mut self, e: &Export) -> Result<(), Why> {
+        use super::shader::{SHEET_SLOTS, SHEET_SPANS, SLOT_SHEETS};
+        let [Some(x), Some(y), _, Some(w)] = e.values else {
+            return Ok(());
+        };
+        let float = |l: &mut Self, v: Value| -> Result<V, Why> {
+            let i = l.i32_of(v)?;
+            Ok(match l.floats.get(&v) {
+                Some(&f) => f,
+                None => l.as_float(i),
+            })
+        };
+        let (x, y, w) = (float(self, x)?, float(self, y)?, float(self, w)?);
+        self.s.flags |= flags::WAVE_OPS;
+        let c = self.cur;
+        let f = |l: &mut Self, v: f32| l.s.m.f32(v.to_bits());
+        let near = f(self, 0.05);
+        let (big, small) = (f(self, 1.0e6), f(self, -1.0e6));
+        let nx = self.s.m.bin(c, Bin::SDiv, x, w);
+        let ny = self.s.m.bin(c, Bin::SDiv, y, w);
+        // In front, and finite (a NaN fails every ordered compare).
+        let mut ok = self.s.m.cmp(c, pred::OGT, w, near);
+        for v in [nx, ny] {
+            let below = self.s.m.cmp(c, pred::OLT, v, big);
+            let above = self.s.m.cmp(c, pred::OGT, v, small);
+            ok = self.s.m.bin(c, Bin::And, ok, below);
+            ok = self.s.m.bin(c, Bin::And, ok, above);
+        }
+        let f32t = self.s.t.f32;
+        let mut span = None;
+        for v in [nx, ny] {
+            let lo = self.s.m.select(c, ok, v, big);
+            let hi = self.s.m.select(c, ok, v, small);
+            let wave = |l: &mut Self, v: V, op: u8| {
+                let (k, u) = (l.s.m.i8(op), l.s.m.i8(0));
+                l.s.op(c, "waveActiveOp.f32", Attr::NoUnwind, f32t, 119, &[v, k, u])
+            };
+            let (lo, hi) = (wave(self, lo, 2), wave(self, hi, 3));
+            let d = self.s.m.bin(c, Bin::Sub, hi, lo);
+            span = Some(match span {
+                None => d,
+                Some(s) => {
+                    let wider = self.s.m.cmp(c, pred::OGT, d, s);
+                    self.s.m.select(c, wider, d, s)
+                }
+            });
+        }
+        let span = span.ok_or("no span")?;
+        // The row: how many spans it passes, less one.
+        let i32t = self.s.t.i32;
+        let mut row = self.s.m.i32(0);
+        for &s in &SHEET_SPANS {
+            let s = f(self, s);
+            let over = self.s.m.cmp(c, pred::OGT, span, s);
+            let one = self.s.m.cast(c, Cast::ZExt, over, i32t);
+            row = self.s.m.bin(c, Bin::Add, row, one);
+        }
+        let i1t = self.s.t.i1;
+        let first = self.s.op(c, "waveIsFirstLane", Attr::NoUnwind, i1t, 110, &[]);
+        let zero = self.s.m.i32(0);
+        let some = self.s.m.cmp(c, pred::IUGT, row, zero);
+        let noting = self.s.m.bin(c, Bin::And, first, some);
+        let at = self.begin_guarded(Some(noting));
+        let c = self.cur;
+        let one = self.s.m.i32(1);
+        let row = self.s.m.bin(c, Bin::Sub, row, one);
+        let k0 = self.s.m.i32(0);
+        let group = self.s.op(c, "groupId.i32", Attr::ReadNone, i32t, 94, &[k0]);
+        let thread = self.mesh_thread();
+        let c = self.cur;
+        let k5 = self.s.m.i32(5);
+        let wave = self.s.m.bin(c, Bin::LShr, thread, k5);
+        let k2 = self.s.m.i32(2);
+        let g = self.s.m.bin(c, Bin::Shl, group, k2);
+        let slot = self.s.m.bin(c, Bin::Add, g, wave);
+        let mask = self.s.m.i32(SHEET_SLOTS - 1);
+        let slot = self.s.m.bin(c, Bin::And, slot, mask);
+        let width = self.s.m.i32(SHEET_SLOTS);
+        let base = self.s.m.bin(c, Bin::Mul, row, width);
+        let dword = self.s.m.bin(c, Bin::Add, base, slot);
+        let byte = self.s.m.bin(c, Bin::Shl, dword, k2);
+        let h = self.s.root_uav_handle(SLOT_SHEETS);
+        let iu = self.s.m.undef(i32t);
+        let void = self.s.t.void;
+        let mask = self.s.m.i8(1);
+        let align = self.s.m.i32(4);
+        self.s.op(
+            c,
+            "rawBufferStore.i32",
+            Attr::NoUnwind,
+            void,
+            140,
+            &[h, byte, iu, one, iu, iu, iu, mask, align],
+        );
         self.end_guarded(at, &[]);
         Ok(())
     }

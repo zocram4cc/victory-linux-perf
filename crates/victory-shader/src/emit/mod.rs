@@ -123,7 +123,7 @@ pub use sampler::StaticSampler;
 pub use lower::{host_settings, set_host_max_wave, set_host_rdna};
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
+    MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SHEET_BUCKETS, SHEET_SLOTS, SHEET_SPANS, SLOT_FAULTS, SLOT_MEMORY, SLOT_SHEETS, SLOT_STRIDES,
     SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
@@ -373,6 +373,22 @@ thread_local! {
 /// Runs `translate` (one container's translation) on this thread as with
 /// `VICTORY_WAVE_WIDE=1` when `on`, unless `VICTORY_WAVE_WIDE` is set: the callers that know
 /// the container's hash pass [`wave_wide_only`] of it.
+/// Translates with the frame recorder's watch for stretched geometry on
+/// (`on`): a mesh program notes waves of vertices that span much of the
+/// screen ([`SLOT_SHEETS`]). It adds work, not output: what the program
+/// draws is the same.
+pub fn with_sheet_watch<T>(on: bool, translate: impl FnOnce() -> T) -> T {
+    let was = lower::SHEET_WATCH.replace(on);
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            lower::SHEET_WATCH.set(self.0);
+        }
+    }
+    let _restore = Restore(was);
+    translate()
+}
+
 pub fn with_wave_wide<T>(on: bool, translate: impl FnOnce() -> T) -> T {
     struct Restore(bool, bool);
     impl Drop for Restore {

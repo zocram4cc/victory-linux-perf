@@ -68,6 +68,19 @@ pub const MEMORY_PAGES: u32 = 1 << 21;
 pub const MEMORY_READ_ONLY: u32 = 1 << 31;
 /// Dwords of the [`SLOT_FAULTS`] buffer.
 pub const MEMORY_FAULTS: u32 = 4096;
+/// The root UAV `u<SLOT_SHEETS>` of a mesh program translated with
+/// [`super::with_sheet_watch`] (the frame recorder's trigger for stretched
+/// geometry): [`SHEET_BUCKETS`] rows of [`SHEET_SLOTS`] dwords. A host wave
+/// whose vertices span more of the screen than `SHEET_SPANS[k]` stores 1 into
+/// row `k` (the largest such `k`), at a slot of its group and wave; the host
+/// reads and clears them.
+pub const SLOT_SHEETS: u8 = 251;
+/// See [`SLOT_SHEETS`]: spans in clip units (2 is the screen's width).
+pub const SHEET_SPANS: [f32; 4] = [0.25, 0.5, 1.0, 2.0];
+/// See [`SLOT_SHEETS`].
+pub const SHEET_BUCKETS: u32 = 4;
+/// See [`SLOT_SHEETS`].
+pub const SHEET_SLOTS: u32 = 64;
 /// `RootType::Other` code of a user-data dword the host computes: the view
 /// heap slot of the memory copies' views ([`SLOT_MEMORY`]).
 pub const USER_MEMORY_BASE: u32 = 0x100;
