@@ -638,7 +638,74 @@ fn bury(finished: u64) {
             }
             retired.drain(..n).collect()
         };
-        drop(done);
+        if bury_aside_on() {
+            bury_aside(done);
+        } else {
+            drop(done);
+        }
+    }
+}
+
+/// Whether what [`bury`] lets go is dropped by a thread of its own
+/// (`VICTORY_BURY_ASIDE=1`; off by default: by the caller). The caller is the
+/// thread that lands flights: releasing the host's objects took it 7 ms a
+/// frame between two landings (run air512, "the rest" of the landing's
+/// line), and the title is told that the card is done only by the next
+/// landing.
+fn bury_aside_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BURY_ASIDE").is_some_and(|v| v == "1"))
+}
+
+/// Drops `done`: on the thread that only does that, in the order given.
+fn bury_aside(done: Vec<(u64, Retired)>) {
+    static TO: OnceLock<Option<std::sync::mpsc::Sender<Vec<(u64, Retired)>>>> = OnceLock::new();
+    let to = TO.get_or_init(|| {
+        let (to, from) = std::sync::mpsc::channel::<Vec<(u64, Retired)>>();
+        std::thread::Builder::new()
+            .name("victory-bury".into())
+            .spawn(move || {
+                // Each batch is dropped as it comes; the loop ends with the process.
+                for batch in from {
+                    drop(batch);
+                }
+            })
+            .ok()
+            .map(|_| to)
+    });
+    // No thread, or it is gone: dropped here.
+    if let Some(Err(back)) = to.as_ref().map(|to| to.send(done)) {
+        drop(back.0);
+    }
+}
+
+#[cfg(test)]
+mod bury_aside_tests {
+    use std::sync::{Arc, Mutex};
+
+    /// Records the thread that dropped it, in order.
+    struct Mark(usize, Arc<Mutex<Vec<(usize, std::thread::ThreadId)>>>);
+    impl Drop for Mark {
+        fn drop(&mut self) {
+            self.1.lock().unwrap().push((self.0, std::thread::current().id()));
+        }
+    }
+
+    /// What is sent aside is dropped, by another thread, every batch whole
+    /// and in the order sent.
+    #[test]
+    fn batches_are_dropped_aside_in_order() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        for batch in 0..20usize {
+            super::bury_aside((0..5).map(|i| (0, super::Retired::Any(Box::new(Mark(batch * 5 + i, seen.clone()))))).collect());
+        }
+        let began = std::time::Instant::now();
+        while seen.lock().unwrap().len() < 100 && began.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::yield_now();
+        }
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.iter().map(|s| s.0).collect::<Vec<_>>(), (0..100).collect::<Vec<_>>());
+        assert!(seen.iter().all(|s| s.1 != std::thread::current().id()));
     }
 }
 
