@@ -258,11 +258,14 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 /// budget, and the room before stayed blended over the whole picture for
 /// minutes. A wait of seconds once (the driver's cache has it on the next
 /// run) against a picture wrong until the scene ends.
-/// On by default; `VICTORY_PIPELINE_COMPUTE_WAIT=0`: within the budget, as
-/// before.
+/// Off by default here: under Proton on NVIDIA the wait held the title's
+/// thread until its render loop stopped at about 30 s of the world, and the
+/// title's watchdog ended it with a write to 0 another 35 s later (runs
+/// 20261127-005324 and -005721; with it off, -010017 played on).
+/// `VICTORY_PIPELINE_COMPUTE_WAIT=1` waits as upstream does.
 fn compute_waits() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_COMPUTE_WAIT").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_COMPUTE_WAIT").is_some_and(|v| v == "1"))
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
