@@ -360,6 +360,15 @@ impl Player {
             let format = if matches!(f.Format.0, 39 | 53 | 60) { f.Format.0 } else { own };
             let Some(bytes) = texel_bytes(format) else {
                 say(format!("{called}.{sub}: format {format} is not shown"));
+                // With --raw: its bytes as the card holds them (block
+                // formats too), rows as the footprint lays them out.
+                if images.raw
+                    && let Some(all) = self.contents_of(id, sub)?
+                {
+                    let to = format!("{id:05}.{sub}_f{format}_pitch{}.bin", f.RowPitch);
+                    std::fs::write(images.folder.join(&to), &all)?;
+                    say(format!("{called}.{sub}: {} bytes in {to}", all.len()));
+                }
                 continue;
             };
             let Some(all) = self.contents_of(id, sub)? else {

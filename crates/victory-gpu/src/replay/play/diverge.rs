@@ -1161,11 +1161,63 @@ impl Player {
                             }
                         }
                     }
+                    // VICTORY_SLOTS_FIND=<resource>[,<resource>...]: the
+                    // heap's slots that name those resources at this
+                    // submission (for views picked by an index the
+                    // constants do not show).
+                    let find: Vec<u32> = std::env::var("VICTORY_SLOTS_FIND")
+                        .unwrap_or_default()
+                        .split(',')
+                        .filter_map(|v| v.trim().trim_start_matches('#').parse().ok())
+                        .collect();
+                    if !find.is_empty() {
+                        for (at, s) in self.slots_naming(heap, i, &find) {
+                            say(format!("  found: slot {at}: {}", self.slot_text(&s)));
+                        }
+                    }
+                    // VICTORY_SLOTS_AT=<slot>[,<slot>...]: those slots (indices
+                    // a shader reads out of title memory).
+                    for at in std::env::var("VICTORY_SLOTS_AT")
+                        .unwrap_or_default()
+                        .split(',')
+                        .filter_map(|v| v.trim().parse::<u32>().ok())
+                    {
+                        let s = self.slot_at(heap, at, i);
+                        say(format!("  at: slot {at}: {}", self.slot_text(&s)));
+                    }
                 }
                 here += 1;
             }
         }
         Ok(())
+    }
+
+    /// The slots of `heap` that name one of `ids` as they were for submission
+    /// `submit` (the first 64 of each run of them, 256 in all).
+    fn slots_naming(&self, heap: u32, submit: usize, ids: &[u32]) -> Vec<(u32, Slot)> {
+        let mut at: BTreeMap<u32, Slot> = BTreeMap::new();
+        if let Some(h) = self.frame.descriptor_heaps.iter().find(|h| h.id == heap) {
+            for &(first, n, s) in &h.runs {
+                if ids.contains(&s.res) {
+                    for k in 0..n.min(64) {
+                        at.insert(first + k, s);
+                    }
+                }
+            }
+        }
+        for s in &self.frame.submits[..=submit] {
+            for &(h, i, slot) in &s.views {
+                if h != heap {
+                    continue;
+                }
+                if ids.contains(&slot.res) {
+                    at.insert(i, slot);
+                } else {
+                    at.remove(&i);
+                }
+            }
+        }
+        at.into_iter().take(256).collect()
     }
 
     /// A heap slot as it was for a submission.
