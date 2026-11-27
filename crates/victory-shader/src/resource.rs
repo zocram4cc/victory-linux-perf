@@ -2247,7 +2247,7 @@ impl<'a> Tracer<'a> {
             match t {
                 Term::Const(c) => constant ^= c,
                 Term::Value(x) => match self.xor_operands(x) {
-                    Some([a, b]) if depth < 8 => {
+                    Some([a, b]) if depth < 32 => {
                         stack.push((a, depth + 1));
                         stack.push((b, depth + 1));
                     }
@@ -2263,7 +2263,20 @@ impl<'a> Tracer<'a> {
         }
         match (odd.as_slice(), constant) {
             ([one], 0) => Term::Value(*one),
-            _ => w,
+            _ => {
+                if std::env::var_os("VICTORY_WHY_XOR").is_some() {
+                    let names: Vec<String> = odd
+                        .iter()
+                        .map(|&x| match (self.def(x), self.inputs[x.0 as usize]) {
+                            (_, Some(r)) => format!("in{r:?}"),
+                            (Some(d), None) => format!("{}#{}", d.name(), x.0),
+                            (None, None) => format!("phi#{}", x.0),
+                        })
+                        .collect();
+                    eprintln!("WHY-XOR left [{}] const {constant:#x}", names.join(", "));
+                }
+                w
+            }
         }
     }
 
