@@ -1840,7 +1840,7 @@ impl Staging {
         let judged = self.on_demand.then(|| self.judgement());
         let held = judged.map_or(u32::MAX, |judged| self.held_levels(judged));
         #[cfg(feature = "diagnostics")]
-        if tiled.iter().all(|&b| b == 0) {
+        if tracing::enabled!(tracing::Level::DEBUG) && tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
                 memory = ?self.memory,
                 desc = ?self.layout.desc,
@@ -1961,9 +1961,15 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
         let mut read = read.borrow_mut();
         read.resize(3 * WINDOW, 0);
         let mut take = |from: usize, bytes: usize| {
-            read[..bytes].fill(0);
+            let read = &mut read[..bytes];
+            // A host-side copy fills unreadable pages with zeros. The
+            // no-copy benchmark is the only mode that leaves `read` alone.
+            #[cfg(feature = "diagnostics")]
+            if crate::copystat::mode() == 2 {
+                read.fill(0);
+            }
             crate::host::copy_mapped(read.as_mut_ptr(), (at as usize + from) as *const u8, bytes, false);
-            print = print.rotate_left(37) ^ digest(&read[..bytes]).0;
+            print = print.rotate_left(37) ^ digest(read).0;
         };
         if len <= 3 * WINDOW {
             take(0, len);
