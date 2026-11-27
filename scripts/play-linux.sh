@@ -330,7 +330,11 @@ fi
 # (and after a translator change), a few seconds when they are cached.
 # VICTORY_PREBUILD=0 skips it; the log is in the cache folder.
 if [[ "${VICTORY_PREBUILD:-1}" != 0 ]]; then
-  switches=$(env | grep -E '^VICTORY_' | grep -vE '^VICTORY_(KEYS|FRAMES_CSV|RUNS_DIR|PREBUILD)=' | sort)
+  # (The frame recorder's settings are no switches of the build: they change
+  # no shader or pipeline, and the two commands below run without them. With
+  # them, each of warm's processes made a capture folder of its own.)
+  switches=$(env | grep -E '^VICTORY_' | grep -vE '^VICTORY_(KEYS|FRAMES_CSV|RUNS_DIR|PREBUILD|RECORD|RECORD_[A-Z]+)=' | sort)
+  unrecorded=(env -u VICTORY_RECORD -u VICTORY_RECORD_AT -u VICTORY_RECORD_FRAMES -u VICTORY_RECORD_ALWAYS)
   stamp="$(sha256sum "$exe" | cut -c1-16) $(printf '%s' "$switches" | sha256sum | cut -c1-16)"
   stamp_file="$cache/prebuilt"
   if [[ "$(cat "$stamp_file" 2>/dev/null)" != "$stamp" ]]; then
@@ -338,11 +342,11 @@ if [[ "${VICTORY_PREBUILD:-1}" != 0 ]]; then
     echo "New build or switches: translating the title's shaders first (about 70 s the first time; log: $log)..." >&2
     # Ctrl-C here stops the launch, not just the translating.
     trap 'echo "stopped during the prebuild; nothing launched" >&2; exit 130' INT
-    if umu-run "$win_exe" shaders "$(winpath "$game/shaders.rpf")" > "$log" 2>&1; then
+    if "${unrecorded[@]}" umu-run "$win_exe" shaders "$(winpath "$game/shaders.rpf")" > "$log" 2>&1; then
       sed 's/\x1b\[[0-9;]*m//g' "$log" | grep -E 'shaders in the cache, .*translate' >&2 || true
       if [[ -s "$cache/pipelines/early-pipelines.txt" ]]; then
         echo "making the pipelines earlier runs drew..." >&2
-        VICTORY_LOG=warn umu-run "$win_exe" warm --used >> "$log" 2>&1 || true
+        VICTORY_LOG=warn "${unrecorded[@]}" umu-run "$win_exe" warm --used >> "$log" 2>&1 || true
         sed 's/\x1b\[[0-9;]*m//g' "$log" | grep -E ' made in ' | tail -1 >&2 || true
       fi
       printf '%s\n' "$stamp" > "$stamp_file"
