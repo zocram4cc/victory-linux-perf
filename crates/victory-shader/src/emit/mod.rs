@@ -497,6 +497,45 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    let exact = emit_forms(c, native, p, st, io, res);
+    // A branch on a mask operation's SCC is the wave's ([`structure::Structured::wave_scc`],
+    // DoubleGhosty issue #66) and needs the console's wave, with every lane where it stands.
+    // A program none of whose forms gives it that (and every program of a stage whose host
+    // waves are not the console's) is taken with those branches split per lane, as before:
+    // inexact where an arm runs lanes whose own bit went the other way, but drawn. Dropped,
+    // its dispatch leaves what it writes unwritten (DoubleGhosty #80: the title read that
+    // back as a pointer). `VICTORY_LANE_SPLIT=exact` refuses such a program instead.
+    if !matches!(exact, Err(ShaderError::Unsupported { .. }))
+        || st.wave_scc.is_empty()
+        || std::env::var_os("VICTORY_LANE_SPLIT").is_some_and(|v| v == "exact")
+    {
+        return exact;
+    }
+    let again = structure::with_per_lane(|| {
+        let st = structure::structure(p)?;
+        let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
+        emit_forms(c, native, p, &st, io, &res)
+    });
+    if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+        let was = exact.as_ref().err().map(ToString::to_string).unwrap_or_default();
+        match &again {
+            Ok(_) => eprintln!("WAVE64-RETRY branches on a mask's SCC split per lane (inexact): translated (wave-wide: {was})"),
+            Err(e) => eprintln!("WAVE64-RETRY branches on a mask's SCC split per lane: {e} (wave-wide: {was})"),
+        }
+    }
+    // the exact form's refusal says more than the inexact one's
+    if again.is_err() { exact } else { again }
+}
+
+/// [`emit`] of the program as it is structured: itself, then its other forms.
+fn emit_forms(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
     let original = emit_program(c, native, p, st, io, res);
