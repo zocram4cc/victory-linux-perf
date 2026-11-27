@@ -853,12 +853,14 @@ pub(crate) fn with_heap<T>(heap: usize, f: impl FnOnce(&Heap) -> T) -> Option<T>
     heaps.iter().any(|&(_, _, h)| h == heap).then(|| f(unsafe { &*(heap as *const Heap) }))
 }
 
-/// Gives back a list's dynamic slots `(heap, first, n)` of the host heaps
-/// behind the title heaps, those that still exist: the heaps' list read and
-/// each host heap's lock taken once for a run of entries of one heap (RDNA
-/// port: once an entry).
+/// Gives back a list's dynamic slots `(heap, id, first, n)` of the host heaps
+/// behind the title heaps, those that still exist and that `id` says took
+/// them ([`host::HostHeap::id`]: the title can release the heap a list's
+/// slots came from, and a later heap can be made at the same address before
+/// the list is reset): the heaps' list read and each host heap's lock taken
+/// once for a run of entries of one heap (RDNA port: once an entry).
 #[cfg(windows)]
-pub(crate) fn release_dynamic_many(entries: &[(usize, u32, u32)]) {
+pub(crate) fn release_dynamic_many(entries: &[(usize, u64, u32, u32)]) {
     if entries.is_empty() {
         return;
     }
@@ -866,17 +868,17 @@ pub(crate) fn release_dynamic_many(entries: &[(usize, u32, u32)]) {
     let mut batch: Vec<(u32, u32)> = Vec::new();
     let mut i = 0;
     while i < entries.len() {
-        let heap = entries[i].0;
+        let (heap, id) = (entries[i].0, entries[i].1);
         batch.clear();
-        while i < entries.len() && entries[i].0 == heap {
-            batch.push((entries[i].1, entries[i].2));
+        while i < entries.len() && entries[i].0 == heap && entries[i].1 == id {
+            batch.push((entries[i].2, entries[i].3));
             i += 1;
         }
         if heaps.iter().any(|&(_, _, h)| h == heap)
             // SAFETY: registered heaps are live (removed when dropped).
             && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
         {
-            host.release_many(&batch);
+            host.release_many(id, &batch);
         }
     }
 }
