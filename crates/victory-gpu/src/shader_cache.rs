@@ -128,6 +128,8 @@ fn build() -> [u8; 32] {
             "VICTORY_NAN_GUARD",
             "VICTORY_SPILL_STRICT",
             "VICTORY_LEGACY_FMA",
+            "VICTORY_WAVE_SCC",
+            "VICTORY_LANE_SPLIT",
             // Whether the ray-tracing node test always misses.
             "VICTORY_RT_MISS",
         ] {
