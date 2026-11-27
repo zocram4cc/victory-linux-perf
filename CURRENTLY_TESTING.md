@@ -7,10 +7,106 @@ bimodal; differences under ~5 ms need ≥4 runs an arm).
 ## Test machine and method
 
 - Ryzen 7 5800X3D, Radeon RX 6900 XT 16 GB, Linux 7.3, Mesa RADV 26.3, Proton Experimental
-  (11.0-20261112) with the view-tree wineserver, Series S mode (`CONSOLE=series-s`, 720p + FSR).
-- Scripted runs from a fresh save: keys to the world, then 150 frame-time rows (one a second) of the
-  world (`draws > 100`). Figure = median `ms_per_frame` of those rows; "prep" = median `cpu_prepare_ms`.
+  (11.0-20261112, vkd3d-proton 3.2.0) with the view-tree wineserver, Series S mode (`CONSOLE=series-s`,
+  720p + FSR). Board MSI B450M MORTAR MAX: the card links at **PCIe 3.0 x16 (8 GT/s)**, not 4.0 (AMD's
+  400-series has no Gen4), so anything the card reads from system memory crosses ~16 GB/s a direction.
+- Scripted runs: keys to the world, then 150 frame-time rows (one a second) of the world (`draws > 100`).
+  Figure = median `ms_per_frame` over world rows 15–89 (the steady phase); "prep" = median `cpu_prepare_ms`;
+  "submit thread" = median of the `queue::behind` line's "that thread worked N ms". Arms are interleaved
+  pairs in one batch, base first; identical runs agree within ~1–2 ms; cross-batch numbers are not comparable.
+- **Since 2026-11-28 13:00 every scripted run restores the save from `~/7952987A - 70 percent.zip`**
+  (`scripted-i19.sh`; `SAVE_ZIP=` empty turns it off). Before that, runs carried the save on and the scene
+  drifted between arms (draws 4.1k–5.9k). Restored runs start alike: **~8.5–8.7k draws a frame, 47–51 ms**.
+  Only compare numbers from restored runs with each other. A scripted run wipes play progress on that save.
+- **`gpu_pct` / "card % busy" overstates the card**: it counts the time any submission of ours is in flight,
+  hand-off included. The card's own timestamps (`VICTORY_CARD_SPANS=1`, diag) give the real figure (below).
 - Release build (`--features scripted`), caches warm (prebuild + full `warm`, 93,821 pipelines).
+
+## Latest (2026-11-28 day): `main` = e352af4a8
+
+**Play set now: `play-fast9.sh`** = `play-fast8.sh`'s settings on a **thin-LTO + x86-64-v3 build**
+(`bin/main-f6`, `main` e352af4a8) and the Proton copy **`Proton-Experimental-viewtree-homebo-ww`**, whose
+hand-built `ntdll.so` runs `NtGetWriteWatch`'s kernel scan (`PAGEMAP_SCAN`) after Wine's `virtual_mutex`
+is left instead of under it (patch and build script in the lab notes `wine-writewatch/`; the same idea was
+found independently in Some1sm/clankerVI). `VICTORY_SKIP_MOVIES=end` is no longer set (movies play). Its
+prefix is a symlink to the play prefix (saves shared). `DIAG=1` uses `bin/main-f6/victory-diag.exe`.
+Rollback: `play-fast8.sh`.
+
+### Where the frame goes now (restored save, ~8.6k draws, Series S)
+
+The frame is set by one thread, the submitting thread (`victory-submit`): it works **36–39 ms of a
+47–51 ms frame** (ab42). The card is **not** on the critical path:
+
+| Measure (card timestamps, `VICTORY_CARD_SPANS=1`, diag) | Per frame |
+|---|---|
+| Card actually working | **27.5–28.8 ms** over ~16 submissions (48 %; the old counter said 58–80 %) |
+| Card idle waiting on the submitting thread | ~32 ms |
+| Submitting thread waiting on the card | 0.7 ms |
+| Our own GPU work (compare lists; send/hash lists) | 1.98 ms; 0.05 ms (≈7 % of card time, + ≤1.3 ms alias copies inside title lists) |
+| The title's own GPU work | ~25 ms; flat: the largest pipeline 0.54 ms, the top ten 3.8 ms |
+
+| Submitting thread, by stage (medians, diag) | ms a frame |
+|---|---|
+| **Refreshes** (copy and texture refresh) | **17.3** |
+| Write-watch asks | 5.5 |
+| Copies and fills | 4.8 |
+| Card preparation before sending (`card_before`) | 2.2 |
+| Lock waits | 2.1 |
+| Card-step planning | 0.9 |
+
+Copy-refresh time by memory (diag, `zc-t5`): views of the title's physical pages 81 %, the second
+graphics pool 15 %, the rest 4 %. Only 0.4 MB of the ~30 MB refreshed a frame actually changes.
+
+### Measured today
+
+| Change | Frame (ms) | Prep / submit thread | Notes |
+|---|---|---|---|
+| **thin LTO + x86-64-v3 build + Wine `NtGetWriteWatch` outside the lock** (= `play-fast9`) | **40.7 / 40.0 vs 43.2 / 41.9** | prep 29.6 / 28.9 vs 33.0 / 32.2 | ab40, lighter drifted scene (~5.6k draws): −2.2 ms; AVX2 instructions in the exe 3,263 → 40,355 |
+| same, heavier scene (70 % save, ~5.9k draws, 1 valid pair) | 41.8 vs 41.7 / 42.4 | prep 26.3 vs 29.1 / 29.5; submit thread 34.1 vs 36.4 / 36.4 | ab41; frame flat, CPU work down; M2 drifted to 4.5k draws (excluded) |
+| fat LTO + one codegen unit (dfmbrollins' profile) vs thin | 49.6 / 47.6 vs 50.1 / 46.8 | prep 34.0 / 32.7 vs 35.1 / 32.8 | ab42, restored save (8.5–8.7k draws): no gain; tails vary more by run than by build (worst-frame p95 183 / 233 vs 258 / 116); thin kept (build 35 s vs 182 s) |
+| `VICTORY_ZERO_COPY=1270-1290 VICTORY_ZERO_COPY_TRACK=1` (pool 2: copies kept on the card, writes found by our own userfaultfd; `perf/zero-copy`) on `play-fast8` | 40.5 vs 41.5; 38.9 vs 40.2 | prep −2.3 / −2.5 | zc-ab2/ab3; −1.0…−1.3 ms; Wine asks 270 → 34 a frame; picture checked |
+| same on `play-fast9` | 39.4 / 37.6 / 39.7 vs 38.7 / 38.4 / 38.8; 39.0 / 39.0 / 38.7 vs 40.0 / 38.4 / 38.2 | prep −0.7 | zc-ab5/ab6 (drifted saves): flat; the Wine patch already removed what it saved; off |
+| `VICTORY_ZERO_COPY` on pool 2 read **in place** by the card | +12.5 | prep −10, GPU wait 1.6 → 25 ms | zc-ab1; PCIe 3.0 ceiling; pool 1 in place: noise |
+| `VICTORY_TRACK_VIEWS=1` (view memory tracked by userfaultfd instead of guards) | 220.9 vs 54.5 (diag) | copies 236 vs 20 | one kernel scan per check (~3,600 a frame, mostly clean) vs the guards' bits; off |
+| crashbashash's sync guards (`VICTORY_SYNC_GUARDS=1` + Proton `-homebo-ww-uffd` with his Wine patch 1860c50) | 50.2 / 49.4 / 51.4 vs 50.8 / 49.7 / 48.4 | prep +3.6…+6; copies +3…+5 | zc-ab7, restored save: title threads lose their fault cost, the submitting thread gains bookkeeping + a syscall per arm/disarm; off |
+| refused-ask cache (dfmbrollins, `VICTORY_REFUSED_CACHE=1`) | — | ~0.1 ms | refusals are 3–10 a frame now (were ~240 before 11-26); off |
+
+- Wine microbenchmark (`GetWriteWatch` latency while 4 threads storm the lock): with others asking too,
+  p99 124–175 µs → 4–6 µs and 5–6× the throughput; with others taking guard faults the asking thread
+  itself got slower (median 4 → 12–51 µs). In-game the combination above was a net gain.
+- Avenues checked and not applicable here: `VICTORY_KEEP_SNAPSHOTS_MB=1024` (never refused),
+  Marvisak 19533398f (clean copies already skipped), `VICTORY_POOL_THREADS` (4 helpers), `MERGE_GROUPS`
+  (already one call a submission), Marvisak 2a4938e66 (0.4 ms of sparse reads).
+- Quiesce before free (from clankerVI 949b4625b): every flight settles before a zero-copy region is freed
+  (`perf/zero-copy` 7b624d091).
+
+### Frame generation and FSR 4 (`perf/framegen`, not merged)
+
+- **White screen with AMD frame generation: vkd3d-proton 3.2.0's `VK_EXT_present_timing`.** Presenting
+  through AMD's frame-generation swap chain with it on shows white; our back buffer is correct in every
+  white run. With `VKD3D_DISABLE_EXTENSIONS=VK_EXT_present_timing` the scene shows, generation off and on
+  (e.g. 15.4 real + 9.6 generated = 26.9 fps shown, diag). 6697719ed sets it in-process when
+  `VICTORY_FRAMEGEN=1` (before the device is made; `_putenv_s`). In-game check of the in-process path pending.
+- The HUD's first line and the window title name the upscaler and real/shown rates
+  (`24.6 FPS real / 49.2 shown  FSR 3.1.6+FG`); the frame-time CSV has an `upscaler` column.
+- **FSR 4 cannot run on this stack:** the SDK 2.4 loader offers only FSR 3.1.6 and 2.3.4 upscalers and FG
+  3.1.6 on this card under Proton (device reports Shader Model 6.8). FSR FG 4.x needs RX 9000 by AMD's docs.
+- Known gap: the camera data given to frame-generation prepare is wrong (near 10000 / far 0.15 swapped,
+  zero camera vectors).
+
+### Fixes waiting for a re-warm (`fix/rdna2-picture`, not merged; translator version 7 → 8)
+
+Caullen Omdahl's legacy multiply-add `-0` fix (Vice-Tay #308), Yaekai's BDD memo cap, Marvis' probe
+readback reuse (diag), ruvenesh's `VICTORY_NO_WATCHDOG` hook (off; targets this dump's watchdog stop at
+`image+0x2215c35`; hung instead of stopping in 3 of 6 runs on a 6900 XT in its PR thread). Five more
+fixes from that list were already on `main`.
+
+### In progress
+
+- clankerVI wave 24a (`send_copied` tests a copy's range before upgrading it; our `send_copied` walked all
+  ~3,500 carded copies a call) + 24b + 29c on `perf/clanker-waves`: A/B `cw-ab1` running.
+- Submitting-thread breakdown and the other upstream leads (`perf/submit-chain`), card-side merges and
+  Series X GPU levers (`perf/gpu-load`), batching the sync guards' arm/disarm (`perf/zero-copy`).
 
 ## Latest (2026-11-28 night): `main` = 123ea30a0
 
@@ -220,6 +316,7 @@ VICTORY_INDIRECT_BATCH=2 VICTORY_MAP_THREADS=1 VICTORY_TITLE_PRIORITIES=0 VICTOR
 VICTORY_SHOW_AFTER=1 VICTORY_AMBIENT=0.8 VICTORY_JOIN_PARTS=8 VICTORY_UPLOAD_AHEAD=1
 VICTORY_PIPELINE_BOOK=1 VICTORY_LAND_SKIP=1 GLIBC_TUNABLES=glibc.pthread.rseq=0
 WINE_CPU_TOPOLOGY=16:0,8,1,9,2,10,3,11,4,12,5,13,6,14,7,15`, FSR through `VICTORY_FFX_DIR`.
+`play-fast9.sh` no longer sets `VICTORY_SKIP_MOVIES=end` (movies play); scripted runs keep it.
 
 ## Known picture issues
 
@@ -229,13 +326,13 @@ black world. Purple blinds and violet trees on the first balcony: fixed with
 
 ## Next
 
-1. The heap pass (~15-20 ms, on the submitting thread) is the holdup now; the async heap worker
-   (`VICTORY_HEAP_WORKER`) stays off (tail +84 % in ab13).
-2. `VICTORY_EARLY_TEXTURES_MS` (12 here; 40 in another fork's launcher) and
-   `VICTORY_BAKE_TEXTURES_MS` (1500; 10000 there): single pass ab16.
-3. Vice-Tay round (branch `perf/vicetay-round`, not merged): five correctness fixes built and
-   tested before the round's last reverts; build, picture check and merge next session; then
-   `VICTORY_COPY_BACK`, `VICTORY_LIMITED_STAGING_MB=32`, `VICTORY_IDLE_UNDER_PRESSURE` to re-apply.
-4. Picture A/B for the correctness switches of fast track 2 (`HEAP_RECHECK_PERSISTENT`,
-   `EXACT_NO_WAIT`, `JOURNAL_SHARED=2`).
-5. `VICTORY_FRAME_INTERVAL_MS=16.667` once frames get near the title's 33 ms.
+1. The submitting thread is the frame: refreshes (17.3 ms) first — clankerVI's waves (`send_copied`,
+   lock-free `refresh_front`, single-pass `send::take`), xavifortes' shared list-front scan, Caullen's
+   `ASYNC_WAIT` / `DISPATCH_RUNS` / `MULTI_FLIGHT`.
+2. Write-watch asks (5.5 ms): batch the sync guards' arm/disarm so the submitting thread doesn't pay them.
+3. Merge `fix/rdna2-picture` with a full re-warm and a picture check; test `VICTORY_NO_WATCHDOG=1`.
+4. GPU levers (wave32 on RDNA, card-side merges) on Series X 1440p, where the card is the limit
+   (ab37: card ~89 %).
+5. Frame generation: in-game check of 6697719ed, the camera data, then frame pacing at this base rate
+   (AMD advises ≥60 fps base; ours is ~20).
+6. Vice-Tay round (`perf/vicetay-round`): five correctness fixes to build, picture-check and merge.
