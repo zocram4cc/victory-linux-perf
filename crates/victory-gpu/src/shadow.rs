@@ -3358,11 +3358,7 @@ impl Shadow {
         // shortcut: another host copy of the same bytes (a title buffer
         // inside this one with a copy of its own, a texture in it) is not
         // told: the card's writes are not seen by write watching.
-        // Port 1's 32-bit constants heap (`< 4 GiB`): CPU constants live in the
-        // same 174 MB buffer as skinning writes, so no flight wait on its account.
-        // Above 4 GiB, in-place buffers still declare `Step::GpuWrite` so
-        // `line.written` tracks flight hazards (no snapshot or copy-back).
-        if self.place.is_some() && self.start < (1 << 32) {
+        if self.place.is_some() {
             return;
         }
         self.written.store(true, Ordering::Relaxed);
@@ -5528,12 +5524,8 @@ fn lookup_with(address: u64, len: u64, any: bool, quick: bool, buckets: bool) ->
         // are read too often to stay in the PC's.
         let big = cards() && (size >= card_limits().0 || card_all());
         // Renderer port 1 (`crate::port`, `VICTORY_PORT_CONSTANTS=1`): the
-        // title's 32-bit graphics heap in place, big or not. Above 4 GiB
-        // (`VICTORY_PORT_BUFFERS=1`), keep `big` buffers in local GDDR6 VRAM
-        // so GPU-heavy buffers do not stall over PCIe.
-        if (!big || key.0 + len <= (1u64 << 32))
-            && let Some(placed) = crate::port::place_for(key.0, len, false)
-        {
+        // title's 32-bit graphics heap in place, big or not.
+        if let Some(placed) = crate::port::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
