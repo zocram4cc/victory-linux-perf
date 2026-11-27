@@ -3274,17 +3274,39 @@ impl State {
     /// The stand-in for the indirect light after a dispatch of `p`
     /// (`crate::ambient`). Whether it recorded anything.
     fn ambient(&mut self, list: &HostList, p: &HostPipeline, role: crate::ambient::Role) -> bool {
-        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, Role, Views};
+        use crate::ambient::{AIR, DEPTH, LIGHT, MISS_DEPTH, MISS_LIGHT, MissNote, RADIANCE, Role, Views};
         let Some(t) = p.stages.first().map(|s| s.translated()) else {
             return false;
         };
-        let entry = |kind: ResourceType, at: (u8, u32)| self.table_view(t, true, kind, at);
-        let at = match role {
-            Role::Resolve => LIGHT,
-            Role::Radiance => RADIANCE,
-            Role::Air => AIR,
+        // Every `CS_RayMiss` has its role; followed only when asked for
+        // (`VICTORY_AMBIENT_SPECULAR`).
+        if role == Role::Miss && !crate::ambient::mirroring() {
+            return false;
+        }
+        // Which surfaces the miss program's rays are of (its first root
+        // constant). Water's reflections are left as they are (the depth
+        // here is of what lies under it), and so is the alpha layer unless
+        // asked for (`crate::ambient::mirroring_alpha`).
+        let layer = match role {
+            Role::Miss => t
+                .used
+                .iter()
+                .find(|u| u.root == RootType::Constants)
+                .and_then(|u| match self.roots_ref(true).get(usize::from(u.slot)) {
+                    Some(Root::Constants(c)) => c.first().copied(),
+                    _ => None,
+                })
+                .unwrap_or(u32::MAX),
+            _ => 0,
         };
-        let image = entry(ResourceType::Uav, at);
+        if role == Role::Miss
+            && !(layer == crate::ambient::MISS_OPAQUE
+                || (layer == crate::ambient::MISS_ALPHA && crate::ambient::mirroring_alpha()))
+        {
+            crate::ambient::note_miss(MissNote::Water);
+            return false;
+        }
+        let entry = |kind: ResourceType, at: (u8, u32)| self.table_view(t, true, kind, at);
         // The view at a place of the tables shows a stencil plane
         // ([`stencil_plane`]): no depth.
         let stencil_at = |(slot, offset): (u8, u32)| {
@@ -3316,32 +3338,126 @@ impl State {
                 entry(ResourceType::Srv, at)
             }
         };
-        let depth = match role {
-            Role::Resolve => {
-                let size = image.map(|(of, _)| (of.Width, of.Height));
-                usual_depth(DEPTH).or_else(|| scan(ResourceType::Srv, &|d| depth_like(d) && Some((d.Width, d.Height)) == size))
+        // Once per miss program (16 at most) whose rays' image or depth is
+        // not found: what its tables hold, so one run names their places.
+        let miss_tables = || {
+            crate::ambient::note_miss(MissNote::NotReady);
+            static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            if seen.len() >= 16 || seen.contains(&p.name) {
+                return;
             }
-            Role::Radiance | Role::Air => image,
+            seen.push(p.name.clone());
+            let held: Vec<String> = t
+                .used
+                .iter()
+                .filter(|u| u.root == RootType::Table && matches!(u.kind, ResourceType::Uav | ResourceType::Srv))
+                .map(|u| {
+                    let at = (u.slot, u.table_offset_dwords);
+                    match entry(u.kind, at) {
+                        Some((d, _)) => format!(
+                            "{:?}{:?} {}x{} format {} dimension {}{}",
+                            u.kind,
+                            at,
+                            d.Width,
+                            d.Height,
+                            d.Format.0,
+                            d.Dimension.0,
+                            if stencil_at(at) { " stencil" } else { "" }
+                        ),
+                        None => format!("{:?}{:?} -", u.kind, at),
+                    }
+                })
+                .collect();
+            tracing::info!(
+                program = %p.name,
+                tables = %held.join("; "),
+                "reflections stand-in: a miss program whose rays' image or depth was not found"
+            );
         };
-        let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
-            once!(?role, "no stand-in for the indirect light: other tables");
+        let at = match role {
+            Role::Resolve => LIGHT,
+            Role::Radiance => RADIANCE,
+            Role::Air => AIR,
+            Role::Miss => MISS_LIGHT,
+        };
+        // Variants of the miss program bind the rays' image and the depth at
+        // other places of their tables than the one found first (trustno1
+        // f89b79d: 416 of 472 dispatches): where the usual place has none,
+        // the first unordered view of a 2D R11G11B10 image.
+        let image = match role {
+            Role::Miss => entry(ResourceType::Uav, at).or_else(|| {
+                scan(ResourceType::Uav, &|d| d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Format.0 == 26)
+            }),
+            _ => entry(ResourceType::Uav, at),
+        };
+        let Some((of, image)) = image else {
+            // (Other programs of that name write other histories.)
+            match role {
+                Role::Miss => miss_tables(),
+                _ => once!(?role, "no stand-in for the indirect light: missing image UAV"),
+            }
             return false;
+        };
+        let (seen, depth) = match role {
+            Role::Resolve => {
+                let Some((seen, depth)) = usual_depth(DEPTH).or_else(|| {
+                    scan(ResourceType::Srv, &|d| depth_like(d) && (d.Width, d.Height) == (of.Width, of.Height))
+                }) else {
+                    once!(?role, "no stand-in for the indirect light: missing depth SRV");
+                    return false;
+                };
+                if (seen.Width, seen.Height) != (of.Width, of.Height) {
+                    once!(?role, "no stand-in for the indirect light: depth dimensions differ");
+                    return false;
+                }
+                (seen, depth)
+            }
+            Role::Miss => {
+                // The picture's depth: 32-bit, and twice the rays' image each
+                // way (1706x960 for 853x480; trustno1 9b91d27: a looser match
+                // took another depth texture), at its usual place or found
+                // among the tables.
+                let pictures = |d: &D3D12_RESOURCE_DESC| {
+                    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_R24G8_TYPELESS};
+                    depth_like(d)
+                        && !matches!(d.Format, DXGI_FORMAT_R24G8_TYPELESS | DXGI_FORMAT_D24_UNORM_S8_UINT)
+                        && d.Width.abs_diff(of.Width * 2) <= 1
+                        && u64::from(d.Height).abs_diff(u64::from(of.Height) * 2) <= 1
+                };
+                let found = usual_depth(MISS_DEPTH).filter(|(d, _)| pictures(d)).or_else(|| scan(ResourceType::Srv, &pictures));
+                let Some(found) = found else {
+                    once!(?role, "no stand-in for reflections: the picture's depth is not among the program's tables");
+                    miss_tables();
+                    return false;
+                };
+                found
+            }
+            Role::Radiance | Role::Air => (of, image),
         };
         // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT.)
         let format = if role == Role::Resolve { 42 } else { 26 };
         let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
-        if of.Format.0 != format || (seen.Width, seen.Height) != (of.Width, of.Height) || volume != (role == Role::Air) {
+        if of.Format.0 != format || volume != (role == Role::Air) {
             once!(?role, format = of.Format.0, "no stand-in for the indirect light: another image");
+            if role == Role::Miss {
+                crate::ambient::note_miss(MissNote::NotReady);
+            }
             return false;
         }
         // The pass sets the compute root signature and its arguments.
         self.sets.forget_roots(true);
-        crate::ambient::after(list, role, &Views {
+        let ran = crate::ambient::after(list, role, &Views {
             image,
             depth,
             size: [of.Width as u32, of.Height],
             slices: u32::from(of.DepthOrArraySize),
-        })
+            depth_size: [seen.Width as u32, seen.Height],
+        });
+        if ran && role == Role::Miss {
+            crate::ambient::note_miss(MissNote::Ran(layer));
+        }
+        ran
     }
 
     /// The view a shader of the bound pipeline reads through a table, at
