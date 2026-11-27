@@ -127,6 +127,8 @@ fn build() -> [u8; 32] {
             "VICTORY_D16_BITS",
             "VICTORY_NAN_GUARD",
             "VICTORY_SPILL_STRICT",
+            // Whether the ray-tracing node test always misses.
+            "VICTORY_RT_MISS",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');

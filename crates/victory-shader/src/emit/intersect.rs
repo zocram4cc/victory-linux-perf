@@ -123,6 +123,20 @@ impl<'a> Lower<'a> {
             x.push(self.i32_of(v)?);
         }
         let pointer = x[0];
+        if crate::emit::rt_miss() {
+            // A box node: no child; any other kind: the triangle miss.
+            let head = self.cur;
+            let (k4, k6) = (self.s.m.i32(4), self.s.m.i32(6));
+            let pair = self.s.m.bin(head, Bin::And, pointer, k6);
+            let is_box = self.s.m.cmp(head, pred::EQ, pair, k4);
+            let none = self.s.m.i32(bvh::NONE);
+            for (k, miss) in bvh::MISS.iter().enumerate() {
+                let miss = self.s.m.i32(miss.to_bits());
+                let r = self.s.m.select(head, is_box, none, miss);
+                self.write(inst, Reg::V(dst + k as u8), r, guard);
+            }
+            return Ok(());
+        }
         let pointer_high = wide.then(|| x[1]);
         let f: Vec<V> = x[1 + usize::from(wide)..]
             .iter()
