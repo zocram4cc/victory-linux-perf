@@ -677,6 +677,13 @@ mod late {
         *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_STEPS_LEARN").is_none_or(|v| v != "0"))
     }
 
+    /// Tests: nothing is learned any more (they share the pages, and memory
+    /// one test freed is given to the next at the same address).
+    #[cfg(test)]
+    pub(super) fn forget() {
+        *PAGES.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
     /// Whether the title was found writing a page of `[from, to)` late.
     pub(super) fn written(from: usize, to: usize) -> bool {
         let pages = PAGES.lock().unwrap_or_else(|e| e.into_inner());
@@ -1167,6 +1174,7 @@ mod tests {
     /// one left alone is not.
     #[test]
     fn places_written_after_sending_are_learned() {
+        late::forget();
         // Two pages of memory of our own, page-aligned, as title memory.
         let memory = vec![0u8; 4 * 4096];
         let page = (memory.as_ptr() as usize).next_multiple_of(4096);
@@ -1190,6 +1198,7 @@ mod tests {
     /// again before landing, is learned; one that still matches is not.
     #[test]
     fn fills_done_on_the_cpu_are_learned_too() {
+        late::forget();
         let memory = vec![0u8; 4 * 4096];
         let page = (memory.as_ptr() as usize).next_multiple_of(4096);
         let (kept, changed) = (page + 16, page + 4096 + 0xbd0);
