@@ -134,13 +134,14 @@ unsafe impl Sync for Staging {}
 
 static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
 
-/// The buffer a texture the host writes is copied through into the texture
-/// of a view the title placed in its memory in another format
-/// ([`alias`]): every level of every layer as each of the two formats lays
-/// it out for a copy (the same bytes: the texels are as wide), the written
-/// texture's layout first.
+/// How a texture the host writes is copied into the texture of a view the
+/// title placed in its memory in another format ([`alias`]): every level of
+/// every layer as each of the two formats lays it out for a copy (the same
+/// bytes: the texels are as wide), the written texture's layout first, and
+/// the buffer the copy goes through (`None`: texture to texture directly,
+/// [`direct_alias`]).
 struct Through {
-    buffer: ID3D12Resource,
+    buffer: Option<ID3D12Resource>,
     parts: Vec<(
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
@@ -161,8 +162,8 @@ static THROUGH: Mutex<Option<HashMap<usize, Arc<Through>>>> = Mutex::new(None);
 /// Brings `placed`, the texture of a view the title placed in the memory
 /// of `source` in another format (`crate::resource::alias_of`), up to date
 /// with what the host wrote to `source`: the texels of every level and
-/// layer are copied as they are, through a buffer (the host copies between
-/// two formats of one texel width in no other way). Recorded the first time
+/// layer are copied as they are, through a buffer (D3D12 copies between the
+/// formats of one family only), or directly under Wine ([`direct_alias`]). Recorded the first time
 /// the list reads the view
 /// and again whenever the list used `source` in another way since (wrote
 /// it, or read it itself). Leaves `placed` in the copy destination state,
@@ -238,15 +239,21 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
                 if bytes[0] == 0 || bytes[0] != bytes[1] || !alike {
                     return false;
                 }
-                let Some(buffer) = host.uav_buffer(bytes[0]) else {
-                    return false;
+                // Under Wine, texture to texture: no buffer.
+                let buffer = if direct_alias() {
+                    None
+                } else {
+                    let Some(buffer) = host.uav_buffer(bytes[0]) else {
+                        return false;
+                    };
+                    crate::host::name(&buffer, || {
+                        format!(
+                            "alias copy {}x{} f{} to f{}",
+                            of_from.Width, of_from.Height, of_from.Format.0, of_to.Format.0
+                        )
+                    });
+                    Some(buffer)
                 };
-                crate::host::name(&buffer, || {
-                    format!(
-                        "alias copy {}x{} f{} to f{}",
-                        of_from.Width, of_from.Height, of_from.Format.0, of_to.Format.0
-                    )
-                });
                 tracing::info!(
                     view = ?placed,
                     texture = ?source,
@@ -255,6 +262,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
                     parts,
                     written_as = of_from.Format.0,
                     read_as = of_to.Format.0,
+                    direct = buffer.is_none(),
                     "a view placed in the memory of a texture the host writes, in another format: read from that texture by a copy on the host"
                 );
                 let [of_written, of_read] = rows;
@@ -295,40 +303,52 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
             SubresourceIndex: index as u32,
         },
     };
-    let rows = |row: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
-        // SAFETY: as above.
-        pResource: unsafe { std::mem::transmute_copy(&through.buffer) },
-        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-            PlacedFootprint: *row,
-        },
-    };
-    let (common, read, written) = (
-        D3D12_RESOURCE_STATE_COMMON,
-        D3D12_RESOURCE_STATE_COPY_SOURCE,
-        D3D12_RESOURCE_STATE_COPY_DEST,
-    );
     #[cfg(feature = "diagnostics")]
     list.note_op(|| format!("alias copy of {source:?} into {placed:?}"));
-    // SAFETY: an open list and live resources; the buffer is as big as
-    // the footprints and rests in the common state between copies.
-    unsafe {
-        list.list
-            .ResourceBarrier(&[crate::host::transition(&through.buffer, common, written)]);
-        for (index, (of_written, _)) in through.parts.iter().enumerate() {
-            list.list
-                .CopyTextureRegion(&rows(of_written), 0, 0, 0, &part(from, index), None);
+    match &through.buffer {
+        None => {
+            // SAFETY: an open list and live textures of equal footprints,
+            // the source in the copy source state, `placed` in the copy
+            // destination state.
+            unsafe {
+                for index in 0..through.parts.len() {
+                    list.list
+                        .CopyTextureRegion(&part(to, index), 0, 0, 0, &part(from, index), None);
+                }
+            }
         }
-        list.list
-            .ResourceBarrier(&[crate::host::transition(&through.buffer, written, read)]);
-        for (index, (_, of_read)) in through.parts.iter().enumerate() {
-            list.list
-                .CopyTextureRegion(&part(to, index), 0, 0, 0, &rows(of_read), None);
+        Some(buffer) => {
+            let rows = |row: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: as above.
+                pResource: unsafe { std::mem::transmute_copy(buffer) },
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: *row,
+                },
+            };
+            let (common, read, written) = (
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            );
+            // SAFETY: an open list and live resources; the buffer is as big as
+            // the footprints and rests in the common state between copies.
+            unsafe {
+                list.list.ResourceBarrier(&[crate::host::transition(buffer, common, written)]);
+                for (index, (of_written, _)) in through.parts.iter().enumerate() {
+                    list.list
+                        .CopyTextureRegion(&rows(of_written), 0, 0, 0, &part(from, index), None);
+                }
+                list.list.ResourceBarrier(&[crate::host::transition(buffer, written, read)]);
+                for (index, (_, of_read)) in through.parts.iter().enumerate() {
+                    list.list
+                        .CopyTextureRegion(&part(to, index), 0, 0, 0, &rows(of_read), None);
+                }
+                list.list.ResourceBarrier(&[crate::host::transition(buffer, read, common)]);
+            }
+            list.keep(buffer);
         }
-        list.list
-            .ResourceBarrier(&[crate::host::transition(&through.buffer, read, common)]);
     }
-    list.keep(&through.buffer);
     // A draw that also writes the source (a view of it handled before
     // this one) needs it in that state again; the next read of the alias
     // then copies once more, as it must after a write.
@@ -338,6 +358,18 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         crate::list::ensure_state(list, source, before);
     }
     true
+}
+
+/// Whether [`alias`] copies texture to texture directly
+/// (`VICTORY_ALIAS_DIRECT`, on unless `=0`; under Wine only): D3D12 copies
+/// between the formats of one family only, but vkd3d-proton copies with
+/// `vkCmdCopyImage`, which takes any two formats of one texel size (the
+/// title's R32_UINT light written by compute shaders and read as
+/// R9G9B9E5): half the bytes of the way through a buffer, and two barriers
+/// fewer. 78 such copies a frame cost 2.6 ms of the card's time in the jail
+/// (2026-11-27).
+fn direct_alias() -> bool {
+    crate::pipeline::on_wine() && crate::toggled!("VICTORY_ALIAS_DIRECT")
 }
 
 /// Whether a texture refresh that finds the runtime remapping title memory
