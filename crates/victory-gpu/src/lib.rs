@@ -81,6 +81,7 @@ mod popwatch;
 mod primitive;
 pub mod query;
 pub mod queue;
+pub mod remap;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub mod replay;
 #[cfg(windows)]

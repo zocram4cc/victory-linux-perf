@@ -98,7 +98,9 @@ cpu_prepare_ms,gpu_ms,gpu_pct,copies_ms,copies_mb,textures_ms,textures_mb,\
 copyback_ms,copyback_mb,draws,dropped,making,indirect,heap_passes,heap_ms,\
 texture_refresh_ms,card_passes,card_compares,card_sent_mb,card_ranges,\
 card_pieces,card_fetched,card_fetched_mb,card_waits,card_wait_ms,\
-twins_into_depth,twins_into_colour,depth_planes,ram_mb,cpu_pct\n";
+twins_into_depth,twins_into_colour,depth_planes,ram_mb,cpu_pct,map_n,map_ms,map_mb,\
+unmap_n,unmap_ms,unmap_mb,split_n,split_ms,alias_n,alias_ms,alias_mb,lock_wait_ms,\
+lock_hold_ms\n";
 
 /// The `#` block a dump starts with: the machine and the switches, so a file
 /// from another PC can be compared and reproduced. `pandas.read_csv(...,
@@ -364,6 +366,8 @@ pub(crate) struct Row {
     /// processor, all threads), from `copystat`; 0 without `diagnostics`.
     pub ram_mb: f64,
     pub cpu_pct: f64,
+    /// Title memory remaps per frame (zero without `VICTORY_REMAP_STATS=1`).
+    pub remaps: crate::remap::Frame,
 }
 
 /// The header line: the column names (the line after the `#` block).
@@ -383,7 +387,9 @@ fn write_row(out: &mut impl Write, t_ms: u128, r: &Row) -> std::io::Result<()> {
          {texture_refresh_ms:.3},{card_passes:.3},{card_compares:.3},{card_sent_mb:.3},\
          {card_ranges:.3},{card_pieces:.3},{card_fetched:.3},{card_fetched_mb:.3},\
          {card_waits:.3},{card_wait_ms:.3},{twins_into_depth:.3},{twins_into_colour:.3},\
-         {depth_planes:.3},{ram_mb:.3},{cpu_pct:.3}",
+         {depth_planes:.3},{ram_mb:.3},{cpu_pct:.3},{map_n:.3},{map_ms:.3},{map_mb:.3},\
+         {unmap_n:.3},{unmap_ms:.3},{unmap_mb:.3},{split_n:.3},{split_ms:.3},{alias_n:.3},\
+         {alias_ms:.3},{alias_mb:.3},{lock_wait_ms:.3},{lock_hold_ms:.3}",
         frame = r.frame,
         frames = r.frames,
         fps = r.fps,
@@ -420,6 +426,19 @@ fn write_row(out: &mut impl Write, t_ms: u128, r: &Row) -> std::io::Result<()> {
         depth_planes = r.depth_planes,
         ram_mb = r.ram_mb,
         cpu_pct = r.cpu_pct,
+        map_n = r.remaps.map.calls,
+        map_ms = r.remaps.map.ms,
+        map_mb = r.remaps.map.mb,
+        unmap_n = r.remaps.unmap.calls,
+        unmap_ms = r.remaps.unmap.ms,
+        unmap_mb = r.remaps.unmap.mb,
+        split_n = r.remaps.split.calls,
+        split_ms = r.remaps.split.ms,
+        alias_n = r.remaps.alias.calls,
+        alias_ms = r.remaps.alias.ms,
+        alias_mb = r.remaps.alias.mb,
+        lock_wait_ms = r.remaps.lock_wait.ms,
+        lock_hold_ms = r.remaps.lock_hold.ms,
     )
 }
 
@@ -447,7 +466,9 @@ mod tests {
         copyback_ms,copyback_mb,draws,dropped,making,indirect,heap_passes,heap_ms,\
         texture_refresh_ms,card_passes,card_compares,card_sent_mb,card_ranges,\
         card_pieces,card_fetched,card_fetched_mb,card_waits,card_wait_ms,\
-        twins_into_depth,twins_into_colour,depth_planes,ram_mb,cpu_pct";
+        twins_into_depth,twins_into_colour,depth_planes,ram_mb,cpu_pct,map_n,map_ms,map_mb,\
+        unmap_n,unmap_ms,unmap_mb,split_n,split_ms,alias_n,alias_ms,alias_mb,lock_wait_ms,\
+        lock_hold_ms";
 
     #[test]
     fn header_then_row_carry_the_columns() {
@@ -459,7 +480,7 @@ mod tests {
         let mut lines = text.lines();
         assert_eq!(lines.next(), Some(COLUMNS));
         let names: Vec<&str> = COLUMNS.split(',').collect();
-        assert_eq!(names.len(), 37);
+        assert_eq!(names.len(), 50);
         let values: Vec<&str> = lines.next().unwrap_or_default().split(',').collect();
         assert_eq!(values.len(), names.len(), "one value per column: {values:?}");
         let at = |name: &str| values[names.iter().position(|n| *n == name).unwrap()];

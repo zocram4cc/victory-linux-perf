@@ -553,7 +553,7 @@ impl Section {
         if lean() && done() {
             return true;
         }
-        if !counted(Call::Commit, || commit(base, len)) {
+        if !counted(Call::Commit, len, || commit(base, len)) {
             return false;
         }
         for p in pages {
@@ -1344,8 +1344,22 @@ enum Call {
     Commit = 13,
 }
 
-/// Runs `f`, a system call, and counts it while the streaming log is on.
-fn counted<T>(call: Call, f: impl FnOnce() -> T) -> T {
+impl Call {
+    /// The remap counter of this call, if it changes a mapping ([`victory_gpu::remap`]).
+    fn remap_kind(self) -> Option<victory_gpu::remap::Kind> {
+        match self {
+            Call::Map => Some(victory_gpu::remap::Kind::Map),
+            Call::Unmap => Some(victory_gpu::remap::Kind::Unmap),
+            Call::Split => Some(victory_gpu::remap::Kind::Split),
+            Call::Commit => None,
+        }
+    }
+}
+
+/// Runs `f`, a system call over `bytes` of a mapping, and counts it while the
+/// streaming log is on and in the remap counters (`VICTORY_REMAP_STATS=1`).
+fn counted<T>(call: Call, bytes: usize, f: impl FnOnce() -> T) -> T {
+    let _remapped = call.remap_kind().and_then(|kind| victory_gpu::remap::Timed::begin(kind, bytes));
     if !super::dstorage::stream_log::on() {
         return f();
     }
@@ -1638,6 +1652,12 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 /// the title maps pages into a pool view, then has the GPU map them into its tiled
 /// heap. Page by page; false if a source page is not mapped physical memory.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
+    let _remapped = victory_gpu::remap::Timed::begin(victory_gpu::remap::Kind::Alias, len as usize);
+    alias(to, from, len)
+}
+
+/// [`map_alias`]'s work, which [`map_aliases`] calls without counting it again.
+fn alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let _costed = Costed::begin(None);
     let _busy = Busy::begin();
@@ -1663,9 +1683,13 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
 /// [`map_alias`] of many ranges, in order.
 pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
     let _costed = Costed::begin(None);
+    let _remapped = victory_gpu::remap::Timed::begin(
+        victory_gpu::remap::Kind::Alias,
+        ranges.iter().map(|r| r.2 as usize).sum(),
+    );
     lift_thread();
     if side_by_side() <= 1 {
-        return ranges.iter().all(|&(to, from, len)| map_alias(to, from, len));
+        return ranges.iter().all(|&(to, from, len)| alias(to, from, len));
     }
     // By the page: the address, and the one whose page it is to show.
     let pages: Vec<(usize, Option<usize>)> = ranges
@@ -1675,7 +1699,7 @@ pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
         })
         .collect();
     if pages.iter().any(|p| p.0 % PAGE != 0 || p.1.is_some_and(|from| from % PAGE != 0)) {
-        return ranges.iter().all(|&(to, from, len)| map_alias(to, from, len));
+        return ranges.iter().all(|&(to, from, len)| alias(to, from, len));
     }
     let mut ok = true;
     let mut at = 0;
@@ -1855,7 +1879,7 @@ impl Op {
 
     /// The system calls; whether the host did as asked.
     fn run(&self) -> bool {
-        if self.had && !counted(Call::Unmap, || hide(self.at, PAGE)) {
+        if self.had && !counted(Call::Unmap, PAGE, || hide(self.at, PAGE)) {
             return false;
         }
         let Some(slice) = &self.slice else {
@@ -2070,7 +2094,7 @@ fn split(base: usize, len: usize) {
         return; // no placeholder there, and nothing to cut
     }
     // SAFETY: acts only on a placeholder.
-    counted(Call::Split, || unsafe {
+    counted(Call::Split, len, || unsafe {
         VirtualFree(
             base as *mut c_void,
             len,
@@ -2086,7 +2110,7 @@ fn show(base: usize, len: usize, slice: &Slice, own: bool) -> bool {
         // Under Wine, with renderer port 1: the title's 32-bit graphics pages
         // as memory of their own ([`home_on`]).
         if let Some(first) = home_for(base, len, slice) {
-            return counted(Call::Map, || show_home(base, len, slice, first));
+            return counted(Call::Map, len, || show_home(base, len, slice, first));
         }
         if slice.section.any_home() {
             homeless(&slice.section);
@@ -2097,7 +2121,7 @@ fn show(base: usize, len: usize, slice: &Slice, own: bool) -> bool {
             tracing::warn!(address = format_args!("{base:#x}"), len, "mapping physical pages failed: their section has no file descriptor");
             return false;
         };
-        let shown = counted(Call::Map, || wine_map::show(base, len, fd, (slice.index * PAGE) as u64));
+        let shown = counted(Call::Map, len, || wine_map::show(base, len, fd, (slice.index * PAGE) as u64));
         if !shown {
             tracing::warn!(address = format_args!("{base:#x}"), len, "mapping physical pages with the host's mmap failed");
         }
@@ -2107,7 +2131,7 @@ fn show(base: usize, len: usize, slice: &Slice, own: bool) -> bool {
     }
     let map_view = || {
         // SAFETY: maps the section over a placeholder; acts only on one.
-        counted(Call::Map, || unsafe {
+        counted(Call::Map, len, || unsafe {
             MapViewOfFile3(
                 slice.section.handle,
                 GetCurrentProcess(),
@@ -2249,7 +2273,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             victory_gpu::title_memory_splitting(at, size);
         }
         victory_gpu::title_memory_unmapping(at, size);
-        let gone = counted(Call::Unmap, || hide(at, size));
+        let gone = counted(Call::Unmap, size, || hide(at, size));
         if gone && at >= base && at + size <= end {
             physical.holes.insert(at, size);
         }

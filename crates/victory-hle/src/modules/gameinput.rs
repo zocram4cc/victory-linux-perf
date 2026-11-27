@@ -1248,7 +1248,9 @@ mod host {
     /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
     /// `Left`, `Right` (the stand-in pad's table maps them to buttons:
     /// `Enter` is A). In every build, not only diagnostics ones: a launcher
-    /// uses it to press A on the start screen.
+    /// uses it to press A on the start screen. Its first call logs where the clock
+    /// starts (`VICTORY_KEYS clock starts`, with the wall clock in epoch ms), to place
+    /// a run's frame times on it.
     fn scripted() -> Vec<u8> {
         static SCRIPT: LazyLock<(Instant, Vec<(Duration, Duration, u8)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
@@ -1275,7 +1277,18 @@ mod host {
                 };
                 Some((from, to, vk))
             });
-            (Instant::now(), keys.collect())
+            let origin = Instant::now();
+            let wall = std::time::SystemTime::now();
+            let keys: Vec<_> = keys.collect();
+            if !list.is_empty() {
+                let since = wall.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+                tracing::info!(
+                    epoch_ms = since.as_millis() as u64,
+                    entries = keys.len(),
+                    "VICTORY_KEYS clock starts"
+                );
+            }
+            (origin, keys)
         });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
