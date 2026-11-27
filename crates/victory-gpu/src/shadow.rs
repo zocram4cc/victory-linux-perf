@@ -99,6 +99,8 @@ pub(crate) struct Shadow {
     /// Of a copy with two sides: only the dwords the title changed go up,
     /// as with [`send_changed`] ([`by_address`]).
     changes_only: std::sync::atomic::AtomicBool,
+    /// Shader writes of it are left on the card ([`Shadow::leave_on_card`]).
+    left_on_card: std::sync::atomic::AtomicBool,
     /// A window in card memory the CPU maps ([`window_mapped_for`]).
     mapped: bool,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
@@ -2159,6 +2161,15 @@ pub(crate) fn exact_back() -> bool {
 /// joined over bytes that had not changed.
 pub(crate) static PUT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
+/// `VICTORY_WC_JOIN_BYTES` (0): how many unchanged bytes may lie between
+/// changed dwords of one range sent up to a copy whose shader writes stay on
+/// the card ([`Shadow::leave_on_card`]). 0: every run on its own; 256 made
+/// 600 ranges of 10,000 a frame and put the patches back on the phone.
+fn left_join() -> usize {
+    static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| std::env::var("VICTORY_WC_JOIN_BYTES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
 /// The dwords (of title memory from `at` on) where `merged` differs from
 /// `title`, as (offset, bytes) in order, joined where at most `gap` bytes
 /// lie between.
@@ -3242,6 +3253,7 @@ impl Shadow {
             card: None,
             window: false,
             changes_only: Default::default(),
+            left_on_card: Default::default(),
             mapped: false,
             place: None,
         }
@@ -4335,7 +4347,13 @@ impl Shadow {
             }
             return self.copy(from, to);
         };
-        let whole = !known && card.before.lock().unwrap_or_else(|e| e.into_inner()).is_none();
+        let whole = !known
+            && !self.left_on_card.load(Ordering::Relaxed)
+            && card.before.lock().unwrap_or_else(|e| e.into_inner()).is_none();
+        // A copy whose shader writes stay on the card: changed dwords at most
+        // this far apart go up as one range (thousands of ranges a frame
+        // otherwise, each a copy on the card).
+        let join = if self.left_on_card.load(Ordering::Relaxed) { left_join() } else { 0 };
         let start = self.start as usize;
         TITLE.with_borrow_mut(|title| {
             title.resize(PAGE, 0);
@@ -4351,7 +4369,7 @@ impl Shadow {
                 // refresh lie apart.
                 let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at - start), n) };
                 let was = crate::host::upcheck::on().then(|| held.to_vec());
-                let runs = if whole { vec![(0, n)] } else { dword_runs(at, held, title, 0) };
+                let runs = if whole { vec![(0, n)] } else { dword_runs(at, held, title, join) };
                 for &(a, len) in &runs {
                     held[a..a + len].copy_from_slice(&title[a..a + len]);
                     self.changed(at - start + a, at - start + a + len);
@@ -4451,6 +4469,13 @@ impl Shadow {
     /// the title changes go up ([`by_address`]).
     pub(crate) fn keep_stores(&self) {
         self.changes_only.store(true, Ordering::Relaxed);
+    }
+
+    /// Shader writes of it stay on the card, not fetched back: from here on
+    /// only the dwords the title changes go up, also of pages never taken.
+    pub(crate) fn leave_on_card(&self) {
+        self.changes_only.store(true, Ordering::Relaxed);
+        self.left_on_card.store(true, Ordering::Relaxed);
     }
 
     /// Offsets `[from, to)` go up again whole, as the CPU's side has them.

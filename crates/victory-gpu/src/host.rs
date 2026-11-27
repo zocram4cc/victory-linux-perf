@@ -1902,6 +1902,19 @@ fn card_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_CARD_BUDGET").is_none_or(|v| v != "0"))
 }
 
+/// Whether a piece of `bytes` of `shadow`, declared written over `declared`,
+/// is left on the card as write-combining title memory ([`crate::wcskip`]).
+/// A copy with a piece left there takes only what the title changes from
+/// then on: the CPU's side no longer has what shaders wrote, and a page sent
+/// whole would put older bytes over it.
+fn wc_left(shadow: &crate::shadow::Shadow, declared: (usize, usize), bytes: u64) -> bool {
+    let left = crate::wcskip::skip_back(shadow.span().1, declared, bytes);
+    if left {
+        shadow.leave_on_card();
+    }
+    left
+}
+
 /// Whether each list of a submission runs and is timed on its own, slow
 /// ones logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
 /// builds; the commands are noted with `VICTORY_D3D12_DRED` on).
@@ -4703,9 +4716,9 @@ impl Host {
         let work = work.as_mut()?;
         // A copy whose shader writes are declared for the first time gets
         // its bytes from before, whole.
-        let whole_wc = |s: &crate::shadow::Shadow| {
+        let whole_wc = |s: &Arc<crate::shadow::Shadow>| {
             let (bs, bl) = s.span();
-            crate::wcskip::skip_back(bl, (bs as usize, (bs + bl) as usize), 0)
+            wc_left(s, (bs as usize, (bs + bl) as usize), 0)
         };
         let mut whole: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
         for shadow in declared.iter().filter(|(s, _)| !whole_wc(s)).map(|d| &d.0).chain(looked.iter().map(|l| &l.0)) {
@@ -4880,7 +4893,7 @@ impl Host {
             }
             let twin = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
             for (from, to) in spans {
-                if crate::wcskip::skip_back(shadow.span().1, (from, to), (to - from) as u64) {
+                if wc_left(shadow, (from, to), (to - from) as u64) {
                     continue;
                 }
                 let Some(span) = shadow.card_span(from, to) else {
@@ -5118,9 +5131,7 @@ impl Host {
                             let (lo, hi) = r.shadow.card_piece(&r.span, p);
                             let (runs, count) = card_page_runs(start, lo, hi, mask);
                             for &(rlo, rhi) in &runs[..count] {
-                                if !crate::wcskip::skip_back(r.shadow.span().1, r.declared, (rhi - rlo) as u64)
-                                    && !seen.contains(&(copy, rlo, rhi))
-                                {
+                                if !wc_left(&r.shadow, r.declared, (rhi - rlo) as u64) && !seen.contains(&(copy, rlo, rhi)) {
                                     let key = (r.shadow.id(), start + rlo, rhi - rlo);
                                     if fetch.as_ref().is_some_and(|f| f.had.holds(behind, key)) {
                                         land::count(land::stat::HAD, 1);
@@ -5166,7 +5177,7 @@ impl Host {
                         }
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
                         if lo < hi
-                            && !crate::wcskip::skip_back(r.shadow.span().1, r.declared, (hi - lo) as u64)
+                            && !wc_left(&r.shadow, r.declared, (hi - lo) as u64)
                             && !seen.contains(&(copy, lo, hi))
                         {
                             let key = (r.shadow.id(), r.shadow.span().0 as usize + lo, hi - lo);
@@ -5555,7 +5566,7 @@ impl Host {
                     let (lo, hi) = r.shadow.card_piece(&r.span, p);
                     let (runs, count) = card_page_runs(start, lo, hi, mask);
                     for &(rlo, rhi) in &runs[..count] {
-                        if !crate::wcskip::skip_back(r.shadow.span().1, r.declared, (rhi - rlo) as u64)
+                        if !wc_left(&r.shadow, r.declared, (rhi - rlo) as u64)
                             && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, rlo, rhi))
                         {
                             pieces.push((i, rlo, rhi, total));
@@ -5569,7 +5580,7 @@ impl Host {
                 }
                 let (lo, hi) = r.shadow.card_piece(&r.span, p);
                 if lo < hi
-                    && !crate::wcskip::skip_back(r.shadow.span().1, r.declared, (hi - lo) as u64)
+                    && !wc_left(&r.shadow, r.declared, (hi - lo) as u64)
                     && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi))
                 {
                     pieces.push((i, lo, hi, total));
