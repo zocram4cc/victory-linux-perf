@@ -2201,6 +2201,8 @@ impl State {
             // The title may release the pipeline before it submits the list.
             list.bind_pipeline(&p.name, &p.pso, &p.root);
         }
+        #[cfg(feature = "diagnostics")]
+        crate::constwatch::pipeline(&p.name);
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
@@ -5387,6 +5389,8 @@ impl State {
                         };
                         let slot = (std::ptr::from_ref(heap) as usize, index);
                         list.defer_constants(to, address as *const u8, size as usize, slot);
+                        #[cfg(feature = "diagnostics")]
+                        crate::constwatch::fill(address, size, std::ptr::from_ref(list) as usize);
                         host.constant_at(index, &buffer, gpu, size);
                     }
                     Some(view) => {
