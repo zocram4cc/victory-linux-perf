@@ -83,3 +83,8 @@ Moving into new areas: 2-6 fps for a few seconds while the title streams (its ma
 - The game folder is never written. The game is never started while the user plays (ktrials refuses).
 - Public messages (PRs, comments) in the first person singular, in English; commits with the noreply address.
 - Nothing goes to other people's repositories unless the user asks (PR #1 was asked for).
+
+## 10. Update, 27 Nov ~04:50
+
+- **Play:** `~/Games/victory-data/run-kroeeee.sh` now also collapses renderer port 1's heap into huge pages every 15 s (merged from kroeeee; helper `linux/thp/victory-thp-collapse` with `cap_sys_nice`, done; log `run-*.thp`). The save was restored from `royale-save` (the autosaved one is `perfiles/kroeeee/data.autosaved-20261127`); the pipeline library polluted by P.4 runs is set aside (`cache/pipelines.polluted-by-p4-20261127`); P.4 scripts use `cache-p4`. Settled play 15-21 fps.
+- **P.4 translator: 931 of 2,680** 0x218 programs translate (542 at the start of the night), 6 whole families. README section 6 has every step and the next design: descriptor tables addressed from constant data (the view heap is at console `0x0b3c0000`-`0x0d9c0000`; tables are console addresses in it).
