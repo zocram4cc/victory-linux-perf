@@ -11584,7 +11584,13 @@ impl<'a> Lower<'a> {
             // float format (the console converts by the view's format).
             // One channel goes into a view the program also counts in.
             let counter = *dmask == 1 && self.is_counter(src);
-            if *dmask != 0xF && !counter {
+            // The first one, two or three channels (R, RG, RGB): the data
+            // holds those, packed; a view of a format with that many has no
+            // others to keep (the title's own compute programs, P.4, write
+            // single-channel targets so). Other masks could leave channels
+            // the format has: refused.
+            let prefix = matches!(*dmask, 1 | 3 | 7) && !counter;
+            if *dmask != 0xF && !counter && !prefix {
                 return Err("an image store of some channels");
             }
             let iu = self.s.m.undef(self.s.t.i32);
@@ -11624,7 +11630,13 @@ impl<'a> Lower<'a> {
                 return Ok(());
             }
             let mut vals = Vec::new();
+            let present = (*dmask as u32).count_ones() as u8;
             for k in 0..4u8 {
+                if k >= present {
+                    // A channel the store does not write (a prefix mask).
+                    vals.push(self.s.m.f32(0));
+                    continue;
+                }
                 // d16: two f16 channels per VGPR, low half first.
                 let r = if *d16 { k / 2 } else { k };
                 let v = inst.read(Reg::V(reg + r)).ok_or("image store data")?;
