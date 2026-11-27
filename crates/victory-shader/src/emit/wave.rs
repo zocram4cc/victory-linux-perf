@@ -1308,7 +1308,10 @@ mod tests {
         // constants (240..=248: 0.5, -0.5, 1.0, ..., 1/(2*pi)) are non-zero
         // f16 values on GFX10 and must not be decoded as f32 bits whose low 15
         // bits happen to be zero.
-        let run = |src_const: u16| -> (Option<Shape>, Value, Value) {
+        // (Upstream also checks that the add of 0 matches its half-wave sum
+        // shape, which this tree does not have; here only that an add of an
+        // inline float constant matches no sum.)
+        let run = |src_const: u16| -> Option<Shape> {
             let mut w = vec![sop1(0, 0x3D, 193)]; // s_or_saveexec_b32 s0, -1
             w.extend(vop3(1, 0x101, 128, 256, 0)); // v_cndmask_b32 v1, 0, v0, s0
             w.push(vop2(1, 0x32, src_const, 1)); // v_add_f16 v1, <const>, v1
@@ -1323,21 +1326,12 @@ mod tests {
 
             let p = build(&w, false);
             let insts = &p.blocks[0].insts;
-            let saved = insts[0].write(Reg::S(0)).unwrap();
-            let v0_in = insts[1].read(Reg::V(0)).unwrap();
             let s1 = insts[insts.len() - 3].write(Reg::S(1)).unwrap();
             let sec = &sections(&p, 0)[&0];
-            (sec.shapes.get(&s1).copied(), v0_in, saved)
+            sec.shapes.get(&s1).copied()
         };
-
-        let (zero_shape, v0_in, saved) = run(128);
-        assert_eq!(
-            zero_shape,
-            Some(Shape::Half(Op::AddH, v0_in, saved, 0, 31))
-        );
         for c in 240..=248u16 {
-            let (shape, _, _) = run(c);
-            assert_eq!(shape, None, "inline float const {c} was treated as identity");
+            assert_eq!(run(c), None, "inline float const {c} was treated as identity");
         }
     }
 }
