@@ -55,3 +55,9 @@ Seen: the intro flickers before the loading screen (the author lists it as known
 - **The metadata matches the code exactly:** SRV table offset 0 (8 dwords), UAV 8 (8 dwords), CBV 16 (4 dwords), all user data 4, root slot 0; sampler root type 4 (immediate). So the FSPX record mapping is not the fault, at least here.
 - **Lost UAV writes ruled out:** `placed unordered texture view not mirrored (null: writes … lost)` is asked as often without native programs (`times` 2,048, 12 textures) as with them (512, 10).
 - **Next (needs the game):** trace one native pipeline's dispatch: which root signature and root parameter values the list holds at that moment, and what user data the translated shader gets. Suspect: the title binds these pipelines' resources through a console path the layer does not carry over, so they read empty or wrong tables.
+
+**P.4 correction (27 Nov, ~01:40): draws a frame were a wrong test; the "bad" programs are fine**
+- Plain runs (no native programs) go from ~11,000 draws a frame outside the house to ~6,000 (sometimes ~4,000) when the camera cuts indoors, at a different moment each run. Every bisect/hunt/grow verdict by draws is unreliable (`bench/p4-grow-by-draws-invalid`, `bench/p4-bad.txt`).
+- **Screenshots tell it:** luminance standard deviation of the game window ~72 for a real scene, ~1-4 for the grey screen (mean ~50), 0.7 for the white one (mean 247). The ~30 "bad" programs made alone (`bench/k-…-p4-trace`): **a perfect picture** (Jason on the porch, sea, light, HUD). What is grey: all 542 translatable made together (`p4-translatable`, `p4-uav-all`). The white one (call 169, `0f0039f000`) is real.
+- `VICTORY_PLACED_UAV=1` made no difference (its counter never showed); left off.
+- `p4-grow.sh` now judges by screenshots (std ≥ 15) and fps ≥ 5, from scratch.
