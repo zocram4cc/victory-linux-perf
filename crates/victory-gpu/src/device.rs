@@ -429,7 +429,7 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
             // translation is deterministic, so one that passes here does not
             // panic when the pipeline is made.)
             let translates = std::panic::catch_unwind(|| victory_shader::emit::translate(&container).is_ok());
-            if translates != Ok(true) {
+            if !matches!(translates, Ok(true)) {
                 NATIVE_COMPUTE[2].fetch_add(1, Ordering::Relaxed);
                 return E_NOTIMPL;
             }
