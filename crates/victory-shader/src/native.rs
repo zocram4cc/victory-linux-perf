@@ -564,6 +564,32 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
         }
         used.push(u);
     }
+    // The title's own programs (device method 0x218, P.4) also get the
+    // resource and sampler heaps' 32-bit bases in the last two user SGPRs,
+    // which the metadata does not list: they fetch descriptors from the heap
+    // by index (`s_add_u32 addr, s[n-2], index * 32`). Taken as such where
+    // no listed parameter covers them.
+    let user_sgprs = ((u32_at(packet, PACKET_RSRC2)? >> 1) & 0x1F) as u8;
+    let covered = |layout: &[RootParam], r: u8| {
+        layout
+            .iter()
+            .any(|p| (p.user_data..p.user_data.saturating_add(p.sgprs as u8)).contains(&r))
+    };
+    for (root, at, slot) in [(RootType::ResourceHeap, 2, 0xFE), (RootType::SamplerHeap, 1, 0xFF)] {
+        if let Some(r) = user_sgprs.checked_sub(at)
+            && !covered(&layout, r)
+            && layout.iter().any(|p| p.user_data < r)
+        {
+            layout.push(RootParam {
+                root,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: r,
+                slot,
+            });
+        }
+    }
     Ok(NativeProgram {
         stage: HwStage::Cs,
         wave64,
