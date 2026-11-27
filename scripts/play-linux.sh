@@ -44,6 +44,9 @@
 # then `touch <folder>/go` for each capture (capture-1, capture-2, ... in it; the file is
 # taken away). VICTORY_RECORD_GAP: seconds after a capture in which a touch is not followed
 # (5). VICTORY_RECORD_AT (seconds, or f<frame>), VICTORY_RECORD_FRAMES, VICTORY_RECORD_ALWAYS=1.
+# VICTORY_RECORD_SHEETS=1: also a capture by itself when the characters' pre-skinned mesh
+# programs draw waves of vertices spanning much of the screen (stretched "sheets"); at most
+# VICTORY_RECORD_SHEETS_MAX a run (2); _ROW and _MIN set what counts. Best with ALWAYS=1.
 #
 # Every game run leaves a folder in ~/.local/share/victory/runs/ (VICTORY_RUNS_DIR):
 # run.json, victory.log, frames.csv, system.csv, marks.csv, marks/ (mangohud.csv with --mangohud).
