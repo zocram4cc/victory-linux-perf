@@ -38,6 +38,21 @@ fn host_gpu_failed(what: &str) -> ! {
     unreachable!("the process has ended")
 }
 
+/// Makes the host GPU now, before any title code runs, unless
+/// `VICTORY_HOST_EARLY=0` (then it is made at the title's first command
+/// list): whether there is one and how long making it took. Made inside the
+/// title's start, a slow driver counts against the title's own watchdog
+/// (`victory_gpu::host_early`).
+pub fn make_host_gpu_early() -> Option<(bool, std::time::Duration)> {
+    #[cfg(windows)]
+    if victory_gpu::host_early() {
+        let began = std::time::Instant::now();
+        let made = victory_gpu::prepare_host();
+        return Some((made, began.elapsed()));
+    }
+    None
+}
+
 /// Translates `container` into the cache ([`use_shader_cache`]) ahead of
 /// any run: whether it was there already, or why it does not translate.
 pub fn precompile(container: &[u8]) -> Result<bool, String> {

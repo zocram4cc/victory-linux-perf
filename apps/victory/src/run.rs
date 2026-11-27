@@ -235,6 +235,21 @@ pub fn run(
     victory_hle::runtime::set_title_dll_loader(Box::new(move |file| {
         late.load(file, show).map_err(|e| format!("{e:#}"))
     }));
+    // The host GPU is made now, before any title code runs
+    // (`VICTORY_HOST_EARLY`, on unless `0`), not at the title's first command
+    // list: the time the driver takes is then not spent inside the title's
+    // start, which the title's own watchdog ends after about 30 s without
+    // progress. The driver alone took that long in some runs (AMD's reads its
+    // whole pipeline cache in `D3D12CreateDevice`). Not on a thread of its own
+    // earlier: the loading above patches the process's TLS and maps DLLs while
+    // the driver would be loading its own.
+    if let Some((made, took)) = victory_hle::modules::d3d12x::make_host_gpu_early() {
+        println!(
+            "host gpu       {} before the title starts, in {} ms",
+            if made { "made" } else { "not made" },
+            took.as_millis()
+        );
+    }
     // SAFETY: imports are bound; from here on we run title code.
     let main = unsafe { Arc::new(image).spawn_main(dlls)? };
     let code = main

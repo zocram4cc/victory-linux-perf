@@ -595,6 +595,37 @@ unsafe fn instruction_bytes(at: usize) -> String {
     hex.join(" ")
 }
 
+/// Whether the instruction at `at` writes to the fixed address 0 (`mov
+/// [0], imm` or `mov [0], reg`), how a title crashes on purpose so that its
+/// own crash handler writes a report: its watchdog or a fatal error, not a
+/// null pointer.
+///
+/// # Safety
+/// `at`'s page is readable.
+unsafe fn writes_fixed_zero(at: usize) -> bool {
+    let n = (0x1000 - (at & 0xfff)).min(15);
+    // SAFETY: `n` bytes from `at` stay inside its page, which the caller
+    // says is readable.
+    let bytes = unsafe { std::slice::from_raw_parts(at as *const u8, n) };
+    is_mov_to_fixed_zero(bytes)
+}
+
+/// `bytes` start with a `mov` (88, 89, c6, c7, after operand-size and REX
+/// prefixes) whose operand is the absolute address 0: ModRM mod 00 rm 100,
+/// SIB 25 (no base, no index), then a 32-bit displacement of 0.
+fn is_mov_to_fixed_zero(bytes: &[u8]) -> bool {
+    let prefixes = bytes
+        .iter()
+        .take_while(|&&b| b == 0x66 || (0x40..=0x4f).contains(&b))
+        .count();
+    match bytes.get(prefixes..prefixes + 7) {
+        Some([op, modrm, 0x25, 0, 0, 0, 0]) => {
+            matches!(op, 0x88 | 0x89 | 0xc6 | 0xc7) && modrm & 0xc7 == 0x04
+        }
+        _ => false,
+    }
+}
+
 /// MSVC's code for a C++ `throw`, and its magic first parameter.
 const CPP_EXCEPTION: i32 = 0xE06D_7363_u32 as i32;
 const CPP_MAGIC: usize = 0x1993_0520;
@@ -675,6 +706,15 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
         code as u32,
         locate(at)
     ));
+    // SAFETY: the CPU fetched the instruction at `at` to run it.
+    if code == EXCEPTION_ACCESS_VIOLATION && p[0] == 1 && p[1] == 0 && unsafe { writes_fixed_zero(at) } {
+        line(
+            "  (the instruction itself names address 0: the title stops itself here on purpose, \
+             from its watchdog or a fatal error, not through a null pointer; what it was waiting \
+             for is in its other threads and in the lines before)"
+                .into(),
+        );
+    }
     line(format!(
         "  rax {:#x} rbx {:#x} rcx {:#x} rdx {:#x} rsi {:#x} rdi {:#x} rsp {:#x} rbp {:#x}",
         context.Rax,
@@ -1391,6 +1431,25 @@ mod tests {
         let captured = capture_frames();
         std::hint::black_box(&captured);
         captured
+    }
+
+    #[test]
+    fn a_mov_to_the_fixed_address_zero_is_told_from_other_writes() {
+        // mov dword ptr [0], 0 (a title's watchdog), then int3
+        assert!(is_mov_to_fixed_zero(&[0xc7, 0x04, 0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0xcc]));
+        // mov qword ptr [0], 1
+        assert!(is_mov_to_fixed_zero(&[0x48, 0xc7, 0x04, 0x25, 0, 0, 0, 0, 1, 0, 0, 0]));
+        // mov byte ptr [0], 0 / mov [0], eax
+        assert!(is_mov_to_fixed_zero(&[0xc6, 0x04, 0x25, 0, 0, 0, 0, 0]));
+        assert!(is_mov_to_fixed_zero(&[0x89, 0x04, 0x25, 0, 0, 0, 0]));
+        // through a register: mov dword ptr [rax], 0
+        assert!(!is_mov_to_fixed_zero(&[0xc7, 0x00, 0, 0, 0, 0]));
+        // a fixed address other than 0: mov dword ptr [0x10], 0
+        assert!(!is_mov_to_fixed_zero(&[0xc7, 0x04, 0x25, 0x10, 0, 0, 0, 0, 0, 0, 0]));
+        // rip-relative: mov dword ptr [rip+0], 0
+        assert!(!is_mov_to_fixed_zero(&[0xc7, 0x05, 0, 0, 0, 0, 0, 0, 0, 0]));
+        // cut short (the page ends)
+        assert!(!is_mov_to_fixed_zero(&[0xc7, 0x04, 0x25, 0, 0]));
     }
 
     #[test]

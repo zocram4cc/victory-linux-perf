@@ -967,6 +967,91 @@ pub(crate) fn host() -> Option<&'static Host> {
     .as_ref()
 }
 
+/// Whether the runtime makes the host GPU before the title runs
+/// (`VICTORY_HOST_EARLY`, on unless `0`) instead of at the title's first
+/// command list. Made inside the title's start, the time the driver takes
+/// counts against the title's own watchdog, which ends the title (a write to
+/// address 0) when its start makes no progress for about 30 s; the driver
+/// alone can take that long (see `Making`).
+pub fn early() -> bool {
+    std::env::var_os("VICTORY_HOST_EARLY").is_none_or(|v| v != "0")
+}
+
+/// Makes the host GPU now if it is not made yet; whether there is one.
+pub fn prepare() -> bool {
+    host().is_some()
+}
+
+/// The driver making the host device. `D3D12CreateDevice` is not quick on
+/// every machine: AMD's driver first reads its whole on-disk pipeline cache,
+/// and runs whose cache had grown to a few GB took 5 to 10 s, and over 30 s
+/// when those files had to come from the disk again. So the time it took is
+/// logged, and while it has not returned a line every 5 s says so (a run
+/// that ends then has the reason in its log).
+struct Making {
+    /// When the driver was asked.
+    asked: std::time::Instant,
+    /// The process's page faults then.
+    faults: u64,
+    /// Dropped when the device is made (or making it failed): ends the
+    /// thread that writes the lines.
+    _watch: std::sync::mpsc::Sender<()>,
+}
+
+impl Making {
+    fn start() -> Self {
+        let began = std::time::Instant::now();
+        let (watch, stop) = std::sync::mpsc::channel::<()>();
+        let _ = std::thread::Builder::new()
+            .name("host-device-watch".into())
+            .spawn(move || {
+                while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                    stop.recv_timeout(std::time::Duration::from_secs(5))
+                {
+                    tracing::warn!(
+                        after_s = began.elapsed().as_secs(),
+                        "the host D3D12 device is not made yet: the driver is still in D3D12CreateDevice"
+                    );
+                }
+            });
+        // Diagnostics: a slow driver on demand (`VICTORY_HOST_DELAY_MS`), to
+        // see what a slow `D3D12CreateDevice` does to the title's start.
+        #[cfg(feature = "diagnostics")]
+        if let Some(ms) = std::env::var("VICTORY_HOST_DELAY_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+            tracing::warn!(ms, "test: the host D3D12 device is made this much later (VICTORY_HOST_DELAY_MS)");
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+        Self { asked: std::time::Instant::now(), faults: page_faults(), _watch: watch }
+    }
+
+    fn done(self) {
+        let ms = self.asked.elapsed().as_millis() as u64;
+        let page_faults = page_faults().saturating_sub(self.faults);
+        if ms >= 5_000 {
+            tracing::warn!(
+                ms,
+                page_faults,
+                "the driver took long to make the host D3D12 device (AMD's reads its whole pipeline cache from disk first)"
+            );
+        } else {
+            tracing::info!(ms, page_faults, "the driver made the host D3D12 device");
+        }
+    }
+}
+
+/// The process's page faults so far (soft and hard).
+fn page_faults() -> u64 {
+    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut c = PROCESS_MEMORY_COUNTERS {
+        cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: our own process and a sized structure.
+    unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+    u64::from(c.PageFaultCount)
+}
+
 fn create() -> windows::core::Result<Host> {
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
@@ -1020,12 +1105,15 @@ fn create() -> windows::core::Result<Host> {
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
+        let making = Making::start();
         if cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_WARP") {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            making.done();
             tracing::info!("host device on the software adapter (WARP)");
         } else {
             device = Some(victory_shader::emit::host::create_preferred_device()?);
+            making.done();
             // Whether a GPU hang ends the run or freezes the PC (#1054).
             crate::tdr::log();
         }
