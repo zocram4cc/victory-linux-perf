@@ -71,11 +71,12 @@ pub(crate) struct Shader {
     /// so the views it is dispatched with are logged once (`crate::draw`).
     #[cfg(windows)]
     pub(crate) views_wanted: bool,
-    /// `VICTORY_CLEAR_AFTER=<name part>:<root parameter>:<dwords>;...`: the
-    /// images of its tables that are set to zero after each dispatch of it
-    /// (an experiment's tool: what a program writes without rays is dropped).
+    /// `VICTORY_CLEAR_AFTER=<name part>:<root parameter>:<dwords>[:<w>x<h>];...`:
+    /// the images of its tables that are set to zero after each dispatch of it
+    /// (an experiment's tool: what a program writes without rays is dropped);
+    /// with a size, only that much of the image's top-left corner (0: all).
     #[cfg(windows)]
-    pub(crate) clear_after: Vec<(u8, u32)>,
+    pub(crate) clear_after: Vec<(u8, u32, u32, u32)>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -113,8 +114,8 @@ pub(crate) fn kept() -> [u64; 7] {
 }
 
 /// `VICTORY_CLEAR_AFTER`, read once.
-fn clear_after() -> &'static [(Vec<u8>, u8, u32)] {
-    static SET: OnceLock<Vec<(Vec<u8>, u8, u32)>> = OnceLock::new();
+fn clear_after() -> &'static [(Vec<u8>, u8, u32, u32, u32)] {
+    static SET: OnceLock<Vec<(Vec<u8>, u8, u32, u32, u32)>> = OnceLock::new();
     SET.get_or_init(|| {
         std::env::var("VICTORY_CLEAR_AFTER")
             .unwrap_or_default()
@@ -124,7 +125,12 @@ fn clear_after() -> &'static [(Vec<u8>, u8, u32)] {
                 let name = parts.next()?.trim().as_bytes().to_vec();
                 let slot = parts.next()?.trim().parse().ok()?;
                 let at = parts.next()?.trim().parse().ok()?;
-                (!name.is_empty()).then_some((name, slot, at))
+                let (w, h) = parts
+                    .next()
+                    .and_then(|s| s.trim().split_once('x'))
+                    .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))
+                    .unwrap_or((0, 0));
+                (!name.is_empty()).then_some((name, slot, at, w, h))
             })
             .collect()
     })
@@ -175,7 +181,7 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 probe: crate::lightprobe::on().then(|| crate::lightprobe::role(bytes)).flatten(),
                 #[cfg(windows)]
                 clear_after: if stage == "compute" {
-                    clear_after().iter().filter(|(part, ..)| bytes.windows(part.len()).any(|w| w == part.as_slice())).map(|(_, slot, at)| (*slot, *at)).collect()
+                    clear_after().iter().filter(|(part, ..)| bytes.windows(part.len()).any(|w| w == part.as_slice())).map(|(_, slot, at, w, h)| (*slot, *at, *w, *h)).collect()
                 } else {
                     Vec::new()
                 },

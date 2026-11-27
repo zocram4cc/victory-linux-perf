@@ -2766,6 +2766,8 @@ impl State {
                 // again, unless the host copy may need more.)
                 crate::texture::PICKING.set(Some(there.filter(|_| partly.is_none()).unwrap_or(u64::MAX)));
                 let _ = crate::residency::take_staging_deferred();
+                #[cfg(feature = "diagnostics")]
+                NOW_PIPELINE.with(|p| p.set(self.pipeline as usize));
                 readable(list, sampled.kind, view);
                 crate::texture::PICKING.set(None);
             }
@@ -3006,6 +3008,7 @@ impl State {
         let t = stage.translated();
         let mut any = false;
         for &at in &stage.shader.clear_after {
+            let (corner, at) = ([at.2, at.3], (at.0, at.1));
             let Some((of, image)) = self.table_view(t, true, ResourceType::Uav, at) else {
                 once!(hash = stage.shader.hash, ?at, "VICTORY_CLEAR_AFTER: no image there");
                 continue;
@@ -3016,7 +3019,9 @@ impl State {
             }
             // (R32_UINT, R16_UINT, R8_UINT, R16G16_UINT, R32G32_UINT.)
             let integer = matches!(of.Format.0, 42 | 57 | 62 | 36 | 17);
-            any |= crate::ambient::zero(list, image, [of.Width as u32, of.Height], integer);
+            let whole = [of.Width as u32, of.Height];
+            let size = if corner[0] > 0 && corner[1] > 0 { [corner[0].min(whole[0]), corner[1].min(whole[1])] } else { whole };
+            any |= crate::ambient::zero(list, image, size, integer);
         }
         any
     }
@@ -3047,7 +3052,7 @@ impl State {
     /// The stand-in for the indirect light after a dispatch of `p`
     /// (`crate::ambient`). Whether it recorded anything.
     fn ambient(&self, list: &HostList, p: &HostPipeline, role: crate::ambient::Role) -> bool {
-        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, REFLECTIONS, REFLECTIONS_ALPHA, Role, Views};
+        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, REFLECTIONS, REFLECTIONS_ALPHA, REFLECTIONS_SCREEN, Role, Views};
         if role == Role::Reflected {
             static SEEN: std::sync::Once = std::sync::Once::new();
             SEEN.call_once(|| tracing::info!(translated = p.stages.first().is_some(), "the title's last reflection program was dispatched"));
@@ -3062,11 +3067,12 @@ impl State {
             Role::Air => AIR,
             Role::Reflected => REFLECTIONS,
             Role::ReflectedAlpha => REFLECTIONS_ALPHA,
+            Role::ReflectedScreen => REFLECTIONS_SCREEN,
         };
         let image = entry(ResourceType::Uav, at);
         let depth = match role {
             Role::Resolve => entry(ResourceType::Srv, DEPTH),
-            Role::Radiance | Role::Air | Role::Reflected | Role::ReflectedAlpha => image,
+            Role::Radiance | Role::Air | Role::Reflected | Role::ReflectedAlpha | Role::ReflectedScreen => image,
         };
         let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
             once!(?role, "no stand-in for the indirect light: other tables");
@@ -3554,6 +3560,8 @@ impl State {
             return;
         };
         if let Some(view) = host.mirror(index, handle, true) {
+            #[cfg(feature = "diagnostics")]
+            NOW_PIPELINE.with(|p| p.set(self.pipeline as usize));
             readable(list, u.kind, &view);
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
@@ -3678,6 +3686,8 @@ impl State {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
+                        #[cfg(feature = "diagnostics")]
+                        NOW_PIPELINE.with(|p| p.set(self.pipeline as usize));
                         readable(list, u.kind, &view);
                     }
                 }
@@ -3689,6 +3699,8 @@ impl State {
                     if let Some(view) = crate::descriptor::view(handle)
                         && let Some(kind) = view_kind(&view)
                     {
+                        #[cfg(feature = "diagnostics")]
+                        NOW_PIPELINE.with(|p| p.set(self.pipeline as usize));
                         readable(list, kind, &view);
                     }
                 }
@@ -3758,6 +3770,8 @@ impl State {
                             }
                         } else if let Some(view) = crate::descriptor::host::listed_view(recording, words) {
                             TESTED_DEPTH.set((tested.0, false));
+                            #[cfg(feature = "diagnostics")]
+                            NOW_PIPELINE.with(|p| p.set(self.pipeline as usize));
                             readable(list, kind, &view);
                             let depth = TESTED_DEPTH.get().1;
                             TESTED_DEPTH.set((tested.0, tested.1 || depth));
@@ -3812,6 +3826,8 @@ impl State {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
                         if let Some(kind) = kind {
+                            #[cfg(feature = "diagnostics")]
+                            NOW_PIPELINE.with(|p| p.set(self.pipeline as usize));
                             readable(list, kind, &view);
                         }
                         // The title's slot is a table's: out of the queue
@@ -4585,6 +4601,13 @@ impl RecordHash {
     }
 }
 
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    /// The pipeline whose views [`readable`] is being called for (the
+    /// dumped frames' "program writes an image" lines).
+    static NOW_PIPELINE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn readable(list: &HostList, kind: ResourceType, view: &View) {
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
@@ -4663,6 +4686,18 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
+            // Which program writes which image, in the frames whose targets
+            // are dumped (`VICTORY_DUMP_TARGETS`): the dump's files carry the
+            // resource, the log's "first bind" lines the pipeline's hash.
+            #[cfg(feature = "diagnostics")]
+            if crate::capture::listed(crate::queue::presented() + 1) {
+                tracing::info!(
+                    frame = crate::queue::presented() + 1,
+                    resource = format_args!("{:#x}", *resource as usize),
+                    pipeline = format_args!("{:#x}", NOW_PIPELINE.with(|p| p.get())),
+                    "a dumped frame's program writes an image"
+                );
+            }
             // Some compute-written textures are also read by the title CPU.
             list.texture_written(*resource as This);
             // Unordered access to a depth texture is its colour twin's.
