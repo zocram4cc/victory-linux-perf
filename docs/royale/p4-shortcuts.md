@@ -10,7 +10,7 @@ Every translator step that rests on an assumption about the title's code, rather
 | # | shortcut | where | switch to turn it off | assumption | risk if wrong | status |
 |---|---|---|---|---|---|---|
 | 1 | **Partial image stores merged** (step 27): read the texel, replace the masked channels, write all four | `emit/lower.rs`, image stores (`merge`) | `VICTORY_PARTIAL_IMAGE_STORES=0` | each texel has one writing thread per dispatch (the programs take one entry each of a list of texels) | two threads writing different channels of one texel at once lose one write: wrong alpha or colour on some texels | **to verify** |
-| 2 | **Dead descriptor dwords in joins are 0** (step 28), **and read as lane masks are no lanes** (step 29) | `emit/lower.rs`, phi lowering and `atom()` | `VICTORY_DEAD_DESCRIPTOR_JOINS=0` | a join that mixes a descriptor's address/format dword with another value is read only on paths where the other value is live (the compiler reuses the register) | a program that really reads an address or format through the join gets 0: wrong data, or reads at address 0 (the log's "shaders touched pages that had no copy … 0x…") | **to verify** |
+| 2 | **Dead descriptor dwords in joins are 0** (step 28), **and read as lane masks are no lanes** (step 29): **now only where proven**; the assumption behind `=assume` | `emit/lower.rs`, phi lowering (`edge_unread`) and `atom()` | `VICTORY_DEAD_DESCRIPTOR_JOINS=0` (off), `=assume` (the assumption) | a join that mixes a descriptor's address/format dword with another value is read only on paths where the other value is live (the compiler reuses the register) | a program that really reads an address or format through the join gets 0: wrong data, or reads at address 0 (the log's "shaders touched pages that had no copy … 0x…") | **to verify** |
 | 3 | **Buffer dword 1 = stride << 16** (step 28) | `emit/lower.rs`, `descriptor_data` | none (always on) | the stride from the FSPX record is the descriptor's | wrong element size: wrong record counts in raw views | to verify with 1-2 |
 | 4 | **High half of table addresses proven 0** over reaching paths, XOR multisets, 0 + carry (steps 22-26) | `resource.rs`: `is_zero`, `xor_leaves`, `edge_reaches`, `one_leaf` | none | heap and table addresses fit in 32 bits (already assumed by `high_half`) | none expected: console heaps are below 4 GB | low |
 | 5 | **View heap SGPR from the code** (step 19) | `native::view_heap_sgpr` | none | the user SGPR used as a 32-bit base with index × 32 is the view heap | a wrong SGPR filled with the heap's start: wrong descriptors | checked: family 0x33cb3490 loads its pyramid view right (desc trace) |
@@ -41,3 +41,24 @@ Some of the ~100 programs may stop translating; those that stay are right by con
 - **A/B in game** of any family whole thanks to this rule: on, and off (`VICTORY_DEAD_DESCRIPTOR_JOINS=0`).
 - **Read the real values on the console's side of our layer.** The layer knows each view's description; a debug switch can log, for a native dispatch, the dwords such a register would have held, i.e. the view's console descriptor bits from the title's heap record. If any program then reads them as a number on a live path, the trace would show it.
 - **A runtime check:** a debug build of the translation can write, where the rule substitutes 0, a marker into a debug buffer when the substituted value is actually used (an edge taken by an active lane). Any hit in game means the rule was wrong there.
+
+
+### Done (27 Nov, late): the rule is now proven by default
+
+**Measured** (harness over the 2,680 dumped 0x218 programs):
+
+| version | translate |
+|---|---|
+| assumption everywhere (steps 28-30) | 1,340 |
+| lane-mask leaf proven, joins assumed | 1,334 |
+| **both proven (default now)** | **1,265** |
+
+**What "proven" means in the code (`emit/lower.rs`):**
+- **Lane-mask leaf** (`atom()`, `Atom::Opaque`): the register must *be* the descriptor dword (`self.stale`), not a join that brings it on some paths. Then no path ever set the mask's variable here: it is undefined on every path, so the compiler's code cannot depend on it, and "no lanes" gives the console's result. Costs 6 programs.
+- **Join** (phi lowering): only on an edge that no lane reading the join can have come by (`Lower::edge_unread`). It collects the blocks that read the join; a read inside another join → not proven. For each reader, it asks the lanes' paths (`Structured`: `reach`, `exits`, `bools.meet`) whether a lane can both reach the reader and have come by that edge; it must be no for every reader. Costs 69 programs: the proof rarely succeeds, so those programs did depend on the assumption.
+
+**What did not change.** The translator's original rule, `Lower::dead`: number joins with at least one real number, where a dead dword is 0. It rests on the upstream authors' reasoning: "compiled code joins numbers with numbers". It was already there before our work; it stays as it was and is listed here for completeness.
+
+**The 75 programs that need the assumption** are behind `VICTORY_DEAD_DESCRIPTOR_JOINS=assume`. Before they are accepted, check them with real values:
+1. An A/B in game of any family that becomes whole with `=assume` (screenshots against plain play and against the default).
+2. A runtime marker: a debug translation that writes to a debug buffer whenever an assumed-dead value is actually used by an active lane. Any hit means the assumption was wrong there. To be built: emit `atomicrmw or` into a host debug UAV at each substituted edge, guarded by "this lane came by that edge".
