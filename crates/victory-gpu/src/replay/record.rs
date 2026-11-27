@@ -49,6 +49,8 @@ pub struct Settings {
     /// After a capture ends, how long asks for the next are not followed:
     /// the title catches up on the time it stood frozen.
     pub gap: std::time::Duration,
+    /// The automatic trigger for stretched geometry, if on.
+    pub sheets: Option<super::trigger::Sheets>,
 }
 
 /// The rest after a capture, by default.
@@ -67,8 +69,10 @@ pub enum At {
 
 impl Settings {
     /// From `VICTORY_RECORD`, `VICTORY_RECORD_AT` (seconds, or `f<frame>`),
-    /// `VICTORY_RECORD_FRAMES`, `VICTORY_RECORD_ALWAYS=1` and
-    /// `VICTORY_RECORD_GAP` (seconds of rest after a capture; 5).
+    /// `VICTORY_RECORD_FRAMES`, `VICTORY_RECORD_ALWAYS=1`,
+    /// `VICTORY_RECORD_GAP` (seconds of rest after a capture; 5) and
+    /// `VICTORY_RECORD_SHEETS=1` (the automatic trigger, with
+    /// `VICTORY_RECORD_SHEETS_ROW`, `_MIN` and `_MAX`: see [`sheets_from`]).
     pub fn from_env() -> Option<Settings> {
         let folder = PathBuf::from(std::env::var_os("VICTORY_RECORD").filter(|v| !v.is_empty())?);
         let at = parse_at(&std::env::var("VICTORY_RECORD_AT").unwrap_or_default());
@@ -88,9 +92,36 @@ impl Settings {
             frames: std::cmp::max(frames, 1),
             always,
             gap,
+            sheets: sheets_from(|name| std::env::var(name).ok()),
         })
     }
 }
+
+/// The automatic trigger's settings from the variables `var` gives:
+/// `VICTORY_RECORD_SHEETS=1` turns it on; `VICTORY_RECORD_SHEETS_ROW` the
+/// least span counted (row of `victory_shader::emit::SHEET_SPANS`),
+/// `VICTORY_RECORD_SHEETS_MIN` the waves a frame needs,
+/// `VICTORY_RECORD_SHEETS_MAX` the captures a run takes (2).
+pub fn sheets_from(var: impl Fn(&str) -> Option<String>) -> Option<super::trigger::Sheets> {
+    if var("VICTORY_RECORD_SHEETS").as_deref().map(str::trim) != Some("1") {
+        return None;
+    }
+    let number = |name: &str, default: u32| {
+        var(name)
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(default)
+    };
+    let rows = victory_shader::emit::SHEET_BUCKETS;
+    Some(super::trigger::Sheets {
+        row: number("VICTORY_RECORD_SHEETS_ROW", SHEETS_ROW).min(rows - 1) as usize,
+        min: number("VICTORY_RECORD_SHEETS_MIN", SHEETS_MIN).max(1),
+        most: number("VICTORY_RECORD_SHEETS_MAX", 2),
+    })
+}
+
+/// The automatic trigger's defaults: see [`sheets_from`].
+pub const SHEETS_ROW: u32 = 1;
+pub const SHEETS_MIN: u32 = 1;
 
 fn parse_at(text: &str) -> At {
     let text = text.trim();
@@ -2902,6 +2933,25 @@ mod tests {
         assert_eq!(parse_at("f900"), At::Frame(900));
         assert_eq!(parse_at(""), At::Trigger);
         assert_eq!(parse_at("later"), At::Trigger);
+    }
+
+    #[test]
+    fn the_automatic_trigger_is_off_unless_asked() {
+        let vars = |set: &'static [(&'static str, &'static str)]| {
+            move |name: &str| set.iter().find(|v| v.0 == name).map(|v| v.1.to_owned())
+        };
+        assert_eq!(sheets_from(vars(&[])), None);
+        assert_eq!(sheets_from(vars(&[("VICTORY_RECORD_SHEETS", "0")])), None);
+        let on = sheets_from(vars(&[("VICTORY_RECORD_SHEETS", "1")])).unwrap();
+        assert_eq!((on.row, on.min, on.most), (SHEETS_ROW as usize, SHEETS_MIN, 2));
+        let set = sheets_from(vars(&[
+            ("VICTORY_RECORD_SHEETS", "1"),
+            ("VICTORY_RECORD_SHEETS_ROW", "9"),
+            ("VICTORY_RECORD_SHEETS_MIN", "0"),
+            ("VICTORY_RECORD_SHEETS_MAX", "5"),
+        ]))
+        .unwrap();
+        assert_eq!((set.row, set.min, set.most), (3, 1, 5), "the row is a row there is, at least one wave");
     }
 
     #[test]

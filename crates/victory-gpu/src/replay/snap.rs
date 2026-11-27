@@ -142,6 +142,12 @@ pub(super) fn present(r: &Recorder, texture: &ID3D12Resource, state: u32) {
     let mut finished = None;
     // Taken whenever it is there: an ask that is not followed is not kept.
     let asked = trigger::take(&r.settings.folder);
+    // Read (and cleared) at every present: what the frames since saw.
+    let sheets = r
+        .settings
+        .sheets
+        .and_then(|s| Some((s, crate::sheets::take()?)))
+        .and_then(|(s, rows)| Some((s, s.seen(&rows)?, rows)));
     match &mut phase.stage {
         Stage::Waiting => {
             // The time or frame set asks for the first capture only.
@@ -168,6 +174,30 @@ pub(super) fn present(r: &Recorder, texture: &ID3D12Resource, state: u32) {
                         left.as_secs_f64()
                     ),
                     Verdict::Busy => tracing::info!("frame recorder: the trigger is not followed: a capture is under way"),
+                    Verdict::Spent => {}
+                }
+            } else if let Some((s, waves, rows)) = sheets {
+                match phase.gate.ask_auto(Instant::now(), s.most) {
+                    Verdict::Take(n) => {
+                        let why = format!(
+                            "stretched geometry: {waves} waves of the pre-skinned programs spanning over {} of the screen (rows {rows:?})",
+                            victory_shader::emit::SHEET_SPANS[s.row] / 2.0
+                        );
+                        tracing::info!(presents, capture = n, why = %why, "frame recorder: lists are recorded from now on");
+                        r.asked();
+                        phase.stage = Stage::Armed(presents, n);
+                    }
+                    Verdict::Spent => {
+                        static ONCE: std::sync::Once = std::sync::Once::new();
+                        ONCE.call_once(|| {
+                            tracing::info!(
+                                most = s.most,
+                                "frame recorder: stretched geometry seen again; no more automatic captures this run (VICTORY_RECORD_SHEETS_MAX)"
+                            );
+                        });
+                    }
+                    // Seen while resting: the frames to come may show it again.
+                    Verdict::Resting(_) | Verdict::Busy => {}
                 }
             }
         }
@@ -182,7 +212,10 @@ pub(super) fn present(r: &Recorder, texture: &ID3D12Resource, state: u32) {
             let n = *n;
             let waited = presents - *since;
             let whole = submits > 0 && missing == 0;
-            if waited >= 2 && (whole || waited > PATIENCE) {
+            // Lists recorded all along (VICTORY_RECORD_ALWAYS): the next frame
+            // may be the one, which matters for faults that last a few frames.
+            let least = if r.settings.always { 1 } else { 2 };
+            if waited >= least && (whole || waited > PATIENCE) {
                 if !whole {
                     r.problem("no frame was found whose lists were all recorded");
                 }

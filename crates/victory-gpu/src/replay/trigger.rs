@@ -34,6 +34,26 @@ pub(super) fn take(folder: &Path) -> bool {
     }
 }
 
+/// The automatic trigger for stretched geometry (`VICTORY_RECORD_SHEETS=1`,
+/// see `crate::sheets`): a frame is captured when the pre-skinned programs
+/// noted at least `min` waves whose vertices span more of the screen than
+/// row `row`'s span, at most `most` times a run.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Sheets {
+    pub row: usize,
+    pub min: u32,
+    pub most: u32,
+}
+
+impl Sheets {
+    /// What was noted since the last present, per row: the waves at or over
+    /// the row asked for, if they are enough to ask for a capture.
+    pub(super) fn seen(&self, rows: &[u32]) -> Option<u32> {
+        let waves: u32 = rows.iter().skip(self.row).sum();
+        (waves >= self.min.max(1)).then_some(waves)
+    }
+}
+
 /// What the gate says to a request for a capture.
 #[derive(Debug, PartialEq)]
 pub(super) enum Verdict {
@@ -43,6 +63,8 @@ pub(super) enum Verdict {
     Busy,
     /// The last one ended too recently: this long to go.
     Resting(Duration),
+    /// Automatic captures: as many as a run may take were taken.
+    Spent,
 }
 
 /// Keeps captures apart: one at a time, and `gap` after each one ends (the
@@ -54,6 +76,8 @@ pub(super) struct Gate {
     busy: bool,
     ended: Option<Instant>,
     taken: u32,
+    /// Of them, asked for by the automatic trigger.
+    auto: u32,
 }
 
 impl Gate {
@@ -63,6 +87,7 @@ impl Gate {
             busy: false,
             ended: None,
             taken: 0,
+            auto: 0,
         }
     }
 
@@ -85,6 +110,19 @@ impl Gate {
         self.busy = true;
         self.taken += 1;
         Verdict::Take(self.taken)
+    }
+
+    /// The automatic trigger asks for a capture at `now`; it may take `most`
+    /// a run.
+    pub(super) fn ask_auto(&mut self, now: Instant, most: u32) -> Verdict {
+        if self.auto >= most {
+            return Verdict::Spent;
+        }
+        let v = self.ask(now);
+        if matches!(v, Verdict::Take(_)) {
+            self.auto += 1;
+        }
+        v
     }
 
     /// The capture under way ended (written or failed) at `now`.
@@ -135,6 +173,38 @@ mod tests {
         assert_eq!(gate.ask(t0), Verdict::Take(1));
         gate.end(t0);
         assert_eq!(gate.ask(t0), Verdict::Take(2));
+    }
+
+    #[test]
+    fn automatic_captures_are_capped_and_wait_their_turn() {
+        let t0 = Instant::now();
+        let s = Duration::from_secs(1);
+        let mut gate = Gate::new(5 * s);
+        assert_eq!(gate.ask_auto(t0, 2), Verdict::Take(1));
+        assert_eq!(gate.ask_auto(t0, 2), Verdict::Busy);
+        gate.end(t0 + 10 * s);
+        assert_eq!(gate.ask_auto(t0 + 11 * s, 2), Verdict::Resting(4 * s));
+        // A manual one in between does not count against the cap.
+        assert_eq!(gate.ask(t0 + 20 * s), Verdict::Take(2));
+        gate.end(t0 + 30 * s);
+        assert_eq!(gate.ask_auto(t0 + 40 * s, 2), Verdict::Take(3));
+        gate.end(t0 + 50 * s);
+        assert_eq!(gate.ask_auto(t0 + 60 * s, 2), Verdict::Spent);
+        // The cap is of automatic ones only.
+        assert_eq!(gate.ask(t0 + 60 * s), Verdict::Take(4));
+    }
+
+    #[test]
+    fn sheets_are_seen_from_the_row_asked_for() {
+        let s = Sheets { row: 1, min: 3, most: 2 };
+        assert_eq!(s.seen(&[40, 0, 0, 0]), None, "small spans are not counted");
+        assert_eq!(s.seen(&[0, 1, 1, 0]), None, "under the minimum");
+        assert_eq!(s.seen(&[0, 1, 1, 1]), Some(3));
+        assert_eq!(s.seen(&[9, 0, 0, 5]), Some(5));
+        let any = Sheets { row: 0, min: 0, most: 2 };
+        assert_eq!(any.seen(&[0, 0, 0, 0]), None, "nothing seen is never enough");
+        assert_eq!(any.seen(&[1, 0, 0, 0]), Some(1));
+        assert_eq!(any.seen(&[]), None);
     }
 
     #[test]

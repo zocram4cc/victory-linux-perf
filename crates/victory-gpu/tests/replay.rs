@@ -1654,6 +1654,7 @@ fn a_frame_is_recorded_and_replayed() {
         frames: 1,
         always: false,
         gap: std::time::Duration::ZERO,
+        sheets: None,
     };
     let folder = record::start(settings, &device).unwrap();
     assert!(record::on());
@@ -1666,6 +1667,7 @@ fn a_frame_is_recorded_and_replayed() {
                 frames: 1,
                 always: false,
                 gap: record::GAP,
+                sheets: None,
             },
             &device
         )

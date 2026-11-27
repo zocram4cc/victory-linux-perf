@@ -351,6 +351,7 @@ fn a_frame_of_a_titles_size() {
         frames: 1,
         always: false,
         gap: record::GAP,
+        sheets: None,
     };
     let folder = record::start(settings, &device).unwrap();
     let began = Instant::now();
