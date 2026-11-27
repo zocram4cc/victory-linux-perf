@@ -170,13 +170,20 @@ impl Notes {
         self.read(shard_of(page)).parts_since(page, taken)
     }
 
-    /// The notes of pages `[first, last)` in page order, `each` of them
-    /// until it says no: whether it never did. A part at a time.
+    /// The notes of pages `[first, last)`, one shard at a time, until the
+    /// predicate says no. Large ranges visit each shard once.
     fn each(&self, first: usize, last: usize, mut each: impl FnMut(usize, u64) -> bool) -> bool {
         match pieces(first, last) {
-            Some(pieces) => pieces.into_iter().all(|(from, to)| {
+            Some(mut pieces) if spans_walk() => pieces.all(|(from, to)| {
                 let s = self.read(shard_of(from));
                 s.written.range(from..to).all(|(&p, &w)| each(p, w))
+            }),
+            Some(pieces) => pieces.collect::<Vec<_>>().into_iter().all(|(from, to)| {
+                let s = self.read(shard_of(from));
+                s.written.range(from..to).all(|(&p, &w)| each(p, w))
+            }),
+            None if spans_walk() => (0..SHARDS).all(|shard| {
+                self.read(shard).written.range(first..last).all(|(&p, &w)| each(p, w))
             }),
             None => {
                 let mut all: Vec<(usize, u64)> = Vec::new();
@@ -196,6 +203,9 @@ impl Notes {
             out.push((p, w));
             true
         });
+        if spans_walk() && pieces(first, last).is_none() {
+            out.sort_unstable();
+        }
         out
     }
 
@@ -231,15 +241,32 @@ impl Notes {
 /// The pieces of pages `[first, last)` in page order, each in one part;
 /// `None` for a range of more pieces than is worth walking (then each part
 /// is looked at once).
-fn pieces(first: usize, last: usize) -> Option<Vec<(usize, usize)>> {
-    if first >= last {
-        return Some(Vec::new());
-    }
-    let (a, b) = (first >> SHARD_SHIFT, (last - 1) >> SHARD_SHIFT);
-    if b - a >= 4 * SHARDS {
+fn pieces(first: usize, last: usize) -> Option<impl Iterator<Item = (usize, usize)>> {
+    let (a, end) = if first < last {
+        (first >> SHARD_SHIFT, ((last - 1) >> SHARD_SHIFT) + 1)
+    } else {
+        (0, 0)
+    };
+    if end - a > 4 * SHARDS {
         return None;
     }
-    Some((a..=b).map(|piece| (first.max(piece << SHARD_SHIFT), last.min((piece + 1) << SHARD_SHIFT))).collect())
+    Some((a..end).map(move |piece| {
+        let step = 1 << SHARD_SHIFT;
+        (first.max(piece * step), last.min((piece + 1).saturating_mul(step)))
+    }))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_SPANS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+fn spans_walk() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_SPANS.get() {
+        return on;
+    }
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("VICTORY_WATCH_SPANS").is_some_and(|v| v == "1"));
+    *ON
 }
 
 /// Parts of [`Notes`] held ([`Notes::hold`]).
@@ -271,7 +298,11 @@ impl Held<'_> {
     /// The notes of pages `[first, last)` in page order; their parts held.
     fn range(&self, first: usize, last: usize) -> Vec<(usize, u64)> {
         match pieces(first, last) {
+            Some(pieces) if spans_walk() => pieces
+                .flat_map(|(from, to)| self.shard(from).written.range(from..to).map(|(&p, &w)| (p, w)))
+                .collect(),
             Some(pieces) => pieces
+                .collect::<Vec<_>>()
                 .into_iter()
                 .flat_map(|(from, to)| self.shard(from).written.range(from..to).map(|(&p, &w)| (p, w)))
                 .collect(),
@@ -8297,8 +8328,16 @@ mod port7_tests {
         assert_eq!(shards_of(P - 1, P + 1), 0b11);
         assert_eq!(shards_of(63 * P, 65 * P), 1 << 63 | 1);
         assert_eq!(shards_of(5, 5 + SHARDS * P), u64::MAX);
-        assert_eq!(pieces(P - 2, 2 * P + 3), Some(vec![(P - 2, P), (P, 2 * P), (2 * P, 2 * P + 3)]));
-        assert_eq!(pieces(0, 1 << 40), None);
+        assert_eq!(
+            pieces(P - 2, 2 * P + 3).unwrap().collect::<Vec<_>>(),
+            [(P - 2, P), (P, 2 * P), (2 * P, 2 * P + 3)]
+        );
+        assert_eq!(pieces(7, 4).unwrap().next(), None);
+        assert_eq!(
+            pieces(usize::MAX - 1, usize::MAX).unwrap().next(),
+            Some((usize::MAX - 1, usize::MAX))
+        );
+        assert!(pieces(0, 1 << 40).is_none());
         let notes = Notes::new();
         let mut want: BTreeMap<usize, u64> = BTreeMap::new();
         let mut seed = 7;
@@ -8318,6 +8357,34 @@ mod port7_tests {
         // The whole space: each part once.
         assert_eq!(notes.range(0, usize::MAX / 2), want.iter().map(|(&p, &w)| (p, w)).collect::<Vec<_>>());
         assert_eq!(notes.hold(u64::MAX, false).range(0, usize::MAX / 2).len(), want.len());
+    }
+
+    #[test]
+    fn walks_agree_with_the_model_in_both_modes() {
+        const P: usize = 1 << SHARD_SHIFT;
+        let notes = Notes::new();
+        let mut want: BTreeMap<usize, u64> = BTreeMap::new();
+        let mut seed = 11;
+        for n in 1..2000u64 {
+            let page = rng(&mut seed, 70 * P);
+            let mut held = notes.hold(shards_of_pages([page]), true);
+            held.note(page, WHOLE, n);
+            want.insert(page, n);
+        }
+        let whole: Vec<(usize, u64)> = want.iter().map(|(&p, &w)| (p, w)).collect();
+        for spans in [false, true] {
+            TEST_SPANS.set(Some(spans));
+            for _ in 0..200 {
+                let first = rng(&mut seed, 70 * P);
+                let last = first + rng(&mut seed, 3 * P);
+                let expected: Vec<(usize, u64)> = want.range(first..last).map(|(&p, &w)| (p, w)).collect();
+                assert_eq!(notes.range(first, last), expected, "{first}..{last} spans={spans}");
+                assert_eq!(notes.hold(shards_of(first, last), false).range(first, last), expected, "{first}..{last} held, spans={spans}");
+            }
+            assert_eq!(notes.range(0, usize::MAX / 2), whole, "the whole space, spans={spans}");
+            assert_eq!(notes.hold(u64::MAX, false).range(0, usize::MAX / 2), whole, "the whole space held, spans={spans}");
+        }
+        TEST_SPANS.set(None);
     }
 
     /// Noted out of order (shared noters' numbers may come in any order): a
