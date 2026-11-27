@@ -56,7 +56,10 @@ type HandleToFd = unsafe extern "C" fn(HANDLE, u32, *mut i32, *mut u32) -> i32;
 const PROT_READ: i32 = 1;
 const PROT_WRITE: i32 = 2;
 const MAP_SHARED: i32 = 1;
+const MAP_PRIVATE: i32 = 2;
 const MAP_FIXED: i32 = 0x10;
+const MAP_ANONYMOUS: i32 = 0x20;
+const MAP_NORESERVE: i32 = 0x4000;
 
 struct Direct {
     mmap: Mmap,
@@ -211,6 +214,19 @@ fn mapping(line: &str) -> Option<(usize, usize, bool, usize, &str)> {
         usize::from_str_radix(offset, 16).ok()?,
         path,
     ))
+}
+
+/// For tests: whether one mapping of the process's own, with no file behind
+/// it, holds all of `[at, at + len)`, by the host's list of mappings (`None`:
+/// the list could not be read).
+#[cfg(test)]
+pub(crate) fn one_own_mapping(at: usize, len: usize) -> Option<bool> {
+    let maps = own_maps().ok()?;
+    Some(
+        maps.lines()
+            .filter_map(mapping)
+            .any(|(start, end, _, _, path)| start <= at && at + len <= end && path.is_empty()),
+    )
 }
 
 /// The values of the functions `names` in the dynamic symbols of `elf` (a
@@ -416,6 +432,39 @@ impl Direct {
         }
         true
     }
+}
+
+/// Makes `[base, base + len)`, a stretch of a reservation of [`Spaces`] that
+/// shows nothing, committed memory of the process's own in one mapping of the
+/// host's: one `mmap` of fresh memory over all of it, then the host's books.
+/// (Committed piece by piece, with pages written in between, the host kernel
+/// keeps a mapping for each piece: memory of the process's own all the same,
+/// but not what its graphics driver takes by address, `xmem`'s `show_home`.)
+pub(crate) fn own(base: usize, len: usize) -> bool {
+    let Some(direct) = DIRECT.as_ref() else {
+        return false;
+    };
+    // SAFETY: over a range of a reservation of the title's that shows nothing
+    // (the caller looked): fresh memory first, then the host's books; nothing
+    // but that range is touched.
+    unsafe {
+        let at = (direct.mmap)(
+            base as *mut c_void,
+            len,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE,
+            -1,
+            0,
+        );
+        if at as usize != base {
+            return false;
+        }
+        if VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE).is_null() {
+            VirtualFree(base as *mut c_void, len, MEM_DECOMMIT);
+            return false;
+        }
+    }
+    true
 }
 
 /// The file descriptor behind `section`, to show its pages with; `None` if

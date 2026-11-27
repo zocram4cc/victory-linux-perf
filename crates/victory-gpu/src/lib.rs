@@ -146,3 +146,5 @@ pub use watch::{
 };
 #[cfg(windows)]
 pub use watch::title_view_space;
+#[cfg(windows)]
+pub use inplace::title_memory_home;

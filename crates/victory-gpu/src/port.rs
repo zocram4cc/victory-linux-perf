@@ -196,8 +196,11 @@ fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usiz
     // Under Wine (vkd3d-proton on RADV) such a heap is accepted but holds
     // memory of the host's own, not the view's pages: the card would read
     // zeros (#163). Asked once on a section of our own; a copy as before
-    // unless the card read the bytes there.
-    if on_wine() && !crate::inplace::section_views_seen(device) {
+    // unless the card read the bytes there. (Where the runtime shows pages as
+    // memory of their own, `VICTORY_PORT_HOME=1`, a heap is opened there and
+    // not on a view: told below, once the stretch is known.)
+    let homes = crate::inplace::homes_any();
+    if on_wine() && !homes && !crate::inplace::section_views_seen(device) {
         let why = "the host does not show the card a view's pages (a heap of its own memory)";
         return Err((5, why.to_owned()));
     }
@@ -220,6 +223,18 @@ fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usiz
     }
     if first > at || first + bytes < end || offset % K64 != 0 {
         return Err((3, format!("the stretch {first:#x}+{bytes:#x} does not hold it")));
+    }
+    if homes {
+        // The heap is opened where the title has the pages, if the runtime
+        // shows them as memory of their own (`crate::inplace::title_memory_home`,
+        // `xmem`'s `home_on`); a stretch that is a view is refused where the
+        // card would read zeros.
+        if crate::inplace::at_home(first as usize, bytes as usize) {
+            return open_at_home(device, first, bytes);
+        }
+        if !crate::inplace::section_views_seen(device) {
+            return Err((5, "the host opens a heap on a view with memory of its own, and these pages are not shown as memory of their own (VICTORY_PORT_HOME)".to_owned()));
+        }
     }
     // SAFETY: the section of a view the title has; the runtime keeps its
     // handle open while a view of it is there, and the range is inside it.
@@ -254,6 +269,56 @@ fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usiz
             Err((5, format!("refused by the host: {e}")))
         }
     }
+}
+
+/// Under Wine, with `VICTORY_PORT_HOME=1`: opens `[first, first + bytes)`,
+/// pages the runtime shows as memory of their own, as a heap right there
+/// ([`open_region`]). No view of ours: while the heap stands these pages must
+/// stay as they are (the runtime tells before it takes them away,
+/// `crate::inplace::title_memory_home`, and the guards leave them alone).
+///
+/// The host says yes also where it gave the heap memory of its own, so the
+/// card is asked what it reads there. It read zeros in 3 launches of 13
+/// (runs 42, 44 and 49 of upstream's docs/linux-wine.md): the kernel takes
+/// memory by address only as one mapping, and the pieces the runtime
+/// committed one by one were several (`xmem`'s `whole_home`, which now makes
+/// the stretch one mapping first). Should the card read zeros all the same,
+/// the heap is let go and opened again, a few times, and then the stretch is
+/// given up for good (`crate::inplace::home_given_up`): copied as before, its
+/// pages guarded as views are.
+fn open_at_home(device: &ID3D12Device, first: u64, bytes: u64) -> Result<Region, (usize, String)> {
+    const TRIES: u32 = 4;
+    if !committed(first as usize, bytes as usize) {
+        return Err((4, "pages of the stretch are not committed".to_owned()));
+    }
+    for attempt in 1..=TRIES {
+        let heap = crate::inplace::open(device, crate::inplace::From::Part(first as usize, bytes as usize)).map_err(|e| (5, format!("refused by the host: {e}")))?;
+        let shows = crate::inplace::heap_shows(device, &heap, first as usize, bytes as usize);
+        // Diagnostics (`VICTORY_PORT_HOME_FAIL=1`, read here): as if the card
+        // had read zeros every time, to see what a stretch given up costs.
+        #[cfg(feature = "diagnostics")]
+        let shows = if std::env::var_os("VICTORY_PORT_HOME_FAIL").is_some_and(|v| v == "1") { Some(false) } else { shows };
+        if shows != Some(false) {
+            tracing::info!(
+                start = format_args!("{first:#x}"),
+                bytes,
+                card_reads_it = ?shows,
+                attempt,
+                "renderer port 1: a stretch of the title's graphics memory opened as a host heap where the title has it (pages shown as memory of their own, under Wine)"
+            );
+            return Ok(Region { start: first, end: first + bytes, heap });
+        }
+        tracing::warn!(
+            start = format_args!("{first:#x}"),
+            bytes,
+            attempt,
+            "renderer port 1: the card reads zeros in the heap the host opened on the title's pages (the host gave it memory of its own: the pages are not one mapping of the process's own to the kernel)"
+        );
+        drop(heap);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
+    crate::inplace::home_given_up(first as usize, bytes as usize);
+    Err((5, "the card reads zeros in the heap the host opened on the title's pages".to_owned()))
 }
 
 /// Whether every page of `[at, at + len)` is committed.
@@ -345,6 +410,78 @@ pub(crate) fn log(frames: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Under Wine, on the card (nothing is tried elsewhere): a stretch whose
+    /// pages are memory of their own is opened where it is, and the card
+    /// reads and writes the bytes at that address; a stretch that is a view
+    /// is opened through a view of ours only where the card then reads the
+    /// view's bytes, and is refused where the host gives such a heap memory
+    /// of its own (vkd3d-proton with RADV).
+    #[test]
+    fn under_wine_a_stretch_at_home_is_opened_where_it_is_and_a_view_only_if_shared() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        if !on_wine() {
+            return;
+        }
+        let mut device: Option<ID3D12Device> = None;
+        // SAFETY: plain device creation on the default adapter.
+        let made = unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device) };
+        let Some(device) = device.filter(|_| made.is_ok()) else {
+            eprintln!("not tried: no device");
+            return;
+        };
+        let k64 = K64 as usize;
+        let bytes = 8 * k64;
+        let bytes_at = |at: usize, len: usize| -> &'static [u8] {
+            // SAFETY: committed memory of the test's own, never freed before the last look.
+            unsafe { std::slice::from_raw_parts(at as *const u8, len) }
+        };
+        // SAFETY: memory, a section and a view of the test's own.
+        unsafe {
+            // As the runtime shows pages at home: private memory, told as two
+            // views of a section that follow one another.
+            let home = mem::VirtualAlloc(std::ptr::null(), bytes, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE) as usize;
+            let invalid = windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+            let section = mem::CreateFileMappingW(invalid, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_COMMIT, 0, bytes as u32, std::ptr::null()) as usize;
+            assert!(home != 0 && section != 0);
+            crate::inplace::title_memory_section(section, bytes as u64, true);
+            crate::inplace::title_memory_view(home, bytes / 2, section, 0);
+            crate::inplace::title_memory_view(home + bytes / 2, bytes / 2, section, (bytes / 2) as u64);
+            crate::inplace::title_memory_home(home, bytes, true);
+            for i in 0..bytes {
+                ((home + i) as *mut u8).write((i as u8).wrapping_mul(7).wrapping_add(3));
+            }
+            let region = open_region(&device, home as u64 + K64, home as u64 + 2 * K64).unwrap_or_else(|e| panic!("not opened: {e:?}"));
+            assert_eq!((region.start, region.end), (home as u64, (home + bytes) as u64), "the whole stretch, where the title has it");
+            let buffer = crate::inplace::place(&device, &region.heap, K64, K64).unwrap();
+            let mut rig = crate::inplace::Rig::new(&device).unwrap();
+            assert!(rig.fetch(&buffer, 0, k64).unwrap() == bytes_at(home + k64, k64), "the card reads the bytes at the title's address");
+            ((home + k64 + 5) as *mut u8).write(0x77);
+            assert!(rig.fetch(&buffer, 0, k64).unwrap() == bytes_at(home + k64, k64), "and those written afterwards");
+            rig.store(&buffer, 16, &[0xa5; 64]).unwrap();
+            assert_eq!(bytes_at(home + k64 + 16, 64), [0xa5; 64], "the card's write is at the title's address");
+            // A stretch that is a view of the section.
+            let view = mem::MapViewOfFile(section as _, mem::FILE_MAP_WRITE, 0, 0, bytes).Value as usize;
+            assert!(view != 0);
+            crate::inplace::title_memory_view(view, bytes, section, 0);
+            let shared = crate::inplace::section_views_seen(&device);
+            eprintln!("a heap opened on a view is the view's memory to the card: {shared}");
+            let opened = open_region(&device, view as u64, view as u64 + K64);
+            if shared {
+                assert!(opened.is_ok());
+            } else {
+                assert!(matches!(opened, Err((5, _))), "refused: the card would read zeros");
+            }
+            drop((opened, buffer, region));
+            crate::inplace::title_memory_home(home, bytes, false);
+            crate::inplace::views_gone(home, bytes);
+            crate::inplace::views_gone(view, bytes);
+            assert!(!crate::inplace::at_home(home, 1));
+            mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ });
+            crate::inplace::title_memory_section_gone(section);
+            windows_sys::Win32::Foundation::CloseHandle(section as _);
+        }
+    }
 
     /// Only the title's 32-bit memory is asked for.
     #[test]

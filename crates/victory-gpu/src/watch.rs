@@ -3737,7 +3737,9 @@ fn is_view(start: usize, end: usize) -> bool {
         if n == 0 {
             return false;
         }
-        if info.Type == MEM_MAPPED || (info.State == MEM_COMMIT && in_view_space(at)) {
+        // (Under Wine, pages shown as memory of their own are private memory
+        // to the guards too, never read-only by our hand: `inplace::HOMES`.)
+        if info.Type == MEM_MAPPED || (info.State == MEM_COMMIT && in_view_space(at) && !crate::inplace::at_home(at, 1)) {
             return true;
         }
         // Committed memory that is no view (the title's heaps, ours), or
