@@ -1780,6 +1780,23 @@ pub(crate) fn targets_room_kept() -> u64 {
     most.saturating_sub(targets)
 }
 
+/// Whether `bytes` more stay within 95 % of the budget the system gives
+/// this process for the card's memory (`memory`, as the host asked it), by
+/// what is in use now alone: none of the room [`room`] keeps for copies
+/// not made yet. For uploads that are small and needed at once: a skin
+/// bake's own sources, which it reads once and keeps what it made from
+/// for the run (fxceless PR #1422: `room` refused 106 of a bake's uploads
+/// on a card at 6.7 GB of a 15.4 GB budget, and faces came out black).
+/// Past the budget the system moves the card's memory into the PC's.
+/// Without a budget to ask: as [`room`].
+#[cfg(windows)]
+pub(crate) fn within_budget(memory: Option<[u64; 4]>, bytes: u64) -> bool {
+    match memory {
+        Some([budget, used, ..]) if budget > 0 => used.saturating_add(bytes) < budget / 100 * 95,
+        _ => room(memory),
+    }
+}
+
 /// [`room`] as it was at most a tenth of a second ago, for a question
 /// asked of many textures a frame ([`room`] asks the system each time).
 #[cfg(windows)]
@@ -3458,6 +3475,17 @@ mod tests {
         for other in ["", "0", "1", "r11g11b10 ", " r16g16b16a16"] {
             assert_eq!(e5_stand_in_for(Some(other)), 26, "{other:?}");
         }
+    }
+
+    /// A bake's own uploads stay within 95 % of the card's budget by what
+    /// is in use (fxceless PR #1422), whatever the texture line says.
+    #[test]
+    fn bake_uploads_keep_within_the_cards_budget() {
+        const GB: u64 = 1 << 30;
+        let card = |budget: u64, used: u64| Some([budget, used, 0, 0]);
+        assert!(within_budget(card(16 * GB, 6 * GB), 256 << 20));
+        assert!(!within_budget(card(16 * GB, 15 * GB), 256 << 20));
+        assert!(within_budget(card(16 * GB, 15 * GB), 0) == (15 * GB < 16 * GB / 100 * 95));
     }
 
     #[test]
