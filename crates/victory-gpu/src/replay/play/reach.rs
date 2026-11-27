@@ -35,6 +35,11 @@ use super::find;
 pub const WORDS: usize = 24;
 const VERTEX_BYTES: u64 = 12;
 
+/// The slots after the table at user-data dword 8 that hold the skinned
+/// position buffers the mesh programs pick between by bits 24-25 of the range
+/// word: 0 (descriptor at +0x420), anything else (+0xa80).
+pub const SKINNED: [u32; 2] = [0x420 / 32, 0xa80 / 32];
+
 /// A stream word's byte offset from the root address and its stride.
 pub fn stream(word: u32) -> (u64, u64) {
     (u64::from((word >> 7) & 0x01ff_fffc), u64::from((word >> 3) & 60))
@@ -156,11 +161,24 @@ pub fn root_reach(
                 continue;
             }
             let (mut pso, mut heap, mut table) = (NONE, NONE, None);
+            // The graphics root constants of parameter 0: the title's user
+            // data, whose dwords 8 and 9 hold the heap places of its tables.
+            let mut user = [0u32; 16];
             for (n, c) in Cmd::all(&frame.lists[l as usize].commands.0)?.iter().enumerate() {
                 match c {
                     Cmd::Pipeline { pso: p } => pso = *p,
                     Cmd::Heaps { heaps } => heap = heaps.first().copied().unwrap_or(NONE),
-                    Cmd::RootSignature { graphics: true, .. } => table = None,
+                    Cmd::RootSignature { graphics: true, .. } => {
+                        table = None;
+                        user = [0; 16];
+                    }
+                    Cmd::Constants { graphics: true, param: 0, offset, values } => {
+                        for (k, v) in values.iter().enumerate() {
+                            if let Some(at) = user.get_mut(*offset as usize + k) {
+                                *at = *v;
+                            }
+                        }
+                    }
                     Cmd::Table { graphics: true, param: p, heap: h, slot } if *p == param => table = Some((*h, *slot)),
                     c if c.runs_shaders() && !matches!(c, Cmd::Dispatch { .. }) => {
                         let name = names.get(&pso).copied().unwrap_or_default();
@@ -195,6 +213,20 @@ pub fn root_reach(
                             laid.map_or("?".into(), |r| r.to_string()),
                             if over { " PAST THE VIEW" } else { "" },
                             &header[..],
+                        ));
+                        // Where the skinned positions are found (`skinned`).
+                        let raw = |at: u32| {
+                            let v = slot_at(&frame, heap, at, i);
+                            (v.kind == slot::SRV && v.res != NONE)
+                                .then(|| (v.res, (u64::from(word(&v, 4)) | u64::from(word(&v, 5)) << 32) * 4))
+                        };
+                        let (base, record) = (user[8] >> 5, user[9] >> 5);
+                        let show = |r: Option<(u32, u64)>| r.map_or("none".to_owned(), |(res, at)| format!("{res}+{at:#x}"));
+                        line(&format!(
+                            "skin {here}:{n} {name}: record {} positions-0 {} positions-1 {}",
+                            show(raw(record)),
+                            show(raw(base + SKINNED[0])),
+                            show(raw(base + SKINNED[1])),
                         ));
                     }
                     _ => {}
