@@ -3,7 +3,8 @@
 The layer is Windows code. It also runs on Linux under Wine: Proton (Wine plus
 vkd3d-proton, Direct3D 12 on Vulkan) on an AMD card with Mesa's RADV driver.
 This page says what that needs, how to build and run, and what goes wrong
-there, with the cause and the switch for each fix.
+there, with the cause and the switch for each fix. A step-by-step install
+for Ubuntu-, Arch- and Fedora-based distributions: [linux-howto.md](linux-howto.md).
 
 **Measured on one machine only**: CachyOS (kernel 7.3), Radeon RX 9070 16 GB,
 Mesa RADV 26.3.1, Proton Experimental 11.0-20261112 (its vkd3d-proton is
