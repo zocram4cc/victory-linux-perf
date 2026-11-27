@@ -1331,6 +1331,20 @@ thread_local! {
     pub(super) static TEST_HOST_WAVE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
+/// A select (`v_cndmask_b32`) on a mask the code holds as a number, not one it tracks as
+/// lanes (a constant bit pattern, one loaded from memory): the lowering takes this lane's
+/// bit of it, which is the console's bit only where host lanes are the console's (trustno1
+/// PR #52, from avatarmanz #308). Off with `VICTORY_SELECT_MASK_LANES=0`.
+pub(super) fn selects_on_mask_data(st: &Structured, i: &Inst) -> bool {
+    let Fields::Valu(v) = &i.fields else {
+        return false;
+    };
+    super::select_mask_lanes()
+        && i.name() == "v_cndmask_b32"
+        && matches!(v.src.get(2), Some(&Operand::Scalar { code, .. })
+            if i.read(Reg::S(code)).is_some_and(|m| !st.masks.contains_key(&m)))
+}
+
 pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     // A scalar select uses the condition of the whole guest wave, even
     // when the preceding mask operation has no scalar-dword consumers.
@@ -1597,6 +1611,7 @@ impl<'a> Lower<'a> {
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                     || reads_mask_as_data(x.st, i)
+                    || selects_on_mask_data(x.st, i)
             }) || lane_constant_masks(x.st)
                 // (a branch the wave takes together asks the wave)
                 || !x.st.wide.is_empty()
@@ -1639,6 +1654,8 @@ impl<'a> Lower<'a> {
                         || n.starts_with("ds_permute")
                         || n.starts_with("ds_bpermute")
                         || reads_mask_as_data(x.st, i)
+                        // (its high dword is lanes 32..63: the other host wave's)
+                        || selects_on_mask_data(x.st, i)
                 }) || lane_constant_masks(x.st)
                     || !x.st.wide.is_empty()
                     || !x.st.wave_scc.is_empty();

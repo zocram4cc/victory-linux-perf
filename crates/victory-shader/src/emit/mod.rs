@@ -219,6 +219,16 @@ pub fn exchange_absent_zero() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_EXCHANGE_ABSENT_ZERO").is_none_or(|v| v != "0"))
 }
 
+/// Whether a compute program that selects (`v_cndmask_b32`) on a lane mask held as a number
+/// keeps the console's lanes (and, wave64 on host waves of 32, the exchange form), so that
+/// each lane takes its console lane's bit of the number; on unless
+/// `VICTORY_SELECT_MASK_LANES=0` (as before). Part of the translation: the shader cache keys
+/// on it.
+pub fn select_mask_lanes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SELECT_MASK_LANES").is_none_or(|v| v != "0"))
+}
+
 /// Whether a first-lane read (`v_readfirstlane_b32`) of a value the lanes may hold
 /// differently makes a console wave64 compute program on host waves of 32 one whose lanes
 /// cross halves (the exchange form), so that lanes 32..63 read the console wave's first lane,
