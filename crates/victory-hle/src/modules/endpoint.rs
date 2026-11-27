@@ -528,15 +528,99 @@ extern "system" fn enumerator_query(this: *mut Enumerator, iid: *const Guid, out
 }
 
 /// The host's list as it is (its devices are not ours); said once.
+/// The active outputs, as a console has them: one, the output
+/// [`choose`] gives (a host device that opens, else our silent one). With no
+/// output active on the host, the host's list is empty and the title gave up
+/// on audio before it asked for the default: its loading screen then waited
+/// forever. Other lists are the host's.
 extern "system" fn enum_endpoints(this: *mut Enumerator, flow: i32, mask: u32, out: *mut *mut c_void) -> HRESULT {
-    // SAFETY: a proxy of ours; slot 3 is `EnumAudioEndpoints`.
+    // SAFETY: a proxy of ours.
     let host = unsafe { (*this).host };
-    let f: extern "system" fn(*mut Host, i32, u32, *mut *mut c_void) -> HRESULT = unsafe { Host::method(host, 3) };
-    let hr = f(host, flow, mask, out);
     if once(format!("enum {flow} {mask}")) {
-        tracing::info!(flow, mask, hr = format_args!("{hr:#010x}"), "audio output: the title lists the host's devices");
+        tracing::info!(flow, mask, "audio output: the title lists the outputs");
     }
-    hr
+    if flow == RENDER && mask & ACTIVE != 0 {
+        if out.is_null() {
+            return E_POINTER;
+        }
+        let device = choose(host, 0);
+        let list = Box::into_raw(Box::new(Collection { vtable: &COLLECTION, refs: AtomicU32::new(1), device }));
+        // SAFETY: checked non-null.
+        unsafe { out.write(list.cast()) };
+        return S_OK;
+    }
+    // SAFETY: slot 3 is `EnumAudioEndpoints`.
+    let f: extern "system" fn(*mut Host, i32, u32, *mut *mut c_void) -> HRESULT = unsafe { Host::method(host, 3) };
+    f(host, flow, mask, out)
+}
+
+const IID_COLLECTION: Guid = guid(0x0BD7_A1BE, 0x7A1A, 0x44DB, [0x83, 0x97, 0xCC, 0x53, 0x92, 0x38, 0x7B, 0x5E]);
+
+/// A list of one output of ours (`IMMDeviceCollection`).
+#[repr(C)]
+struct Collection {
+    vtable: &'static CollectionMethods,
+    refs: AtomicU32,
+    device: *mut Device,
+}
+
+impl Proxy for Collection {
+    fn refs(&self) -> &AtomicU32 {
+        &self.refs
+    }
+}
+
+impl Drop for Collection {
+    fn drop(&mut self) {
+        release(self.device);
+    }
+}
+
+#[repr(C)]
+struct CollectionMethods {
+    query_interface: extern "system" fn(*mut Collection, *const Guid, *mut *mut c_void) -> HRESULT,
+    add_ref: extern "system" fn(*mut Collection) -> u32,
+    release: extern "system" fn(*mut Collection) -> u32,
+    count: extern "system" fn(*mut Collection, *mut u32) -> HRESULT,
+    item: extern "system" fn(*mut Collection, u32, *mut *mut c_void) -> HRESULT,
+}
+
+static COLLECTION: CollectionMethods = CollectionMethods {
+    query_interface: collection_query,
+    add_ref: add_ref::<Collection>,
+    release: release::<Collection>,
+    count: collection_count,
+    item: collection_item,
+};
+
+extern "system" fn collection_query(this: *mut Collection, iid: *const Guid, out: *mut *mut c_void) -> HRESULT {
+    answer(this, std::ptr::null_mut(), &[IID_COLLECTION], iid, out)
+}
+
+extern "system" fn collection_count(_: *mut Collection, out: *mut u32) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    // SAFETY: checked non-null.
+    unsafe { out.write(1) };
+    S_OK
+}
+
+extern "system" fn collection_item(this: *mut Collection, index: u32, out: *mut *mut c_void) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    if index != 0 {
+        // SAFETY: checked non-null.
+        unsafe { out.write(std::ptr::null_mut()) };
+        return 0x8007_0057_u32 as i32;
+    }
+    // SAFETY: a list of ours, alive while the title calls it.
+    let device = unsafe { (*this).device };
+    add_ref(device);
+    // SAFETY: checked non-null.
+    unsafe { out.write(device.cast()) };
+    S_OK
 }
 
 extern "system" fn default_endpoint(this: *mut Enumerator, flow: i32, role: i32, out: *mut *mut c_void) -> HRESULT {
