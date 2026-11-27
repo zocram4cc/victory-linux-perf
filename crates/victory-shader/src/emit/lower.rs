@@ -7243,6 +7243,7 @@ impl<'a> Lower<'a> {
                         1 => self.write(inst, reg, hi, None),
                         _ => {
                             if let Some(v) = inst.write(reg) {
+                                if std::env::var_os("VICTORY_WHY_STALE").is_some() { eprintln!("WHY-STALE site1 {:#x} {} reg {:?}", inst.machine.offset, inst.name(), v); }
                                 self.vals.insert(v, Val::Missing(OTHER));
                                 self.stale.insert(v);
                             }
@@ -7265,6 +7266,7 @@ impl<'a> Lower<'a> {
                         1 => self.write(inst, reg, hi, None),
                         _ => {
                             if let Some(v) = inst.write(reg) {
+                                if std::env::var_os("VICTORY_WHY_STALE").is_some() { eprintln!("WHY-STALE site2 {:#x} {} reg {:?}", inst.machine.offset, inst.name(), v); }
                                 self.vals.insert(v, Val::Missing(OTHER));
                                 self.stale.insert(v);
                             }
@@ -7487,6 +7489,11 @@ impl<'a> Lower<'a> {
                                 self.write(inst, Reg::S(code + k as u8), x, None);
                                 continue;
                             }
+                        }
+                        if std::env::var_os("VICTORY_WHY_STALE").is_some() && rel == 1 && image.is_none() {
+                            let root = self.scalar.get(&site).and_then(|a| self.x.native.layout.get(a.param).map(|p| p.root));
+                            let param = self.scalar.get(&site).map(|a| a.param);
+                            eprintln!("WHY-STALE buffer d1 at {:#x} root {root:?} param {} used stride {:?} props {:#x}", inst.machine.offset, param.map_or("none".into(), |p| if p == crate::resource::MEMORY { "MEMORY".into() } else { p.to_string() }), used.map(|u| u.stride), props.0);
                         }
                         self.vals.insert(v, Val::Missing(OTHER));
                         self.stale.insert(v);
@@ -8570,7 +8577,11 @@ impl<'a> Lower<'a> {
             .scalar
             .get(load)
             .and_then(|a| self.x.native.layout.get(a.param))
-            .is_some_and(|p| p.root == RootType::ResourceHeap);
+            // A table's entries are heap slots too: `heap_index` takes the
+            // table's address plus the offset, as when binding them (P.4:
+            // the stride of table-picked buffer descriptors, `s_bfe_u32 x,
+            // d1, 0xe0010`, 47,000 reads).
+            .is_some_and(|p| matches!(p.root, RootType::ResourceHeap | RootType::Table));
         if !heap {
             return Ok(None);
         }

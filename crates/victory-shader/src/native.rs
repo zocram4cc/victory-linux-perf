@@ -487,10 +487,16 @@ fn view_heap_sgpr(code: &[u8], user_sgprs: u8) -> Option<u8> {
     #[derive(Clone, Copy, PartialEq)]
     enum S {
         User(u8),
+        /// A user SGPR plus an offset (`s_add_u32 d, sX, sY`).
+        Plus(u8),
         Zero,
         Times32,
         Other,
     }
+    // Descriptors of four dwords loaded from a user SGPR's heap, by their
+    // first SGPR: a buffer instruction that takes one as its resource
+    // shows that heap is the view heap (samplers are not buffers' resources).
+    let mut pending: Vec<(usize, u8)> = Vec::new();
     let insts = crate::gfx10::decode(code).ok()?;
     let mut st = [S::Other; 106];
     for (i, s) in st.iter_mut().enumerate().take(usize::from(user_sgprs)) {
@@ -519,9 +525,61 @@ fn view_heap_sgpr(code: &[u8], user_sgprs: u8) -> Option<u8> {
                     st[sdst] = S::Times32;
                 }
             }
+            Some("s_add_u32") => {
+                let (a, b) = ((w & 0xff) as usize, ((w >> 8) & 0xff) as usize);
+                let v = match (a, b) {
+                    // `0 + carry`: a heap address's high half.
+                    (128, 253) | (253, 128) => S::Zero,
+                    (0..=105, _) if matches!(st[a], S::User(_)) && b != 253 => match st[a] {
+                        S::User(x) => S::Plus(x),
+                        _ => S::Other,
+                    },
+                    (_, 0..=105) if matches!(st[b], S::User(_)) && a != 253 => match st[b] {
+                        S::User(x) => S::Plus(x),
+                        _ => S::Other,
+                    },
+                    _ => S::Other,
+                };
+                if sdst < st.len() {
+                    st[sdst] = v;
+                }
+            }
+            // A scalar buffer load takes it as its base (SMEM `sbase`, in
+            // units of two).
+            Some(name) if name.starts_with("s_buffer_") => {
+                let base = ((w & 0x3f) * 2) as usize;
+                if let Some(&(_, x)) = pending.iter().find(|p| p.0 == base) {
+                    return Some(x);
+                }
+                let sdata = ((w >> 6) & 0x7f) as usize;
+                for s in st.iter_mut().skip(sdata).take(16) {
+                    *s = S::Other;
+                }
+            }
+            Some(name) if (name.starts_with("buffer_") || name.starts_with("tbuffer_")) && inst.words.len() >= 2 => {
+                // MUBUF/MTBUF: the resource's first SGPR in bits 16-20 of the
+                // second dword, in units of four.
+                let rsrc = (((inst.words[1] >> 16) & 0x1f) * 4) as usize;
+                if let Some(&(_, x)) = pending.iter().find(|p| p.0 == rsrc) {
+                    return Some(x);
+                }
+            }
             Some("s_load_dwordx4" | "s_load_dwordx8") if inst.words.len() >= 2 => {
                 let base = ((w & 0x3f) * 2) as usize;
                 let soffset = (inst.words[1] >> 25) as usize;
+                // A heap address computed by an add (a waterfall loop's: the
+                // first lane's byte offset added to the heap's base).
+                if base + 1 < st.len()
+                    && let (S::Plus(x), S::Zero) = (st[base], st[base + 1])
+                    && x + 2 >= user_sgprs
+                {
+                    let sdata = ((w >> 6) & 0x7f) as usize;
+                    if inst.name() == Some("s_load_dwordx8") {
+                        return Some(x);
+                    }
+                    pending.retain(|p| p.0 != sdata);
+                    pending.push((sdata, x));
+                }
                 if base + 1 < st.len()
                     && let (S::User(x), S::Zero) = (st[base], st[base + 1])
                     && soffset < st.len()
