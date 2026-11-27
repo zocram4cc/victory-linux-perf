@@ -229,6 +229,11 @@ fi
 # 11.2 -> 9.7 GB, 99th percentile frame 802 -> 578 ms); the willy build's
 # setting. --levels-on-demand turns it back on.
 d VICTORY_LEVELS_ON_DEMAND 0
+# The screen-probe ray activation runs even with the ray-tracing structure
+# builder off: left out, foliage came out rainbow-coloured right after it was
+# drawn (trustno1's notes: "skipping them left rainbow glitter"); with it the
+# same plants were green and brown (test run 20261127-000808).
+d VICTORY_ACTIVATE_RAYS 1
 # The title's own short waits for textures in the first frames and the first
 # cutscene: with the willy build's longer ones (--texture-waits) the first
 # 20 s of the world were slow and the first car scene dark; without them the
