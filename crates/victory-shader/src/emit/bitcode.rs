@@ -916,6 +916,11 @@ impl Module {
                 let inst = &self.insts[i as usize];
                 let rel = |v: V| {
                     let a = abs(v);
+                    if a >= inst_id {
+                        // Which instruction, reading what (to find the lowering that
+                        // put a use before its definition).
+                        eprintln!("FORWARD-REF in {:?} reads {:?}", inst.op, match v { V::Inst(k) => self.insts.get(k as usize).map(|d| format!("{:?}", d.op)), _ => None });
+                    }
                     assert!(a < inst_id, "forward reference outside a phi");
                     u64::from(inst_id - a)
                 };
