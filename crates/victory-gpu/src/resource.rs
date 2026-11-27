@@ -914,9 +914,14 @@ fn place<'a>(
     descs: impl Iterator<Item = &'a ResourceDesc>,
     mut each: impl FnMut(usize, AllocationInfo1),
 ) -> AllocationInfo {
+    // The resources' own alignment (4 KiB for small textures, as the
+    // console); `VICTORY_SMALL_ALIGN=0`: at least 64 KiB, as before, so the
+    // title spaces its textures as it did (to compare the two).
+    static SMALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let small = *SMALL.get_or_init(|| std::env::var_os("VICTORY_SMALL_ALIGN").is_none_or(|v| v != "0"));
     let mut total = AllocationInfo {
         size: 0,
-        alignment: 0,
+        alignment: if small { 0 } else { KIB_64 },
     };
     for (i, desc) in descs.enumerate() {
         let Some(one) = footprint(desc) else {
