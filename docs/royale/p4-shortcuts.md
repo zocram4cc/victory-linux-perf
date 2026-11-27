@@ -87,3 +87,32 @@ Some of the ~100 programs may stop translating; those that stay are right by con
   - the view-identity values for dwords 0-1 (case 1);
   - a fix of the analysis (case 2);
   - then this test again.
+
+
+### Correction (27 Nov, ~23:15): the two marker hits were false alarms, misread by me
+
+My reading of the two hits (a comparison of descriptor addresses; EXEC restored) came from the disassembly around the offsets, **not from the registers the translator had marked**, and it was wrong.
+
+`VICTORY_WHY_DEAD=1` now prints the register and its readers. In both programs (`…05456500` at 0x2214, `…05499700` at 0x2014), the marked joins are **`s80`, `s85`, `s86`, `s87`, dwords of an image descriptor `s[80:87]`**. Their only readers are `s_mov` copies, the spill saves that `ir::unspill` turns into moves: a descriptor kept in spill lanes and restored on the next loop pass to be used again as a descriptor. No number depends on those values. The descriptor use itself is traced to its load, not read.
+
+**Made a proof** (`Lower::descriptor_only`): a dead dword is 0 by right when every use, followed through copies (`s_mov_b32`/`s_mov_b64`) and joins, is the resource or sampler operand of a memory instruction. `soffset` is excluded: it is a number. Both hits are now proven cases.
+
+No program gained: the 75 need other joins too. **What those other joins' readers are** (all assumed-dead edges, with `=assume`):
+
+| reader | count | what it means |
+|---|---|---|
+| `s_mov_b32` | 777 | copies whose chain ends in some other use |
+| `image_load` | 123 | descriptor uses: fine, but the same value also has other readers |
+| `v_readfirstlane_b32` | 63 | **waterfall loops**: lanes compare their descriptor with the first lane's. A real numeric use; 0 for all would wrongly say "uniform" |
+| `v_cmpx_eq_i32` | 63 | the same |
+| `s_and_b32` | 34 | lane-mask merges |
+| `s_mul_i32` | 19 | real numeric uses (sizes from descriptor bits) |
+| `s_bfe_u32` | 11 | the same |
+| float ops (`v_max_f32`, `v_add_f32`, `v_mul_f32`, `v_subrev_f32`, `v_fma_f32`) | 45 | a float op on a descriptor dword cannot be meaningful: the register is dead there at run time (reused), but the analysis cannot prove it path by path |
+
+**Status:**
+- Default: proven only, **1,265**.
+- `=assume` stays unsafe: the waterfall comparisons (63) are real numeric uses where 0 is wrong.
+- **To gain these programs correctly:**
+  - give descriptor dwords values that answer comparisons as on the console: the view's identity in dwords 0-1, for waterfall and change tests;
+  - prove the float-op cases dead per path.
