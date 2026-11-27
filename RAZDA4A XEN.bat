@@ -2,13 +2,25 @@
 setlocal
 
 REM ============================================================================
-REM  RAZDA4A XEN — Budget & 16 GB RAM Edition (Wave 5)
+REM  RAZDA4A XEN — Budget & 16 GB RAM Edition (Wave 5 + Hotfix)
 REM  Pure --release Zen 3 build | Win10 Agility SDK | FSR 4.1.2 ML + HUDLess FG
-REM  Run with --no-gui to skip the Frame Generation / profile dialog.
+REM  Run with --no-gui to skip the Launch Options dialog.
 REM ============================================================================
 
 set "ROOT=%~dp0"
 if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
+
+set "XEN_FRAMEGEN=1"
+set "XEN_PROFILE=balanced"
+if exist "%ROOT%\launcher_prefs.bat" call "%ROOT%\launcher_prefs.bat"
+
+if /I not "%~1"=="--no-gui" (
+    if exist "%ROOT%\launcher_ui.ps1" (
+        powershell -NoProfile -ExecutionPolicy Bypass -STA -File "%ROOT%\launcher_ui.ps1" -PrefsFile "%ROOT%\launcher_prefs.bat" -ConfigFile "%ROOT%\config.bat" -RootDir "%ROOT%"
+        if errorlevel 2 exit /b 0
+        if exist "%ROOT%\launcher_prefs.bat" call "%ROOT%\launcher_prefs.bat"
+    )
+)
 
 if not exist "%ROOT%\config.bat" (
     echo [ERROR] config.bat not found next to RAZDA4A XEN.bat!
@@ -19,24 +31,12 @@ call "%ROOT%\config.bat"
 
 if not exist "%GAME_EXE%" (
     echo ============================================================================
-    echo  [!] Please edit config.bat first! / Сначала отредактируй config.bat!
-    echo  Executable not found: "%GAME_EXE%"
-    echo  Set GAME_DIR and GAME_EXE to your executable file and run again.
+    echo  [!] Executable not found: "%GAME_EXE%"
+    echo  Run RAZDA4A XEN.bat without --no-gui to select your .exe via Browse...,
+    echo  or edit config.bat and set GAME_DIR and GAME_EXE to your unpacked folder.
     echo ============================================================================
     pause
     exit /b 1
-)
-
-set "XEN_FRAMEGEN=1"
-set "XEN_PROFILE=balanced"
-if exist "%ROOT%\launcher_prefs.bat" call "%ROOT%\launcher_prefs.bat"
-
-if /I not "%~1"=="--no-gui" (
-    if exist "%ROOT%\launcher_ui.ps1" (
-        powershell -NoProfile -ExecutionPolicy Bypass -STA -File "%ROOT%\launcher_ui.ps1" -PrefsFile "%ROOT%\launcher_prefs.bat"
-        if errorlevel 2 exit /b 0
-        if exist "%ROOT%\launcher_prefs.bat" call "%ROOT%\launcher_prefs.bat"
-    )
 )
 
 if not exist "%ROOT%\cache" mkdir "%ROOT%\cache"
@@ -66,7 +66,7 @@ set "VICTORY_ALLOW_TEARING=1"
 set "VICTORY_VSYNC=0"
 set "VICTORY_FRAME_INTERVAL_MS=16.667"
 
-REM === FACE FIX + MAX CPU FPS (6-core friendly) ===
+REM === FACE FIX + MAX CPU FPS (6-core friendly, fast texture recheck) ===
 set "VICTORY_COMPUTE_WAIT_MS=5000"
 set "VICTORY_COMPUTE_LATE_WAIT_MS=400"
 set "VICTORY_HELPER_PRIORITY=1"
@@ -75,6 +75,7 @@ set "VICTORY_CARD_STEPS=2"
 set "VICTORY_PLACED_ORDER=1"
 set "VICTORY_FETCH_CHECK=1"
 set "VICTORY_TEXTURE_NO_WAIT=1"
+set "VICTORY_TEXTURE_LOOK_MS=350"
 set "VICTORY_RELAY=2"
 set "VICTORY_WIDE_BACK=1"
 set "VICTORY_WIDE_SPIN=100"
@@ -82,9 +83,9 @@ set "VICTORY_CARD_REHASH_RUNS=1"
 set "VICTORY_JOIN_COPIES=1"
 set "VICTORY_JOIN_BARRIERS=1"
 set "VICTORY_UP_QUEUE=1"
-set "VICTORY_INDIRECT_WINDOW=1"
+set "VICTORY_INDIRECT_WINDOW=0"
 set "VICTORY_RELAY_COPY=1"
-set "VICTORY_INDIRECT_BATCH=2"
+set "VICTORY_INDIRECT_BATCH=1"
 set "VICTORY_MAP_THREADS=1"
 set "VICTORY_CARD_AWAKE=1"
 set "VICTORY_SHOW_AFTER=1"
@@ -113,6 +114,8 @@ set "VICTORY_PIPELINE_BOOK=1"
 set "VICTORY_PIPELINE_WORKERS=4"
 
 REM === 16 GB RAM + ZERO-OOM (0x8007000E) + DYNAMIC AUTO-VRAM ===
+REM Note: VICTORY_CARD_BUFFERS_MIN_KB is left unset ("auto") so 8 GB GPUs
+REM automatically use 512 KB instead of being overridden down to 64 KB.
 set "VICTORY_RESIDENCY=1"
 set "VICTORY_SEGMENT_TIGHT=92"
 set "VICTORY_STAGING_IDLE_MS=1500"
@@ -120,7 +123,6 @@ set "VICTORY_WINDOW_IDLE_MS=2500"
 set "VICTORY_SCRATCH_SPARE_MB=16"
 set "VICTORY_READ_KEEP_MB=16"
 set "VICTORY_WAIT_RESIDENT=textures"
-set "VICTORY_CARD_BUFFERS_MIN_KB=64"
 set "VICTORY_KEEP_FREED=0"
 set "VICTORY_LIST_IDLE_MOST=1024"
 set "VICTORY_LIST_IDLE_TRIM_S=60"
@@ -144,6 +146,7 @@ if /I "%XEN_PROFILE%"=="cbv_exp" (
 if /I "%XEN_PROFILE%"=="safe" (
     set "VICTORY_ALLOW_TEARING=0"
     set "VICTORY_VSYNC=1"
+    set "VICTORY_HELPER_PRIORITY=0"
     set "VICTORY_SUBMIT_FRAMES=1"
     set "VICTORY_JOIN_PARTS=12"
     set "VICTORY_PORT_DESCRIPTORS=0"
@@ -156,8 +159,8 @@ if /I "%XEN_PROFILE%"=="safe" (
     set "VICTORY_WINDOW_BUDGET_MB=96"
     set "VICTORY_WINDOW_IDLE_MS=2000"
     set "VICTORY_SEND_SPARE_MB=24"
-    set "VICTORY_CARD_BUFFERS_MIN_KB=128"
-    set "VICTORY_CARD_BUFFERS_MB=1536"
+    set "VICTORY_CARD_BUFFERS_MIN_KB=256"
+    set "VICTORY_CARD_BUFFERS_MB=1280"
     set "VICTORY_CARD_ROOM_FOR_TARGETS_MB=1536"
     set "VICTORY_LIST_IDLE_MOST=128"
     set "VICTORY_LIST_IDLE_TRIM_S=30"
@@ -183,6 +186,6 @@ echo  Profile: %XEN_PROFILE% ^| Frame Generation: %FG_LABEL%
 echo  Controls: F2 or ~ = toggle mouse-look ^| F3 = toggle FPS HUD
 echo ============================================================================
 pushd "%ROOT%"
-start "" /WAIT /B /ABOVENORMAL "%ROOT%\RAZDA4A_XEN.exe" run --console series-s "%GAME_EXE%" --execute
+start "" /WAIT /B "%ROOT%\RAZDA4A_XEN.exe" run --console series-s "%GAME_EXE%" --execute
 popd
 pause

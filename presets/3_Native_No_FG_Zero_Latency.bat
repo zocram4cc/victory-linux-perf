@@ -44,6 +44,7 @@ set "VICTORY_CARD_STEPS=2"
 set "VICTORY_PLACED_ORDER=1"
 set "VICTORY_FETCH_CHECK=1"
 set "VICTORY_TEXTURE_NO_WAIT=1"
+set "VICTORY_TEXTURE_LOOK_MS=350"
 set "VICTORY_RELAY=2"
 set "VICTORY_WIDE_BACK=1"
 set "VICTORY_WIDE_SPIN=100"
@@ -51,9 +52,9 @@ set "VICTORY_CARD_REHASH_RUNS=1"
 set "VICTORY_JOIN_COPIES=1"
 set "VICTORY_JOIN_BARRIERS=1"
 set "VICTORY_UP_QUEUE=1"
-set "VICTORY_INDIRECT_WINDOW=1"
+set "VICTORY_INDIRECT_WINDOW=0"
 set "VICTORY_RELAY_COPY=1"
-set "VICTORY_INDIRECT_BATCH=2"
+set "VICTORY_INDIRECT_BATCH=1"
 set "VICTORY_MAP_THREADS=1"
 set "VICTORY_CARD_AWAKE=1"
 set "VICTORY_SHOW_AFTER=1"
@@ -106,6 +107,6 @@ echo  RAZDA4A XEN — Preset: Native No-FG (Zero Latency)
 echo  FSR 4.1.2 ML + Tearing ^| Frame Gen OFF ^| 16 GB RAM Safe
 echo ============================================================================
 pushd "%ROOT%"
-start "" /WAIT /B /ABOVENORMAL "%ROOT%\RAZDA4A_XEN.exe" run --console series-s "%GAME_EXE%" --execute
+start "" /WAIT /B "%ROOT%\RAZDA4A_XEN.exe" run --console series-s "%GAME_EXE%" --execute
 popd
 pause

@@ -83,7 +83,8 @@ Measured on **Ryzen 5 5600 (6C/12T), Radeon RX 9060 XT 16 GB, 16 GB DDR4, Window
 
 | File | Profile |
 |---|---|
-| `RAZDA4A XEN.bat` | Balanced launcher with **Frame Generation ON/OFF checkbox** (remembers choice in `config.bat`), dynamic Auto-VRAM, HUDLess FG + Tearing |
+| `RAZDA4A XEN.bat` | Balanced launcher with **Browse... `.exe` picker**, **Frame Generation ON/OFF checkbox** (saved in `launcher_prefs.bat`), auto-Safe-Mode for 8 GB GPUs, preflight warnings, HUDLess FG + Tearing |
+| `launch_linux_proton.sh` | Linux (Proton / Wine / VKD3D) direct launcher without PowerShell/WinForms GUI |
 | `presets\1_Low_Commit_NVMe_16GB.bat` | Tight pagefile / background apps: NVMe file-backed physical pages, ~8.0 GB VRAM, >11 GB load commit headroom |
 | `presets\2_Max_FPS_Experimental_CBV.bat` | Balanced + in-place constant buffers (experimental) |
 | `presets\3_Native_No_FG_Zero_Latency.bat` | Native rendering, Frame Gen off, lowest input latency |

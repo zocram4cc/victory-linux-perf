@@ -42,6 +42,17 @@
 - Нативные 30 FPS (`<= 33.3 мс`) продолжаем дожимать на `dev`: `victory-submit` уже снижен до `34.4 мс/кадр`, следующая цель — потоки записи списков (`victory-list-0..3`) и копии CBV.
 - Переход из пролога в открытый мир на сильно урезанных файлах подкачки смягчён проактивным `emergency_reclaim()` и автодетекцией NVMe (`VICTORY_FILE_PHYSICAL=auto`) на `dev`.
 
+## Подтверждённые результаты железа и комьюнити (Wave 4 / Wave 5)
+
+| Железо / ОС | Стенд / Тестер | Статус и результаты |
+|---|---|---|
+| **AMD Ryzen 7 7800X3D + Radeon RX 9060 XT (RDNA 4)** — Windows | Основной стенд разработки | Стабильно. Wave 4: **~14–24 нативных FPS** (`14.0 FPS` ср. в открытом мире, `15–19 FPS` в типовых сценах) + 2× с **AMD FSR 3.1.6 FG (`HUDLessColor`)**, VRAM `~11.9 ГБ`. После последнего апдейта: **35 FPS без FG / 60+ FPS с FG**. |
+| **AMD Ryzen 5 5600 + 16 ГБ RAM** — Windows | Стенд проверки 16 ГБ ОЗУ | Стабильно в открытом мире без 5–10 с фризов после фиксов Wave 4/5 (`15.2 ср. / 16.6 мед. / 23.4 пик` нативных FPS в Wave 5). |
+| **AMD Ryzen 7 7700X + Radeon RX 7800 XT (16 ГБ) + 64 ГБ RAM** — Windows | `@LynxarAD` | Работает: **31–37 FPS с FSR FG** (`15.7×2`–`18.6×2`, натив `~16–19 FPS`), VRAM `~12.3 GiB`, GPU `46%` / CPU `75%`. Второй запуск заметно плавнее первого после прогрева кэша PSO; в катсценах и новых зонах возможны просадки до `~7 FPS`. |
+| **AMD Radeon RX 6600 (8 ГБ) + 16 ГБ RAM** — Windows | `@TriguerosZoe99` | Работает в **14–20 нативных FPS** (без FG) с **`Preset 1 (Low-Commit NVMe)`** или **`Preset 4 (Safe Mode 8–12GB VRAM)`** + файл подкачки на NVMe. Лаунчер теперь автоматически предвыбирает Safe Mode на картах `<= 8 ГБ VRAM`. |
+| **Intel Core i7-8700 + NVIDIA RTX 2070 (8 ГБ) + 16 ГБ DDR4** — Linux | `@supimcinnamon` | Запускается в **~10 нативных FPS** только на модифицированном форке поверх `RAZDA4A-XEN` с пропатченным `wineserver`. |
+| **AMD Ryzen 5 5500 + NVIDIA RTX 5060 (8 ГБ) + 16 ГБ RAM** — Windows | `@Golden_L2` | Не работает (`0 FPS` в 3D, чёрный экран, нехватка ОЗУ). Ветка поддерживает только AMD RDNA; для RTX используйте комьюнити-форки (например, `trustno1-coder/VIctory-NVIDIA`). |
+
 ## Быстрый старт
 
 1. Скачай ветку `main` (**Code -> Download ZIP** или `git clone --branch main https://github.com/crossducking/RAZDA4A-XEN.git`) и распакуй (например `D:\RAZDA4A-XEN\`). Все нужные DLL (`D3D12\D3D12Core.dll`, `fidelityfx\*.dll`) уже внутри.
@@ -54,7 +65,8 @@
 
 | Файл | Профиль |
 |---|---|
-| `RAZDA4A XEN.bat` | Основной лаунчер с **галочкой Frame Generation (вкл/выкл)** (запоминает выбор в `config.bat`), авто-VRAM, HUDLess FG + Tearing |
+| `RAZDA4A XEN.bat` | Основной лаунчер с **кнопкой `Browse...` для выбора `.exe`**, **галочкой Frame Generation (вкл/выкл)** (сохраняется в `launcher_prefs.bat`), авто-Safe-Mode для 8 ГБ видеокарт и проверкой железа/Commit |
+| `launch_linux_proton.sh` | Прямой запуск на Linux (Proton / Wine / VKD3D) без PowerShell/WinForms GUI |
 | `presets\1_Low_Commit_NVMe_16GB.bat` | Маленький файл подкачки / открыт браузер: физические страницы на NVMe, ~8.0 ГБ VRAM, >11 ГБ свободного Commit при загрузке |
 | `presets\2_Max_FPS_Experimental_CBV.bat` | Сбалансированный + чтение констант на месте (экспериментальный) |
 | `presets\3_Native_No_FG_Zero_Latency.bat` | Нативный рендер без Frame Gen, минимальная задержка ввода |
