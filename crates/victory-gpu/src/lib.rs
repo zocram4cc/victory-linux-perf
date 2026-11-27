@@ -117,6 +117,8 @@ mod wine;
 
 #[cfg(windows)]
 pub use host::on_failure;
+#[cfg(windows)]
+pub use host::{early as host_early, prepare as prepare_host};
 
 /// Whether `switch` is on now, if it is one of those `VICTORY_AB` turns on and
 /// off while the title runs (`ab`).
