@@ -9,7 +9,7 @@
 # A run is good when its screenshots show a picture (luminance standard
 # deviation >= K_MIN_STD, default 15: a grey, black or white screen is
 # below 5, a real scene ~70) AND it is not crawling (>= K_MIN_FPS median
-# fps, default 5). (Draws a frame were a wrong test: they go from ~11,000
+# fps, default 14: without native programs it runs at 17-19). (Draws a frame were a wrong test: they go from ~11,000
 # to ~6,000 by themselves when the camera cuts indoors.) A
 # good batch joins the set; a bad one is split in two and both halves are
 # queued; a bad single program goes to bench/p4-grow/bad.txt.
@@ -25,7 +25,7 @@ mkdir -p "$W/queue"
 touch "$W/good.txt" "$W/bad.txt"
 say() { printf '\e[1;32mp4-grow:\e[0m %s\n' "$*"; }
 winpath() { local p; p=$(readlink -f "$1"); echo "Z:${p//\//\\}"; }
-min_std=${K_MIN_STD:-15} min_fps=${K_MIN_FPS:-5}
+min_std=${K_MIN_STD:-15} min_fps=${K_MIN_FPS:-14}
 # The lowest luminance standard deviation of a run's screenshots.
 picture_std() {
     python3 -I - "$1" <<'PY'
@@ -51,7 +51,7 @@ while :; do
     batch=$W/queue/$next
     cat "$W/good.txt" "$batch" >"$W/try.txt"
     label=p4-grow-$n-$(wc -l <"$batch")
-    K_SHOTS=1 scripts/ktrials.sh -n 1 -l "$label" -s 15 VICTORY_NATIVE_COMPUTE=1 "VICTORY_NATIVE_COMPUTE_ONLY=$(winpath "$W/try.txt")" >/dev/null 2>&1
+    K_SHOTS=2 scripts/ktrials.sh -n 1 -l "$label" -s 15 VICTORY_NATIVE_COMPUTE=1 "VICTORY_NATIVE_COMPUTE_ONLY=$(winpath "$W/try.txt")" >/dev/null 2>&1
     d=$(ls -d bench/k-*"$label" | tail -1)
     log=$(awk -F'\t' 'NR==2 {print $13}' "$d/runs.tsv" 2>/dev/null)
     draws=$(picture_std "$d")
