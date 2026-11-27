@@ -495,6 +495,7 @@ struct Call {
     provider: Provider,
     context: usize,
     identity: usize,
+    cleaned: AtomicBool,
     done: Mutex<bool>,
     finished: Condvar,
 }
@@ -514,6 +515,12 @@ impl Call {
             context: self.context as *mut c_void,
         };
         (self.provider)(op, &data)
+    }
+
+    fn cleanup(&self, block: *mut AsyncBlock) {
+        if !self.cleaned.swap(true, Ordering::AcqRel) {
+            self.provider(OP_CLEANUP, block, 0, std::ptr::null_mut());
+        }
     }
 }
 
@@ -555,7 +562,7 @@ fn release(block: *mut AsyncBlock) {
     // Unlocked before the provider runs: it may call back into us.
     let removed = lock(&CALLS).remove(&(block as usize));
     if let Some(call) = removed {
-        call.provider(OP_CLEANUP, block, 0, std::ptr::null_mut());
+        call.cleanup(block);
     }
 }
 
@@ -593,6 +600,7 @@ pub fn XAsyncBegin(
         provider,
         context: context as usize,
         identity: identity as usize,
+        cleaned: AtomicBool::new(false),
         done: Mutex::new(false),
         finished: Condvar::new(),
     });
@@ -679,11 +687,21 @@ fn complete_call(call: &Call, block: *mut AsyncBlock, result: HRESULT, required_
     // SAFETY: a block in flight is valid.
     let (handle, routine) = unsafe { ((*block).queue, (*block).callback) };
     let (status, size) = words(block);
-    if result < 0 || required_size == 0 {
-        release(block);
+    let drop_call = result < 0 || required_size == 0;
+    if drop_call {
+        // Run cleanup before publishing status (while the title cannot free
+        // `block`), but keep the call filed in `CALLS` until status is stored
+        // so `XAsyncGetStatus(_, true)` cannot skip waiting and read `E_PENDING`.
+        call.cleanup(block);
     }
     size.store(required_size, Ordering::Release);
     status.store(result as u32 as usize, Ordering::Release);
+    if drop_call {
+        let mut calls = lock(&CALLS);
+        if calls.get(&(block as usize)).is_some_and(|c| std::ptr::eq(&**c, call)) {
+            calls.remove(&(block as usize));
+        }
+    }
     *done = true;
     call.finished.notify_all();
     drop(done);
@@ -1660,5 +1678,22 @@ mod tests {
         std::thread::sleep(Duration::from_millis(200));
         assert_eq!(*lock(&EVENTS), ["canceled", "terminated"]);
         XTaskQueueCloseHandle(q);
+    }
+
+    #[test]
+    fn get_status_wait_never_observes_pending_after_error_completion() {
+        extern "system" fn work(_: *mut AsyncBlock) -> HRESULT {
+            E_ABORT
+        }
+        for _ in 0..500 {
+            let mut block = AsyncBlock {
+                queue: std::ptr::null(),
+                context: std::ptr::null_mut(),
+                callback: None,
+                internal: [0; 4],
+            };
+            assert_eq!(XAsyncRun(&mut block, Some(work)), S_OK);
+            assert_eq!(XAsyncGetStatus(&mut block, true), E_ABORT);
+        }
     }
 }
