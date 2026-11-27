@@ -1,6 +1,6 @@
 //! IR to DXIL, one machine instruction at a time (decision 0003).
 //!
-//! Every register dword is an `i32` (SCC an `i1`); float o.is_some_and(|p| matches!(p.root, RootType::ResourceHeap | RootType::Table));erations bitcast
+//! Every register dword is an `i32` (SCC an `i1`); float operations bitcast
 //! their operands. Lane masks exist only as the per-lane booleans of
 //! structurisation; branches and guards are built from them. A value the
 //! emitter cannot express is `Missing` with a reason, and only fails the
@@ -14577,9 +14577,12 @@ mod tests {
         let lowered = |d16| lower_with(&words(d16), layout.clone(), used.clone()).unwrap();
         let d16 = lowered(true);
         assert_eq!(d16.half_views, vec![(0, 0)], "d16: the place is a half view");
-        assert!(!d16.root_srvs.contains(&super::super::shader::SLOT_STRIDES), "d16: no kind word");
         let wide = lowered(false);
         assert!(wide.half_views.is_empty(), "32-bit: no half view");
-        assert!(!wide.root_srvs.contains(&super::super::shader::SLOT_STRIDES), "32-bit");
+        // The host's table by heap slot may be bound for the record counts
+        // (`slot_counts`, `SLOT_COUNTS_AT`), which any buffer load reads; the
+        // d16 load must not bind it beyond what the 32-bit one does.
+        let table = |l: &super::Lowered| l.root_srvs.contains(&super::super::shader::SLOT_STRIDES);
+        assert_eq!(table(&d16), table(&wide), "d16: no kind word beyond the 32-bit load's table");
     }
 }
