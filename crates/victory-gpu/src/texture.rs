@@ -492,15 +492,39 @@ thread_local! {
     static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// The most bytes a thread's read buffer keeps between reads
+/// (`VICTORY_READ_KEEP_MB`; unset, all it ever grew to). A buffer grows to
+/// the largest texture its thread read and stays that size for the run; one
+/// over this is let go after the read, and the next read makes it anew.
+fn read_keep() -> Option<usize> {
+    static MOST: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_READ_KEEP_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|mb| mb.saturating_mul(1 << 20))
+    })
+}
+
 /// Calls `f` with `size` bytes of this thread's read buffer (their
 /// contents are whatever the last texture left).
 fn with_read<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
+    with_read_keeping(size, read_keep(), f)
+}
+
+/// [`with_read`], the buffer let go after `f` if it holds more than `keep`
+/// bytes.
+fn with_read_keeping<R>(size: usize, keep: Option<usize>, f: impl FnOnce(&mut [u8]) -> R) -> R {
     READ.with(|read| {
         let mut read = read.borrow_mut();
         if read.len() < size {
             read.resize(size, 0);
         }
-        f(&mut read[..size])
+        let out = f(&mut read[..size]);
+        if keep.is_some_and(|most| read.capacity() > most) {
+            *read = Vec::new();
+        }
+        out
     })
 }
 
@@ -568,6 +592,26 @@ pub(crate) fn let_go() -> [u64; 2] {
     [LET_GO[0].load(Relaxed), LET_GO[1].load(Relaxed)]
 }
 
+/// How long a staging buffer no list used is kept, in milliseconds, in place
+/// of what free memory decides (`VICTORY_STAGING_IDLE_MS`; unset, that).
+/// With 12 GiB or more free that is five minutes, which kept 40-46 GB alive
+/// in long runs; a shorter time lets go of them sooner.
+fn staging_idle_ms() -> Option<u64> {
+    static MS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("VICTORY_STAGING_IDLE_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+    })
+}
+
+/// The idle time to use: `over` if one was set, no shorter than the 2 s
+/// free memory alone can come down to (`crate::host::ram_idle_ms` under
+/// high pressure), else `computed`.
+pub(crate) fn idle_ms(over: Option<u64>, computed: u64) -> u64 {
+    over.map_or(computed, |ms| ms.max(2_000))
+}
+
 /// Lets go of the staging buffers no list recorded a use of for `IDLE_MS`
 /// and `IDLE_FRAMES` frames and no list holds: a staging buffer is system memory the size of its
 /// texture, kept so that an unchanged texture is not uploaded again, and
@@ -585,7 +629,10 @@ pub(crate) fn let_go_idle() {
     if map.is_empty() {
         return;
     }
-    let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+    let idle_ms = idle_ms(
+        staging_idle_ms(),
+        crate::host::ram_idle_ms(crate::host::available_physical_ram()),
+    );
     // A list that recorded an upload or a check holds the staging until it
     // is reset: one only the table holds is named by no list, recorded or
     // running.
@@ -2434,6 +2481,32 @@ mod detile_retry {
 #[cfg(test)]
 mod title_memory_tests {
     use super::with_title;
+
+    /// No override leaves free memory's time as it was; one under 2 s is 2 s.
+    #[test]
+    fn an_idle_override_is_two_seconds_or_more() {
+        use super::idle_ms;
+        assert_eq!(idle_ms(None, 300_000), 300_000);
+        assert_eq!(idle_ms(None, 2_000), 2_000);
+        assert_eq!(idle_ms(Some(10_000), 300_000), 10_000);
+        assert_eq!(idle_ms(Some(0), 300_000), 2_000);
+        assert_eq!(idle_ms(Some(1_999), 10_000), 2_000);
+    }
+
+    /// A read buffer over the most kept is let go after the read; the next,
+    /// smaller read still gets its bytes.
+    #[test]
+    fn a_read_buffer_over_the_most_is_let_go() {
+        use super::{READ, with_read_keeping};
+        const MOST: usize = 1 << 20;
+        with_read_keeping(4 * MOST, Some(MOST), |bytes| {
+            assert_eq!(bytes.len(), 4 * MOST)
+        });
+        assert_eq!(READ.with(|read| read.borrow().capacity()), 0);
+        with_read_keeping(1000, Some(MOST), |bytes| assert_eq!(bytes.len(), 1000));
+        let kept = READ.with(|read| read.borrow().capacity());
+        assert!((1000..=MOST).contains(&kept), "{kept}");
+    }
 
     /// Title memory whose tail is reserved and not committed reads through
     /// the copy as its bytes and then zeros, without a fault; so does
