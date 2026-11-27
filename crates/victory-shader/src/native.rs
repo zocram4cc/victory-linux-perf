@@ -103,6 +103,8 @@ const RECORD_LAYOUT: usize = 0x28;
 const RECORD_USED: usize = 0x30;
 const RECORD_COUNTS: usize = 0x38;
 const ENTRY_SIZE: u64 = 20;
+/// `s0`-`s105`: the SGPRs a program can address (106 on is VCC).
+const SGPRS: u32 = 106;
 const MAX_SEMANTICS: u32 = 32;
 const PS_INPUTS: usize = 0x24;
 const PS_INPUT_COUNT: usize = 0x124;
@@ -850,7 +852,15 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
                 user_data: e[16],
                 slot: e[17],
             })
-            .collect();
+            .collect::<Vec<RootParam>>();
+        // A parameter's SGPRs must exist: `user_sgpr` and the high half of a
+        // root descriptor are computed from these bytes.
+        if layout.iter().any(|p| {
+            let first = u32::from(p.user_data) + u32::from(stage.user_sgpr(0));
+            u64::from(first) + u64::from(p.sgprs.max(1)) > u64::from(SGPRS)
+        }) {
+            return Err(Malformed("root parameter outside the SGPRs"));
+        }
         let used = table(RECORD_USED, RECORD_COUNTS + 4)?
             .as_chunks::<{ ENTRY_SIZE as usize }>()
             .0
@@ -1204,6 +1214,20 @@ mod tests {
                 slot: 1
             }]
         );
+
+        // Parameters must sit in SGPRs the program can address: s9 plus 97
+        // dwords ends at s105, one more is past it, and so is a user-data
+        // byte past the SGPR file.
+        let entry = FSSM_HEADER + tables as usize;
+        let layout = |blob: &[u8]| native_programs(&part(&[(KIND_NATIVE, &xbch(blob))]));
+        let mut wide = blob.clone();
+        wide[entry + 8..entry + 12].copy_from_slice(&97u32.to_le_bytes());
+        assert_eq!(layout(&wide).unwrap()[0].layout[0].sgprs, 97);
+        wide[entry + 8..entry + 12].copy_from_slice(&98u32.to_le_bytes());
+        assert!(layout(&wide).is_err());
+        let mut far = blob.clone();
+        far[entry + 16] = 0xFF;
+        assert!(layout(&far).is_err());
 
         blob[record + RECORD_COUNTS] = 9;
         assert!(native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).is_err());
