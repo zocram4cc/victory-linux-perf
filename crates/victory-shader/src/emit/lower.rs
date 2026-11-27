@@ -4617,7 +4617,7 @@ impl<'a> Lower<'a> {
             // reads a register its variable never set on this path (P.4).
             // No lanes. `p4-shortcuts.md` #2, `VICTORY_DEAD_DESCRIPTOR_JOINS=0`.
             Atom::Opaque(v)
-                if matches!(self.vals.get(&v), Some(Val::Missing("a descriptor's address or format read as data")))
+                if matches!(self.vals.get(&v), Some(Val::Missing(w)) if DEAD_DESCRIPTOR_WORDS.contains(w))
                     && !std::env::var_os("VICTORY_DEAD_DESCRIPTOR_JOINS").is_some_and(|x| x == "0") =>
             {
                 Ok(self.s.m.bool(false))
@@ -13593,7 +13593,7 @@ impl<'a> Lower<'a> {
                     // `VICTORY_DEAD_DESCRIPTOR_JOINS=0` refuses, as before.
                     (Some(Val::Missing(why)), false)
                         if self.read_phis.contains(&phi.value)
-                            && why == "a descriptor's address or format read as data"
+                            && DEAD_DESCRIPTOR_WORDS.contains(&why)
                             && !std::env::var_os("VICTORY_DEAD_DESCRIPTOR_JOINS").is_some_and(|v| v == "0") =>
                     {
                         self.s.m.i32(0)
@@ -13617,6 +13617,16 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 }
+
+/// Why a register holds a descriptor's dword with no host value: such a
+/// dword, dead where a join or a lane-mask merge reads the register (the
+/// console compiler reuses it), is 0 / no lanes there (`p4-shortcuts.md`
+/// #2, `VICTORY_DEAD_DESCRIPTOR_JOINS=0` refuses).
+const DEAD_DESCRIPTOR_WORDS: [&str; 3] = [
+    "a descriptor's address or format read as data",
+    "a sampler's descriptor read as data",
+    "a constant buffer's descriptor read as data",
+];
 
 /// The DXIL interpolation mode of a kind of barycentrics (none for the
 /// pull model).
