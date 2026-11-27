@@ -8133,6 +8133,24 @@ impl HostList {
         self.deferred().copies.push(Step::Texture(staging));
     }
 
+    /// Detiles the textures the list uploads now, ahead of its submission
+    /// ([`crate::texture::Staging::refresh`]); how many there were.
+    pub(crate) fn refresh_textures_ahead(&self) -> u64 {
+        let textures: Vec<_> = self
+            .deferred()
+            .copies
+            .iter()
+            .filter_map(|step| match step {
+                Step::Texture(staging) => Some(staging.clone()),
+                _ => None,
+            })
+            .collect();
+        for staging in &textures {
+            staging.refresh();
+        }
+        textures.len() as u64
+    }
+
     /// Runs the list's submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges). Copies and fills that
@@ -10359,6 +10377,19 @@ impl Meter {
                 let [plan_passes, plan_rebuilds] =
                     [0, 1].map(|i| crate::draw::PLAN_SPANS[i].swap(0, Ordering::Relaxed) as f64 / frames);
                 tracing::info!("span plan (VICTORY_PLAN_REUSE=1): kept for {plan_passes:.1} passes a frame, rebuilt {plan_rebuilds:.2} a frame");
+            }
+            {
+                let [busy, detiling, lists, textures] = std::array::from_fn::<f64, 4, _>(|i| {
+                    crate::heap_worker::STATS[i].swap(0, Ordering::Relaxed) as f64 / frames
+                });
+                if busy > 0.0 {
+                    tracing::info!(
+                        "textures picked by index, their own thread (VICTORY_HEAP_WORKER), per frame: {:.1} ms at work, of them {:.1} detiling; \
+                         {lists:.1} lists, {textures:.0} textures detiled ahead",
+                        busy / 1e6,
+                        detiling / 1e6
+                    );
+                }
             }
             // Copies between depth textures and their colour twins, each way.
             let [twin_to_depth, twin_to_colour] =

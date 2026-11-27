@@ -211,6 +211,11 @@ impl Detached {
         &self.host
     }
 
+    /// A closed list of ours, to run among a title's.
+    pub(crate) fn ours(host: crate::host::HostList) -> Self {
+        Detached { host, _uploads: Vec::new(), _state: Default::default() }
+    }
+
     /// Its submission has run (its flight landed): its dynamic descriptor
     /// slots go back now, not when it is dropped [`crate::host`]'s bury lag
     /// later (64 submissions, about two frames). (Belobug/VIctory-Belobug-AMD
@@ -272,7 +277,7 @@ fn pools() -> bool {
 /// A host list open for recording: one that has run, as a title's list is
 /// after its reset, or a new one.
 #[cfg(windows)]
-fn fresh_list() -> Option<crate::host::HostList> {
+pub(crate) fn fresh_list() -> Option<crate::host::HostList> {
     let idle = {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         let taken = idle.0.pop();

@@ -1556,6 +1556,14 @@ impl Drop for Held {
     }
 }
 
+/// Holds title texture `this` alive, for work on a thread the title knows
+/// nothing of. `None` if it is no texture, or is being released.
+#[cfg(windows)]
+pub(crate) fn hold(this: This) -> Option<Held> {
+    let all = textures();
+    (all.contains(&(this as usize)) && object::add_ref_alive(this)).then_some(Held(this))
+}
+
 /// The lookup behind [`alias_of`]: `found` runs on the texture while the
 /// lock of the table it was found in is still held.
 #[cfg(windows)]
