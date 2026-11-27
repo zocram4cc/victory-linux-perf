@@ -40,6 +40,11 @@
 #   --mangohud      also MangoHud's frame log (off by default: its NVIDIA thread
 #                   aborted the title under umu, `free(): invalid pointer`)
 #
+# The frame recorder (with --diag; docs/replay.md): VICTORY_RECORD=<Windows path of a folder>,
+# then `touch <folder>/go` for each capture (capture-1, capture-2, ... in it; the file is
+# taken away). VICTORY_RECORD_GAP: seconds after a capture in which a touch is not followed
+# (5). VICTORY_RECORD_AT (seconds, or f<frame>), VICTORY_RECORD_FRAMES, VICTORY_RECORD_ALWAYS=1.
+#
 # Every game run leaves a folder in ~/.local/share/victory/runs/ (VICTORY_RUNS_DIR):
 # run.json, victory.log, frames.csv, system.csv, marks.csv, marks/ (mangohud.csv with --mangohud).
 # scripts/victory-report.py summarises one; scripts/victory-mark.sh marks a moment.
@@ -334,7 +339,8 @@ if [[ "${VICTORY_PREBUILD:-1}" != 0 ]]; then
   # no shader or pipeline, and the two commands below run without them. With
   # them, each of warm's processes made a capture folder of its own.)
   switches=$(env | grep -E '^VICTORY_' | grep -vE '^VICTORY_(KEYS|FRAMES_CSV|RUNS_DIR|PREBUILD|RECORD|RECORD_[A-Z]+)=' | sort)
-  unrecorded=(env -u VICTORY_RECORD -u VICTORY_RECORD_AT -u VICTORY_RECORD_FRAMES -u VICTORY_RECORD_ALWAYS)
+  unrecorded=(env)
+  for v in $(compgen -e | grep -E '^VICTORY_RECORD'); do unrecorded+=(-u "$v"); done
   stamp="$(sha256sum "$exe" | cut -c1-16) $(printf '%s' "$switches" | sha256sum | cut -c1-16)"
   stamp_file="$cache/prebuilt"
   if [[ "$(cat "$stamp_file" 2>/dev/null)" != "$stamp" ]]; then
