@@ -4385,11 +4385,23 @@ mod tests {
         host.execute(&[&fill]);
 
         // A list in which a shader writes the twins: closing it draws the
-        // depth plane's twin into the plane.
+        // depth plane's twin into the plane. Two lists recorded before
+        // either runs keep views of their own (fxceless PR #1377): neither
+        // may overwrite the other's.
         let list = host.new_list().unwrap();
         assert!(list.twin_use(depth, true, true));
         list.twins_written();
         list.close();
+        let other = host.new_list().unwrap();
+        assert!(other.twin_use(depth, true, true));
+        other.twins_written();
+        other.close();
+        let first = list.kept_shader_heaps();
+        let second = other.kept_shader_heaps();
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_ne!(first[0], second[0], "recorded passes share their views");
+        drop((first, second, other));
         host.execute(&[&list]);
 
         // The draws: a triangle over the target at the depth of a class,
