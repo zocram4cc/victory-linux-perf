@@ -22,6 +22,7 @@ Read first: [STATUS.md](STATUS.md) (setup, how to play, every tool), [CHECKPOINT
 5. **Families:** after each few steps recompute whole families (README section 6 has the script idea; `bench/p4-full-families.txt`). When a large family (`0x2996b5a0` 525, `0x1cd48770` 330, `0x2996b900` 246) becomes whole: test it alone in game (`VICTORY_NATIVE_COMPUTE=1 VICTORY_NATIVE_COMPUTE_ONLY=<its list>`, 3 runs with `K_EARLY_SHOT=1 K_SHOTS=2`, screenshots compared with plain runs), and if it holds, a checkpoint with it on.
 6. **Turning P.4 on by default** only for families that hold, through a list file in the repo; never all translatable programs (partial chains break the picture).
 7. Then **0x1c8** (graphics, 10,206 descriptions) the same way.
+8. **Image stores of the alpha channel alone** (`dmask:0x8`, 69 programs), deferred on purpose: README section 6 "Deferred on purpose" has why and how (read-modify-write only where each texel has one writing thread; raw atomics for linear textures).
 
 ## Other open threads (lower)
 
