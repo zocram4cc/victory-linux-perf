@@ -1,12 +1,16 @@
 //! Small D3D12 helpers the recorder and the replayer share.
 
-use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Foundation::{E_FAIL, HANDLE, WAIT_TIMEOUT};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
-use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::core::{Interface, Result};
 
 use super::wire;
+
+/// The longest wait for our own work on the card: far more than any of it
+/// takes, so that a fence that never comes is an error, not a hang.
+const PATIENCE_MS: u32 = 120_000;
 
 /// Lists of our own on a queue, with a fence.
 pub(super) struct Worker {
@@ -86,7 +90,17 @@ impl Worker {
         unsafe {
             if self.fence.GetCompletedValue() < value {
                 self.fence.SetEventOnCompletion(value, self.event)?;
-                WaitForSingleObject(self.event, INFINITE);
+                if WaitForSingleObject(self.event, PATIENCE_MS) == WAIT_TIMEOUT {
+                    self.device.GetDeviceRemovedReason()?;
+                    return Err(windows::core::Error::new(
+                        E_FAIL,
+                        format!(
+                            "the card did not reach fence value {value} in {} s (it is at {})",
+                            PATIENCE_MS / 1000,
+                            self.fence.GetCompletedValue()
+                        ),
+                    ));
+                }
             }
             self.device.GetDeviceRemovedReason()
         }
