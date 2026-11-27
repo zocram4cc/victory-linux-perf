@@ -200,6 +200,15 @@ pub fn scalar_splits() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_SCALAR_SPLITS").is_none_or(|v| v != "0"))
 }
 
+/// Whether a DPP row mask of a console wave64 program run as host waves of 32 tests the
+/// console row (0..3) of each lane, so that the upper host wave holds rows 2 and 3; on unless
+/// `VICTORY_DPP_CONSOLE_ROWS=0` (the host lane's row, 0 or 1 in both host waves, as before).
+/// Part of the translation: the shader cache keys on it.
+pub fn dpp_console_rows() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DPP_CONSOLE_ROWS").is_none_or(|v| v != "0"))
+}
+
 /// Whether a console wave64 compute program that no other form takes off 64-lane waves is
 /// tried, last of all, with its branches taken wave-wide ([`widen`]: two host waves of 32
 /// exchanging, with group barriers inside those branches) instead of being refused; off

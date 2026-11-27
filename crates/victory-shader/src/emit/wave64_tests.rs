@@ -1413,3 +1413,97 @@ fn a_scalar_written_in_a_lane_branch_reaches_every_lane() {
         eprintln!("ran on the hardware device (wave64 {wave64}): the region's scalar in every lane");
     }
 }
+
+/// Runs `shader` (`groups` groups on the hardware device) with root constant s0 and gives
+/// the first `dwords` dwords of the raw UAV; None (and a line) without a device that takes it.
+fn words_on_the_card(shader: &HostShader, s0: u32, dwords: u32, groups: u32) -> Option<Vec<u32>> {
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return None;
+    };
+    let (root, pso) = match host.compute_pipeline(shader) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("the hardware device does not take this program: {e}; not run");
+            return None;
+        }
+    };
+    let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    for u in &shader.user_data {
+        if let (RootType::Constants, 0, 0) = (u.root, u.slot, u.dword) {
+            ud[u.index as usize] = s0;
+        }
+    }
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(dwords)],
+                samplers: &[],
+                groups: [groups, 1, 1],
+            },
+        )
+        .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+    Some(out[0][..dwords as usize].to_vec())
+}
+
+/// A console wave64 program, 64 threads: v1 = 3t + 1, then `v_mov_b32 v4, v1 row_shr:1
+/// row_mask:0x6 bank_mask:0xf` over v4 = 1000, and v4 stored at dword t. With `crossing`,
+/// `v_mbcnt` (lanes 32..63 are the other host wave's: the exchange form) and the lane number
+/// it gives stored at dword 64 + t; without, the halves form (host waves that do not exchange).
+fn dpp_row_mask(crossing: bool) -> NativeProgram {
+    let mut words = vec![
+        0x1602_0083, // v_mul_u32_u24 v1, 3, v0
+        0x4A02_0281, // v_add_nc_u32 v1, 1, v1
+        0x7E08_02FF, // v_mov_b32 v4, 1000
+        1000,
+        0x7E08_02FA, // v_mov_b32 v4, v1 row_shr:1 row_mask:0x6 bank_mask:0xf
+        0x6 << 28 | 0xF << 24 | 0x111 << 8 | 1,
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0xE070_1000,
+        0x8002_0402, // buffer_store_dword v4, v2, s[8:11], 0 offen
+    ];
+    if crossing {
+        words.extend([
+            0xD765_0005,
+            0x0001_00C1, // v_mbcnt_lo_u32_b32 v5, -1, 0
+            0xD766_0005,
+            0x0002_0AC1, // v_mbcnt_hi_u32_b32 v5, -1, v5
+            0xE070_1100,
+            0x8002_0502, // buffer_store_dword v5, v2, s[8:11], 0 offen offset:256
+        ]);
+    }
+    native(&words)
+}
+
+/// On the card, a wave64 DPP row mask in host waves of 32, in the halves and the exchange
+/// forms: rows 1 and 2 (console lanes 16..47) take the lane below in their row, the others
+/// keep 1000. The expected words follow the ISA's definition of the row mask (rows of 16
+/// lanes of the 64-lane wave): this project's model of the console, not a measurement of
+/// one. With `VICTORY_DPP_CONSOLE_ROWS=0` the upper host wave tests rows 0 and 1 instead.
+#[test]
+fn a_dpp_row_mask_of_a_wave64_program_tests_the_console_rows() {
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for crossing in [false, true] {
+        let native = dpp_row_mask(crossing);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
+        }
+        let x = |t: u32| 3 * t + 1;
+        let want: Vec<u32> = (0..64u32)
+            .map(|t| if matches!(t >> 4, 1 | 2) && t & 15 != 0 { x(t - 1) } else { 1000 })
+            .collect();
+        let dwords = if crossing { 128 } else { 64 };
+        let Some(got) = words_on_the_card(&shader, 0, dwords, 1) else { return };
+        let wrong = (0..64).filter(|&t| got[t] != want[t]).count();
+        assert_eq!(&got[..64], &want[..], "crossing {crossing}: {wrong} of 64 lanes wrong");
+        if crossing {
+            assert_eq!(&got[64..], &(0..64).collect::<Vec<u32>>()[..], "the console lane numbers");
+        }
+        eprintln!("ran on the hardware device (crossing {crossing}): the row mask over the console rows");
+    }
+}

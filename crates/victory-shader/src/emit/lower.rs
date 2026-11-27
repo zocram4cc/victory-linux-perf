@@ -4456,6 +4456,23 @@ impl<'a> Lower<'a> {
         cl
     }
 
+    /// [`Self::console_lane`] also for a console wave64 program in host waves of 32 that do
+    /// not exchange (`halves`): its thread's console lane (0..63), not the host lane.
+    fn console_lane_of_halves(&mut self) -> V {
+        if self.exchange.is_some() || self.halves.is_none() {
+            return self.console_lane();
+        }
+        if let Some(v) = self.clane {
+            return v;
+        }
+        let e = self.s.entry;
+        let f = self.console_thread();
+        let k63 = self.s.m.i32(63);
+        let cl = self.s.m.bin(e, Bin::And, f, k63);
+        self.clane = Some(cl);
+        cl
+    }
+
     /// A group barrier with an LDS fence in `block`.
     fn group_sync(&mut self, block: usize) {
         let mode = self.s.m.i32(meeting_mode());
@@ -8281,7 +8298,14 @@ impl<'a> Lower<'a> {
         if let Some((rows, banks)) = masks {
             // Row (16 lanes) and bank (4 lanes of a row) write masks.
             let (four, two, three) = (k(self, 4), k(self, 2), k(self, 3));
-            let ri = self.s.m.bin(c, Bin::LShr, lane, four);
+            // A console wave64 program in host waves of 32: the upper host wave holds rows 2
+            // and 3, which its host lanes (0..31) would call rows 0 and 1 (AnyXboxX PR #297).
+            let row_lane = if (self.exchange.is_some() || self.halves.is_some()) && super::dpp_console_rows() {
+                self.console_lane_of_halves()
+            } else {
+                lane
+            };
+            let ri = self.s.m.bin(c, Bin::LShr, row_lane, four);
             let ri = self.s.m.bin(c, Bin::And, ri, three);
             let bi = self.s.m.bin(c, Bin::LShr, lane, two);
             let bi = self.s.m.bin(c, Bin::And, bi, three);
