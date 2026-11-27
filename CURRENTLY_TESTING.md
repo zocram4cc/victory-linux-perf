@@ -12,7 +12,7 @@ bimodal; differences under ~5 ms need ≥4 runs an arm).
   world (`draws > 100`). Figure = median `ms_per_frame` of those rows; "prep" = median `cpu_prepare_ms`.
 - Release build (`--features scripted`), caches warm (prebuild + full `warm`, 93,821 pipelines).
 
-## Latest (2026-11-27 night): `main` = fce609012
+## Latest (2026-11-27 night): `main` = 505d89688
 
 Each step merged into `main` after an A/B against the step before (single runs, 150–200 world rows,
 same play-fast set; caches prebuilt and warm, no builds during runs).
@@ -27,6 +27,9 @@ same play-fast set; caches prebuilt and warm, no builds during runs).
 | + Wine `memcmp` | DoubleGhosty d78b9eb5b: 16 bytes a step under Wine (no switch, same results) | 50.1 vs 50.3 | 37.7 vs 38.3 | 21.0 vs 22.0 | 5.7 | | prof2; p90 63.6 vs 67.9 |
 | fast track 2 (switches off) | heap round, journal round, guard round: `PLAN_REUSE`, `UPLOAD_BARRIERS`, `JOURNAL_SHARED=2`, `HEAP_RECHECK_PERSISTENT`, `EXACT_NO_WAIT` | 48.3 vs 47.1 (all on) | 38.0 vs 35.8 | 20.5 vs 19.2 | 5.4 | 12.7 vs 13.1 | ab11: no gain, worse tail (p95 210 vs 152); merged with the switches off |
 | + alias hold fix | `alias_of` released a reference it never took when the texture was being released (`then_some` builds its argument eagerly) | | | | | | crash fix, no switch |
+| + `VICTORY_HOME_BO=1` | port 1's home heap is a memfd the card opens by a dma-buf handle (needs patched vkd3d-proton + win32u: the `-homebo` Proton and prefix) | 51.6 vs 54.0 | 38.8 vs 40.2 | 20.5 vs 21.2 | | | ab14; userptr walks per 10 s: 0 vs ~17,500; worst p95 171 vs 205 |
+| + `VICTORY_ASK_SPREAD=1` | existing switch, was off | 52.3 vs 54.0 | 41.5 vs 40.2 | 18.9 vs 21.2 | | | ab14; p90 65.4 vs 71.5 |
+| + Vice-Tay `VICTORY_WATCH_SPANS=1` (merged, off) | write-watch shards walked without range lists | 46.7 vs 48.0 | 38.9 vs 39.2 | 19.3 vs 19.8 | 5.0 | | ab15; tail worse (p90 65.3 vs 61.3, worst p95 202 vs 153): not in the play set yet |
 
 - Run to run, one setup moves by about 4 ms (same exe and switches: 46.4 ms at 19:55, 50.2 at 20:24).
 - Fast track 1: equal frame, 3 ms less CPU prep, steadier tail. Prep (37 ms) is now below the frame
@@ -57,7 +60,9 @@ same play-fast set; caches prebuilt and warm, no builds during runs).
   `then_some` bug above, hit at once by the worker). Off until the pass can begin at present.
 
 Play set now: the play-fast settings below + combined + `VICTORY_SKIP_WC_BACK=1
-VICTORY_AMBIENT_MAGENTA=1` + the landings and fast track 1 switches above (`play-fast5.sh`).
+VICTORY_AMBIENT_MAGENTA=1` + the landings and fast track 1 switches + `VICTORY_HOME_BO=1
+VICTORY_ASK_SPREAD=1` (`play-fast6.sh`, on the `-homebo` Proton; saves shared with the play prefix).
+List-recording threads: 8 (default) stays; 12 and 14 raised the heap pass to 19-20 ms (ab14).
 
 ## Ladder on `main` (2026-11-27, cumulative: each rung adds to the one above)
 
@@ -169,11 +174,13 @@ black world. Purple blinds and violet trees on the first balcony: fixed with
 
 ## Next
 
-1. Submissions a frame (~90, each one a walk of the 185 MB home heap): what sets the count, and
-   joining more of them.
-2. Heap worker with the pass begun at present for the next frame (`VICTORY_HEAP_WORKER_EARLY`), and
-   a count of how long submissions wait for it; A/B against `main`.
-3. Picture A/B for the correctness switches of fast track 2 (`HEAP_RECHECK_PERSISTENT`,
+1. The heap pass (~15-20 ms, on the submitting thread) is the holdup now; the async heap worker
+   (`VICTORY_HEAP_WORKER`) stays off (tail +84 % in ab13).
+2. `VICTORY_EARLY_TEXTURES_MS` (12 here; 40 in another fork's launcher) and
+   `VICTORY_BAKE_TEXTURES_MS` (1500; 10000 there): single pass ab16.
+3. Vice-Tay round (branch `perf/vicetay-round`, not merged): five correctness fixes built and
+   tested before the round's last reverts; build, picture check and merge next session; then
+   `VICTORY_COPY_BACK`, `VICTORY_LIMITED_STAGING_MB=32`, `VICTORY_IDLE_UNDER_PRESSURE` to re-apply.
+4. Picture A/B for the correctness switches of fast track 2 (`HEAP_RECHECK_PERSISTENT`,
    `EXACT_NO_WAIT`, `JOURNAL_SHARED=2`).
-4. List-recording threads (~4.7 cores): lock and descriptor-write costs.
 5. `VICTORY_FRAME_INTERVAL_MS=16.667` once frames get near the title's 33 ms.
