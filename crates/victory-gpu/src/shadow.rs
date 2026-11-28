@@ -1143,6 +1143,75 @@ fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
 /// and the second is how many bytes of the title's (where title memory held
 /// another value than the CPU's side and the card did not change it) took
 /// the card's value.
+/// Whether what shaders wrote lands a dword at a time (`VICTORY_LAND_DWORDS=0`:
+/// a byte at a time, as before): a dword of a copy in the card's memory that
+/// the card changed in any byte goes into title memory, and into the CPU's
+/// side, whole.
+///
+/// A merge keeps a byte of the title's where the card's byte is what it was
+/// when the flight began. A skinned float's top byte (sign and exponent)
+/// mostly stays the same from frame to frame while its low bytes change: the
+/// card's three low bytes landed under a top byte title memory held, which
+/// was a byte of the title's 12-byte record. A dword nobody wrote went up at
+/// the next refresh: one coordinate near minus infinity (a cafe capture:
+/// 4,812 vertices in 17 draws, nearly all with exactly one wrong top byte),
+/// the giant sheets; in the packed buffers a 24-bit field's high byte.
+///
+/// What it can do wrong: a shader that stores single bytes or halves beside
+/// bytes the title writes in the same dword while the flight is in the air:
+/// the card's copy of the title's bytes lands over them. The per-copy lines
+/// count the dwords landed whole where the title's bytes differed ("dwords
+/// landed whole that a byte merge would have mixed"): a copy whose shaders
+/// store dwords should show the title's stray bytes there, one that stores
+/// bytes would show it where both wrote.
+fn land_dwords() -> bool {
+    crate::toggled!("VICTORY_LAND_DWORDS")
+}
+
+/// For [`land_dwords`], ahead of a byte merge of `now` (the card's bytes)
+/// into `held` (the CPU's side) from title address `addr` on: each dword (by
+/// title address) that the card changed in some bytes but not all has its
+/// other bytes made to differ in `held` (the card's, inverted), so that the
+/// merge puts the whole dword and `held` takes it. Bytes of a dword outside
+/// the slices are not touched. Returns the dwords widened, and of them those
+/// where `title` (title memory, if read) held another byte than `held` at a
+/// byte the card kept: the ones a byte merge would have mixed.
+fn widen_to_dwords(addr: usize, now: &[u8], held: &mut [u8], title: Option<&[u8]>) -> (u64, u64) {
+    let n = now.len().min(held.len());
+    let (mut widened, mut mixed) = (0u64, 0u64);
+    let mut i = 0;
+    while i < n {
+        let end = (((addr + i) / 4 + 1) * 4 - addr).min(n);
+        let (mut any, mut all) = (false, true);
+        for j in i..end {
+            let d = now[j] != held[j];
+            any |= d;
+            all &= d;
+        }
+        if any && !all {
+            widened += 1;
+            let mut mixes = false;
+            for j in i..end {
+                if now[j] == held[j] {
+                    mixes |= title.is_some_and(|t| t.get(j).is_some_and(|&t| t != held[j]));
+                    held[j] = !now[j];
+                }
+            }
+            mixed += u64::from(mixes);
+        }
+        i = end;
+    }
+    (widened, mixed)
+}
+
+/// `[first, last]` (byte offsets in a stretch from title address `addr` of
+/// `n` bytes) widened to whole dwords by title address, within the stretch.
+fn dword_bounds(addr: usize, first: usize, last: usize, n: usize) -> (usize, usize) {
+    let lo = (addr + first) / 4 * 4;
+    let hi = ((addr + last) / 4 + 1) * 4 - 1;
+    (lo.max(addr) - addr, (hi - addr).min(n - 1))
+}
+
 fn merge_piece_won(now: &[u8], held: &mut [u8], title: &mut [u8], wins: bool) -> (bool, u64) {
     let mut differs = 0u8;
     let mut won = 0u64;
@@ -2235,6 +2304,9 @@ pub(crate) mod resent {
         /// of a submission that declared writes to them.
         pub(crate) held: u64,
         pub(crate) ahead: u64,
+        /// [`super::land_dwords`]: dwords landed whole where a byte merge
+        /// would have kept a byte of the title's under the card's others.
+        pub(crate) dwords: u64,
     }
 
     impl Resent {
@@ -2249,6 +2321,7 @@ pub(crate) mod resent {
             self.won += o.won;
             self.held += o.held;
             self.ahead += o.ahead;
+            self.dwords += o.dwords;
         }
 
         pub(crate) fn is_empty(&self) -> bool {
@@ -2261,7 +2334,8 @@ pub(crate) mod resent {
             format!(
                 "pages sent up {:.1} (title-written {:.1}, landing noted and differing {:.1}; whole {:.1}, as runs {:.1}), \
                  {:.1} KB differing from the card, echo pages left {:.1}, landing pages title memory missed {:.1}, \
-                 card won over title bytes {:.1} KB, held back {:.1} KB, sent ahead of a declaring submission {:.1} KB",
+                 card won over title bytes {:.1} KB, held back {:.1} KB, sent ahead of a declaring submission {:.1} KB, \
+                 dwords landed whole that a byte merge would have mixed {:.0}",
                 f(self.title + self.landed),
                 f(self.title),
                 f(self.landed),
@@ -2272,7 +2346,8 @@ pub(crate) mod resent {
                 f(self.missed),
                 f(self.won) / 1024.0,
                 f(self.held) / 1024.0,
-                f(self.ahead) / 1024.0
+                f(self.ahead) / 1024.0,
+                f(self.dwords)
             )
         }
     }
@@ -3259,6 +3334,41 @@ mod landing_tests {
         assert_eq!(back.due(&[(0, usize::MAX)]), [(100, 180), (220, 270)]);
         assert!(back.is_empty() && back.bytes() == 0);
         assert!(super::landed_lately(Some(5), 6) && !super::landed_lately(Some(5), 7) && !super::landed_lately(None, 5));
+    }
+
+    /// A dword whose low bytes the card changed, over a top byte of the
+    /// title's record in title memory, lands whole; one the card did not
+    /// touch keeps the title's bytes; byte by byte (the switch off) the top
+    /// byte stays the title's, as before.
+    #[test]
+    fn a_dword_the_card_changed_in_part_lands_whole() {
+        // Title address 0x1000: dword 0 the card changed in its low three
+        // bytes (a float's mantissa), its top byte as before; dword 1 the
+        // card did not touch; the title wrote 0xf8 on both top bytes.
+        let held0 = [0x10u8, 0x20, 0x30, 0x3f, 1, 2, 3, 4];
+        let now = [0x11u8, 0x21, 0x31, 0x3f, 1, 2, 3, 4];
+        let title0 = [0x10u8, 0x20, 0x30, 0xf8, 1, 2, 3, 0xf8];
+        // Off: the mixed dword, as a byte merge makes it.
+        let (mut held, mut title) = (held0, title0);
+        super::merge_piece_won(&now, &mut held, &mut title, false);
+        assert_eq!(title, [0x11, 0x21, 0x31, 0xf8, 1, 2, 3, 0xf8]);
+        // On: widened first, then the same merge.
+        let (mut held, mut title) = (held0, title0);
+        assert_eq!(super::widen_to_dwords(0x1000, &now, &mut held, Some(&title)), (1, 1));
+        super::merge_piece_won(&now, &mut held, &mut title, false);
+        assert_eq!(title, [0x11, 0x21, 0x31, 0x3f, 1, 2, 3, 0xf8], "whole dword landed; untouched dword keeps the title's");
+        assert_eq!(held, [0x11, 0x21, 0x31, 0x3f, 1, 2, 3, 4], "the CPU's side takes it");
+        // Not on a dword line: by title address, and nothing outside the slice.
+        let (mut held, title) = ([7u8, 7, 7], [7u8, 9, 7]);
+        assert_eq!(super::widen_to_dwords(0x1002, &[8, 7, 7], &mut held, Some(&title)), (1, 1));
+        assert_eq!(held, [7, !7, 7], "dword 0x1000 widened over byte 0x1003 only; dword 0x1004 untouched");
+    }
+
+    #[test]
+    fn a_stretch_widens_to_whole_dwords_inside_itself() {
+        assert_eq!(super::dword_bounds(0x1000, 5, 9, 64), (4, 11));
+        assert_eq!(super::dword_bounds(0x1001, 0, 0, 64), (0, 2), "not before the stretch");
+        assert_eq!(super::dword_bounds(0x1000, 60, 61, 62), (60, 61), "nor past it");
     }
 
     /// Which copies a refresh sends changed dwords of.
@@ -4712,6 +4822,33 @@ impl Shadow {
         to - from
     }
 
+    /// [`land_dwords`] ahead of a landing's merge of `parts` (offsets from
+    /// `lo` in the copy) of a piece the card's bytes of which are at `now`
+    /// ([`widen_to_dwords`]). Returns the dwords a byte merge would have
+    /// mixed.
+    ///
+    /// # Safety
+    /// As [`Shadow::all_the_cards`].
+    unsafe fn widen_parts(&self, lo: usize, now: *const u8, parts: &[(usize, usize)]) -> u64 {
+        let mut mixed = 0u64;
+        let mut title = Vec::new();
+        let start = self.start as usize;
+        for &(a, b) in parts {
+            if a >= b {
+                continue;
+            }
+            // SAFETY: the caller's.
+            let card = unsafe { std::slice::from_raw_parts(now.add(a), b - a) };
+            // SAFETY: inside the mapping of the CPU's side (the caller's).
+            let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(lo + a), b - a) };
+            title.clear();
+            title.resize(b - a, 0);
+            let read = crate::host::read_into((start + lo + a) as *const u8, &mut title);
+            mixed += widen_to_dwords(start + lo + a, card, held, read.then_some(title.as_slice())).1;
+        }
+        mixed
+    }
+
     /// For [`card_wins`], ahead of a landing's merge of `parts` (offsets from
     /// `lo` in the copy) of a piece the card's bytes of which are at `now`:
     /// counts the title's bytes that are to take the card's value (title
@@ -5242,6 +5379,8 @@ impl Shadow {
             return 0;
         };
         let last = last_difference(gpu, old).unwrap_or(first);
+        let dwords = land_dwords();
+        let (first, last) = if dwords { dword_bounds(start + at, first, last, gpu.len()) } else { (first, last) };
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, old) = (&gpu[first..=last], &mut old[first..=last]);
         title.clear();
@@ -5252,6 +5391,12 @@ impl Shadow {
             // title's, and may have been written again since.
             // As in `copy_back`: the card's byte where it is not what it
             // was before the submission, else the title's.
+            if dwords {
+                let (_, mixed) = widen_to_dwords(start + at, gpu, old, Some(title));
+                if mixed > 0 {
+                    resent::note(self.start, self.len, resent::Resent { dwords: mixed, ..Default::default() });
+                }
+            }
             let mut differs = 0u8;
             let was = title.clone();
             let wins = card_wins();
@@ -5320,6 +5465,8 @@ impl Shadow {
             return 0;
         };
         let last = last_difference(gpu, held).unwrap_or(first);
+        let dwords = land_dwords();
+        let (first, last) = if dwords { dword_bounds(start + at, first, last, gpu.len()) } else { (first, last) };
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, held) = (&gpu[first..=last], &mut held[first..=last]);
         let skip: Vec<(usize, usize)> = {
@@ -5335,16 +5482,20 @@ impl Shadow {
         let was = title.clone();
         let mut changed = false;
         let mut won = 0u64;
+        let mut mixed = 0u64;
         for (a, b) in outside(at, at + n, skip) {
             let (a, b) = (a - at, b - at);
+            if dwords {
+                mixed += widen_to_dwords(start + at + a, &gpu[a..b], &mut held[a..b], mapped.then(|| &title[a..b])).1;
+            }
             // Title memory that is not mapped: the CPU's side keeps what
             // the card wrote, as before; `title` is scratch then.
             let (c, w) = merge_piece_won(&gpu[a..b], &mut held[a..b], &mut title[a..b], card_wins() && mapped);
             changed |= c;
             won += w;
         }
-        if won > 0 {
-            resent::note(self.start, self.len, resent::Resent { won, ..Default::default() });
+        if won > 0 || mixed > 0 {
+            resent::note(self.start, self.len, resent::Resent { won, dwords: mixed, ..Default::default() });
         }
         if !mapped && changed {
             // The CPU's side took the card's bytes; title memory did not.
@@ -5447,6 +5598,13 @@ impl Shadow {
             }
             let near: Vec<(usize, usize)> = skip.iter().copied().filter(|&(a, b)| a < hi && b > lo).collect();
             let parts: Vec<(usize, usize)> = outside(lo, hi, near).into_iter().map(|(a, b)| (a - lo, b - lo)).collect();
+            if land_dwords() && !card_wins() {
+                // SAFETY: as below; `now` stays as it is during the call.
+                let mixed = unsafe { self.widen_parts(lo, now as *const u8, &parts) };
+                if mixed > 0 {
+                    resent::note(self.start, self.len, resent::Resent { dwords: mixed, ..Default::default() });
+                }
+            }
             if card_wins() {
                 // Every byte of the parts goes as the card has it: the
                 // CPU's side is made to differ from it everywhere first.
