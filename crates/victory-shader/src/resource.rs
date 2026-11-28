@@ -369,10 +369,17 @@ pub fn track(
     for (block, (accesses, mut reads, loads)) in offset_at {
         reads.sort_unstable();
         reads.dedup();
-        if let Ok(proof) = t.waterfall(block, &accesses, &reads) {
-            out.waterfall.compares.extend(proof.compares);
-            out.waterfall.reads.extend(proof.reads);
-            out.waterfall.loads.extend(loads);
+        match t.waterfall(block, &accesses, &reads) {
+            Ok(proof) => {
+                out.waterfall.compares.extend(proof.compares);
+                out.waterfall.reads.extend(proof.reads);
+                out.waterfall.loads.extend(loads);
+            }
+            Err(why) => {
+                if std::env::var_os("VICTORY_WHY_WATERFALL").is_some() {
+                    eprintln!("WHY-WATERFALL table-offset loop in block {block} not proven: {why}");
+                }
+            }
         }
     }
     out.lane_copied = t.lane_copied.take();
@@ -2493,16 +2500,37 @@ impl<'a> Tracer<'a> {
         const LOOP: &str = "a descriptor read from the first lane outside a waterfall loop";
         const SPLIT: &str = "a waterfall loop nested in another or split over blocks";
         const SELECT: &str = "a waterfall loop whose compares do not select the access's lanes";
+        let sel = |k: u32| {
+            if std::env::var_os("VICTORY_WHY_WATERFALL").is_some() {
+                eprintln!("WHY-WATERFALL select check {k} fails");
+            }
+            SELECT
+        };
         const RETRY: &str = "a waterfall loop whose retry does not keep the lanes still waiting";
         let access = accesses[0];
         let block = &self.p.blocks[b];
         let lanes = self.lanes.ok_or(LOOP)?;
         let exit = block.insts.last().ok_or(LOOP)?;
-        if !matches!(block.exit, Exit::Branch { taken, not_taken } if taken == b && not_taken != b)
-            || exit.name() != "s_cbranch_execnz"
-        {
+        if !matches!(block.exit, Exit::Branch { taken, not_taken } if taken == b && not_taken != b) {
             return Err(LOOP);
         }
+        // The retry: `s_cbranch_execnz`, which reads EXEC; or RDNA2's
+        // `s_andn2_wrexec_b*` (EXEC narrowed, SCC = some lane left) then
+        // `s_cbranch_scc1` on that very SCC (the console compiler's form,
+        // P.4), whose remaining lanes are the EXEC the wrexec writes.
+        let retry_at: &Inst = match exit.name() {
+            "s_cbranch_execnz" => exit,
+            "s_cbranch_scc1" => {
+                let n = block.insts.len();
+                let prev = n.checked_sub(2).map(|k| &block.insts[k]).ok_or(LOOP)?;
+                let scc = exit.read(Reg::Scc).ok_or(LOOP)?;
+                if !prev.name().starts_with("s_andn2_wrexec_b") || prev.write(Reg::Scc) != Some(scc) {
+                    return Err(LOOP);
+                }
+                prev
+            }
+            _ => return Err(LOOP),
+        };
         let mask = |low: Option<Value>, high: Option<Value>| {
             let high = if self.p.wave64 { Some(high?) } else { None };
             lanes.mask_bits(low?, high)
@@ -2517,21 +2545,45 @@ impl<'a> Tracer<'a> {
         {
             return Err(SPLIT);
         }
-        let selected = exec(&block.insts[access]).ok_or(SELECT)?;
-        if accesses
-            .iter()
-            .any(|&i| exec(&block.insts[i]) != Some(selected))
-        {
-            return Err(SELECT);
+        if std::env::var_os("VICTORY_WHY_WATERFALL").is_some() {
+            let i = &block.insts[access];
+            let lo = i.read(Reg::S(EXEC));
+            eprintln!(
+                "WHY-WATERFALL access {} wave64 {}: EXEC read {:?}, as lanes {:?}",
+                i.name(),
+                self.p.wave64,
+                lo,
+                lo.map(|l| lanes.mask_bits(l, if self.p.wave64 { i.read(Reg::S(EXEC + 1)) } else { None }).is_some())
+            );
         }
-        let retry = exec(exit).ok_or(RETRY)?;
+        // The lanes an access runs for: the EXEC it reads; a scalar access
+        // reads none, and runs while the EXEC last written before it in the
+        // block holds (the loop's `v_cmpx`, say).
+        let exec_at = |i: usize| -> Option<Bool> {
+            exec(&block.insts[i]).or_else(|| {
+                let w = block.insts[..i].iter().rev().find(|x| x.write(Reg::S(EXEC)).is_some())?;
+                mask(w.write(Reg::S(EXEC)), w.write(Reg::S(EXEC + 1)))
+            })
+        };
+        let selected = exec_at(access).ok_or(sel(1))?;
+        if accesses.iter().any(|&i| exec_at(i) != Some(selected)) {
+            return Err(sel(2));
+        }
+        let retry = if std::ptr::eq(retry_at, exit) {
+            exec(exit)
+        } else {
+            mask(retry_at.write(Reg::S(EXEC)), retry_at.write(Reg::S(EXEC + 1)))
+        }
+        .ok_or(RETRY)?;
         let first = self.defs[reads[0].0 as usize].ok_or(LOOP)?;
-        let remaining = exec(self.inst(first)).ok_or(SELECT)?;
+        let remaining = exec(self.inst(first))
+            .or_else(|| (first.0 == b).then(|| exec_at(first.1)).flatten())
+            .ok_or(sel(3))?;
         if reads.iter().any(|v| {
             self.defs[v.0 as usize]
                 .is_none_or(|at| at.1 >= access || exec(self.inst(at)) != Some(remaining))
         }) {
-            return Err(SELECT);
+            return Err(sel(4));
         }
         let reach = (lanes.reach[b], true);
         let meet = |conditions: &[(Bool, bool)]| self.meet(lanes, conditions);
@@ -2607,12 +2659,12 @@ impl<'a> Tracer<'a> {
         if reads.iter().any(|v| !out.reads.contains(v))
             || meet(&[reach, (selected, true), (remaining, false)])
         {
-            return Err(SELECT);
+            return Err(sel(5));
         }
         // The access must take every match.
         required.extend([reach, (selected, false)]);
         if meet(&required) {
-            return Err(SELECT);
+            return Err(sel(6));
         }
         // The retry must keep exactly the lanes that were eligible but did
         // not perform the access.

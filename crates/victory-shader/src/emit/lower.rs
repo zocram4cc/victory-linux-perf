@@ -6384,6 +6384,9 @@ impl<'a> Lower<'a> {
             Ok(()) => Ok(()),
             Err(why) if effect => Err(unsupported(offset, why)),
             Err(why) => {
+                if std::env::var_os("VICTORY_WHY_DEFER").is_some() {
+                    eprintln!("WHY-DEFER {:#x} {}: {why}", inst.machine.offset, inst.name());
+                }
                 for &(_, v) in &inst.writes {
                     self.vals.insert(v, Val::Missing(why));
                 }
@@ -6513,6 +6516,31 @@ impl<'a> Lower<'a> {
                                 None => return false,
                             }
                             continue;
+                        }
+                        // A waterfall loop's first-lane read of a per-lane descriptor
+                        // (plain: no modifiers): its result is followed as well.
+                        if name == "v_readfirstlane_b32"
+                            && let Fields::Valu(f) = &i.fields
+                            && f.abs == 0
+                            && f.neg == 0
+                            && f.sdwa.is_none()
+                            && f.dpp.is_none()
+                        {
+                            match i.writes.first() {
+                                Some(&(_, w)) => todo.push(w),
+                                None => return false,
+                            }
+                            continue;
+                        }
+                        // A waterfall loop's compare of each lane's descriptor with the
+                        // first lane's, as the resource analysis recognized it
+                        // (`resource::Waterfall::compares`): lowered from the traced
+                        // sources, never from these values.
+                        if self.x.res.waterfall.compares.contains(&(bi, ii)) {
+                            continue;
+                        }
+                        if std::env::var_os("VICTORY_WHY_DEAD").is_some() {
+                            eprintln!("WHY-DESCRIPTOR-ONLY stops at {:#x} {name} (waterfall compares known: {})", i.machine.offset, self.x.res.waterfall.compares.len());
                         }
                         // Only the resource and sampler operands (never `soffset`,
                         // stored `data`, or `image_bvh` `BvhNodes::Memory` addresses).
@@ -14873,7 +14901,9 @@ impl<'a> Lower<'a> {
                                 let readers: Vec<String> = p.blocks.iter().flat_map(|bl| bl.insts.iter())
                                     .filter(|i| i.reads.iter().any(|r| r.1 == phi.value))
                                     .map(|i| format!("{:#x} {}", i.machine.offset, i.name())).collect();
-                                eprintln!("WHY-DEAD reg {:?} into {at:#x} from IR pred {q}: {why}; read by {readers:?}", phi.reg);
+                                let def = self.def_block.get(&arg).and_then(|&db| p.blocks[db].insts.iter().find(|i| i.writes.iter().any(|w| w.1 == arg))).map(|i| format!("{:#x} {}", i.machine.offset, i.name()));
+                                let phi_def = self.phi_at.get(&arg).map(|&(pb, _)| format!("a join in IR block {pb}"));
+                                eprintln!("WHY-DEAD reg {:?} into {at:#x} from IR pred {q}: {why}; arg made by {:?}; read by {readers:?}", phi.reg, def.or(phi_def));
                             }
                             self.dead_marker(qb, b, at);
                         }
