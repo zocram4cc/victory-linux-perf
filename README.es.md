@@ -1,118 +1,134 @@
-﻿[English](README.md) | [Русский](README.ru.md) | [简体中文](README.zh.md) | Español | [Português (BR)](README.pt-BR.md)
+﻿<p align="center">
+  <span style="font-size:64px">🦋</span>
+</p>
 
-# RAZDA4A XEN
+<h1 align="center">RAZDA4A XEN</h1>
 
-Capa de ejecución Direct3D 12 para Windows orientada a **GPUs AMD RDNA2 / RDNA3 / RDNA4**, **16 GB de RAM**, **CPUs de 6 núcleos**, **8–16 GB de VRAM** y **Windows 10 / 11** (y Linux mediante Proton / VKD3D-Proton).
+<p align="center">
+  Runtime Direct3D 12 para AMD RDNA.<br>
+  <b>Wave 11</b> · <b>~31 native / 62-63 FG</b>
+</p>
 
-No se incluyen archivos, assets ni ejecutables del juego. Debes aportar tu propia copia de *El Gran Simulador de Préstamo de Coches del Estudio Estrellado*.
+<p align="center">
+  <img alt="Versión: Wave 11" src="https://img.shields.io/badge/release-Wave%2011-2ea44f">
+  <a href="https://github.com/crossducking/RAZDA4A-XEN/archive/refs/heads/main.zip"><img alt="Descargar el ZIP de main" src="https://img.shields.io/badge/download-main%20ZIP-0969da"></a>
+  <a href="LICENSE"><img alt="Licencia GPL-3.0-or-later" src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue"></a>
+  <img alt="Windows 10/11 y Linux con Proton" src="https://img.shields.io/badge/platform-Windows%2010%2F11%20%7C%20Linux%20Proton-informational">
+</p>
 
-## Rendimiento Medido (FPS Nativos vs. Frame Generation)
+<p align="center">
+  <a href="README.md">English</a> ·
+  <a href="README.ru.md">Русский</a> ·
+  <a href="README.zh.md">简体中文</a> ·
+  Español ·
+  <a href="README.pt-BR.md">Português (BR)</a>
+</p>
 
-Todas las métricas separan **FPS nativos (Frame Gen OFF)** de **FPS mostrados (FSR 3.1.6 Frame Gen 2x)** indicando escena y hardware exactos.
+## Resultados
 
-### Base 16 GB VRAM / 16 GB RAM (Mundo Abierto, 1080p Series S, RT OFF)
-
-Medido en **Ryzen 5 5600 (6C/12T), Radeon RX 9060 XT 16 GB, 16 GB DDR4, Windows 10 (19045)** — pruebas de 180 s en mundo abierto + prueba de estabilidad Wave 11 de 22 minutos (18.393 cuadros), 0 errores, 0 OOM:
-
-| Métrica | Base (config upstream) | RAZDA4A XEN (Wave 7 / Wave 11) |
-|---|---|---|
-| **FPS nativos (FG OFF, Mundo Abierto)** | 14,08 media (71,03 ms, p99 152,1 ms / 1% low 6,6 FPS) | **18,19 p50** (54,97 ms), **16,17** media, 15,2–23,4 estable, p99.9 **478,6 ms** |
-| **FPS mostrados (FSR 3.1.6 FG 2x)** | 25–27 FPS (caídas a 15–20 por VSync) | **29,2 – 31,0 FPS** estables (anillo RGBA8 `HUDLessColor`, sin caídas VSync) |
-| Private Commit (estable) | 21,8 – 30+ GB (`0x8007000E` OOM) | **19,3 GB** (6,2 GB RAM WS, 5,5 GB commit libre) |
-| VRAM dedicada | 9,92 GB (`5,06 GB` pool de texturas) | **12,11 GB** (auto 8–24 GB DXGI; `0` rechazos VRAM en 22 min en Wave 11) |
-| GPU compartida (`NON_LOCAL`) | 6,68 GB (5,58 GB Series S) | **2,18 GB** (`-61%` vs Series S) |
-| Tráfico copy-back | 27,0 MB / cuadro | **0,5 MB / cuadro** |
-| CPU `preparing` / `heap buffers` | 45,8 ms / 821,1 ms máx. | **32,2 – 35,4 ms** / **33,8 ms máx.** (0 picos >50 ms) |
-| Vistas raw (`LIST_VIEWS`, Wave 11) | 372,1–575,8 null/cuadro (árboles/objetos desaparecían) | **0,0 null/cuadro** (28.212/cuadro; árboles, follaje, vallas y postes corregidos) |
-| Windows 10 D3D12 | Configuración manual Agility SDK | `D3D12Core.dll` incluido (Agility SDK 620) |
-
-### Verificación 8 GB VRAM — Safe Mode (PR #1 de `nathanbzrr`)
-
-Probado en **Ryzen 5 5500X3D, Radeon RX 7600 8 GB, 32 GB DDR4, Windows 11 (26340)** — 1080p Series S, Safe Mode (`65%` texturas / `2048 MB` targets / `768 MB` búferes), FSR FG 2x, 180 s:
-
-| Métrica | Antes del ajuste 8 GB | Después del ajuste a presupuesto vivo |
-|---|---:|---:|
-| **FPS nativos (sin FG)** | 3,67 | **12,7** (media 79,01 ms, p50 68,90 ms, p99 **242,26 ms** vs 1047,30 ms) |
-| **FPS mostrados (FSR FG 2x)** | 7,32 | **24,86** (1803 generados / 1803 renderizados) |
-| VRAM pico / presupuesto vivo | 6548 MB | **6169 MB** / 5934–5981 MB (`0` errores, `0` OOM, `0` device removal) |
-
-## Cambios Técnicos
-
-- **Wave 11 (follaje/objetos y binario portable):** corrige `372–575` vistas raw `NULL` por cuadro en `LIST_VIEWS` (elimina la desaparición de árboles, follaje, vallas, postes y señales); soporte `SW_64KB_D`; ajuste de residencia 16 GB (`0` rechazos VRAM en 22 min); binario portable **`x86-64-v3`** (AVX2/BMI2/FMA en AMD Zen 2–5 e Intel Haswell–Arrow Lake).
-- **Wave 6–7 (texturas, descriptores y estabilidad):** caché TLS de 8192 ranuras (`100%` aciertos), cola de texturas intercalada (retraso en cinemáticas `3936 -> 0`), prioridad normal de CPU y registro en archivo `VICTORY_LOG_FILE`.
-- **Memoria y OOM (`0x8007000E`):** `recycle_landed`, `emergency_reclaim()` proactivo, recuperación `E_OUTOFMEMORY`, Auto-VRAM DXGI (`8/12/16/24 GB`) y páginas físicas NVMe (`VICTORY_FILE_PHYSICAL=auto`).
-- **Presentación y controles:** `HUDLessColor` RGBA8 para FSR 3.1.6 FG, tearing swapchain, FSR 4.1.2 ML nativo, espera compute `5000 ms` (rostros), escudo RDNA4 (`240cb516c1af0bc3`), ratón/teclado PC (`F2`/`~` cámara, `F3` HUD FPS).
-
-## Límites Conocidos (Trabajo Activo en `dev`)
-
-- Las zonas urbanas densas aún pueden bajar a `5–10` FPS nativos y generar pausas largas en sesiones extensas (**Wave 12** en curso en `dev`).
-- Ray Tracing permanece desactivado mientras se estabilizan el render base y los 30 FPS nativos.
-- El primer inicio compila shaders PSO (1–3 min con tirones); ejecuta `warm_shaders.bat` tras cerrar para que el segundo inicio sea mucho más fluido.
-
-## Compatibilidad de Hardware y FAQ
-
-| Pregunta | Respuesta |
+| | |
 |---|---|
-| **¿GPUs AMD soportadas?** | **AMD RDNA2 / RDNA3 / RDNA4** (RX 6000 / 7000 / 9000; requiere DX12 Ultimate + Mesh Shaders). |
-| **¿NVIDIA / Intel Arc?** | **No soportado en este fork.** En RTX hay pantalla negra/crashes; usa forks NVIDIA de la comunidad como [`trustno1-coder/VIctory-NVIDIA`](https://github.com/trustno1-coder/VIctory-NVIDIA). |
-| **¿CPU Intel + GPU AMD?** | **Sí.** Desde Wave 11 el binario usa `-C target-cpu=x86-64-v3`. |
-| **¿8 GB / 6 GB / <=4 GB VRAM?** | **8 GB:** funciona con **Safe Mode** (12,7 nativos / 24,86 FG en RX 7600; probado en RX 6600). **6 GB:** experimental/lento (Safe Mode + FG OFF). **<=4 GB, RDNA1 (RX 5500/5700), GTX 10/16:** no soportado (sin Mesh Shaders o poca VRAM). |
-| **¿16 GB RAM / HDD?** | **16 GB RAM:** soportado en **SSD NVMe/SATA** con pagefile de 24–32 GB (`pagefile_16gb_ram.ps1`) o preset `Low-Commit NVMe`. **HDD:** no soportado. |
-| **¿Necesito el GDK filtrado?** | **No.** Runtime open-source independiente (`GPL-3.0-or-later`). |
-| **¿Dónde enviar bugs y logs?** | Ejecuta **`collect_logs.bat`** (o **Export Logs** en el lanzador) para generar `logs\bug_report_*.txt` sin rutas privadas y adjúntalo en [GitHub Issues](https://github.com/crossducking/RAZDA4A-XEN/issues). |
+| **Versión** | Wave 11 (`main`) |
+| **Equipo** | Radeon RX 9060 XT + Ryzen 7 7800X3D |
+| **FPS** | **~31 native / 62-63 FG** |
 
-## Inicio Rápido (Windows)
+`62-63 FG` es frame generation. El nativo es ~31.
 
-1. Descarga `main` (**Code -> Download ZIP** o `git clone --branch main https://github.com/crossducking/RAZDA4A-XEN.git`) y descomprime. Incluye `D3D12\D3D12Core.dll` y `fidelityfx\*.dll`.
-2. Ejecuta **`RAZDA4A XEN.bat`**, pulsa **Browse...** para elegir **`your_executable.exe`** (guardado en UTF-8 en `config.bat`), selecciona perfil y Frame Generation y pulsa **Launch**.
-   - Lanzadores externos (`VILauncher`, etc.): usa **`RAZDA4A XEN.bat --no-gui`**.
+Las tarjetas de 8 GB usan Safe Mode. Una RX 7600 midió **12,7 nativos / 24,86 FG**. Tablas: [Rendimiento](docs/es/performance.md).
+
+## Inicio rápido
+
+Este repositorio no trae archivos del juego. Usa tu propia copia.
+
+1. Descarga [main.zip](https://github.com/crossducking/RAZDA4A-XEN/archive/refs/heads/main.zip) o `git clone --branch main https://github.com/crossducking/RAZDA4A-XEN.git` y descomprime.
+2. Arranca **`RAZDA4A_XEN.exe`** o **`RAZDA4A XEN.bat`**.
+3. En el lanzador, elige el `.exe` del juego, un perfil y frame generation, y pulsa **Launch**.
+
+No ejecutes el `.exe` del juego directamente. El runtime solo entra si lo arranca el lanzador.
+
+`F2` o `~` alterna la cámara con el ratón (`Esc` suelta el cursor). `F3` alterna el FPS.
+
+En Linux, `launch_linux_proton.sh`. Presets y Linux: [Cómo ejecutarlo](docs/es/running.md).
+
+## Requisitos
+
+| | Wave 11 |
+|---|---|
+| **GPU** | AMD RDNA2 / RDNA3 / RDNA4 (RX 6000 / 7000 / 9000), DX12 Ultimate y mesh shaders |
+| **CPU** | x86-64-v3 (AMD Zen 2–5, Intel Haswell hasta Arrow Lake) |
+| **Memoria** | 16 GB de RAM en SSD. Commit justo: pagefile de 24–32 GB (`pagefile_16gb_ram.ps1`). 8–12 GB de VRAM: Safe Mode |
+| **SO** | Windows 10 / 11, o Linux con Proton / VKD3D-Proton |
+| **No es esta build** | NVIDIA, Intel Arc, RDNA1, GTX 10/16, tarjetas de 4 GB y HDD |
+
+La versión NVIDIA está en camino. AMD salió primero. Mientras tanto: [trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA).
+
+## Presets
 
 | Archivo | Uso |
 |---|---|
-| `RAZDA4A XEN.bat` | Lanzador principal (selector `.exe`, FG ON/OFF, auto-Safe-Mode 8 GB, Warm Shaders y Export Logs) |
-| `presets\1_Low_Commit_NVMe_16GB.bat` | 16 GB RAM / pagefile pequeño: páginas físicas en NVMe |
-| `presets\2_Max_FPS_Experimental_CBV.bat` | Equilibrado + CBV in-place experimental (`VICTORY_PORT_CBV=1`) |
-| `presets\3_Native_No_FG_Zero_Latency.bat` | Nativo sin Frame Gen, latencia mínima |
-| `presets\4_Safe_Mode_8GB_12GB_VRAM.bat` | Safe Mode 8–12 GB VRAM (`65%` / `2048 MB` targets / `768 MB` búferes, VSync ON) |
-| `warm_shaders.bat` / `collect_logs.bat` | Precompilar PSOs / exportar reporte sanitizado con `logs\last_run.log` |
+| `RAZDA4A XEN.bat` | Ventana del lanzador: `.exe` del juego, frame generation, Safe Mode en 8 GB |
+| `presets\1_Low_Commit_NVMe_16GB.bat` | 16 GB de RAM, páginas en NVMe |
+| `presets\2_Max_FPS_Experimental_CBV.bat` | Equilibrado, más búferes de constantes in-place |
+| `presets\3_Native_No_FG_Zero_Latency.bat` | Solo nativo, frame generation apagado |
+| `presets\4_Safe_Mode_8GB_12GB_VRAM.bat` | 8–12 GB de VRAM |
 
-Controles: **`F2` / `~`** alterna cámara con ratón (`Esc` libera cursor), **`F3`** alterna HUD FPS.
+## FAQ
 
-## Inicio Rápido (Linux — Proton / Wine / VKD3D-Proton)
+<details>
+<summary>¿Incluye el juego?</summary>
 
-1. Instala **Proton Experimental / GE-Proton** (`umu-run`, Steam o Lutris) con **Mesa RADV** en GPU AMD RDNA2+.
-2. Ejecuta `launch_linux_proton.sh` (configura automáticamente `WINEDLLOVERRIDES="d3d12,d3d12core=n"` para evitar que `D3D12Core.dll` de Windows 10 bloquee `vkd3d-proton` y cause 1 FPS / pantalla 3D vacía):
-   ```bash
-   chmod +x launch_linux_proton.sh
-   GAME_DIR="/path/to/unpacked" \
-   GAME_EXE="/path/to/unpacked/your_executable.exe" \
-   RUNNER="umu-run" \
-   XEN_PROFILE="safe" \
-   XEN_FRAMEGEN="0" \
-   ./launch_linux_proton.sh
-   ```
+No. Aporta tu copia. No hace falta un GDK filtrado. Aquí no hay enlaces de descarga del juego.
+</details>
 
-## Seguridad, Falsos Positivos y Compilación desde Código Fuente
+<details>
+<summary>¿NVIDIA o Intel Arc?</summary>
 
-Brave/Edge y Windows Defender ML pueden marcar ZIPs sin firmar con `.exe` + `.bat` + `.ps1` como **`Trojan:Script/Wacatac.H!ml`**. Verifica el SHA-256 o compila tú mismo desde `dev`:
+Wave 11 es AMD RDNA. La versión NVIDIA está en camino. AMD salió primero. El fork de la comunidad está arriba. Intel Arc no está soportado. Un adaptador que no sea AMD puede quedar en negro o cerrarse.
+</details>
 
-```powershell
-Get-FileHash .\RAZDA4A_XEN.exe -Algorithm SHA256
-```
+<details>
+<summary>¿8 GB de VRAM, o menos?</summary>
 
-- Wave 11 `RAZDA4A_XEN.exe` (`x86-64-v3`) SHA-256: `4ab8fcf7e2614cb669ad54069011d8cb0bed74b3eac7b994854c278f2a862622` (todos los DLL en [`SHA256SUMS.txt`](SHA256SUMS.txt)).
+8–12 GB: Safe Mode (preset 4, o el lanzador lo elige en 8 GB). RX 7600: 12,7 nativos / 24,86 FG. 6 GB o menos no es una configuración soportada. RDNA1 y GTX 10/16 no tienen los mesh shaders que esta build necesita.
+</details>
 
-```powershell
-git clone --branch dev https://github.com/crossducking/RAZDA4A-XEN.git
-cd RAZDA4A-XEN
-cargo xtask agility
-$env:RUSTFLAGS = "-C target-cpu=x86-64-v3"
-cargo build --release --locked -p victory
-```
+<details>
+<summary>¿Ray tracing?</summary>
 
-## Ramas y Licencia
+Apagado en Wave 11. El constructor de estructuras de ray tracing no se ejecuta.
+</details>
 
-- `main`: binario precompilado, DLLs, presets, lanzador, checksums y documentación.
-- `dev`: código fuente Rust completo, tests, `xtask policy`, CI y `AGENTS.md`.
+<details>
+<summary>¿Disco duro, o 16 GB de RAM?</summary>
 
-Derivado de VIctory bajo **GPL-3.0-or-later** ([LICENSE](LICENSE)). Código completo en [`dev`](https://github.com/crossducking/RAZDA4A-XEN/tree/dev).
+Un HDD no está soportado. Usa un SSD NVMe o SATA. Con 16 GB de RAM, `pagefile_16gb_ram.ps1` o el preset 1 cubren un pagefile justo.
+</details>
+
+## Si algo falla
+
+- El primer arranque compila pipelines (cerca de 1–3 minutos de tirones). Cierra, ejecuta `warm_shaders.bat` una vez y vuelve a abrir el lanzador.
+- Windows Defender puede marcar el ZIP sin firmar como `Trojan:Script/Wacatac.H!ml`. Compara `RAZDA4A_XEN.exe` con [SHA256SUMS.txt](SHA256SUMS.txt): `4ab8fcf7e2614cb669ad54069011d8cb0bed74b3eac7b994854c278f2a862622`.
+- `collect_logs.bat`, o **Export Logs** en el lanzador, escribe `logs\bug_report_*.txt` en este PC.
+- Linux a ~1 FPS o imagen vacía: usa `launch_linux_proton.sh`, que evita que `D3D12Core.dll` sustituya a vkd3d-proton.
+
+[Cómo ejecutarlo](docs/es/running.md) · [Seguridad y compilación](docs/es/security-and-build.md)
+
+## Acerca del proyecto
+
+RAZDA4A XEN es una capa Direct3D 12 de código abierto para 16 GB de RAM, CPUs de 6 núcleos y 8–16 GB de VRAM. Wave 11 en `main` es el lanzador, los presets, las DLL y estas páginas. El código Rust está en [`dev`](https://github.com/crossducking/RAZDA4A-XEN/tree/dev).
+
+## Créditos
+
+- [VIctory](https://github.com/Marvisak/VIctory), de Marvisak, upstream, bajo GPL-3.0-or-later ([LICENSE](LICENSE)).
+- `nathanbzrr` — Safe Mode de 8 GB, publicado en `main`.
+- [trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA) — fork NVIDIA de la comunidad.
+
+## Documentación
+
+- [Rendimiento](docs/es/performance.md)
+- [Cómo ejecutarlo](docs/es/running.md)
+- [Hardware](docs/es/hardware.md)
+- [Qué trae Wave 11](docs/es/technical-changes.md)
+- [Límites conocidos](docs/es/known-limits.md)
+- [Seguridad, checksums y compilación](docs/es/security-and-build.md)
+- [Ramas y licencia](docs/es/project.md)

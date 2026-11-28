@@ -1,124 +1,134 @@
-﻿[English](README.md) | Русский | [简体中文](README.zh.md) | [Español](README.es.md) | [Português (BR)](README.pt-BR.md)
+﻿<p align="center">
+  <span style="font-size:64px">🦋</span>
+</p>
 
-# RAZDA4A XEN
+<h1 align="center">RAZDA4A XEN</h1>
 
-Direct3D 12 Windows-рантайм для **видеокарт AMD RDNA2 / RDNA3 / RDNA4**, нацеленный на **16 ГБ ОЗУ**, **6-ядерные CPU**, **8–16 ГБ VRAM** и **Windows 10 / 11** (а также Linux через Proton / VKD3D-Proton).
+<p align="center">
+  Direct3D 12 рантайм для AMD RDNA.<br>
+  <b>Wave 11</b> · <b>~31 native / 62-63 FG</b>
+</p>
 
-Файлы игры, ассеты и исполняемые файлы игры в репозиторий не входят — используйте собственную копию *Великого симулятора автоугона от Звёздной студии*.
+<p align="center">
+  <img alt="Релиз: Wave 11" src="https://img.shields.io/badge/release-Wave%2011-2ea44f">
+  <a href="https://github.com/crossducking/RAZDA4A-XEN/archive/refs/heads/main.zip"><img alt="Скачать ZIP ветки main" src="https://img.shields.io/badge/download-main%20ZIP-0969da"></a>
+  <a href="LICENSE"><img alt="Лицензия GPL-3.0-or-later" src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue"></a>
+  <img alt="Windows 10/11 и Linux через Proton" src="https://img.shields.io/badge/platform-Windows%2010%2F11%20%7C%20Linux%20Proton-informational">
+</p>
 
-## Подтверждённые замеры (Нативный FPS отдельно от Frame Generation)
+<p align="center">
+  <a href="README.md">English</a> ·
+  Русский ·
+  <a href="README.zh.md">简体中文</a> ·
+  <a href="README.es.md">Español</a> ·
+  <a href="README.pt-BR.md">Português (BR)</a>
+</p>
 
-Во всех таблицах ниже **нативный FPS (без Frame Gen)** всегда указан отдельно от **отображаемого FPS (FSR 3.1.6 Frame Gen 2x)** с указанием точной сцены и конфигурации.
+## Результаты
 
-### 16 ГБ VRAM / 16 ГБ RAM (Открытый мир, 1080p Series S, RT выкл.)
-
-Замерено на **Ryzen 5 5600 (6C/12T), Radeon RX 9060 XT 16 ГБ, 16 ГБ DDR4, Windows 10 (19045)** — 180-секундные прогоны в открытом мире + 22-минутный прогон Wave 11 (18 393 кадра), 0 ошибок, 0 OOM:
-
-| Метрика | База (апстрим-конфиг) | RAZDA4A XEN (Wave 7 / Wave 11) |
-|---|---|---|
-| **Нативный FPS (FG выкл., открытый мир)** | 14.08 средн. (71.03 мс, p99 152.1 мс / 1% low 6.6 FPS) | **18.19 p50** (54.97 мс), **16.17** средн., 15.2–23.4 стабильно, p99.9 **478.6 мс** |
-| **Отображаемый FPS (FSR 3.1.6 FG 2x)** | 25–27 FPS (падения до 15–20 из-за VSync) | **29.2 – 31.0 FPS** стабильно (HUDLess RGBA8-кольцо, без просадок VSync) |
-| Private Commit (устоявшийся) | 21.8 – 30+ ГБ (`0x8007000E` OOM) | **19.3 ГБ** (6.2 ГБ RAM WS, 5.5 ГБ свободного Commit) |
-| Выделенная VRAM | 9.92 ГБ (`5.06 ГБ` пул текстур) | **12.11 ГБ** (авто 8–24 ГБ DXGI; `0` отказов по VRAM за 22 мин в Wave 11) |
-| Shared GPU (`NON_LOCAL`) | 6.68 ГБ (5.58 ГБ Series S) | **2.18 ГБ** (`-61%` к базе Series S) |
-| Трафик copy-back | 27.0 МБ / кадр | **0.5 МБ / кадр** |
-| CPU `preparing` / `heap buffers` | 45.8 мс / 821.1 мс макс. | **32.2 – 35.4 мс** / **33.8 мс макс.** (0 пиков >50 мс) |
-| Raw buffer views (`LIST_VIEWS`, Wave 11) | 372.1–575.8 null/кадр (пропадали деревья/объекты) | **0.0 null/кадр** (28 212/кадр, 932.5 невыровн. -> 0 null; деревья/листва/заборы починены) |
-| Windows 10 D3D12 | Ручная настройка Agility SDK | Встроенный `D3D12Core.dll` (Agility SDK 620) |
-
-### Проверка 8 ГБ VRAM — Safe Mode (PR #1 от `nathanbzrr`)
-
-Замерено на **Ryzen 5 5500X3D, Radeon RX 7600 8 ГБ, 32 ГБ DDR4, Windows 11 (26340)** — 1080p Series S, Safe Mode (`65%` лимит текстур / `2048 МБ` рендер-таргеты / `768 МБ` буферы карты), FSR FG 2x, 180 с:
-
-| Метрика | До подгонки 8 ГБ | После подгонки под живой бюджет |
-|---|---:|---:|
-| **Нативный FPS (без FG)** | 3.67 | **12.7** (средн. 79.01 мс, p50 68.90 мс, p99 **242.26 мс** против 1047.30 мс) |
-| **Отображаемый FPS (FSR FG 2x)** | 7.32 | **24.86** (1803 сгенерировано / 1803 отрендерено) |
-| Пик VRAM / живой бюджет | 6548 МБ | **6169 МБ** / 5934–5981 МБ (`0` ошибок, `0` OOM, `0` device removal) |
-
-## Технические изменения
-
-- **Wave 11 (деревья/листва и портативный бинарь):** исправлено `372–575` принудительных `NULL` raw-буферных view за кадр в `LIST_VIEWS` (перестали пропадать деревья, листва, заборы, столбы и знаки); поддержка `SW_64KB_D`; донастройка 16 ГБ VRAM residency (`0` отказов `card has no room` и `host memory pressure` за 22 минуты); переносимый бинарь **`x86-64-v3`** (полный AVX2/BMI2/FMA на AMD Zen 2–5 и Intel Haswell–Arrow Lake без AMD-специфичных расширений `znver3`).
-- **Wave 6–7 (текстуры, дескрипторы и стабильность):** HashMap + 8192-слотовый TLS-кэш дескрипторов (`100%` попаданий), best-fit пул, ограниченная `let_go_idle`, перемежающаяся очередь текстур (очередь в катсценах `3936 -> 0` кадров), гистерезис для 16 ГБ RAM, обычный приоритет CPU (не вешает фоновые приложения) и запись лога в файл `VICTORY_LOG_FILE`.
-- **Память и OOM (`0x8007000E`):** ограниченные пулы прелюдий, мгновенная переработка `recycle_landed`, упреждающая `emergency_reclaim()` (<2.5 ГБ свободного Commit или >=88% Shared GPU), восстановление при `E_OUTOFMEMORY`, `MEM_RESET`, динамический DXGI Auto-VRAM (`8/12/16/24 ГБ`), опциональный NVMe-файл физических страниц (`VICTORY_FILE_PHYSICAL=auto`).
-- **Отрисовка и управление:** 3-слотовый RGBA8-захват `HUDLessColor` для FSR 3.1.6 FG, swapchain с tearing, нативный апскейл AMD FSR 4.1.2 ML (откат на FSR 3.1), бюджет ожидания compute `5000 мс` (исправление лиц), защита от краш-шейдера RDNA4 (`240cb516c1af0bc3`), управление ПК (`F2`/`~` — обзор мышью, `F3` — HUD FPS в правом верхнем углу).
-
-## Известные ограничения (в работе на `dev`)
-
-- В плотных городских районах нативный FPS может падать до `5–10` с длинными статтерами на таблице дескрипторов в долгих сессиях (активно решается в **Wave 12** на `dev`).
-- Трассировка лучей (RT) отключена на время стабилизации базового рендера, VRAM и достижения нативных 30 FPS.
-- Первый запуск компилирует PSO-шейдеры (1–3 минуты возможных фризов); со второго запуска и после `warm_shaders.bat` работает заметно плавнее.
-
-## Совместимость железа и FAQ
-
-| Вопрос | Ответ |
+| | |
 |---|---|
-| **Какие AMD GPU поддерживаются?** | **AMD RDNA2 / RDNA3 / RDNA4** (RX 6000 / 7000 / 9000 — требуются DX12 Ultimate и Mesh Shaders). |
-| **Работает ли на NVIDIA / Intel Arc?** | **Нет.** Этот форк только для AMD RDNA; на RTX будет чёрный экран/вылет. Для NVIDIA используйте форки сообщества, например [`trustno1-coder/VIctory-NVIDIA`](https://github.com/trustno1-coder/VIctory-NVIDIA). |
-| **Intel CPU + AMD GPU подойдёт?** | **Да.** Сборки начиная с Wave 11 используют универсальный `-C target-cpu=x86-64-v3`. |
-| **8 ГБ / 6 ГБ / <=4 ГБ VRAM?** | **8 ГБ:** работает через **Safe Mode** (проверено: 12.7 native / 24.86 FG на RX 7600, также проверено на RX 6600). **6 ГБ:** экспериментально и тяжело (Safe Mode + FG выкл.). **<=4 ГБ, RDNA1 (RX 5500/5700), GTX 10/16:** не поддерживаются (нет аппаратных Mesh Shaders или слишком мало VRAM). |
-| **16 ГБ ОЗУ / HDD?** | **16 ГБ ОЗУ:** поддерживается на **NVMe/SATA SSD** с файлом подкачки 24–32 ГБ (`pagefile_16gb_ram.ps1`) или пресетом `Low-Commit NVMe`. **HDD:** не поддерживается (подгрузка / DirectStorage). |
-| **Нужен ли утёкший GDK?** | **Нет.** Полностью автономный open-source рантайм (`GPL-3.0-or-later`). |
-| **Куда отправлять баги и логи?** | Запустите **`collect_logs.bat`** (или кнопку **Export Logs** в лаунчере) — создастся очищенный от личных путей `logs\bug_report_*.txt`, приложите его в [GitHub Issues](https://github.com/crossducking/RAZDA4A-XEN/issues). |
+| **Релиз** | Wave 11 (`main`) |
+| **Машина** | Radeon RX 9060 XT + Ryzen 7 7800X3D |
+| **FPS** | **~31 native / 62-63 FG** |
 
-## Быстрый старт (Windows)
+`62-63 FG` — это frame generation. Нативно — ~31.
 
-1. Скачайте ветку `main` (**Code -> Download ZIP** или `git clone --branch main https://github.com/crossducking/RAZDA4A-XEN.git`) и распакуйте (например, в `D:\RAZDA4A-XEN\`). Все DLL (`D3D12\D3D12Core.dll`, `fidelityfx\*.dll`) уже внутри.
-2. Запустите **`RAZDA4A XEN.bat`**, через **Browse...** выберите **`ваш_запускной_файл.exe`** (сохранится в `config.bat` в UTF-8, включая русские пути), выберите профиль и галочку Frame Generation и нажмите **Launch**.
-   - Для сторонних лаунчеров (`VILauncher` и т.д.): используйте **`RAZDA4A XEN.bat --no-gui`** после настройки `config.bat`.
+Карты на 8 ГБ идут в Safe Mode. На RX 7600 замерено **12.7 native / 24.86 FG**. Таблицы: [Замеры](docs/ru/performance.md).
+
+## Быстрый старт
+
+В репозитории нет файлов игры. Используйте свою копию.
+
+1. Скачайте [main.zip](https://github.com/crossducking/RAZDA4A-XEN/archive/refs/heads/main.zip) или `git clone --branch main https://github.com/crossducking/RAZDA4A-XEN.git` и распакуйте.
+2. Запустите **`RAZDA4A_XEN.exe`** или **`RAZDA4A XEN.bat`**.
+3. В лаунчере выберите `.exe` игры, профиль и frame generation, затем **Launch**.
+
+Не запускайте исполняемый файл игры напрямую. Рантайм подключается только через лаунчер.
+
+`F2` или `~` — обзор мышью (`Esc` отпускает курсор). `F3` — показ FPS.
+
+Linux: `launch_linux_proton.sh`. Пресеты и Linux: [Как запускать](docs/ru/running.md).
+
+## Требования
+
+| | Wave 11 |
+|---|---|
+| **GPU** | AMD RDNA2 / RDNA3 / RDNA4 (RX 6000 / 7000 / 9000), DX12 Ultimate и mesh shaders |
+| **CPU** | x86-64-v3 (AMD Zen 2–5, Intel от Haswell до Arrow Lake) |
+| **Память** | 16 ГБ ОЗУ на SSD. Малый commit: файл подкачки 24–32 ГБ (`pagefile_16gb_ram.ps1`). 8–12 ГБ VRAM: Safe Mode |
+| **ОС** | Windows 10 / 11 или Linux через Proton / VKD3D-Proton |
+| **Не эта сборка** | NVIDIA, Intel Arc, RDNA1, GTX 10/16, карты класса 4 ГБ, HDD |
+
+Версия для NVIDIA в пути. Сначала вышла AMD. До неё: [trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA).
+
+## Пресеты
 
 | Файл | Назначение |
 |---|---|
-| `RAZDA4A XEN.bat` | Основной лаунчер (выбор `.exe`, FG вкл/выкл, авто-Safe-Mode для 8 ГБ, кнопки Warm Shaders и Export Logs) |
-| `presets\1_Low_Commit_NVMe_16GB.bat` | Для 16 ГБ RAM и малого pagefile: NVMe-файл физических страниц (`VICTORY_FILE_PHYSICAL=1`) |
-| `presets\2_Max_FPS_Experimental_CBV.bat` | Balanced + экспериментальные in-place CBV (`VICTORY_PORT_CBV=1`) |
-| `presets\3_Native_No_FG_Zero_Latency.bat` | Чистый нативный рендер без Frame Gen, минимальная задержка |
-| `presets\4_Safe_Mode_8GB_12GB_VRAM.bat` | Safe Mode для 8–12 ГБ VRAM (`65%` / `2048 МБ` таргеты / `768 МБ` буферы, VSync вкл.) |
-| `warm_shaders.bat` | Предкомпиляция встреченных PSO после первой сессии |
-| `collect_logs.bat` | Сбор очищенного багрепорта (железо + `logs\last_run.log`) |
-| `pagefile_16gb_ram.ps1` / `backup_saves.bat` | Помощник файла подкачки 16–32 ГБ / бэкап `data\` |
+| `RAZDA4A XEN.bat` | Окно лаунчера: `.exe` игры, frame generation, Safe Mode на 8 ГБ |
+| `presets\1_Low_Commit_NVMe_16GB.bat` | 16 ГБ ОЗУ, страницы на NVMe |
+| `presets\2_Max_FPS_Experimental_CBV.bat` | Balanced плюс in-place константные буферы |
+| `presets\3_Native_No_FG_Zero_Latency.bat` | Только натив, frame generation выключен |
+| `presets\4_Safe_Mode_8GB_12GB_VRAM.bat` | 8–12 ГБ VRAM |
 
-Управление: **`F2` / `~`** — обзор мышью (`Esc` — отпустить курсор), **`F3`** — HUD FPS в правом верхнем углу.
+## FAQ
 
-## Быстрый старт (Linux — Proton / Wine / VKD3D-Proton)
+<details>
+<summary>Игра внутри?</summary>
 
-1. Установите **Proton Experimental / GE-Proton** (через `umu-run`, Steam или Lutris) и **Mesa RADV** на AMD RDNA2+ GPU.
-2. Запустите `launch_linux_proton.sh` (скрипт автоматически выставляет `WINEDLLOVERRIDES="d3d12,d3d12core=n"`, чтобы встроенный Windows 10 `D3D12Core.dll` не перекрывал `vkd3d-proton` и не вызывал 1 FPS / пустой 3D-экран):
-   ```bash
-   chmod +x launch_linux_proton.sh
-   GAME_DIR="/path/to/unpacked" \
-   GAME_EXE="/path/to/unpacked/your_executable.exe" \
-   RUNNER="umu-run" \
-   XEN_PROFILE="safe" \
-   XEN_FRAMEGEN="0" \
-   ./launch_linux_proton.sh
-   ```
-   Лог пишется в `logs/last_run.log`. На картах 12–16+ ГБ VRAM можно использовать `XEN_PROFILE=balanced`.
+Нет. Нужна своя копия. Утёкший GDK не нужен. Ссылок на скачивание игры здесь нет.
+</details>
 
-## Безопасность, ложные срабатывания антивируса и сборка из исходников
+<details>
+<summary>NVIDIA или Intel Arc?</summary>
 
-Браузеры (Brave/Edge) и Windows Defender ML могут помечать неподписанные ZIP-архивы с `.exe` + `.bat` + `.ps1` как **`Trojan:Script/Wacatac.H!ml`**. Не доверяйте неподписанным бинарям на слово — сверьте хеш или соберите бинарь сами из открытой ветки `dev`:
+Wave 11 — это AMD RDNA. Версия для NVIDIA в пути. Сначала вышла AMD. Форк сообщества — выше. Intel Arc не поддерживается. Не-AMD адаптер может дать чёрный экран или вылет.
+</details>
 
-```powershell
-# Проверка хеша по SHA256SUMS.txt
-Get-FileHash .\RAZDA4A_XEN.exe -Algorithm SHA256
-```
+<details>
+<summary>8 ГБ VRAM или меньше?</summary>
 
-- Wave 11 `RAZDA4A_XEN.exe` (`x86-64-v3`) SHA-256: `4ab8fcf7e2614cb669ad54069011d8cb0bed74b3eac7b994854c278f2a862622` (хеши всех DLL см. в [`SHA256SUMS.txt`](SHA256SUMS.txt)).
+8–12 ГБ: Safe Mode (пресет 4, на 8 ГБ лаунчер выбирает его сам). RX 7600: 12.7 native / 24.86 FG. 6 ГБ и меньше — не поддерживаемая конфигурация. У RDNA1 и GTX 10/16 нет mesh shaders, которые нужны этой сборке.
+</details>
 
-Сборка из исходников (ветка `dev`, Rust MSVC):
+<details>
+<summary>Трассировка лучей?</summary>
 
-```powershell
-git clone --branch dev https://github.com/crossducking/RAZDA4A-XEN.git
-cd RAZDA4A-XEN
-cargo xtask agility
-$env:RUSTFLAGS = "-C target-cpu=x86-64-v3"
-cargo build --release --locked -p victory
-```
+В Wave 11 выключена. Построитель структур трассировки не запускается.
+</details>
 
-## Ветки и лицензия
+<details>
+<summary>Жёсткий диск или 16 ГБ ОЗУ?</summary>
 
-- `main`: готовый бинарь, DLL, пресеты, лаунчер, контрольные суммы, документация.
-- `dev`: полный исходный код на Rust, юнит-тесты, `xtask policy`, CI, `AGENTS.md`.
+HDD не поддерживается. Нужен NVMe или SATA SSD. На 16 ГБ ОЗУ тесный pagefile закрывают `pagefile_16gb_ram.ps1` или пресет 1.
+</details>
 
-Производный проект от VIctory под лицензией **GPL-3.0-or-later** ([LICENSE](LICENSE)). Полный исходный код доступен в [`dev`](https://github.com/crossducking/RAZDA4A-XEN/tree/dev).
+## Если что-то не так
+
+- Первый запуск компилирует пайплайны (около 1–3 минут подёргиваний). Закройте, один раз запустите `warm_shaders.bat` и снова откройте лаунчер.
+- Windows Defender может пометить неподписанный ZIP как `Trojan:Script/Wacatac.H!ml`. Сверьте `RAZDA4A_XEN.exe` с [SHA256SUMS.txt](SHA256SUMS.txt): `4ab8fcf7e2614cb669ad54069011d8cb0bed74b3eac7b994854c278f2a862622`.
+- `collect_logs.bat` или **Export Logs** в лаунчере пишет `logs\bug_report_*.txt` на этом ПК.
+- Linux около 1 FPS или пустая картинка: используйте `launch_linux_proton.sh`, он не даёт `D3D12Core.dll` подменить vkd3d-proton.
+
+[Как запускать](docs/ru/running.md) · [Безопасность и сборка](docs/ru/security-and-build.md)
+
+## О проекте
+
+RAZDA4A XEN — open-source слой Direct3D 12 для 16 ГБ ОЗУ, 6-ядерных CPU и 8–16 ГБ VRAM. Wave 11 на `main` — это лаунчер, пресеты, DLL и эти страницы. Исходники на Rust — в [`dev`](https://github.com/crossducking/RAZDA4A-XEN/tree/dev).
+
+## Благодарности
+
+- [VIctory](https://github.com/Marvisak/VIctory) от Marvisak, апстрим, GPL-3.0-or-later ([LICENSE](LICENSE)).
+- `nathanbzrr` — Safe Mode для 8 ГБ, в составе `main`.
+- [trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA) — форк сообщества для NVIDIA.
+
+## Документация
+
+- [Замеры](docs/ru/performance.md)
+- [Как запускать](docs/ru/running.md)
+- [Железо](docs/ru/hardware.md)
+- [Что входит в Wave 11](docs/ru/technical-changes.md)
+- [Известные ограничения](docs/ru/known-limits.md)
+- [Безопасность, контрольные суммы и сборка](docs/ru/security-and-build.md)
+- [Ветки и лицензия](docs/ru/project.md)
