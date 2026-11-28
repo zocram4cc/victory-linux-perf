@@ -729,6 +729,11 @@ impl PlacedFootprint {
         Some(u64::from(self.row_pitch) * lines.saturating_sub(1) + last)
     }
 
+    /// Whether the host's format for this footprint's has another texel size.
+    pub(crate) fn host_texel_differs(&self) -> bool {
+        element(pc_format(self.format)) != element(self.format)
+    }
+
     /// For a read back through a host buffer: this footprint at offset 0
     /// with its rows pitched as the host wants them (multiples of 256
     /// bytes), then the bytes that buffer needs, the bytes of a row, the

@@ -1358,6 +1358,12 @@ fn read_back(
     }
     let host = crate::host::host().ok_or("no host")?;
     let (footprint, [size, row, rows, pitch]) = dst.footprint.host_rows().ok_or("an unknown format")?;
+    // Console formats such as 118..=120 (3-byte D16S8) map to 4-byte PC
+    // substitutes (45..=47): a raw read-back would mis-size the buffer and
+    // write the wrong texel layout.
+    if dst.footprint.host_texel_differs() {
+        return Err("a format whose host texel size differs");
+    }
     // The title's buffer holds every row at its own pitch.
     let bytes = pitch * (rows - 1) + row;
     let data = buffer_range(dst.resource, dst.footprint.offset, bytes).ok_or("a destination outside its buffer")?;
