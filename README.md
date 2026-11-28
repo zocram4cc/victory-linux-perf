@@ -15,12 +15,23 @@ Performance-focused Linux/Proton fork of `victory-proton` targeting native **30+
   - `VICTORY_SLEEP0_YIELD=1` in `victory-hle/src/modules/kernel.rs` to throttle tight `Sleep(0)` spin loops (eliminates a 68% CPU spin thread).
   - Thin LTO (`lto = "thin"`) and `x86-64-v3` (AVX2/BMI2/FMA) codegen.
 
-## Measured Progress (Xbox Series X @ 2560×1440, `VICTORY_UPSCALER=6`)
-| Milestone | Series X @ 1440p FPS | Frame Time | `victory-submit` / `preparing` |
-|---|---:|---:|---:|
-| Baseline (`f353c97`) | 24.7–25.3 fps | 39.6–40.4 ms | 32–34 ms preparing |
-| Waves 1–5 (TLS views, `HostHeap::keep`, `EachPool`, `Sleep(0)`, `shard_max`, AVX2 digest) | 26.0–27.7 fps | 36.0–38.4 ms | 28.5–31.8 ms preparing |
-| Wave 8c/8d (Wine `UFFD_WP` section write-watch + `LAND_TAKEN` + parallel `PAGEMAP_SCAN` + `JOIN_BARRIERS=1`) | **28.5–28.8 fps** | **34.8–35.1 ms** | **23.6–26.3 ms preparing** |
+## Measured Progress (Native, Zero Frame Gen, `VICTORY_UPSCALER=6`)
+| Milestone | Console / Res | FPS | Frame Time | `preparing` |
+|---|---|---:|---:|---:|
+| Baseline (`f353c97`) | Series X @ 2560×1440 | 24.7–25.3 fps | 39.6–40.4 ms | 32–34 ms |
+| Waves 1–5 (TLS views, `HostHeap::keep`, `EachPool`, `Sleep(0)`, `shard_max`, AVX2 digest) | Series X @ 2560×1440 | 26.0–27.7 fps | 36.0–38.4 ms | 28.5–31.8 ms |
+| Wave 8c/8d (Wine `UFFD_WP` section write-watch + `LAND_TAKEN` + parallel `PAGEMAP_SCAN` + `JOIN_BARRIERS=1`) | Series X @ 2560×1440 | 28.5–28.8 fps | 34.8–35.1 ms | 23.6–26.3 ms |
+| Wave 11 (`PAGE_MAX`, AVX2 `safecopy`, worker priority, `THIN_THREADS=6`, `GUARD_HOT=500`) | Series X @ 2560×1440 | **29.5–30.8 fps** | **32.5–33.9 ms** | **26.7–27.6 ms** |
+| Wave 11 (same + full `GATE=1 GATE_REACH=1` correctness) | **Series S** | **30.3–31.7 fps** | **31.6–33.0 ms** | **23.2–25.4 ms** |
+
+## Play
+```bash
+# Series S (sustained 30.3-31.7 fps with full GATE_REACH=1 correctness)
+./linux/play-nixos.sh
+
+# Series X @ 2560x1440 (29.5-30.8 fps)
+CONSOLE=series-x ./linux/play-nixos.sh
+```
 
 ## Build
 ```bash
