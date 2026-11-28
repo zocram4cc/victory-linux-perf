@@ -120,7 +120,10 @@ if not defined VICTORY_SKIP_PIPELINES set "VICTORY_SKIP_PIPELINES=f16876929fa64f
 if not defined VICTORY_THIN set "VICTORY_THIN=1"
 if not defined VICTORY_LATE_WAIT_LISTS set "VICTORY_LATE_WAIT_LISTS=256"
 if not defined VICTORY_JOIN_PARTS set "VICTORY_JOIN_PARTS=8"
-if not defined VICTORY_PORT_CONSTANTS set "VICTORY_PORT_CONSTANTS=1"
+rem Black-texture test A (28 Nov 2026): with the game's constants heap used in
+rem place (1) some textures went black and card memory held 1.2-1.5 GB more
+rem (F3: BV 1.2-1.5 -> 0.1 GB); KLBF Lab saw the same. Off.
+if not defined VICTORY_PORT_CONSTANTS set "VICTORY_PORT_CONSTANTS=0"
 if not defined VICTORY_PORT_ALL set "VICTORY_PORT_ALL=1"
 if not defined VICTORY_WINDOW_KB set "VICTORY_WINDOW_KB=512"
 if not defined VICTORY_CARD_BUFFERS_MIN_MB set "VICTORY_CARD_BUFFERS_MIN_MB=1"
