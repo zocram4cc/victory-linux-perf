@@ -52,3 +52,19 @@ Candidates now:
 - a waterfall loop over descriptors compared lane against first lane (step 34);
 - a descriptor kept in spill lanes around a loop (the marker hits, step 33);
 - the occlusion test with level gathers (the house bug).
+
+## Checking shortcut #1 (partial image stores) with console code (28 Nov, ~02:40)
+
+Two cases added to `CS_CASES`, both **equal**:
+- "alpha-only store": each thread writes its texel; after a barrier, half the threads set the alpha of their neighbour's texel;
+- "alpha-only store, read and written back": the texel is read, its alpha changed, and the texel written back.
+
+**But neither exercises our merge path.** Dumping the console code (`VICTORY_EMIT_DUMP`, then `translate_file FILE --code OUT` and `llvm-mc`) shows that for both, the console compiler emits `image_load … dmask:0x7` (RGB) then `image_store … dmask:0xf` (all four). It does not emit a partial store, and `VICTORY_WHY_MERGE=1` stays silent.
+
+**What we learn (real data):** the console compiler does not turn `tex[p].w = x`, or a read-modify-write of a float4 texel, into a mask-0x8 store. The title's `image_store … dmask:0x8 … unorm d16` (half 1.0 into alpha, e.g. `218_0000000f00431000`) must come from something else. The SDK's list of console intrinsics has no partial texture store (checked: typed buffer loads and stores, global memory, LDS and lane intrinsics, nothing for texture channel masks).
+
+**Next candidates:**
+- **a half-precision texture** (`RWTexture2D<half4>` / `min16float4` with 16-bit types): the `d16` points there, and the harness needs a 16-bit texture UAV for it;
+- **a `unorm` texture format** whose view the compiler knows.
+
+Until a case makes the console compiler emit it, shortcut #1 stays **not verified by console code** (it is still the only way to translate those stores at all).
