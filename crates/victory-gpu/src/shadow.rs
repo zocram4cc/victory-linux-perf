@@ -1404,7 +1404,8 @@ pub(crate) fn dword_path_line(frames: f64) -> Option<String> {
     let [n, bytes, widened, ns] = [0, 1, 2, 3].map(|i| DWORD_PATH[i].swap(0, Ordering::Relaxed) as f64 / frames.max(1.0));
     (n > 0.0).then(|| {
         format!(
-            "dword landing per frame (VICTORY_LAND_DWORDS={}): {n:.0} stretches, {:.1} MB looked at, {widened:.0} dwords widened, {:.2} ms",
+            "dword landing per frame (VICTORY_LAND_DWORDS={}): {n:.0} stretches, {:.1} MB looked at, {widened:.0} dwords widened, \
+             {:.2} ms of the landing threads' time (several at once)",
             dword_mode(),
             bytes / 1e6,
             ns / 1e6
@@ -2618,9 +2619,20 @@ pub(crate) mod resent {
         a.iter().zip(b).filter(|(x, y)| x != y).count() as u64
     }
 
-    /// For the frame-rate line, over `frames` frames: the totals, and every
-    /// five seconds a line per copy (the most bytes first).
-    pub(crate) fn log(frames: f64) {
+    /// Presents since the last [`log`]. (The frame-rate line's own count is of
+    /// its last second, and the lines that print with it every fifth second
+    /// gathered five: divided by it, they came out five times too high.)
+    static PRESENTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// A frame was presented.
+    pub(crate) fn presented() {
+        PRESENTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// For the frame-rate line: the totals per frame since the last call, and
+    /// every five seconds a line per copy (the most bytes first).
+    pub(crate) fn log() {
+        let frames = PRESENTED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64;
         static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
         let line = take_line();
         if !line.is_empty() {

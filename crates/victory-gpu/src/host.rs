@@ -9601,6 +9601,7 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         crate::constwatch::presented();
         self.frames += 1;
+        crate::shadow::resent::presented();
         #[cfg(feature = "diagnostics")]
         {
             self.copy_stats_frames += 1;
@@ -9924,7 +9925,7 @@ impl Meter {
                 objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
             );
             // Always: what refreshes send up again over what shaders wrote.
-            crate::shadow::resent::log(frames);
+            crate::shadow::resent::log();
             #[cfg(feature = "diagnostics")]
             {
                 let put = [0, 1, 2, 3].map(|i| crate::shadow::PUT[i].swap(0, Ordering::Relaxed) as f64 / frames);
