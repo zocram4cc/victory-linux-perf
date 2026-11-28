@@ -3171,6 +3171,8 @@ impl HostHeap {
         &self,
         words: [u32; 3],
         index: u32,
+        list: &crate::host::HostList,
+        kept_resources: &mut std::collections::HashSet<usize, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
     ) -> Option<(Listed, D3D12_CPU_DESCRIPTOR_HANDLE, Option<D3D12_CPU_DESCRIPTOR_HANDLE>)> {
         if self.sampler {
             return None;
@@ -3278,9 +3280,18 @@ impl HostHeap {
                 self.clear_twin(index);
                 None
             };
-            self.keep(index, made.kept.as_ref().map(Cow::Borrowed));
-            if made.release_dim != 0 {
-                self.note_release_view(index, made.release_dim);
+            if self.release_views.is_empty() {
+                if let Some(res) = made.kept.as_ref() {
+                    let raw = windows::core::Interface::as_raw(res) as usize;
+                    if kept_resources.insert(raw) {
+                        list.keep_resource(res.clone());
+                    }
+                }
+            } else {
+                self.keep(index, made.kept.as_ref().map(Cow::Borrowed));
+                if made.release_dim != 0 {
+                    self.note_release_view(index, made.release_dim);
+                }
             }
             Some((made.listed, main_src, twin_src))
         })

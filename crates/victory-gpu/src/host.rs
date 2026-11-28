@@ -8062,6 +8062,11 @@ impl HostList {
         }
     }
 
+    /// Keeps `resource` alive until the list is reset (zero-cost upcast).
+    pub(crate) fn keep_resource(&self, resource: ID3D12Resource) {
+        self.deferred().kept.push(resource.into());
+    }
+
     /// Whether this is the first time since the reset that the list asks
     /// about `key` (a texture to bring up to date).
     pub(crate) fn first_use(&self, key: usize) -> bool {

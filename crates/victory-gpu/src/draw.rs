@@ -633,6 +633,10 @@ pub(crate) struct State {
     /// Direct table SRV entries already mirrored & made readable in this list:
     /// handle → (record words, list epoch, tested depth, is tested depth).
     direct_ready: std::collections::HashMap<u64, ([u32; 3], u64, usize, bool), std::hash::BuildHasherDefault<crate::host::AddressHash>>,
+    /// Raw `ID3D12Resource` pointers already retained on this list via
+    /// `HostList::keep_resource` for dynamic `make_listed` slots, avoiding
+    /// ~60,000/frame per-slot `HostHeap::kept` locks + `retire_resource` calls.
+    kept_resources: std::collections::HashSet<usize, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
     /// Root UAVs bound as one-view tables in this list, likewise.
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
     /// The list ran and its dynamic slots were given back.
@@ -716,6 +720,7 @@ impl State {
         }
         self.fresh_tables.clear();
         self.direct_ready.clear();
+        self.kept_resources.clear();
         self.recording = 0;
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
@@ -4336,7 +4341,7 @@ impl State {
                 if list_views
                     && !halved
                     && let Some(words) = crate::descriptor::record_at(table + u64::from(k) * 32)
-                    && let Some((mut listed, main_src, twin_src)) = host.make_listed(words, index)
+                    && let Some((mut listed, main_src, twin_src)) = host.make_listed(words, index, list, &mut self.kept_resources)
                 {
                     #[cfg(feature = "diagnostics")]
                     let tk1 = {
