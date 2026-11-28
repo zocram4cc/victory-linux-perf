@@ -1160,10 +1160,11 @@ fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
 /// What it can do wrong: a shader that stores single bytes or halves beside
 /// bytes the title writes in the same dword while the flight is in the air:
 /// the card's copy of the title's bytes lands over them. The per-copy lines
-/// count the dwords landed whole where the title's bytes differed ("dwords
-/// landed whole that a byte merge would have mixed"): a copy whose shaders
-/// store dwords should show the title's stray bytes there, one that stores
-/// bytes would show it where both wrote.
+/// count the dwords the card changed in part and that landed whole: a copy
+/// whose programs store bytes or halves and shows many is the one to look at.
+///
+/// Cost: a pass over each landed stretch a word at a time (as a compare),
+/// nothing read again.
 fn land_dwords() -> bool {
     crate::toggled!("VICTORY_LAND_DWORDS")
 }
@@ -1179,27 +1180,62 @@ fn land_dwords() -> bool {
 fn widen_to_dwords(addr: usize, now: &[u8], held: &mut [u8], title: Option<&[u8]>) -> (u64, u64) {
     let n = now.len().min(held.len());
     let (mut widened, mut mixed) = (0u64, 0u64);
-    let mut i = 0;
-    while i < n {
-        let end = (((addr + i) / 4 + 1) * 4 - addr).min(n);
+    // A dword cut by the slice's ends: a byte at a time.
+    fn bytes(now: &[u8], held: &mut [u8], title: Option<&[u8]>, i: usize, end: usize) -> (u64, u64) {
         let (mut any, mut all) = (false, true);
         for j in i..end {
             let d = now[j] != held[j];
             any |= d;
             all &= d;
         }
-        if any && !all {
-            widened += 1;
-            let mut mixes = false;
-            for j in i..end {
-                if now[j] == held[j] {
-                    mixes |= title.is_some_and(|t| t.get(j).is_some_and(|&t| t != held[j]));
-                    held[j] = !now[j];
-                }
-            }
-            mixed += u64::from(mixes);
+        if !any || all {
+            return (0, 0);
         }
-        i = end;
+        let mut mixes = false;
+        for j in i..end {
+            if now[j] == held[j] {
+                mixes |= title.is_some_and(|t| t.get(j).is_some_and(|&t| t != held[j]));
+                held[j] = !now[j];
+            }
+        }
+        (1, u64::from(mixes))
+    }
+    let head = ((4 - addr % 4) % 4).min(n);
+    if head > 0 {
+        let (w, m) = bytes(now, held, title, 0, head);
+        widened += w;
+        mixed += m;
+    }
+    // Whole dwords: a word at a time. In `x = now ^ held` a byte that is 0
+    // is one the card left as it was.
+    let words = (n - head) / 4;
+    for k in 0..words {
+        let i = head + 4 * k;
+        let w = |b: &[u8]| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+        let (c, h) = (w(now), w(held));
+        let x = c ^ h;
+        if x == 0 {
+            continue;
+        }
+        // The high bit of each byte that is not 0.
+        let set = (((x & 0x7f7f_7f7f) + 0x7f7f_7f7f) | x) & 0x8080_8080;
+        if set == 0x8080_8080 {
+            continue;
+        }
+        // The bytes the card kept, all ones.
+        let kept = ((!set & 0x8080_8080) >> 7) * 0xff;
+        widened += 1;
+        if let Some(t) = title.filter(|t| t.len() >= i + 4) {
+            mixed += u64::from((w(t) ^ h) & kept != 0);
+        }
+        let marked = (h & !kept) | (!c & kept);
+        held[i..i + 4].copy_from_slice(&marked.to_le_bytes());
+    }
+    let tail = head + 4 * words;
+    if tail < n {
+        let (w, m) = bytes(now, held, title, tail, n);
+        widened += w;
+        mixed += m;
     }
     (widened, mixed)
 }
@@ -2304,8 +2340,8 @@ pub(crate) mod resent {
         /// of a submission that declared writes to them.
         pub(crate) held: u64,
         pub(crate) ahead: u64,
-        /// [`super::land_dwords`]: dwords landed whole where a byte merge
-        /// would have kept a byte of the title's under the card's others.
+        /// [`super::land_dwords`]: dwords the card changed in part, landed
+        /// whole (a byte merge would have kept the title's other bytes).
         pub(crate) dwords: u64,
     }
 
@@ -2335,7 +2371,7 @@ pub(crate) mod resent {
                 "pages sent up {:.1} (title-written {:.1}, landing noted and differing {:.1}; whole {:.1}, as runs {:.1}), \
                  {:.1} KB differing from the card, echo pages left {:.1}, landing pages title memory missed {:.1}, \
                  card won over title bytes {:.1} KB, held back {:.1} KB, sent ahead of a declaring submission {:.1} KB, \
-                 dwords landed whole that a byte merge would have mixed {:.0}",
+                 dwords the card changed in part, landed whole {:.0}",
                 f(self.title + self.landed),
                 f(self.title),
                 f(self.landed),
@@ -3362,6 +3398,53 @@ mod landing_tests {
         let (mut held, title) = ([7u8, 7, 7], [7u8, 9, 7]);
         assert_eq!(super::widen_to_dwords(0x1002, &[8, 7, 7], &mut held, Some(&title)), (1, 1));
         assert_eq!(held, [7, !7, 7], "dword 0x1000 widened over byte 0x1003 only; dword 0x1004 untouched");
+    }
+
+    /// The word-at-a-time widening does what a byte-at-a-time one does, at
+    /// every alignment and length.
+    #[test]
+    fn the_word_way_widens_as_the_byte_way() {
+        fn by_bytes(addr: usize, now: &[u8], held: &mut [u8], title: &[u8]) -> (u64, u64) {
+            let (mut w, mut m) = (0, 0);
+            let mut i = 0;
+            while i < now.len() {
+                let end = (((addr + i) / 4 + 1) * 4 - addr).min(now.len());
+                let any = (i..end).any(|j| now[j] != held[j]);
+                let all = (i..end).all(|j| now[j] != held[j]);
+                if any && !all {
+                    w += 1;
+                    let mut mixes = false;
+                    for j in i..end {
+                        if now[j] == held[j] {
+                            mixes |= title[j] != held[j];
+                            held[j] = !now[j];
+                        }
+                    }
+                    m += u64::from(mixes);
+                }
+                i = end;
+            }
+            (w, m)
+        }
+        let mut seed = 0x1234_5678u32;
+        let mut next = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 24) as u8
+        };
+        for addr in 0x1000..0x1004 {
+            for len in [0usize, 1, 3, 4, 5, 9, 31, 64] {
+                for _ in 0..20 {
+                    // Bytes mostly alike, as a landed stretch's are.
+                    let held: Vec<u8> = (0..len).map(|_| next() & 3).collect();
+                    let now: Vec<u8> = held.iter().map(|&h| if next() < 64 { h ^ 1 } else { h }).collect();
+                    let title: Vec<u8> = held.iter().map(|&h| if next() < 32 { h ^ 2 } else { h }).collect();
+                    let (mut a, mut b) = (held.clone(), held.clone());
+                    let fast = super::widen_to_dwords(addr, &now, &mut a, Some(&title));
+                    let slow = by_bytes(addr, &now, &mut b, &title);
+                    assert_eq!((fast, &a), (slow, &b), "{addr:#x} {len}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -4824,14 +4907,13 @@ impl Shadow {
 
     /// [`land_dwords`] ahead of a landing's merge of `parts` (offsets from
     /// `lo` in the copy) of a piece the card's bytes of which are at `now`
-    /// ([`widen_to_dwords`]). Returns the dwords a byte merge would have
-    /// mixed.
+    /// ([`widen_to_dwords`]). Returns the dwords widened: those the card
+    /// changed in part (title memory is not read for the count here).
     ///
     /// # Safety
     /// As [`Shadow::all_the_cards`].
     unsafe fn widen_parts(&self, lo: usize, now: *const u8, parts: &[(usize, usize)]) -> u64 {
-        let mut mixed = 0u64;
-        let mut title = Vec::new();
+        let mut widened = 0u64;
         let start = self.start as usize;
         for &(a, b) in parts {
             if a >= b {
@@ -4841,12 +4923,9 @@ impl Shadow {
             let card = unsafe { std::slice::from_raw_parts(now.add(a), b - a) };
             // SAFETY: inside the mapping of the CPU's side (the caller's).
             let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(lo + a), b - a) };
-            title.clear();
-            title.resize(b - a, 0);
-            let read = crate::host::read_into((start + lo + a) as *const u8, &mut title);
-            mixed += widen_to_dwords(start + lo + a, card, held, read.then_some(title.as_slice())).1;
+            widened += widen_to_dwords(start + lo + a, card, held, None).0;
         }
-        mixed
+        widened
     }
 
     /// For [`card_wins`], ahead of a landing's merge of `parts` (offsets from
@@ -5392,7 +5471,7 @@ impl Shadow {
             // As in `copy_back`: the card's byte where it is not what it
             // was before the submission, else the title's.
             if dwords {
-                let (_, mixed) = widen_to_dwords(start + at, gpu, old, Some(title));
+                let (mixed, _) = widen_to_dwords(start + at, gpu, old, None);
                 if mixed > 0 {
                     resent::note(self.start, self.len, resent::Resent { dwords: mixed, ..Default::default() });
                 }
@@ -5486,7 +5565,7 @@ impl Shadow {
         for (a, b) in outside(at, at + n, skip) {
             let (a, b) = (a - at, b - at);
             if dwords {
-                mixed += widen_to_dwords(start + at + a, &gpu[a..b], &mut held[a..b], mapped.then(|| &title[a..b])).1;
+                mixed += widen_to_dwords(start + at + a, &gpu[a..b], &mut held[a..b], None).0;
             }
             // Title memory that is not mapped: the CPU's side keeps what
             // the card wrote, as before; `title` is scratch then.
