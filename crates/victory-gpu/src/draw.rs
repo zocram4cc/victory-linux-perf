@@ -154,6 +154,9 @@ thread_local! {
     /// While a stage's tables are walked (`State::tables`): whether that
     /// stage's shader can store to buffers (`Translated::stores`).
     static STORES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// While a stage's tables are walked: whether it is a skinning program
+    /// (what it declares written is noted for `crate::shadow::hold_back`).
+    static SKINNING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// While `State::early_textures` runs the texture pass: the
     /// milliseconds and the bytes that run may take, in place of the
     /// pass's own per frame.
@@ -2291,12 +2294,24 @@ impl State {
         #[cfg(feature = "diagnostics")]
         crate::constwatch::pipeline(&p.name);
         for stage in &p.stages {
+            // A pre-skinned character program: the copies it finds the
+            // skinned positions in are the ones hold-back holds title bytes
+            // over (`crate::shadow::hold_back`).
+            if stage.shader.pre_skinned && crate::shadow::holding() {
+                self.mark_positions(compute);
+            }
             let t = stage.translated();
             STORES.set(t.stores);
             if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
                 crate::picked::runs_in(list);
             }
+            let skinning = stage.shader.skinning && crate::shadow::holding();
+            if skinning {
+                crate::shadow::skinning_seen(&stage.shader.hash);
+            }
+            SKINNING.set(skinning);
             let made = self.tables(list, &t.tables, &t.host.half_views, compute);
+            SKINNING.set(false);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -5217,6 +5232,22 @@ impl State {
         }
     }
 
+    /// The copies of the two skinned position buffers a pre-skinned draw
+    /// reads (the views at bytes 0x420 and 0xa80 of its first table) are
+    /// marked as such (`crate::shadow::Shadow::mark_positions`).
+    fn mark_positions(&self, compute: bool) {
+        let Some(&Root::Table(table)) = self.roots_ref(compute).first() else {
+            return;
+        };
+        for at in [0x420, 0xa80] {
+            if let Some(view) = crate::descriptor::view(table + at)
+                && let Some((shadow, _, _)) = crate::descriptor::host::buffer_copy(&view)
+            {
+                shadow.mark_positions();
+            }
+        }
+    }
+
     fn roots_ref(&self, compute: bool) -> &Vec<Root> {
         if compute {
             &self.compute
@@ -6416,6 +6447,9 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
                 #[cfg(feature = "diagnostics")]
                 crate::host::wide_write(address, len, 0);
                 shadow.gpu_writes(list, address, len);
+                if SKINNING.get() {
+                    list.defer_skinned(&shadow);
+                }
             } else {
                 #[cfg(feature = "diagnostics")]
                 {

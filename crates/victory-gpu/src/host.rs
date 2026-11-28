@@ -2891,6 +2891,9 @@ struct Deferred {
     /// memory (host copy, address, bytes): declaring them again would
     /// change nothing.
     gpu_written: std::collections::HashSet<(usize, usize, usize), std::hash::BuildHasherDefault<AddressHash>>,
+    /// Copies a skinning program of the list declared it writes
+    /// (`crate::shadow::hold_back`, mode 3).
+    skinned: Vec<std::sync::Arc<crate::shadow::Shadow>>,
     /// Scratch memory [`HostList::fill_scratch`] fills since the list last
     /// wrote title memory (source, bytes): its host address.
     filled: std::collections::HashMap<(usize, usize), u64, std::hash::BuildHasherDefault<AddressHash>>,
@@ -6441,7 +6444,9 @@ impl Host {
         }
         // The title's bytes held back for the shaders of this submission
         // (and those held too long), ahead of its lists.
-        crate::shadow::release_held_back(&declared);
+        let skinned: Vec<std::sync::Arc<crate::shadow::Shadow>> =
+            runs.iter().flat_map(|l| l.deferred().skinned.clone()).collect();
+        crate::shadow::release_held_back(&declared, &skinned);
         let card = self.card_before(&declared, &picked, flown);
         // The sends are taken: from here on the references hold what the
         // copies in the lists put.
@@ -7797,6 +7802,14 @@ impl HostList {
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.gpu_written.insert(key) || !declare_once() {
             deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
+        }
+    }
+
+    /// A skinning program of the list writes `shadow` (`crate::shadow::hold_back`).
+    pub(crate) fn defer_skinned(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>) {
+        let mut deferred = self.deferred();
+        if !deferred.skinned.iter().any(|s| std::sync::Arc::ptr_eq(s, shadow)) {
+            deferred.skinned.push(shadow.clone());
         }
     }
 

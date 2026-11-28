@@ -377,6 +377,8 @@ mod tests {
             hash: "0123456789abcdef".to_owned(),
             container: b"CS_Test".to_vec(),
             ambient: None,
+            pre_skinned: false,
+            skinning: false,
             translated: OnceLock::new(),
         };
         let corner = Some((80, 45));

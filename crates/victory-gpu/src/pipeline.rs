@@ -66,6 +66,15 @@ pub(crate) struct Shader {
     pub(crate) ambient: Option<crate::ambient::Role>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    /// Whether it is a pre-skinned character program (`PreSkin` in its
+    /// name): what reads the skinned position buffers.
+    #[cfg(windows)]
+    pub(crate) pre_skinned: bool,
+    /// Whether it is a skinning program (`Skinning` in its name: the
+    /// `CS_PedStandardSkinning_*` and `CS_PosOnlyLodSkinning*` programs):
+    /// what writes the skinned position buffers.
+    #[cfg(windows)]
+    pub(crate) skinning: bool,
 }
 
 impl std::fmt::Debug for Shader {
@@ -120,6 +129,10 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
+                #[cfg(windows)]
+                pre_skinned: crate::sheets::pre_skinned(bytes),
+                #[cfg(windows)]
+                skinning: named::name_in(bytes).is_some_and(|n| n.contains("Skinning")),
             })
         })
         .clone()

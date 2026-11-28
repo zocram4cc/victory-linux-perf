@@ -180,6 +180,9 @@ pub(crate) struct Shadow {
     /// Mode 2 of [`dword_mode`]: the frame a refresh last found title bytes
     /// over a lately landed piece of it, plus one (0: never).
     title_over_landed: AtomicU64,
+    /// Whether a pre-skinned character program reads its skinned positions
+    /// from it ([`hold_back`] holds title bytes over its pieces only).
+    positions: std::sync::atomic::AtomicBool,
     /// The frame shaders were last declared to write it, plus one (0: never).
     declared_at: AtomicU64,
 }
@@ -213,10 +216,35 @@ fn hold_back() -> bool {
     hold_mode() != 0
 }
 
+/// Whether [`hold_back`] is on, for the draws that mark the copies it acts on.
+pub(crate) fn holding() -> bool {
+    hold_back()
+}
+
+/// A skinning program met while [`hold_back`] is on: said once per program,
+/// so that a run shows which ones release held bytes (mode 3).
+pub(crate) fn skinning_seen(hash: &str) {
+    static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.iter().any(|h| h == hash) {
+        seen.push(hash.to_owned());
+        tracing::info!(program = hash, known = seen.len(), "hold-back: a skinning program declares writes (mode 3 releases ahead of its submissions)");
+    }
+}
+
 /// `VICTORY_FLIGHT_HOLD_BACK`: 0 (off, unless set), 1 ([`hold_back`]: held
 /// bytes go up ahead of the next submission that declares writes to them),
 /// 2: held bytes go up when their piece has had no landing for
-/// [`IDLE_FRAMES`] frames, whatever is declared.
+/// [`IDLE_FRAMES`] frames, whatever is declared, 3: held bytes go up only
+/// ahead of a submission that runs a skinning program (`Skinning` in its
+/// name) declaring writes to the copy. In every mode only copies a
+/// pre-skinned program reads its positions from hold anything.
+///
+/// Mode 3 is the title's order: the record it fills a range with comes before
+/// the skinning that overwrites it. Mode 1 released ahead of any declaring
+/// submission, and in a cafe capture a dispatch after the skinning and before
+/// the draws declared the position buffer: the record went up over vertices
+/// already skinned.
 ///
 /// Mode 1 releases a piece's held bytes ahead of the frame's first skinning,
 /// as the skinning declares its whole buffer; a range drawn without being
@@ -232,6 +260,7 @@ fn hold_mode() -> u8 {
     *MODE.get_or_init(|| match std::env::var("VICTORY_FLIGHT_HOLD_BACK").as_deref() {
         Ok("1") => 1,
         Ok("2") => 2,
+        Ok("3") => 3,
         _ => 0,
     })
 }
@@ -255,10 +284,20 @@ static HOLDERS: Mutex<std::collections::BTreeSet<u64>> = Mutex::new(std::collect
 /// ahead of the plan of what goes to the card): the held bytes `declared`
 /// (this submission's declared shader writes, by copy) overlaps go up ahead
 /// of its lists.
-pub(crate) fn release_held_back(declared: &[(Arc<Shadow>, Vec<(usize, usize)>)]) {
-    match hold_mode() {
+pub(crate) fn release_held_back(declared: &[(Arc<Shadow>, Vec<(usize, usize)>)], skinned: &[Arc<Shadow>]) {
+    release_by(hold_mode(), declared, skinned);
+}
+
+/// [`release_held_back`] by `mode` ([`hold_mode`]).
+fn release_by(mode: u8, declared: &[(Arc<Shadow>, Vec<(usize, usize)>)], skinned: &[Arc<Shadow>]) {
+    match mode {
         1 => {
             for (shadow, ranges) in declared {
+                shadow.release_held(ranges);
+            }
+        }
+        3 => {
+            for (shadow, ranges) in declared.iter().filter(|(s, _)| skinned.iter().any(|k| Arc::ptr_eq(k, s))) {
                 shadow.release_held(ranges);
             }
         }
@@ -321,7 +360,6 @@ impl HeldBack {
     }
 
     /// Bytes held.
-    #[cfg(test)]
     pub(crate) fn bytes(&self) -> usize {
         self.total
     }
@@ -2522,6 +2560,8 @@ pub(crate) mod resent {
         /// greatest, not a sum).
         pub(crate) idle: u64,
         pub(crate) longest: u64,
+        /// Title bytes held back at a look (the most of the window's looks).
+        pub(crate) holding: u64,
         /// [`super::dword_mode`]: dwords the card changed in part, landed
         /// whole (a byte merge would have kept the title's other bytes).
         pub(crate) dwords: u64,
@@ -2541,6 +2581,7 @@ pub(crate) mod resent {
             self.ahead += o.ahead;
             self.idle += o.idle;
             self.longest = self.longest.max(o.longest);
+            self.holding = self.holding.max(o.holding);
             self.dwords += o.dwords;
         }
 
@@ -2555,7 +2596,7 @@ pub(crate) mod resent {
                 "pages sent up {:.1} (title-written {:.1}, landing noted and differing {:.1}; whole {:.1}, as runs {:.1}), \
                  {:.1} KB differing from the card, echo pages left {:.1}, landing pages title memory missed {:.1}, \
                  card won over title bytes {:.1} KB, held back {:.1} KB, sent ahead of a declaring submission {:.1} KB, \
-                 released as idle {:.1} KB, longest held {} frames, \
+                 released as idle {:.1} KB, longest held {} frames, still held {:.1} KB, \
                  dwords the card changed in part, landed whole {:.0}",
                 f(self.title + self.landed),
                 f(self.title),
@@ -2570,6 +2611,7 @@ pub(crate) mod resent {
                 f(self.ahead) / 1024.0,
                 f(self.idle) / 1024.0,
                 self.longest,
+                self.holding as f64 / 1024.0,
                 f(self.dwords)
             )
         }
@@ -3515,6 +3557,7 @@ mod landing_tests {
         let mut side = vec![5u8; PIECE + KERNEL_PAGE];
         let copy = Shadow::unbacked(title as u64, side.as_mut_ptr(), side.len() as u64, true);
         copy.note_landing(0, KERNEL_PAGE);
+        copy.mark_positions();
         // A landing put shaders' bytes into the first piece this frame.
         copy.landed_pieces.lock().unwrap().insert(title / PIECE, crate::frame::current());
         let write = |at: usize| {
@@ -3673,6 +3716,7 @@ mod landing_tests {
         let mut side = vec![5u8; PIECE + KERNEL_PAGE];
         let copy = Shadow::unbacked(title as u64, side.as_mut_ptr(), side.len() as u64, true);
         copy.note_landing(0, KERNEL_PAGE);
+        copy.mark_positions();
         let now = crate::frame::current();
         copy.landed_pieces.lock().unwrap().insert(title / PIECE, now);
         let write = |at: usize| {
@@ -3705,6 +3749,52 @@ mod landing_tests {
         assert!(super::piece_idle(None, 0));
         assert!(!super::piece_idle(Some(10), 10) && !super::piece_idle(Some(10), 11));
         assert!(super::piece_idle(Some(10), 12));
+    }
+
+    /// Hold-back holds title bytes only over a copy a pre-skinned program
+    /// reads its positions from: any other copy gets them at once, landed
+    /// piece or not.
+    #[test]
+    fn only_a_copy_of_skinned_positions_holds_title_bytes() {
+        use super::PAGE as PIECE;
+        let room = vec![5u8; 2 * PIECE];
+        let title = (room.as_ptr() as usize).next_multiple_of(PIECE);
+        let mut side = vec![5u8; KERNEL_PAGE];
+        let copy = Shadow::unbacked(title as u64, side.as_mut_ptr(), side.len() as u64, true);
+        copy.note_landing(0, KERNEL_PAGE);
+        copy.landed_pieces.lock().unwrap().insert(title / PIECE, crate::frame::current());
+        // SAFETY: in `room`.
+        unsafe { ((title + 64) as *mut u32).write_volatile(0x0ffff800) };
+        copy.take_with(title, title + KERNEL_PAGE, true, true);
+        assert_eq!(copy.take_dirty(), [(64, 68)], "not marked: at once");
+        assert!(!copy.holds_back());
+        drop(room);
+    }
+
+    /// Mode 3: a submission that declares writes to the copy but runs no
+    /// skinning program releases nothing; one that does releases.
+    #[test]
+    fn mode_three_releases_only_ahead_of_a_skinning_submission() {
+        use super::PAGE as PIECE;
+        let room = vec![5u8; 2 * PIECE];
+        let title = (room.as_ptr() as usize).next_multiple_of(PIECE);
+        let mut side = vec![5u8; KERNEL_PAGE];
+        let copy = Shadow::unbacked(title as u64, side.as_mut_ptr(), side.len() as u64, true);
+        copy.note_landing(0, KERNEL_PAGE);
+        copy.mark_positions();
+        copy.landed_pieces.lock().unwrap().insert(title / PIECE, crate::frame::current());
+        // SAFETY: in `room`.
+        unsafe { ((title + 64) as *mut u32).write_volatile(0x0ffff800) };
+        copy.take_with(title, title + KERNEL_PAGE, true, true);
+        assert_eq!(copy.take_dirty(), []);
+        let declared = vec![(copy.clone(), vec![(title, title + KERNEL_PAGE)])];
+        super::release_by(3, &declared, &[]);
+        assert_eq!(copy.take_dirty(), [], "declared, no skinning: held");
+        assert!(copy.holds_back());
+        super::release_by(3, &declared, &[copy.clone()]);
+        assert_eq!(copy.take_dirty(), [(64, 68)], "a skinning submission: ahead of it");
+        assert!(!copy.holds_back());
+        drop(room);
     }
 
     /// Which copies a refresh sends changed dwords of.
@@ -4101,6 +4191,7 @@ impl Shadow {
             held_back: Mutex::default(),
             held_pieces: Mutex::default(),
             title_over_landed: AtomicU64::new(0),
+            positions: std::sync::atomic::AtomicBool::new(false),
             declared_at: AtomicU64::new(0),
         }
     }
@@ -5295,6 +5386,22 @@ impl Shadow {
         }
         let sent = self.send_held(ahead);
         resent::note(self.start, self.len, resent::Resent { ahead: sent, ..Default::default() });
+        self.note_holding();
+    }
+
+    /// For the five-second lines: the bytes it holds back now and the
+    /// longest a piece of them has been held, in frames (pieces no longer
+    /// holding any go).
+    fn note_holding(&self) {
+        let now = crate::frame::current();
+        let back = self.held_back.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pieces = self.held_pieces.lock().unwrap_or_else(|e| e.into_inner());
+        pieces.retain(|&p, _| {
+            let (from, to) = self.inside(p * PAGE, PAGE);
+            from < to && back.ranges.range(..to).next_back().is_some_and(|(_, &end)| end > from)
+        });
+        let longest = pieces.values().map(|&f| now.saturating_sub(f)).max().unwrap_or(0);
+        resent::note(self.start, self.len, resent::Resent { holding: back.bytes() as u64, longest, ..Default::default() });
     }
 
     /// Mode 2 of [`hold_mode`], before a submission's copies go up: the bytes
@@ -5333,6 +5440,7 @@ impl Shadow {
             let sent = if due.is_empty() { 0 } else { self.send_held(due) };
             resent::note(self.start, self.len, resent::Resent { idle: sent, longest, ..Default::default() });
         }
+        self.note_holding();
         let pieces = self.held_pieces.lock().unwrap_or_else(|e| e.into_inner());
         // The longest still held, as a running figure.
         if let Some(oldest) = pieces.values().min() {
@@ -5386,6 +5494,12 @@ impl Shadow {
         };
         let declared = self.declared_at.load(Ordering::Relaxed).checked_sub(1);
         (landed, held, declared)
+    }
+
+    /// A pre-skinned character program reads its skinned positions from it
+    /// ([`hold_back`]).
+    pub(crate) fn mark_positions(&self) {
+        self.positions.store(true, Ordering::Relaxed);
     }
 
     /// Whether its landings are widened to dwords now ([`dword_mode`]).
@@ -5496,6 +5610,7 @@ impl Shadow {
             return self.copy(from, to);
         };
         let whole = !known && card.before.lock().unwrap_or_else(|e| e.into_inner()).is_none();
+        let mut held_any = false;
         let start = self.start as usize;
         TITLE.with_borrow_mut(|title| {
             title.resize(PAGE, 0);
@@ -5525,12 +5640,17 @@ impl Shadow {
                 if over_landed && dword_mode() == 2 {
                     self.title_over_landed.store(crate::frame::current() + 1, Ordering::Relaxed);
                 }
-                let held_now = hold && over_landed;
+                // Only a copy of skinned positions: a buffer the title fills
+                // for the card to read, in a piece a shader also writes, must
+                // get the title's bytes (mode 2 held such bytes for good: two
+                // runs of two died in the title's code).
+                let held_now = hold && over_landed && self.positions.load(Ordering::Relaxed);
                 if held_now {
-                    if hold_mode() == 2 || cfg!(test) {
-                        self.held_pieces.lock().unwrap_or_else(|e| e.into_inner()).entry(at / PAGE).or_insert(crate::frame::current());
+                    self.held_pieces.lock().unwrap_or_else(|e| e.into_inner()).entry(at / PAGE).or_insert(crate::frame::current());
+                    if hold_mode() == 2 {
                         HOLDERS.lock().unwrap_or_else(|e| e.into_inner()).insert(self.start);
                     }
+                    held_any = true;
                     let mut back = self.held_back.lock().unwrap_or_else(|e| e.into_inner());
                     let fresh: usize = runs.iter().map(|&(a, len)| back.add(at - start + a, at - start + a + len)).sum();
                     drop(back);
@@ -5579,6 +5699,9 @@ impl Shadow {
                 at += n;
             }
         });
+        if held_any {
+            self.note_holding();
+        }
         to - from
     }
 

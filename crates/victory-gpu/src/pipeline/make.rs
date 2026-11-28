@@ -2054,6 +2054,8 @@ mod tests {
             hash: "0000000000000000".to_owned(),
             container: Vec::new(),
             ambient: None,
+            pre_skinned: false,
+            skinning: false,
             translated: OnceLock::from(None),
         });
         let p = Pending::new(vec![untranslatable], None);
