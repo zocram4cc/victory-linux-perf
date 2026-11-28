@@ -3976,6 +3976,7 @@ pub fn title_memory_regrouped(at: usize, len: usize, section: usize, offset: u64
 /// was noted of its blocks (guarded, clean, absent) would be taken for true
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
+    crate::shadow::write_combined_freed(at, len);
     // What was a placeholder reservation there is none from now on
     // ([`ARENAS`]; with no length, from `at` to the end of the one that
     // holds it: no less than the allocation).

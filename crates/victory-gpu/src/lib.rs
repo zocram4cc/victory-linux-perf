@@ -124,3 +124,5 @@ pub use watch::{
     title_memory_splitting, title_memory_unmapping, title_memory_views_tracked, title_memory_written,
     writing as kernel_will_write,
 };
+#[cfg(windows)]
+pub use shadow::title_memory_write_combined;

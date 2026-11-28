@@ -180,6 +180,11 @@ pub extern "system" fn XMemVirtualAlloc(
     if !at.is_null() && !placeholder {
         victory_gpu::title_memory_allocated(at as usize, size);
     }
+    // Write-combined (the console's 0x400): memory the title's CPU writes
+    // and does not read (`VICTORY_WC_NO_BACK`).
+    if !at.is_null() && asked & 0x400 != 0 {
+        victory_gpu::title_memory_write_combined(at as usize, size);
+    }
     // A reservation only views of physical pages come into: the GPU side
     // knows its holes by this word where the host cannot say (Wine).
     if !at.is_null() && placeholder {

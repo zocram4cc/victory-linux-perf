@@ -9658,6 +9658,13 @@ impl Meter {
                     if rehash_runs() { "on" } else { "off" }
                 );
             }
+            let wc_left = crate::shadow::WC_LEFT.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames;
+            if wc_left > 0.0 {
+                tracing::info!(
+                    "{wc_left:.1} MB a frame of ranges shaders were declared to write in write-combined memory left on the card \
+                     (VICTORY_WC_NO_BACK: neither compared nor copied back)"
+                );
+            }
         }
         {
             let [own, asking, still, all] =
