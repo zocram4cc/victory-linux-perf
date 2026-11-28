@@ -1882,6 +1882,9 @@ struct EachPool {
 fn spin(there: impl Fn() -> bool) {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let most = *MOST.get_or_init(|| std::env::var("VICTORY_WIDE_SPIN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
+    // A/B-able by that name: on, 100 us unless the variable says more.
+    #[cfg(feature = "diagnostics")]
+    let most = crate::ab::pick("VICTORY_WIDE_SPIN").map_or(most, |on| if on { most.max(100) } else { 0 });
     if most == 0 {
         return;
     }
@@ -1893,9 +1896,35 @@ fn spin(there: impl Fn() -> bool) {
     }
 }
 
-/// How many threads are kept for [`EachPool`].
+/// How many threads are kept for [`EachPool`]: a quarter of the logical
+/// processors (2-6), or `VICTORY_WIDE_THREADS` (1-15). With
+/// `VICTORY_AB=..,VICTORY_WIDE_MORE` (diagnostics) half of them less one
+/// are kept (2-12), and only a quarter woken in the phases without it.
 fn wide_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        if let Some(n) = std::env::var("VICTORY_WIDE_THREADS").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
+            return n.clamp(1, 15);
+        }
+        #[cfg(feature = "diagnostics")]
+        if crate::ab::bit("VICTORY_WIDE_MORE").is_some() {
+            return std::thread::available_parallelism().map_or(4, |n| n.get() / 2 - 1).clamp(2, 12);
+        }
+        quarter_threads()
+    })
+}
+
+fn quarter_threads() -> usize {
     std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
+}
+
+/// How many of the kept threads a batch wakes.
+fn wide_wake(threads: usize) -> usize {
+    #[cfg(feature = "diagnostics")]
+    if crate::ab::pick("VICTORY_WIDE_MORE") == Some(false) {
+        return threads.min(quarter_threads());
+    }
+    threads
 }
 
 thread_local! {
@@ -1997,10 +2026,11 @@ impl EachPool {
             state.panicked = false;
             self.there.store(count, Ordering::Release);
         }
-        if count > self.threads {
+        let wake = wide_wake(self.threads);
+        if count > self.threads && wake == self.threads {
             self.more.notify_all();
         } else {
-            (1..count).for_each(|_| self.more.notify_one());
+            (1..count.min(wake + 1)).for_each(|_| self.more.notify_one());
         }
         let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             loop {
