@@ -794,12 +794,19 @@ extern "system" fn list_type(this: This) -> u32 {
     unsafe { (*this.cast::<List>()).kind }
 }
 extern "system" fn close(this: This) -> HRESULT {
+    close_recording(this);
+    #[cfg(windows)]
+    crate::descriptor::list_closed();
+    S_OK
+}
+
+// THIN also closes its private host lists during replay and recycling.
+fn close_recording(this: This) {
     let _called = crate::timeline::span("the title's Close");
     #[cfg(windows)]
     if let Some(host) = host_list(this) {
         host.close();
     }
-    S_OK
 }
 extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT {
     if allocator.is_null() {

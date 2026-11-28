@@ -234,10 +234,49 @@ struct SyncRounds {
     /// initialized (e.g. during `VICTORY_THIN=1` translation after enqueue):
     /// earlier rounds skipped that heap while its `OnceLock` was empty.
     floor: u64,
+    /// Whether a title's Close may wake the worker for a pass of its own
+    /// (`VICTORY_EARLY_HEAPS=1`).
+    hint: CloseHint,
+}
+
+/// A Close is a hint only: descriptors can be written until the submit or
+/// until a queue's wait is met, so a pass it wakes counts for no round (no
+/// submission's ticket waits for it), and a requested round absorbs a hint
+/// not yet taken. At most one such pass runs between requested rounds.
+#[cfg(windows)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+enum CloseHint {
+    #[default]
+    Available,
+    Pending,
+    Used,
 }
 
 #[cfg(windows)]
 impl SyncRounds {
+    /// A list was closed: whether the worker is to be woken for a pass.
+    fn list_closed(&mut self) -> bool {
+        if self.has_asked() || self.hint != CloseHint::Available {
+            return false;
+        }
+        self.hint = CloseHint::Pending;
+        true
+    }
+
+    /// Whether the worker is to make a pass for a Close now, with the
+    /// rounds' lock held: a round asked for comes first, and takes the hint.
+    fn take_close(&mut self) -> bool {
+        if self.has_asked() {
+            self.hint = CloseHint::Available;
+            return false;
+        }
+        if self.hint == CloseHint::Pending {
+            self.hint = CloseHint::Used;
+            return true;
+        }
+        false
+    }
+
     /// Minimum round number that is guaranteed to start *after* any title
     /// descriptor write already visible to this thread.
     fn stamp(&self) -> u64 {
@@ -289,7 +328,7 @@ impl SyncRounds {
 /// The thread's work: rounds asked for, started, done, and new-heap floor.
 #[cfg(windows)]
 static SYNC_ROUNDS: (std::sync::Mutex<SyncRounds>, std::sync::Condvar) = (
-    std::sync::Mutex::new(SyncRounds { asked: 0, started: 0, done: 0, floor: 0 }),
+    std::sync::Mutex::new(SyncRounds { asked: 0, started: 0, done: 0, floor: 0, hint: CloseHint::Available }),
     std::sync::Condvar::new(),
 );
 
@@ -305,19 +344,31 @@ pub(crate) fn heap_sync_stamp() -> u64 {
     SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner()).stamp()
 }
 
-/// [`sync_heaps`], begun; done when it is dropped (with [`sync_aside`]), or
-/// when this returns.
+/// Whether passes at a title's Close are made by the heap worker
+/// (`VICTORY_EARLY_HEAPS=1`, off by default).
 #[cfg(windows)]
-pub(crate) struct SyncedHeaps(Option<u64>);
+fn early_heaps() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EARLY_HEAPS").is_some_and(|v| v == "1"))
+}
 
-/// Begins (or reuses an already-completed/in-flight) heap-sync round that
-/// covers all title descriptor writes up to `stamp` (or up to now if `None`).
+/// A title's Close, as a hint to the heap worker: it makes a pass over the
+/// pages written so far while the title goes on recording other lists. Not a
+/// round: no submission's ticket moves for it, and the descriptors written
+/// after it are mirrored by the rounds before the lists execute, as ever.
 #[cfg(windows)]
-pub(crate) fn begin_sync_heaps_for(stamp: Option<u64>) -> SyncedHeaps {
-    if !sync_aside() {
-        sync_heaps();
-        return SyncedHeaps(None);
+pub(crate) fn list_closed() {
+    if early_heaps() && sync_aside() && sync_worker() {
+        let wake = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner()).list_closed();
+        if wake {
+            SYNC_ROUNDS.1.notify_all();
+        }
     }
+}
+
+/// Starts the heap worker once; whether it runs.
+#[cfg(windows)]
+fn sync_worker() -> bool {
     static STARTED: std::sync::Once = std::sync::Once::new();
     static THREAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     STARTED.call_once(|| {
@@ -334,13 +385,20 @@ pub(crate) fn begin_sync_heaps_for(stamp: Option<u64>) -> SyncedHeaps {
                     SYNC_ROUNDS.1.notify_all();
                 }
             }
-            // Between the rounds asked for, while submissions come.
-            let mut last = std::time::Instant::now();
+            // Between the rounds asked for, while submissions come. With
+            // Close hints the first submission may be much later: the timer
+            // window then begins with the first one.
+            let mut last = (!early_heaps()).then(std::time::Instant::now);
             loop {
                 let mut r = rounds();
                 let mut asked = r.has_asked();
+                let mut close = false;
                 while !asked {
-                    let Some(every) = sync_early().filter(|_| last.elapsed().as_millis() < 500) else {
+                    close = r.take_close();
+                    if close {
+                        break;
+                    }
+                    let Some(every) = sync_early().filter(|_| last.is_some_and(|t| t.elapsed().as_millis() < 500)) else {
                         r = SYNC_ROUNDS.1.wait(r).unwrap_or_else(|e| e.into_inner());
                         asked = r.has_asked();
                         continue;
@@ -352,14 +410,26 @@ pub(crate) fn begin_sync_heaps_for(stamp: Option<u64>) -> SyncedHeaps {
                         break;
                     }
                 }
+                if close {
+                    // Not a round: what a submission is stamped with is
+                    // those that begin after its writes.
+                    drop(r);
+                    let _round = crate::timeline::span("the heaps' records, at list close");
+                    let _ = std::panic::catch_unwind(|| scan_heaps(false));
+                    continue;
+                }
                 // Count the round as started *before* releasing the lock and
                 // calling `sync_heaps()`, so any submission stamped after this
                 // point knows it must wait for the next round.
                 r.start_round();
+                if asked {
+                    // A round asked for takes a Close hint not yet taken.
+                    r.hint = CloseHint::Available;
+                }
                 drop(r);
                 priority.keep();
                 if asked {
-                    last = std::time::Instant::now();
+                    last = Some(std::time::Instant::now());
                 }
                 let _over = Over;
                 let _round =
@@ -369,7 +439,23 @@ pub(crate) fn begin_sync_heaps_for(stamp: Option<u64>) -> SyncedHeaps {
         });
         THREAD.store(made.is_ok(), std::sync::atomic::Ordering::Release);
     });
-    if !THREAD.load(std::sync::atomic::Ordering::Acquire) {
+    THREAD.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// [`sync_heaps`], begun; done when it is dropped (with [`sync_aside`]), or
+/// when this returns.
+#[cfg(windows)]
+pub(crate) struct SyncedHeaps(Option<u64>);
+
+/// Begins (or reuses an already-completed/in-flight) heap-sync round that
+/// covers all title descriptor writes up to `stamp` (or up to now if `None`).
+#[cfg(windows)]
+pub(crate) fn begin_sync_heaps_for(stamp: Option<u64>) -> SyncedHeaps {
+    if !sync_aside() {
+        sync_heaps();
+        return SyncedHeaps(None);
+    }
+    if !sync_worker() {
         sync_heaps();
         return SyncedHeaps(None);
     }
@@ -502,6 +588,14 @@ impl Drop for SyncedHeaps {
 /// `VICTORY_HEAP_SYNC=0`: not done, as before. [`SYNCED`] counts.
 #[cfg(windows)]
 pub(crate) fn sync_heaps() {
+    scan_heaps(true);
+}
+
+/// A pass at a title's Close (`VICTORY_EARLY_HEAPS=1`) takes the marked slots
+/// but leaves renderer port #2's per-frame fallback budget for the usual
+/// scans: more writes can follow the Close.
+#[cfg(windows)]
+fn scan_heaps(include_fallback: bool) {
     use std::sync::atomic::Ordering::Relaxed;
     if !sync_on() {
         return;
@@ -562,7 +656,7 @@ pub(crate) fn sync_heaps() {
             let phase = crate::timeline::span("the heaps' records: the marks taken (renderer port 2)");
             let marked = crate::port_descriptors::take(start).unwrap_or_default();
             phase.end();
-            if crate::port_descriptors::ask_due(frame) {
+            if include_fallback && crate::port_descriptors::ask_due(frame) {
                 let began = std::time::Instant::now();
                 let phase = crate::timeline::span("the heaps' records: asking (renderer port 2's fallback)");
                 let taken = written.take(start as usize, end as usize);
@@ -572,7 +666,7 @@ pub(crate) fn sync_heaps() {
             }
             parts = port_scan_parts(
                 &marked,
-                crate::port_descriptors::to_check(frame),
+                if include_fallback { crate::port_descriptors::to_check(frame) } else { Vec::new() },
                 start as usize,
                 end as usize,
                 step as usize,
@@ -2785,5 +2879,38 @@ mod tests {
         r.start_round();
         r.finish_round();
         assert_eq!(r.request(Some(s3)), (None, false));
+    }
+
+    /// A Close wakes the worker for one pass, which counts for no round; a
+    /// round asked for takes a hint not yet taken.
+    #[cfg(windows)]
+    #[test]
+    fn a_close_hint_makes_one_pass_that_is_no_round() {
+        use super::CloseHint::{Available, Pending, Used};
+        let mut r = super::SyncRounds::default();
+        assert!(r.list_closed());
+        assert_eq!(r.hint, Pending);
+        // A second Close before the pass does not wake it again.
+        assert!(!r.list_closed());
+        assert!(r.take_close());
+        assert_eq!(r.hint, Used);
+        // One pass between requested rounds.
+        assert!(!r.list_closed());
+        assert!(!r.take_close());
+        // No ticket moved for the pass.
+        assert_eq!((r.started, r.done, r.stamp()), (0, 0, 1));
+        // A submission asks a round: that takes the hint and the next Close
+        // hints again after it.
+        assert_eq!(r.request(None), (Some(1), true));
+        assert!(!r.list_closed(), "a round is asked for");
+        assert!(!r.take_close());
+        assert_eq!(r.hint, Available);
+        r.start_round();
+        r.finish_round();
+        assert!(r.list_closed());
+        // Asked before the worker took the hint: the round takes it.
+        assert_eq!(r.request(None), (Some(2), true));
+        assert!(!r.take_close());
+        assert_eq!(r.hint, Available);
     }
 }
