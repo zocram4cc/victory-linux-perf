@@ -1167,6 +1167,28 @@ fn translated_compute_matches_pc() {
             View::Cube(4, 1, &cube_texels),
         ])
         .collect();
+    // The layer's table of strides for these views, by heap slot: bytes per
+    // element (structured: the stride; raw: 1; typed: the format's), and
+    // for typed views of integer formats `VIEW_INTEGER` (and `VIEW_SIGNED`).
+    let strides: Vec<u32> = {
+        let mut t = vec![0u32; (super::SLOT_STRIDES_BYTES / 4) as usize];
+        for (i, v) in views.iter().enumerate() {
+            t[i] = match *v {
+                View::Buffer { stride: Stride::Raw, .. } | View::RawUav(_) => 1,
+                View::Buffer { stride: Stride::Typed, .. } => 16,
+                View::Buffer { stride: Stride::Structured(n), .. } => n,
+                View::Buffer { stride: Stride::Format(f, n), .. } => {
+                    n | match f {
+                        DXGI_FORMAT_R8G8B8A8_UINT | DXGI_FORMAT_R16G16B16A16_UINT => super::VIEW_INTEGER,
+                        _ => 0,
+                    }
+                }
+                View::HalfUav(_) => 8,
+                _ => 0,
+            };
+        }
+        t
+    };
     let root_cbv = floats(64, -0.125);
     let root_srv: Vec<u32> = (0..32u32).map(|i| i * 0x0001_0003 + 7).collect();
     let samplers = [D3D12_SAMPLER_DESC {
@@ -1229,11 +1251,13 @@ fn translated_compute_matches_pc() {
         root_views.extend(cs_c.root_srvs.iter().map(|&s| (s, true)));
         root_views.sort_unstable();
         for (n, (slot, srv)) in root_views.into_iter().enumerate() {
-            assert_eq!(slot, 4 + u8::from(srv), "{name}: root view");
-            let data = if srv {
-                root_srv.clone()
+            // The table of strides by heap slot (`SLOT_STRIDES`), as the
+            // layer fills it (victory-gpu `view_stride`, `view_kind`).
+            let data = if srv && slot == super::SLOT_STRIDES {
+                strides.clone()
             } else {
-                root_cbv.clone()
+                assert_eq!(slot, 4 + u8::from(srv), "{name}: root view");
+                if srv { root_srv.clone() } else { root_cbv.clone() }
             };
             roots.push((1 + n as u32, Root::View { srv, data }));
         }
