@@ -335,6 +335,11 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     let Some(layout) = layout(size, attributes) else {
         return std::ptr::null_mut();
     };
+    if watch_xmem_alloc()
+        && let Some(user) = alloc_watched(size, layout)
+    {
+        return user;
+    }
     // shortcut: the host heap's addresses lie above 2^40, unlike the
     // console's; nothing seen builds ray-tracing structures in this memory
     // (the title uses its GPU heap). Sub-allocate from a
@@ -356,6 +361,49 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     }
 }
 
+/// [`XMemAllocDefault`]'s block of `size` bytes as write-watched private
+/// memory of its own (`VICTORY_WATCH_XMEM_ALLOC=1`): blocks of 64 KiB and
+/// more aligned to at most 64 KiB, after a leading 64 KiB page whose last
+/// words are the header `[usize::MAX, base]` ([`XMemFreeDefault`] knows it
+/// by the first). `None` where the block is smaller or the memory cannot
+/// be had: the host heap serves it as before. (Prior art 312f5a8.)
+fn alloc_watched(size: usize, layout: Layout) -> Option<*mut c_void> {
+    if size < PAGE || layout.align() > PAGE {
+        return None;
+    }
+    let total = size.checked_add(PAGE)?;
+    // SAFETY: plain allocation of private memory.
+    let base = unsafe {
+        VirtualAlloc(
+            std::ptr::null(),
+            total,
+            MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+            PAGE_READWRITE,
+        )
+    }
+    .cast::<u8>();
+    if base.is_null() {
+        return None;
+    }
+    victory_gpu::title_memory_allocated(base as usize, total);
+    // SAFETY: `total >= PAGE + size`, `HEADER <= PAGE`.
+    let user = unsafe {
+        let user = base.add(PAGE);
+        user.sub(HEADER)
+            .cast::<[usize; 2]>()
+            .write([usize::MAX, base as usize]);
+        user
+    };
+    if size >= MIB {
+        tracing::info!(
+            at = format_args!("{user:p}"),
+            size = format_args!("{size:#x}"),
+            "XMemAllocDefault watched"
+        );
+    }
+    Some(user.cast())
+}
+
 /// Frees what [`XMemAllocDefault`] returned, given the same attributes.
 pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     if address.is_null() {
@@ -370,6 +418,12 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
         }
         let user = address.cast::<u8>();
         let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
+        if size == usize::MAX {
+            let _changing = victory_gpu::title_memory_remapping();
+            victory_gpu::title_memory_freed(align, 0);
+            VirtualFree(align as *mut c_void, 0, MEM_RELEASE);
+            return;
+        }
         dealloc(
             user.sub(align),
             Layout::from_size_align_unchecked(size, align),
@@ -2925,6 +2979,18 @@ pub extern "system" fn XMemTransferMemory(kind: u32, size: usize) -> BOOL {
     moved.into()
 }
 
+/// Whether large (>= 64 KiB) [`XMemAllocDefault`] allocations use
+/// `VirtualAlloc(..., MEM_WRITE_WATCH)` (`VICTORY_WATCH_XMEM_ALLOC=1`; off by
+/// unless set). A large block the title's buffers live in is then
+/// write-watched, so what the card reads of it is copied by the pages
+/// written, not whole each time (the origin: a 21 MB buffer copied whole
+/// once or twice a frame). Our memory line's "copied whole (memory not
+/// watched)" says whether we have the case.
+fn watch_xmem_alloc() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WATCH_XMEM_ALLOC").is_some_and(|v| v == "1"))
+}
+
 /// The title's own `VirtualFree`. What the GPU side noted of the memory goes
 /// first: the address may be other memory's the moment it is free.
 extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u32) -> BOOL {
@@ -2961,6 +3027,34 @@ pub(crate) fn module() -> HleModule {
 
 #[cfg(test)]
 mod tests {
+    /// A watched block: 64 KiB aligned at most as asked, the header
+    /// marks it, the write watch sees a write to it, and the free path
+    /// gives the whole reservation back; small blocks are not watched.
+    #[test]
+    fn large_blocks_can_be_write_watched() {
+        use windows_sys::Win32::System::Memory::{GetWriteWatch, MEM_FREE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+        assert!(super::alloc_watched(PAGE - 1, Layout::from_size_align(PAGE - 1, 16).unwrap()).is_none());
+        let size = 3 * PAGE + 100;
+        let user = super::alloc_watched(size, Layout::from_size_align(size, 256).unwrap()).expect("watched");
+        assert_eq!(user as usize % PAGE, 0);
+        // SAFETY: the block's header and its bytes.
+        unsafe {
+            let [mark, base] = user.cast::<u8>().sub(HEADER).cast::<[usize; 2]>().read();
+            assert_eq!((mark, base), (usize::MAX, user as usize - PAGE));
+            user.cast::<u8>().add(2 * PAGE + 5).write(7);
+            let mut pages = [std::ptr::null_mut::<c_void>(); 64];
+            let (mut count, mut granularity) = (pages.len(), 0u32);
+            let r = GetWriteWatch(0, base as *const c_void, size + PAGE, pages.as_mut_ptr(), &mut count, &mut granularity);
+            assert_eq!(r, 0);
+            let written = (user as usize + 2 * PAGE + 5) & !(granularity as usize - 1);
+            assert!(pages[..count].iter().any(|&p| p as usize == written), "the written page is reported");
+            XMemFreeDefault(user, 0);
+            let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            VirtualQuery(base as *const c_void, &mut info, size_of::<MEMORY_BASIC_INFORMATION>());
+            assert_eq!(info.State, MEM_FREE);
+        }
+    }
+
     use super::*;
 
     fn query(address: *const c_void) -> BasicInformation {
