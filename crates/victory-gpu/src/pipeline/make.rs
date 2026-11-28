@@ -38,6 +38,8 @@ pub(crate) struct Pending {
     /// Taken by a worker from [`Queue::slow`].
     was_slow: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
+    /// Recording threads waiting for this particular pipeline.
+    completion: (Mutex<()>, Condvar),
     began: OnceLock<Instant>,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw or dispatch has requested it yet.
@@ -161,6 +163,7 @@ impl Pending {
             queue_state: AtomicU8::new(NOT_QUEUED),
             was_slow: AtomicBool::new(false),
             made: OnceLock::new(),
+            completion: (Mutex::new(()), Condvar::new()),
             began: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
@@ -191,7 +194,7 @@ impl Pending {
                 None
             }
         });
-        let (lock, done) = &DONE;
+        let (lock, done) = &self.completion;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
     }
@@ -226,17 +229,21 @@ pub(crate) fn hashes(p: &Pending) -> String {
     hashes.join("+")
 }
 
-/// Signalled whenever a worker has made a pipeline.
-static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
-
-fn wait_for_made<T>(made: &OnceLock<T>, started: Instant, allowance: Duration) -> Option<&T> {
+/// Waits until `made` is set or `allowance` has passed since `started`;
+/// `completion` is signalled by whoever sets it.
+fn wait_for_made<'a, T>(
+    made: &'a OnceLock<T>,
+    completion: &(Mutex<()>, Condvar),
+    started: Instant,
+    allowance: Duration,
+) -> Option<&'a T> {
     if let Some(result) = made.get() {
         return Some(result);
     }
     if started.elapsed() >= allowance {
         return made.get();
     }
-    let (lock, done) = &DONE;
+    let (lock, done) = completion;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while made.get().is_none() {
         let left = allowance.saturating_sub(started.elapsed());
@@ -265,7 +272,7 @@ impl HeadMapWait {
         if self.timed_out.load(Ordering::Acquire) {
             return pipeline.made.get();
         }
-        let made = wait_for_made(&pipeline.made, Instant::now(), self.allowance);
+        let made = wait_for_made(&pipeline.made, &pipeline.completion, Instant::now(), self.allowance);
         if made.is_none() && !self.timed_out.swap(true, Ordering::AcqRel) {
             tracing::warn!(
                 key = pipeline.key,
@@ -506,7 +513,7 @@ fn wait(p: &Pending, frame: u64) {
     }
     let waiting = crate::timeline::span("pipeline: first use waits for a host pipeline");
     let started = Instant::now();
-    let _ = wait_for_made(&p.made, started, left);
+    let _ = wait_for_made(&p.made, &p.completion, started, left);
     let elapsed = started.elapsed();
     crate::launcher_stats::PIPELINE_WAIT_US.fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
     let waited = elapsed.min(left);
@@ -1019,12 +1026,30 @@ mod tests {
     }
 
     #[test]
+    fn another_pipeline_can_finish_while_a_waiter_holds_its_lock() {
+        let first = Pending::new(Vec::new(), None);
+        let second = Pending::new(Vec::new(), None);
+        let guard = first.completion.0.lock().unwrap();
+        std::thread::scope(|scope| {
+            let (sent, received) = std::sync::mpsc::channel();
+            scope.spawn(move || {
+                second.make();
+                sent.send(()).unwrap();
+            });
+            let completed = received.recv_timeout(Duration::from_secs(5));
+            drop(guard);
+            completed.unwrap();
+        });
+    }
+
+    #[test]
     fn a_pipeline_result_remains_visible_after_the_wait_deadline() {
         let made = OnceLock::new();
+        let completion = (Mutex::new(()), Condvar::new());
         let started = Instant::now();
-        assert_eq!(wait_for_made(&made, started, Duration::ZERO), None);
+        assert_eq!(wait_for_made(&made, &completion, started, Duration::ZERO), None);
         made.set(Some(7)).unwrap();
-        assert_eq!(wait_for_made(&made, started, Duration::ZERO), Some(&Some(7)));
+        assert_eq!(wait_for_made(&made, &completion, started, Duration::ZERO), Some(&Some(7)));
     }
 
     fn compute_shader(hash: &str) -> Arc<Shader> {
