@@ -2989,6 +2989,10 @@ impl State {
         };
 
         let began = std::time::Instant::now();
+        // Several slots can show the same texture from the same mip. One
+        // that was brought up to date whole in this pass is not read and
+        // compared again for the next slot: no title copy comes between.
+        let mut uploaded: std::collections::HashSet<(usize, u32)> = std::collections::HashSet::new();
         for (index, write) in due {
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
                 served = false;
@@ -3241,7 +3245,9 @@ impl State {
                 (Some(_), Some(View::Placed(_, _, desc))) => crate::resource::first_mip(desc),
                 _ => 0,
             };
-            let same = !tabled && crate::texture::unchanged(resource, first);
+            let same = !tabled
+                && ((partly.is_none() && uploaded.contains(&(resource as usize, first)))
+                    || crate::texture::unchanged(resource, first));
             if same {
                 if let (Some(sync), Some(key), Some(handle)) = (sync.as_deref_mut(), upload_key, heap.handle(index)) {
                     if let Some(copy) = crate::resource::host_copy(resource) {
@@ -3389,6 +3395,9 @@ impl State {
                 None
             };
             crate::texture::unstage(resource);
+            if again.is_none() && ahead.is_none() && partly.is_none() {
+                uploaded.insert((resource as usize, first));
+            }
             SPENT.fetch_add(bytes, Ordering::Relaxed);
             since_asked += bytes;
             if room && since_asked >= 32 << 20 {
