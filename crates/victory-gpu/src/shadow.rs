@@ -3861,6 +3861,9 @@ pub(crate) fn window_use() -> [u64; 8] {
 /// again. Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
     const IDLE_FRAMES: u64 = 4;
+    if exact_pool_limit() > 0 {
+        trim_exact_pool(crate::residency::pressured());
+    }
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
@@ -6903,6 +6906,499 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     Some(shadow)
 }
 
+/// Minimum bucket size for recycled [`exact`] buffers: D3D12 committed
+/// resources already align to 64 KiB in virtual and physical memory, so
+/// rounding small views up lets all views up to 64 KiB share one bucket at no
+/// extra RAM cost.
+const EXACT_MIN_ALLOC: u64 = 64 << 10;
+/// Largest view length [`exact`] accepts.
+const EXACT_MOST: u64 = 64 << 20;
+/// Cached exact views before throttled pruning begins.
+const EXACT_MANY: usize = 256;
+/// Frames an unreferenced exact view stays cached before moving to quarantine.
+const EXACT_IDLE_FRAMES: u64 = 2;
+/// Additional frames an evicted exact buffer stays in quarantine before reuse
+/// (on top of waiting for all GPU submissions started or queued at eviction).
+const EXACT_QUARANTINE_FRAMES: u64 = 2;
+
+/// Power-of-two host allocation size for a pooled [`exact`] view of `len` bytes.
+fn exact_bucket(len: u64) -> u64 {
+    len.max(EXACT_MIN_ALLOC).next_power_of_two().min(EXACT_MOST)
+}
+
+/// Host allocation size [`exact`] uses for `len` bytes under the current
+/// pooling policy (`exact_bucket(len)` when pooled, `len.next_multiple_of(256)`
+/// when `VICTORY_EXACT_POOL_MB=0`).
+#[cfg(test)]
+pub(crate) fn exact_alloc_size(len: u64) -> u64 {
+    if exact_pool_limit() > 0 {
+        exact_bucket(len)
+    } else {
+        len.next_multiple_of(256)
+    }
+}
+
+/// Byte budget for quarantined + ready recycled buffers of the pooled
+/// store ([`exact_pooled`]), `VICTORY_EXACT_POOL_MB=<n>` MiB; off unless
+/// set (unset or 0: our store, [`exact_plain`]). The origin defaults to 256
+/// MiB under limited host RAM and 320 MiB otherwise: those are the values
+/// to try.
+fn exact_pool_limit_from(override_mb: Option<u64>) -> u64 {
+    override_mb.map_or(0, |mb| mb.saturating_mul(1 << 20))
+}
+
+fn exact_pool_limit() -> u64 {
+    static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let asked = std::env::var("VICTORY_EXACT_POOL_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        exact_pool_limit_from(asked)
+    })
+}
+
+/// An evicted buffer waiting for both frame lag and GPU submission retirement
+/// before re-entering the ready pool.
+struct Quarantined<B> {
+    evicted_frame: u64,
+    retired_sub: u64,
+    bucket: u64,
+    item: B,
+}
+
+/// Quarantined and ready-to-reuse buffers for [`exact`], bounded by a byte
+/// budget across both stages.
+struct ExactPool<B> {
+    quarantine: std::collections::VecDeque<Quarantined<B>>,
+    ready: BTreeMap<u64, Vec<B>>,
+    bytes: u64,
+}
+
+impl<B> ExactPool<B> {
+    const fn new() -> Self {
+        Self {
+            quarantine: std::collections::VecDeque::new(),
+            ready: BTreeMap::new(),
+            bytes: 0,
+        }
+    }
+
+    /// Moves quarantined buffers whose frame quarantine AND GPU submissions
+    /// have both completed into the ready pool.
+    fn graduate(&mut self, now_frame: u64, finished_sub: u64) {
+        while let Some(front) = self.quarantine.front() {
+            if now_frame < front.evicted_frame.saturating_add(EXACT_QUARANTINE_FRAMES)
+                || finished_sub < front.retired_sub
+            {
+                break;
+            }
+            if let Some(done) = self.quarantine.pop_front() {
+                self.ready.entry(done.bucket).or_default().push(done.item);
+            }
+        }
+    }
+
+    /// Places a newly evicted buffer into quarantine if `limit` allows; returns
+    /// `Err(item)` if the pool is at capacity (caller must retire it).
+    fn push_quarantine(
+        &mut self,
+        evicted_frame: u64,
+        retired_sub: u64,
+        bucket: u64,
+        item: B,
+        limit: u64,
+    ) -> Result<(), B> {
+        if self.bytes.saturating_add(bucket) > limit {
+            return Err(item);
+        }
+        self.bytes += bucket;
+        self.quarantine.push_back(Quarantined {
+            evicted_frame,
+            retired_sub,
+            bucket,
+            item,
+        });
+        Ok(())
+    }
+
+    /// Returns a buffer that was never exposed to any GPU command (e.g. lost an
+    /// insert race) directly to the ready pool if `limit` allows.
+    fn push_ready(&mut self, bucket: u64, item: B, limit: u64) -> Result<(), B> {
+        if self.bytes.saturating_add(bucket) > limit {
+            return Err(item);
+        }
+        self.bytes += bucket;
+        self.ready.entry(bucket).or_default().push(item);
+        Ok(())
+    }
+
+    /// Pops a ready buffer of exact `bucket` bytes after graduating eligible
+    /// quarantined entries.
+    fn pop_ready(&mut self, bucket: u64, now_frame: u64, finished_sub: u64) -> Option<B> {
+        self.graduate(now_frame, finished_sub);
+        let item = self.ready.get_mut(&bucket).and_then(Vec::pop)?;
+        self.bytes = self.bytes.saturating_sub(bucket);
+        Some(item)
+    }
+
+    /// Drains all already-retired ready buffers (used under host memory
+    /// pressure), leaving still-quarantined entries safely untouched.
+    fn drain_ready(&mut self) -> Vec<B> {
+        let mut drained = Vec::new();
+        for (bucket, items) in std::mem::take(&mut self.ready) {
+            self.bytes = self.bytes.saturating_sub(bucket.saturating_mul(items.len() as u64));
+            drained.extend(items);
+        }
+        drained
+    }
+
+    fn quarantined_count(&self) -> usize {
+        self.quarantine.len()
+    }
+}
+
+/// Persistently mapped host buffer held inside [`ExactPool`].
+struct RecycledBuffer {
+    buffer: ID3D12Resource,
+    /// Persistent CPU write-back mapping of `buffer`, valid while `buffer` lives.
+    data: usize,
+    /// Upper bound of bytes previously touched in this buffer (`<= bucket`),
+    /// zeroed before the buffer is handed out for a new view.
+    dirty_len: u64,
+}
+
+/// Resets `pruning` to `false` even if a sweep unwinds.
+struct PruneGuard<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for PruneGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Tuning knobs for an [`ExactStore`] lookup.
+#[derive(Clone, Copy)]
+struct ExactPolicy {
+    many: usize,
+    pool_limit: u64,
+    count_global: bool,
+}
+
+/// Lock-stratified cache and quarantined buffer pool for [`exact`]:
+/// - Read hits take only `map.read()` (no serialization across list threads).
+/// - `map` and `pool` are never held simultaneously (deadlock-free).
+/// - D3D12 buffer creation (`shared_buffer`) and overflow retirement run
+///   outside every lock.
+/// - GPU retirement watermarks are sampled after evicting entries from `map`,
+///   so submissions started before eviction cannot race past quarantine.
+struct ExactStore {
+    map: RwLock<BTreeMap<(u64, u64), (Arc<Shadow>, AtomicU64)>>,
+    pool: Mutex<ExactPool<RecycledBuffer>>,
+    count: std::sync::atomic::AtomicUsize,
+    tick: AtomicU64,
+    next_prune: AtomicU64,
+    pruning: std::sync::atomic::AtomicBool,
+    /// `[asked, newly_allocated, recycled_from_pool]` since the last frame line.
+    stats: [AtomicU64; 3],
+}
+
+impl ExactStore {
+    const fn new() -> Self {
+        Self {
+            map: RwLock::new(BTreeMap::new()),
+            pool: Mutex::new(ExactPool::new()),
+            count: std::sync::atomic::AtomicUsize::new(0),
+            tick: AtomicU64::new(0),
+            next_prune: AtomicU64::new(0),
+            pruning: std::sync::atomic::AtomicBool::new(false),
+            stats: [const { AtomicU64::new(0) }; 3],
+        }
+    }
+
+    /// Evicts idle, unreferenced entries from `map` (at most one thread at a
+    /// time, throttled by `next_prune`), sampling the GPU retirement watermark
+    /// after removal so submissions begun before eviction are covered, then
+    /// moving entries into quarantine up to `policy.pool_limit` and retiring
+    /// any overflow outside all locks.
+    fn maybe_prune(
+        &self,
+        now_tick: u64,
+        now_frame: u64,
+        policy: ExactPolicy,
+        sample_retired: impl FnOnce() -> u64,
+    ) {
+        if self.count.load(Ordering::Relaxed) < policy.many
+            || now_tick < self.next_prune.load(Ordering::Relaxed)
+            || self
+                .pruning
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                .is_err()
+        {
+            return;
+        }
+        let _guard = PruneGuard(&self.pruning);
+        let dead: Vec<Arc<Shadow>> = {
+            let mut map = self.map.write().unwrap_or_else(|e| e.into_inner());
+            if map.len() < policy.many {
+                self.count.store(map.len(), Ordering::Relaxed);
+                return;
+            }
+            let keys: Vec<(u64, u64)> = map
+                .iter()
+                .filter_map(|(&key, (shadow, last_frame))| {
+                    let idle = now_frame
+                        >= last_frame.load(Ordering::Relaxed).saturating_add(EXACT_IDLE_FRAMES);
+                    (idle
+                        && Arc::strong_count(shadow) == 1
+                        && crate::host::references(&shadow.buffer) == 1)
+                        .then_some(key)
+                })
+                .collect();
+            let mut removed = Vec::with_capacity(keys.len());
+            for key in keys {
+                if let Some((shadow, _)) = map.remove(&key) {
+                    removed.push(shadow);
+                }
+            }
+            let remaining = map.len();
+            self.count.store(remaining, Ordering::Relaxed);
+            let step = (remaining as u64 / 2).max(policy.many as u64);
+            self.next_prune.store(now_tick.saturating_add(step), Ordering::Relaxed);
+            removed
+        };
+        if dead.is_empty() {
+            return;
+        }
+        // Sample after `map.remove` + write-lock release so no lookup can hand
+        // out any entry in `dead` again and any submission begun in between is
+        // included in `retired_sub`.
+        let retired_sub = sample_retired();
+        let mut to_retire: Vec<Arc<Shadow>> = Vec::new();
+        if policy.pool_limit > 0 {
+            let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
+            for shadow in dead {
+                let bucket = exact_bucket(shadow.len);
+                let dirty_len = shadow.len.next_multiple_of(256).min(bucket);
+                if pool.bytes.saturating_add(bucket) <= policy.pool_limit {
+                    let recycled = RecycledBuffer {
+                        buffer: shadow.buffer.clone(),
+                        data: shadow.data as usize,
+                        dirty_len,
+                    };
+                    drop(shadow);
+                    let _ = pool.push_quarantine(
+                        now_frame,
+                        retired_sub,
+                        bucket,
+                        recycled,
+                        policy.pool_limit,
+                    );
+                } else {
+                    to_retire.push(shadow);
+                }
+            }
+        } else {
+            to_retire = dead;
+        }
+        for shadow in to_retire {
+            crate::host::retire(shadow);
+        }
+    }
+
+    fn get_or_create(
+        &self,
+        address: u64,
+        len: u64,
+        now_frame: u64,
+        policy: ExactPolicy,
+        sample_retired: impl FnOnce() -> u64,
+        finished_sub: impl FnOnce() -> u64,
+    ) -> Option<Arc<Shadow>> {
+        if len == 0 || len > EXACT_MOST || !address.is_multiple_of(4) {
+            return None;
+        }
+        self.stats[0].fetch_add(1, Ordering::Relaxed);
+
+        // Fast path: concurrent read hits take only the shared lock.
+        {
+            let map = self.map.read().unwrap_or_else(|e| e.into_inner());
+            if let Some((shadow, last_frame)) = map.get(&(address, len)) {
+                last_frame.store(now_frame, Ordering::Relaxed);
+                shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+                return Some(shadow.clone());
+            }
+        }
+
+        let alloc_size = if policy.pool_limit > 0 {
+            exact_bucket(len)
+        } else {
+            len.next_multiple_of(256)
+        };
+        let now_tick = self.tick.fetch_add(1, Ordering::Relaxed) + 1;
+        self.maybe_prune(now_tick, now_frame, policy, sample_retired);
+
+        let pooled = if policy.pool_limit > 0 {
+            let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
+            pool.pop_ready(alloc_size, now_frame, finished_sub())
+        } else {
+            None
+        };
+
+        let (shadow, from_pool) = if let Some(recycled) = pooled {
+            let data = recycled.data as *mut u8;
+            if recycled.dirty_len > 0 {
+                let clear = (recycled.dirty_len as usize).min(alloc_size as usize);
+                // SAFETY: `data` is persistently mapped for `alloc_size` bytes
+                // and this buffer graduated past frame quarantine and GPU
+                // submission completion with no remaining references.
+                unsafe { std::ptr::write_bytes(data, 0, clear) };
+            }
+            crate::host::name(&recycled.buffer, || format!("title view {address:#x}+{len:#x}"));
+            // SAFETY: a live buffer recycled after GPU retirement.
+            let gpu = unsafe { recycled.buffer.GetGPUVirtualAddress() };
+            (Arc::new(Shadow::new(recycled.buffer, data, gpu, address, len)), true)
+        } else {
+            // Allocate completely outside all locks so list threads never
+            // serialize on D3D12 resource creation.
+            let (buffer, data) = host()?.shared_buffer(alloc_size)?;
+            crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            (Arc::new(Shadow::new(buffer, data, gpu, address, len)), false)
+        };
+
+        let mut lost_race: Option<Arc<Shadow>> = None;
+        let out = {
+            let mut map = self.map.write().unwrap_or_else(|e| e.into_inner());
+            if let Some((existing, last_frame)) = map.get(&(address, len)) {
+                last_frame.store(now_frame, Ordering::Relaxed);
+                existing.used.store(crate::host::moment(), Ordering::Relaxed);
+                lost_race = Some(shadow);
+                existing.clone()
+            } else {
+                map.insert((address, len), (shadow.clone(), AtomicU64::new(now_frame)));
+                self.count.store(map.len(), Ordering::Relaxed);
+                if from_pool {
+                    self.stats[2].fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.stats[1].fetch_add(1, Ordering::Relaxed);
+                    if policy.count_global {
+                        OWN_MADE.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                shadow
+            }
+        };
+
+        if let Some(unused) = lost_race {
+            // Never seen by any GPU command: return directly to the ready pool
+            // (already zeroed), or drop outside locks if the pool is full.
+            if policy.pool_limit > 0 {
+                let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
+                if pool.bytes.saturating_add(alloc_size) <= policy.pool_limit {
+                    let recycled = RecycledBuffer {
+                        buffer: unused.buffer.clone(),
+                        data: unused.data as usize,
+                        dirty_len: 0,
+                    };
+                    drop(unused);
+                    let _ = pool.push_ready(alloc_size, recycled, policy.pool_limit);
+                } else {
+                    drop(pool);
+                    drop(unused);
+                }
+            } else {
+                drop(unused);
+            }
+        }
+
+        Some(out)
+    }
+
+    /// Graduates retired entries and, under host memory pressure, drops ready
+    /// pooled buffers outside the lock to return RAM to the OS.
+    fn trim(&self, now_frame: u64, finished_sub: u64, pressured: bool) {
+        let drained = {
+            let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
+            pool.graduate(now_frame, finished_sub);
+            if pressured {
+                pool.drain_ready()
+            } else {
+                Vec::new()
+            }
+        };
+        drop(drained);
+    }
+
+    fn snapshot(&self) -> (usize, usize, u64) {
+        let kept = self.count.load(Ordering::Relaxed);
+        let pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
+        (kept, pool.quarantined_count(), pool.bytes)
+    }
+}
+
+/// Copies of single buffer views' own bytes ([`exact`]), with concurrent read
+/// lookup and a GPU-quarantined recycling pool.
+static EXACT_STORE: ExactStore = ExactStore::new();
+
+/// Called by [`let_go_idle`] during the once-per-second submission sweep.
+fn trim_exact_pool(pressured: bool) {
+    let (_, finished_sub) = crate::host::submissions();
+    EXACT_STORE.trim(crate::frame::current(), finished_sub, pressured);
+}
+
+/// A copy of the title memory `[address, address + len)` that starts at
+/// `address` itself: for a buffer view whose bytes do not start on an
+/// element of the copy its buffer has (`descriptor/host.rs` `view_home`).
+/// A host view counts its first element from its buffer's start; a console
+/// view starts at any address, and the title places views at ring
+/// positions inside its big GPU heap. Such a view was refused and its slot
+/// read zeros ("buffer view not on an element of its host copy", in every
+/// run; upstream VIctory 86a5ed6 found its meshlet culling constants and
+/// colour-bake parameter blocks among them and gives each a copy of its
+/// own bytes, as here).
+///
+/// The copy is brought up to date and written back like any other (a list
+/// refreshes the copy its view's slot shows, `buffer_copy`). Kept by
+/// (start, bytes) for as long as a list or a slot holds it; idle entries are
+/// pruned periodically into a GPU-quarantined power-of-two pool so ring-buffer
+/// turnover reuses host buffers without per-frame D3D12 allocations.
+fn exact_pooled(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    EXACT_STORE.get_or_create(
+        address,
+        len,
+        crate::frame::current(),
+        ExactPolicy {
+            many: EXACT_MANY,
+            pool_limit: exact_pool_limit(),
+            count_global: true,
+        },
+        || {
+            let (started, _) = crate::host::submissions();
+            started.saturating_add(crate::queue::queued())
+        },
+        || crate::host::submissions().1,
+    )
+}
+
+/// Copies of single views' bytes made since the start.
+pub(crate) static OWN_MADE: AtomicU64 = AtomicU64::new(0);
+
+/// A copy of its own bytes for a buffer view off its copy's elements: as
+/// before ([`exact_plain`]), or with `VICTORY_EXACT_POOL_MB=<n>` from the
+/// pooled store ([`exact_pooled`]).
+pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    if exact_pool_limit() > 0 { exact_pooled(address, len) } else { exact_plain(address, len) }
+}
+
+/// The frame line of [`exact`]'s copies, of whichever store is in use.
+pub(crate) fn exact_line(frames: f64) {
+    if exact_pool_limit() > 0 { exact_line_pooled(frames) } else { exact_line_plain(frames) }
+}
+
+/// Our store of [`exact`]'s copies, in use unless `VICTORY_EXACT_POOL_MB`
+/// is set: one lock, the idle ones dropped after 512 askings once there are
+/// 256.
 /// Copies of single buffer views' own bytes ([`exact`]), by (start,
 /// bytes), each with the asking that last took it; and the askings so far.
 #[allow(clippy::type_complexity)]
@@ -6927,7 +7423,7 @@ static EXACT_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// (start, bytes) for as long as a list or a slot holds it; of the others,
 /// those not asked for lately go once there are many (ring positions
 /// change every frame).
-pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
+fn exact_plain(address: u64, len: u64) -> Option<Arc<Shadow>> {
     /// Copies kept before the idle ones are looked for, and the askings an
     /// idle one stays for.
     const MANY: usize = 256;
@@ -6965,13 +7461,11 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     Some(shadow)
 }
 
-/// Copies of single views' bytes made since the start.
-pub(crate) static OWN_MADE: AtomicU64 = AtomicU64::new(0);
 
 /// With the frame line: the buffer views that got a copy of their own
 /// bytes ([`exact`]), per frame over `frames`, and the copies kept now.
 /// Nothing while there are none.
-pub(crate) fn exact_line(frames: f64) {
+fn exact_line_plain(frames: f64) {
     let [asked, made] = [0, 1].map(|i| EXACT_STATS[i].swap(0, Ordering::Relaxed));
     if asked == 0 {
         return;
@@ -6982,6 +7476,25 @@ pub(crate) fn exact_line(frames: f64) {
          {:.1} asked for per frame, {:.1} copies of their own bytes made per frame, {kept} kept",
         asked as f64 / frames,
         made as f64 / frames
+    );
+}
+
+/// With the frame line: the buffer views that got a copy of their own
+/// bytes ([`exact`]), per frame over `frames`, and the copies kept/pooled now.
+/// Nothing while there are none.
+fn exact_line_pooled(frames: f64) {
+    let [asked, made, reused] = [0, 1, 2].map(|i| EXACT_STORE.stats[i].swap(0, Ordering::Relaxed));
+    if asked == 0 {
+        return;
+    }
+    let (kept, quarantined, pooled_bytes) = EXACT_STORE.snapshot();
+    tracing::info!(
+        "buffer views off their copy's elements (they were refused and read zeros; VICTORY_VIEW_BYTES=0 refuses them again): \
+         {:.1} asked for per frame, {:.1} new + {:.1} recycled copies per frame, {kept} kept ({quarantined} quarantined, {} MiB pooled)",
+        asked as f64 / frames,
+        made as f64 / frames,
+        reused as f64 / frames,
+        pooled_bytes >> 20,
     );
 }
 
@@ -7142,6 +7655,211 @@ mod window_tests {
             assert!(start <= address && start + len >= end);
             assert!(start % g == 0 && len % g == 0);
         }
+    }
+}
+
+#[cfg(test)]
+mod exact_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use windows::core::Interface;
+
+    use super::{
+        EXACT_IDLE_FRAMES, EXACT_MIN_ALLOC, EXACT_MOST, EXACT_QUARANTINE_FRAMES, ExactPolicy,
+        ExactPool, ExactStore, exact_bucket, exact_pool_limit_from,
+    };
+
+    #[test]
+    fn exact_buckets_round_to_power_of_two_at_least_64k() {
+        assert_eq!(exact_bucket(1), EXACT_MIN_ALLOC);
+        assert_eq!(exact_bucket(456), EXACT_MIN_ALLOC);
+        assert_eq!(exact_bucket(EXACT_MIN_ALLOC), EXACT_MIN_ALLOC);
+        assert_eq!(exact_bucket(EXACT_MIN_ALLOC + 1), 128 << 10);
+        assert_eq!(exact_bucket(300 << 10), 512 << 10);
+        assert_eq!(exact_bucket(EXACT_MOST), EXACT_MOST);
+    }
+
+    #[test]
+    fn exact_pool_limit_is_off_unless_set() {
+        const MIB: u64 = 1 << 20;
+        assert_eq!(exact_pool_limit_from(None), 0, "off unless set");
+        assert_eq!(exact_pool_limit_from(Some(0)), 0);
+        assert_eq!(exact_pool_limit_from(Some(128)), 128 * MIB);
+        assert_eq!(exact_pool_limit_from(Some(320)), 320 * MIB);
+        assert_eq!(exact_pool_limit_from(Some(u64::MAX)), u64::MAX);
+    }
+
+    #[test]
+    fn quarantine_waits_for_both_frames_and_gpu_submissions() {
+        let mut pool: ExactPool<u32> = ExactPool::new();
+        let b = EXACT_MIN_ALLOC;
+        assert!(pool.push_quarantine(10, 50, b, 1, 2 * b).is_ok());
+        assert!(pool.push_quarantine(10, 55, b, 2, 2 * b).is_ok());
+        // Over capacity: rejected and returned to caller for retirement.
+        assert_eq!(pool.push_quarantine(10, 60, b, 3, 2 * b), Err(3));
+        assert_eq!(pool.bytes, 2 * b);
+        assert_eq!(pool.quarantined_count(), 2);
+
+        // Submission finished, but fewer than QUARANTINE_FRAMES elapsed: still held.
+        assert_eq!(pool.pop_ready(b, 10 + EXACT_QUARANTINE_FRAMES - 1, 100), None);
+        // Enough frames elapsed, but GPU submission 50 still in flight: still held.
+        assert_eq!(pool.pop_ready(b, 10 + EXACT_QUARANTINE_FRAMES, 49), None);
+        // Submission 50 finished, submission 55 still in flight: only #1 graduates.
+        assert_eq!(pool.pop_ready(b, 10 + EXACT_QUARANTINE_FRAMES, 50), Some(1));
+        assert_eq!(pool.quarantined_count(), 1);
+        assert_eq!(pool.bytes, b);
+        // Submission 55 finished: #2 graduates.
+        assert_eq!(pool.pop_ready(b, 10 + EXACT_QUARANTINE_FRAMES, 55), Some(2));
+        assert_eq!(pool.quarantined_count(), 0);
+        assert_eq!(pool.bytes, 0);
+    }
+
+    #[test]
+    fn drain_ready_frees_retired_buffers_without_touching_quarantine() {
+        let mut pool: ExactPool<u32> = ExactPool::new();
+        let b = EXACT_MIN_ALLOC;
+        assert!(pool.push_ready(b, 10, 3 * b).is_ok());
+        assert!(pool.push_quarantine(5, 20, b, 20, 3 * b).is_ok());
+        assert_eq!(pool.bytes, 2 * b);
+
+        let drained = pool.drain_ready();
+        assert_eq!(drained, vec![10]);
+        assert_eq!(pool.quarantined_count(), 1);
+        assert_eq!(pool.bytes, b);
+    }
+
+    #[test]
+    fn exact_recycles_quarantined_gpu_buffer_and_zeroes_stale_bytes() {
+        if crate::host::host().is_none() {
+            return; // no host GPU
+        }
+        let store = ExactStore::new();
+        let policy = ExactPolicy {
+            many: 2,
+            pool_limit: 4 * EXACT_MIN_ALLOC,
+            count_global: false,
+        };
+
+        // Invalid asks are rejected without touching the host.
+        assert!(store.get_or_create(0x1000, 0, 1, policy, || 0, || 0).is_none());
+        assert!(store.get_or_create(0x1002, 16, 1, policy, || 0, || 0).is_none());
+        assert!(store.get_or_create(0x1000, EXACT_MOST + 4, 1, policy, || 0, || 0).is_none());
+
+        // Populate two entries on frame 1 so the map reaches `many = 2`.
+        let first = store.get_or_create(0x1_0000, 1024, 1, policy, || 10, || 10).unwrap();
+        let hit = store.get_or_create(0x1_0000, 1024, 1, policy, || 10, || 10).unwrap();
+        assert!(Arc::ptr_eq(&first, &hit));
+        assert_eq!(first.width(), EXACT_MIN_ALLOC);
+        drop(hit);
+
+        // Dirty every byte of the first buffer's view so reuse must zero it.
+        // SAFETY: `first.data` is mapped for `EXACT_MIN_ALLOC >= 1024` bytes.
+        unsafe { std::ptr::write_bytes(first.data, 0xAB, 1024) };
+        let first_raw = first.buffer.as_raw() as usize;
+        drop(first);
+
+        let second = store.get_or_create(0x2_0000, 512, 1, policy, || 10, || 10).unwrap();
+        // Keep `second` held by the caller so pruning skips it and evicts only `first`.
+        // Verify `sample_retired` runs only AFTER eviction removes `first` from the map.
+        let evict_frame = 1 + EXACT_IDLE_FRAMES;
+        let sampled_after_evict = AtomicBool::new(false);
+        let third = store
+            .get_or_create(
+                0x3_0000,
+                512,
+                evict_frame,
+                policy,
+                || {
+                    sampled_after_evict.store(store.snapshot().0 == 1, Ordering::Relaxed);
+                    20
+                },
+                || 10,
+            )
+            .unwrap();
+        assert!(sampled_after_evict.load(Ordering::Relaxed), "watermark must be sampled after map eviction");
+        assert_eq!(store.snapshot().1, 1, "idle unreferenced entry enters quarantine");
+        assert_eq!(store.stats[1].load(Ordering::Relaxed), 3);
+        assert_eq!(store.stats[2].load(Ordering::Relaxed), 0);
+
+        // Before GPU submission 20 finishes, quarantine does not hand out `first`.
+        let ready_frame = evict_frame + EXACT_QUARANTINE_FRAMES;
+        let fourth = store.get_or_create(0x4_0000, 256, ready_frame, policy, || 20, || 19).unwrap();
+        assert_ne!(fourth.buffer.as_raw() as usize, first_raw);
+        assert_eq!(store.stats[2].load(Ordering::Relaxed), 0);
+
+        // Once both frame lag and GPU submission 20 finish, `first` is recycled
+        // into the next 64 KiB ask and all previously dirty bytes are zeroed.
+        let recycled = store.get_or_create(0x5_0000, 256, ready_frame, policy, || 20, || 20).unwrap();
+        assert_eq!(recycled.buffer.as_raw() as usize, first_raw, "expected recycled D3D12 resource");
+        assert_eq!(store.stats[2].load(Ordering::Relaxed), 1);
+        // SAFETY: `recycled.data` is mapped for `EXACT_MIN_ALLOC >= 1024` bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(recycled.data, 1024) };
+        assert!(bytes.iter().all(|&b| b == 0), "recycled buffer must not leak stale bytes");
+
+        // Under memory pressure, ready buffers are drained cleanly.
+        drop(second);
+        drop(third);
+        drop(fourth);
+        drop(recycled);
+        store.trim(ready_frame + 10, 100, true);
+        assert_eq!(store.snapshot().2, 0);
+    }
+
+    #[test]
+    fn exact_pool_disabled_keeps_256_byte_allocation_size() {
+        if crate::host::host().is_none() {
+            return; // no host GPU
+        }
+        let store = ExactStore::new();
+        let disabled = ExactPolicy {
+            many: 64,
+            pool_limit: 0,
+            count_global: false,
+        };
+        let s = store.get_or_create(0x20_0000, 128, 1, disabled, || 0, || 0).unwrap();
+        assert_eq!(s.width(), 256, "pool_limit=0 must not round small views up to 64 KiB");
+    }
+
+    #[test]
+    fn exact_concurrent_misses_return_the_same_shadow_and_pool_losers() {
+        if crate::host::host().is_none() {
+            return; // no host GPU
+        }
+        let store = Arc::new(ExactStore::new());
+        let policy = ExactPolicy {
+            many: 64,
+            pool_limit: 16 * EXACT_MIN_ALLOC,
+            count_global: false,
+        };
+
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                let mut out = Vec::new();
+                for k in 0..8u64 {
+                    let s = store
+                        .get_or_create(0x10_0000 + k * 0x1000, 456, 1, policy, || 0, || 0)
+                        .unwrap();
+                    out.push(s);
+                }
+                out
+            }));
+        }
+        let results: Vec<Vec<Arc<super::Shadow>>> =
+            handles.into_iter().map(|h| h.join().unwrap()).collect();
+        for k in 0..8 {
+            let winner = &results[0][k];
+            for thread in &results[1..] {
+                assert!(Arc::ptr_eq(winner, &thread[k]), "every thread sees one canonical Shadow");
+            }
+        }
+        assert_eq!(store.snapshot().0, 8);
+        assert_eq!(store.stats[1].load(Ordering::Relaxed) + store.stats[2].load(Ordering::Relaxed), 8);
     }
 }
 

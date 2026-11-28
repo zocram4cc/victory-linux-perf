@@ -6883,7 +6883,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         };
         for (off, raw, len) in [(8, true, 128u64), (8, false, 4 * 456)] {
             let v = view(start + off, raw);
-            assert_eq!(width(&v), len.next_multiple_of(256));
+            assert_eq!(width(&v), crate::shadow::exact_alloc_size(len));
             let (copy, address, bytes) = buffer_copy(&v).unwrap();
             assert_eq!((copy.span(), address, bytes), ((start + off, len), start + off, len));
         }
