@@ -8660,6 +8660,20 @@ static SPLIT: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::A
 #[cfg(feature = "diagnostics")]
 static FLUSHES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Since the last frame-rate line, of the refreshes in front
+/// ([`Batch::refresh_spans`]), nanoseconds of all threads together: in
+/// textures [0], in looks that found nothing new [1], in copies brought up
+/// to date [2]; the flushes' own time on the submitting thread [3], and the
+/// pieces of work [4]. With the threads' number, what is left of [3] is the
+/// waking and waiting of the threads.
+#[cfg(feature = "diagnostics")]
+static REFRESH_PARTS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+#[cfg(feature = "diagnostics")]
+fn refresh_part(i: usize, began: std::time::Instant) {
+    REFRESH_PARTS[i].fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+}
+
 /// Counts into [`SPLIT`].
 #[cfg(feature = "diagnostics")]
 struct Split(std::cell::Cell<std::time::Instant>);
@@ -8721,6 +8735,16 @@ fn split_line(frames: f64) {
         ms[15],
         e[0],
         e[1] / 1e3,
+    );
+    let r: Vec<f64> = REFRESH_PARTS.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    tracing::info!(
+        "refreshes in front per frame, threads together: {:.1} ms textures, {:.1} ms looks that found nothing new, {:.1} ms copies \
+         brought up to date; the flushes took {:.1} ms on the submitting thread for {:.0} pieces of work",
+        r[0] / 1e6,
+        r[1] / 1e6,
+        r[2] / 1e6,
+        r[3] / 1e6,
+        r[4],
     );
     tracing::info!(
         "asking about title memory per frame, all threads: {:.0} kernel askings over {:.0} MB ({:.1} ms, {:.0} pages of 4 KiB found \
@@ -9420,20 +9444,36 @@ impl Batch {
         }
         #[cfg(feature = "diagnostics")]
         FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        let pieces = (spans.len() + due.len()) as u64;
         crate::shadow::wide_each(spans.len() + due.len(), move |i| {
+            #[cfg(feature = "diagnostics")]
+            let began = std::time::Instant::now();
             // The textures first: they are the longer pieces.
             let Some(i) = i.checked_sub(due.len()) else {
                 due[i].refresh();
+                #[cfg(feature = "diagnostics")]
+                refresh_part(0, began);
                 return;
             };
             let (shadow, from, to) = &spans[i];
             if many && shadow.nothing_new(*from, *to - *from) {
                 #[cfg(feature = "diagnostics")]
-                FLUSHES[2].fetch_add(1, Ordering::Relaxed);
+                {
+                    FLUSHES[2].fetch_add(1, Ordering::Relaxed);
+                    refresh_part(1, began);
+                }
                 return;
             }
             Self::update(shadow, *from, *to);
+            #[cfg(feature = "diagnostics")]
+            refresh_part(2, began);
         });
+        #[cfg(feature = "diagnostics")]
+        {
+            REFRESH_PARTS[3].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            REFRESH_PARTS[4].fetch_add(pieces, Ordering::Relaxed);
+        }
         if ahead {
             crate::watch::ask_ahead_done();
         }
