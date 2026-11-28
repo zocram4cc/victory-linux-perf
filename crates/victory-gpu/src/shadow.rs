@@ -24,6 +24,8 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
+pub(crate) mod par_refresh;
+
 /// Per-page last copied write-watch sequence, paired with a 64-page-per-word
 /// bitmask of uncopied pages so partially-initialized buffers and windows
 /// still hit the O(1)/O(|written|) fast path on initialized subranges and skip
@@ -5633,9 +5635,16 @@ impl Shadow {
             crate::host::copy_mapped(at, from as *const u8, to - from, false);
         }
         // After the bytes are in: a snapshot taken meanwhile is not current.
+        self.copied_range(from, to);
+        to - from
+    }
+
+    /// Title memory `[from, to)` (inside the buffer) was copied in: a snapshot
+    /// taken meanwhile is not current, and the card's side has it to take.
+    fn copied_range(&self, from: usize, to: usize) {
+        let start = self.start as usize;
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
-        to - from
     }
 
     /// Whether shaders read and write this copy in the card's own memory
@@ -6229,11 +6238,13 @@ mod land_tests {
 
     /// A copy in the card's memory of title memory at `title` (its card side
     /// is never looked at here), all bytes 0 on the CPU's side.
-    fn copy_of(title: usize, len: usize) -> Option<Shadow> {
+    pub(super) fn copy_of(title: usize, len: usize) -> Option<Shadow> {
         let (buffer, data) = crate::host::host()?.shared_buffer(len as u64)?;
         // SAFETY: the mapping, `len` bytes.
         unsafe { std::ptr::write_bytes(data, 0, len) };
         let mut shadow = Shadow::new(buffer.clone(), data, 0, title as u64, len as u64);
+        // Drop accounts for the card side of every card-backed shadow.
+        super::CARD_BYTES[0].fetch_add(len as u64, Ordering::Relaxed);
         shadow.card = Some(Card {
             staging: buffer,
             before: Mutex::default(),

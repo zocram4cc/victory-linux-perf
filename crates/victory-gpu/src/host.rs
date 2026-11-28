@@ -10918,13 +10918,7 @@ impl Batch {
         }
         #[cfg(feature = "diagnostics")]
         FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
-        crate::shadow::wide_each(spans.len() + due.len(), move |i| {
-            // The textures first: they are the longer pieces.
-            let Some(i) = i.checked_sub(due.len()) else {
-                due[i].refresh();
-                return;
-            };
-            let (shadow, from, to) = &spans[i];
+        Self::run_refreshes(spans, due, move |(shadow, from, to)| {
             if many && shadow.nothing_new(*from, *to - *from) {
                 #[cfg(feature = "diagnostics")]
                 FLUSHES[2].fetch_add(1, Ordering::Relaxed);
@@ -10976,8 +10970,7 @@ impl Batch {
         let began = std::time::Instant::now();
         let started = std::time::Instant::now();
         let before = PREPARING[0].load(Ordering::Relaxed);
-        crate::shadow::wide_each(due.len(), move |i| {
-            let (shadow, from, to) = &due[i];
+        Self::run_refreshes(due, Vec::new(), |(shadow, from, to)| {
             if !shadow.nothing_new(*from, *to - *from) {
                 Self::update(shadow, *from, *to);
             }
@@ -10990,6 +10983,25 @@ impl Batch {
             let ns = began.elapsed().as_nanos() as u64;
             SPLIT[6].fetch_add(ns, Ordering::Relaxed);
             SPLIT[9].fetch_add(ns, Ordering::Relaxed);
+        }
+    }
+
+    fn run_refreshes(
+        spans: Vec<crate::shadow::par_refresh::Span>,
+        textures: Vec<std::sync::Arc<crate::texture::Staging>>,
+        update: impl Fn(&crate::shadow::par_refresh::Span) + Send + Sync + 'static,
+    ) {
+        use crate::shadow::par_refresh;
+        let (us, bytes) = par_refresh::run(
+            par_refresh::enabled(),
+            spans,
+            textures.len(),
+            move |i| textures[i].refresh(),
+            update,
+        );
+        if bytes > 0 {
+            PREPARING[0].fetch_add(us, Ordering::Relaxed);
+            PREPARING[1].fetch_add(bytes, Ordering::Relaxed);
         }
     }
 
