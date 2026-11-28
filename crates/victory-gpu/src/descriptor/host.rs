@@ -2171,6 +2171,14 @@ impl HostHeap {
     /// `index`, which holds `view` of a table made afresh: shaders ask it
     /// whether a typed view in a table is of an integer format
     /// (`victory_shader::emit::VIEW_INTEGER`).
+    /// Whether [`HostHeap::dynamic_word`] will actually write anything for `index`.
+    #[inline]
+    pub(crate) fn wants_dynamic_word(&self, index: u32) -> bool {
+        self.strides.is_some()
+            && index >= self.count
+            && index < victory_shader::emit::SLOT_STRIDES_COUNT
+    }
+
     pub(crate) fn dynamic_word(&self, index: u32, view: Option<&View>) {
         if let Some((_, _, data)) = &self.strides
             && index >= self.count
@@ -3177,12 +3185,58 @@ impl HostHeap {
             if !views.made.contains_key(&words) {
                 let view = super::view_at(words[1], words[2])?;
                 let at = 2 * views.made.len() as u32;
-                // (A constant buffer's bytes are copied for each draw.)
-                if at >= ListViews::SLOTS || matches!(view, View::Constant(..)) {
+                if at >= ListViews::SLOTS {
                     return None;
                 }
-                let twin = twinned(&view);
-                let kept = make_twinned(&view, views.slot(at), Some(views.slot(at + 1)))?;
+                let (twin, kept) = if let View::Constant(address, size) = view {
+                    // With `VICTORY_PORT_CBV=1`, in-place constant buffers have
+                    // a fixed GPU address for the whole list and can be cached
+                    // in `ListViews` just like SRVs/UAVs.
+                    if !crate::port_cbv::in_place_on() {
+                        return None;
+                    }
+                    let shadow = crate::shadow::find(address, u64::from(size)).filter(|s| s.in_place())?;
+                    let offset = shadow.offset(address);
+                    let width = shadow.width();
+                    if offset >= width || !crate::port_cbv::raw_ok(offset) {
+                        return None;
+                    }
+                    let bytes = u64::from(constant_bytes(size)).min(width - offset) & !3;
+                    if bytes == 0 {
+                        return None;
+                    }
+                    let gpu = shadow.gpu(address);
+                    let host = host()?;
+                    let raw = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                        Format: DXGI_FORMAT_R32_TYPELESS,
+                        ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                            Buffer: D3D12_BUFFER_SRV {
+                                FirstElement: offset / 4,
+                                NumElements: (bytes / 4) as u32,
+                                StructureByteStride: 0,
+                                Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                            },
+                        },
+                    };
+                    let cbv = D3D12_CONSTANT_BUFFER_VIEW_DESC {
+                        BufferLocation: if gpu.is_multiple_of(256) { gpu } else { 0 },
+                        SizeInBytes: if gpu.is_multiple_of(256) { constant_bytes(size).min(((width - offset) & !255) as u32) } else { 0 },
+                    };
+                    let cbv = if cbv.SizeInBytes == 0 { D3D12_CONSTANT_BUFFER_VIEW_DESC::default() } else { cbv };
+                    // SAFETY: TLS CPU-only heap slots and live in-place buffer.
+                    unsafe {
+                        host.device.CreateConstantBufferView(Some(&cbv), views.slot(at));
+                        host.device.CreateShaderResourceView(&shadow.buffer, Some(&raw), views.slot(at + 1));
+                    }
+                    crate::port_cbv::in_place(size);
+                    (true, Some(shadow.buffer.clone()))
+                } else {
+                    let twin = twinned(&view);
+                    let kept = make_twinned(&view, views.slot(at), Some(views.slot(at + 1)))?;
+                    (twin, kept)
+                };
                 let listed = Listed {
                     kind: crate::draw::view_kind(&view),
                     texture: is_texture_view(&view),
@@ -3487,14 +3541,12 @@ impl HostHeap {
     /// constant buffer view of them where that can be (on 256 bytes), else a
     /// null one. Whether the twin was made (`false`: the caller copies the
     /// bytes as before).
-    pub(crate) fn constant_raw_at(&self, index: u32, buffer: &ID3D12Resource, gpu: u64, size: u32) -> bool {
+    pub(crate) fn constant_raw_at(&self, index: u32, buffer: &ID3D12Resource, gpu: u64, offset: u64, width: u64, size: u32) -> bool {
         let Some(host) = host() else { return false };
         let Some(twin) = self.twin(index) else { return false };
-        // SAFETY: a live buffer.
-        let (base, width) = unsafe { (buffer.GetGPUVirtualAddress(), buffer.GetDesc().Width) };
-        let Some(offset) = gpu.checked_sub(base).filter(|&o| o < width && crate::port_cbv::raw_ok(o)) else {
+        if offset >= width || !crate::port_cbv::raw_ok(offset) {
             return false;
-        };
+        }
         let bytes = u64::from(constant_bytes(size)).min(width - offset) & !3;
         if bytes == 0 {
             return false;

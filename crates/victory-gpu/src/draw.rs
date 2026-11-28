@@ -431,9 +431,22 @@ fn in_place_indirect(arguments: u64, kind: u32) {
     let _ = (arguments, kind);
 }
 
+#[cfg(feature = "diagnostics")]
+static IND_SPLIT: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
 /// With the frame line: indirect executions with arguments in place per
 /// frame over `frames`, and the ranges most of them came from.
 pub(crate) fn in_place_indirect_line(frames: f64) {
+    #[cfg(feature = "diagnostics")]
+    {
+        let s: [f64; 5] = [0, 1, 2, 3, 4].map(|i| IND_SPLIT[i].swap(0, Ordering::Relaxed) as f64 / 1e6 / frames);
+        if s.iter().sum::<f64>() > 0.1 {
+            tracing::info!(
+                "execute_indirect breakdown per frame (all threads): lookup={:.1}ms, clamp={:.1}ms, prepare/bind={:.1}ms, d3d12_exec={:.1}ms, after={:.1}ms",
+                s[0], s[1], s[2], s[3], s[4]
+            );
+        }
+    }
     let [all, alone] = [0, 1].map(|i| IN_PLACE_INDIRECT[i].swap(0, Ordering::Relaxed));
     if all == 0 {
         return;
@@ -579,6 +592,11 @@ pub(crate) struct State {
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
     host_heaps_set: bool,
+    /// Epoch of the last `IASetVertexBuffers` / `IASetIndexBuffer` on this list
+    /// (0 = dirty / unset) and the vertex-slot mask covered by it.
+    host_vb_epoch: u64,
+    host_vb_slots: u32,
+    host_ib_epoch: u64,
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
@@ -1397,6 +1415,9 @@ impl State {
     pub(crate) fn host_state_lost(&mut self) {
         // No title heaps (0) differ from what the host list has, too.
         (self.host_pipeline, self.host_roots, self.host_heaps) = (0, [0; 2], [usize::MAX; 2]);
+        self.host_vb_epoch = 0;
+        self.host_vb_slots = 0;
+        self.host_ib_epoch = 0;
     }
 
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
@@ -1446,16 +1467,21 @@ impl State {
                 *slot = *v;
             }
         }
+        self.host_vb_epoch = 0;
+        self.host_vb_slots = 0;
     }
 
     pub(crate) fn clear_vertex_buffers(&mut self, start: u32, count: u32) {
         for slot in self.vertex.iter_mut().skip(start as usize).take(count as usize) {
             *slot = VertexView::default();
         }
+        self.host_vb_epoch = 0;
+        self.host_vb_slots = 0;
     }
 
     pub(crate) fn set_index_buffer(&mut self, view: Option<&IndexView>) {
         self.index = view.copied().unwrap_or_default();
+        self.host_ib_epoch = 0;
     }
 
     /// Render targets and depth, set on the host list at once, unless it has
@@ -1601,6 +1627,9 @@ impl State {
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
         self.host_heaps_set = false;
+        self.host_vb_epoch = 0;
+        self.host_vb_slots = 0;
+        self.host_ib_epoch = 0;
         if self.topology_set {
             self.set_topology(list, self.topology);
         }
@@ -1809,34 +1838,40 @@ impl State {
             return false;
         }
         let l = &list.list;
-        // Vertex buffers the input layout reads.
-        let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
-        let mut count = 0;
-        for (slot, (view, &v)) in views.iter_mut().zip(&self.vertex).enumerate() {
-            if p.slots & 1 << slot == 0 {
-                continue;
+        let epoch = list.epoch();
+        // Vertex buffers the input layout reads (skip when unchanged since last draw).
+        if p.slots != 0 && (self.host_vb_epoch != epoch || (p.slots & !self.host_vb_slots) != 0) {
+            let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
+            let mut count = 0;
+            let mut mask = p.slots;
+            while mask != 0 {
+                let slot = mask.trailing_zeros() as usize;
+                mask &= mask - 1;
+                let v = self.vertex[slot];
+                count = count.max(slot + 1);
+                if v.address == 0 || v.size == 0 {
+                    continue;
+                }
+                let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
+                    continue;
+                };
+                shadow.refresh(list, v.address, u64::from(v.size));
+                views[slot] = D3D12_VERTEX_BUFFER_VIEW {
+                    BufferLocation: shadow.gpu(v.address),
+                    SizeInBytes: v.size.min(u32::try_from(shadow.left(v.address)).unwrap_or(u32::MAX)),
+                    StrideInBytes: v.stride,
+                };
             }
-            count = slot + 1;
-            if v.address == 0 || v.size == 0 {
-                continue;
+            // SAFETY: an open list; the views name live host buffers.
+            unsafe {
+                if count > 0 {
+                    l.IASetVertexBuffers(0, Some(&views[..count]));
+                }
             }
-            let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
-                continue;
-            };
-            shadow.refresh(list, v.address, u64::from(v.size));
-            *view = D3D12_VERTEX_BUFFER_VIEW {
-                BufferLocation: shadow.gpu(v.address),
-                SizeInBytes: v.size.min(u32::try_from(shadow.left(v.address)).unwrap_or(u32::MAX)),
-                StrideInBytes: v.stride,
-            };
+            self.host_vb_epoch = epoch;
+            self.host_vb_slots |= p.slots;
         }
-        // SAFETY: an open list; the views name live host buffers.
-        unsafe {
-            if count > 0 {
-                l.IASetVertexBuffers(0, Some(&views[..count]));
-            }
-        }
-        if indexed {
+        if indexed && self.host_ib_epoch != epoch {
             let v = self.index;
             let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
                 return false;
@@ -1849,6 +1884,7 @@ impl State {
             };
             // SAFETY: an open list; the view names a live host buffer.
             unsafe { l.IASetIndexBuffer(Some(&view)) };
+            self.host_ib_epoch = epoch;
         }
         const RENDER_TARGET: u32 = 0x4;
         for &t in &self.targets {
@@ -4136,7 +4172,9 @@ impl State {
             for k in 0..n {
                 let index = first + k;
                 // (What shaders ask of a typed view in a table: its kind.)
-                host.dynamic_word(index, crate::descriptor::view(table + u64::from(k) * 32).as_ref());
+                if host.wants_dynamic_word(index) {
+                    host.dynamic_word(index, crate::descriptor::view(table + u64::from(k) * 32).as_ref());
+                }
                 // A view this list has made before: its descriptor copied,
                 // and nothing more if nothing changed in the list since.
                 let halved = half.contains(&(slot, k * 8));
@@ -4189,7 +4227,7 @@ impl State {
                         if crate::port_cbv::in_place_on() {
                             match crate::shadow::find(address, u64::from(size)).filter(|s| s.in_place()) {
                                 Some(shadow) => {
-                                    if host.constant_raw_at(index, &shadow.buffer, shadow.gpu(address), size) {
+                                    if host.constant_raw_at(index, &shadow.buffer, shadow.gpu(address), shadow.offset(address), shadow.width(), size) {
                                         crate::port_cbv::in_place(size);
                                         continue;
                                     }
@@ -4607,6 +4645,8 @@ impl State {
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
+        #[cfg(feature = "diagnostics")]
+        let t0 = std::time::Instant::now();
         let pipeline = self.pipeline as This;
         let host = if kind == DISPATCH {
             crate::pipeline::host_dispatch_pipeline(pipeline)
@@ -4674,6 +4714,12 @@ impl State {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
         }
+        #[cfg(feature = "diagnostics")]
+        let t1 = {
+            let now = std::time::Instant::now();
+            IND_SPLIT[0].fetch_add((now - t0).as_nanos() as u64, Ordering::Relaxed);
+            now
+        };
         // Renderer port 1: arguments (or their count) in the title's memory
         // read in place ([`in_place_order`]): clamped alone, right before
         // their execution, after a wait for every earlier shader write.
@@ -4798,6 +4844,12 @@ impl State {
                 (bounded, 0)
             }
         };
+        #[cfg(feature = "diagnostics")]
+        let t2 = {
+            let now = std::time::Instant::now();
+            IND_SPLIT[1].fetch_add((now - t1).as_nanos() as u64, Ordering::Relaxed);
+            now
+        };
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
@@ -4808,6 +4860,12 @@ impl State {
             why("prepare failed");
             return false;
         }
+        #[cfg(feature = "diagnostics")]
+        let t3 = {
+            let now = std::time::Instant::now();
+            IND_SPLIT[2].fetch_add((now - t2).as_nanos() as u64, Ordering::Relaxed);
+            now
+        };
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
@@ -4832,6 +4890,12 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
+        #[cfg(feature = "diagnostics")]
+        let t4 = {
+            let now = std::time::Instant::now();
+            IND_SPLIT[3].fetch_add((now - t3).as_nanos() as u64, Ordering::Relaxed);
+            now
+        };
         if kind == DISPATCH {
             self.buffers_written();
         } else {
@@ -4847,6 +4911,8 @@ impl State {
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
+        #[cfg(feature = "diagnostics")]
+        IND_SPLIT[4].fetch_add(t4.elapsed().as_nanos() as u64, Ordering::Relaxed);
         true
     }
 }
