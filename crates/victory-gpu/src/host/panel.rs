@@ -678,7 +678,11 @@ unsafe impl Send for Buffers {}
 
 impl Buffers {
     fn new(host: &Host, format: DXGI_FORMAT, scale: u32) -> Option<Buffers> {
-        let (width, height) = size(scale);
+        Buffers::sized(host, format, scale, size(scale))
+    }
+
+    /// Buffers for a box of `width` x `height` pixels (already scaled).
+    fn sized(host: &Host, format: DXGI_FORMAT, scale: u32, (width, height): (u32, u32)) -> Option<Buffers> {
         let pitch = (width * bpp(format)? as u32).next_multiple_of(256);
         let bytes = u64::from(pitch) * u64::from(height);
         let uploads = (0..UPLOADS).map(|_| host.upload_buffer(bytes)).collect::<Option<Vec<_>>>()?;
@@ -707,7 +711,11 @@ impl Buffers {
     }
 
     fn write(&mut self, snap: &Snapshot) {
-        let picture = paint_hud(snap).pack(self.scale, self.format, self.pitch as usize);
+        self.write_canvas(&paint_hud(snap));
+    }
+
+    fn write_canvas(&mut self, canvas: &Canvas) {
+        let picture = canvas.pack(self.scale, self.format, self.pitch as usize);
         self.turn = (self.turn + 1) % UPLOADS;
         // SAFETY: a mapped upload buffer of the picture's size, which the card read a second or more ago.
         unsafe { std::ptr::copy_nonoverlapping(picture.as_ptr(), self.uploads[self.turn].1, picture.len()) };
@@ -731,6 +739,7 @@ pub(super) struct Panel {
     changed: bool,
     buffers: Option<Buffers>,
     failed: bool,
+    bar: LoadBar,
 }
 
 impl Panel {
@@ -750,6 +759,7 @@ impl Panel {
             changed: false,
             buffers: None,
             failed: false,
+            bar: LoadBar::default(),
         }
     }
 
@@ -759,6 +769,7 @@ impl Panel {
         if pressed() {
             shown().fetch_xor(true, Ordering::Relaxed);
         }
+        self.bar.tick();
         if !shown().load(Ordering::Relaxed) {
             self.frames = 0;
             return;
@@ -865,6 +876,7 @@ impl Panel {
         format: DXGI_FORMAT,
     ) {
         self.last_size = (width, height);
+        self.bar.draw(host, list, back, (width, height), format);
         if !shown().load(Ordering::Relaxed) || self.failed {
             return;
         }
@@ -888,58 +900,192 @@ impl Panel {
             buffers.write(snap);
         }
         let (w, h) = size(scale);
-        let list = &list.list;
-        // SAFETY: an open list and live resources; the box lies within both.
-        unsafe {
-            if std::mem::take(&mut buffers.fresh) {
-                if buffers.uploaded {
-                    list.ResourceBarrier(&[transition(
-                        &buffers.card,
-                        D3D12_RESOURCE_STATE_COPY_SOURCE,
-                        D3D12_RESOURCE_STATE_COPY_DEST,
-                    )]);
-                }
-                list.CopyResource(&buffers.card, &buffers.uploads[buffers.turn].0);
-                list.ResourceBarrier(&[transition(
-                    &buffers.card,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_COPY_SOURCE,
-                )]);
-                buffers.uploaded = true;
-            }
-            let from = D3D12_TEXTURE_COPY_LOCATION {
-                pResource: std::mem::transmute_copy(&buffers.card),
-                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-                        Offset: 0,
-                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                            Format: format,
-                            Width: w,
-                            Height: h,
-                            Depth: 1,
-                            RowPitch: buffers.pitch,
-                        },
-                    },
-                },
-            };
-            let to = D3D12_TEXTURE_COPY_LOCATION {
-                pResource: std::mem::transmute_copy(back),
-                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
-            };
-            let part = D3D12_BOX {
-                left: 0,
-                top: 0,
-                front: 0,
-                right: w.min(width),
-                bottom: h.min(height),
-                back: 1,
-            };
-            list.CopyTextureRegion(&to, 0, 0, 0, &from, Some(&part));
-        }
+        blit(list, buffers, back, (0, 0), (w, h), (width, height), format);
         self.cost += began.elapsed();
     }
+}
+
+/// Records the copy of `buffers` (a box of `w` x `h`, its upload copied to
+/// the card's buffer first if fresh) onto `back` at `(x, y)`, clipped to
+/// `width` x `height`.
+fn blit(
+    list: &HostList,
+    buffers: &mut Buffers,
+    back: &ID3D12Resource,
+    (x, y): (u32, u32),
+    (w, h): (u32, u32),
+    (width, height): (u32, u32),
+    format: DXGI_FORMAT,
+) {
+    if x >= width || y >= height {
+        return;
+    }
+    let list = &list.list;
+    // SAFETY: an open list and live resources; the box lies within both.
+    unsafe {
+        if std::mem::take(&mut buffers.fresh) {
+            if buffers.uploaded {
+                list.ResourceBarrier(&[transition(
+                    &buffers.card,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                )]);
+            }
+            list.CopyResource(&buffers.card, &buffers.uploads[buffers.turn].0);
+            list.ResourceBarrier(&[transition(
+                &buffers.card,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            buffers.uploaded = true;
+        }
+        let from = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: std::mem::transmute_copy(&buffers.card),
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: 0,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                        Format: format,
+                        Width: w,
+                        Height: h,
+                        Depth: 1,
+                        RowPitch: buffers.pitch,
+                    },
+                },
+            },
+        };
+        let to = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: std::mem::transmute_copy(back),
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+        };
+        let part = D3D12_BOX {
+            left: 0,
+            top: 0,
+            front: 0,
+            right: w.min(width - x),
+            bottom: h.min(height - y),
+            back: 1,
+        };
+        list.CopyTextureRegion(&to, x, y, 0, &from, Some(&part));
+    }
+}
+
+/// The loading bar's logical size.
+const BAR_W: u32 = 420;
+const BAR_H: u32 = 44;
+
+/// Whether the loading bar may show (`VICTORY_LOAD_BAR=0`: never). On by
+/// default: it only shows while many pipelines are being made.
+fn bar_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LOAD_BAR").is_none_or(|v| v != "0"))
+}
+
+/// A wave of pipeline making counts from this many waiting on: fewer are the
+/// odd one met in play, which would only flash the bar.
+const BAR_FROM: u64 = 24;
+
+/// How long the bar stays at its end after the queue empties.
+const BAR_LINGER: Duration = Duration::from_millis(1500);
+
+/// A bar at the bottom of the picture while pipelines are made in a wave
+/// (the start, or entering the world): how many of the wave's are made.
+/// Pipelines queued while it shows join the wave.
+#[derive(Default)]
+struct LoadBar {
+    /// The wave: pipelines made before it (queued less waiting when it began).
+    base: Option<u64>,
+    /// When the queue went empty, while the bar lingers.
+    empty_since: Option<Instant>,
+    /// What was painted last: (made, all).
+    painted: (u64, u64),
+    canvas: Option<Canvas>,
+    changed: bool,
+    buffers: Option<Buffers>,
+    failed: bool,
+    last: Option<Instant>,
+}
+
+impl LoadBar {
+    fn tick(&mut self) {
+        if !bar_on() {
+            return;
+        }
+        let now = Instant::now();
+        if self.last.is_some_and(|t| now - t < Duration::from_millis(100)) {
+            return;
+        }
+        self.last = Some(now);
+        let (queued, waiting) = (crate::pipeline::queued(), crate::pipeline::making());
+        let base = match self.base {
+            Some(b) => b,
+            None if waiting >= BAR_FROM => {
+                let b = queued.saturating_sub(waiting);
+                self.base = Some(b);
+                self.empty_since = None;
+                b
+            }
+            None => return,
+        };
+        if waiting == 0 {
+            let since = *self.empty_since.get_or_insert(now);
+            if now - since >= BAR_LINGER {
+                (self.base, self.canvas, self.empty_since) = (None, None, None);
+                return;
+            }
+        } else {
+            self.empty_since = None;
+        }
+        let all = queued.saturating_sub(base);
+        let made = all.saturating_sub(waiting);
+        if self.canvas.is_some() && self.painted == (made, all) {
+            return;
+        }
+        self.painted = (made, all);
+        self.canvas = Some(paint_bar(made, all));
+        self.changed = true;
+    }
+
+    fn draw(&mut self, host: &Host, list: &HostList, back: &ID3D12Resource, (width, height): (u32, u32), format: DXGI_FORMAT) {
+        let Some(canvas) = self.canvas.as_ref() else { return };
+        if self.failed {
+            return;
+        }
+        #[cfg(feature = "diagnostics")]
+        let _ours = crate::replay::record::unrecorded();
+        let scale = scale(height);
+        let (w, h) = (BAR_W * scale, BAR_H * scale);
+        if self.buffers.as_ref().is_none_or(|b| (b.format, b.scale) != (format, scale)) {
+            std::mem::forget(self.buffers.take());
+            self.buffers = Buffers::sized(host, format, scale, (w, h));
+            self.failed = self.buffers.is_none();
+            self.changed = true;
+        }
+        let Some(buffers) = &mut self.buffers else { return };
+        if std::mem::take(&mut self.changed) {
+            buffers.write_canvas(canvas);
+        }
+        let x = width.saturating_sub(w) / 2;
+        let y = height.saturating_sub(h + 48 * scale);
+        blit(list, buffers, back, (x, y), (w, h), (width, height), format);
+    }
+}
+
+/// The bar's picture: "PIPELINES  made / all  percent" over a filled track.
+fn paint_bar(made: u64, all: u64) -> Canvas {
+    let mut c = Canvas::new(BAR_W, BAR_H, BG);
+    c.border(0, 0, BAR_W, BAR_H, BORDER);
+    let pct = if all == 0 { 100 } else { made * 100 / all };
+    let x = c.text(10, 8, 2, LABEL, "PIPELINES");
+    let x = c.text(x + 12, 8, 2, WHITE, &format!("{made} / {all}"));
+    c.text(x + 12, 8, 2, if made == all { GREEN } else { YELLOW }, &format!("{pct}%"));
+    let (tx, ty, tw, th) = (10, 28, BAR_W - 20, 8);
+    c.rect(tx, ty, tw, th, BAR_BG);
+    let fill = if all == 0 { tw } else { (u64::from(tw) * made / all) as u32 };
+    c.rect(tx, ty, fill, th, if made == all { GREEN } else { BAR_FILL_LO });
+    c
 }
 
 /// How busy a core was between two reads of its (idle, kernel + user)

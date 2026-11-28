@@ -473,6 +473,12 @@ pub(crate) fn making() -> u64 {
     make::waiting()
 }
 
+/// Host pipelines ever queued since the start (the loading bar).
+#[cfg(windows)]
+pub(crate) fn queued() -> u64 {
+    make::queued()
+}
+
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
 /// (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]

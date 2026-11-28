@@ -459,6 +459,15 @@ pub(crate) fn waiting() -> u64 {
     WAITING.load(Ordering::Relaxed)
 }
 
+/// Pipelines ever queued since the start (the loading bar: made so far is
+/// this less [`waiting`]).
+static QUEUED: AtomicU64 = AtomicU64::new(0);
+
+/// Pipelines ever queued since the start.
+pub(crate) fn queued() -> u64 {
+    QUEUED.load(Ordering::Relaxed)
+}
+
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
@@ -840,6 +849,7 @@ fn start(p: &Arc<Pending>, priority: u8) {
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(new) = queue.push(p, priority) {
         if new {
+            QUEUED.fetch_add(1, Ordering::Relaxed);
             PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
         }
         // (One woken could be a worker that takes passes over the screen
