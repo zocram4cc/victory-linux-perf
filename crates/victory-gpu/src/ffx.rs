@@ -1036,6 +1036,51 @@ pub(crate) fn framegen_on() -> bool {
     })
 }
 
+/// `VKD3D_DISABLE_EXTENSIONS` with `VK_EXT_present_timing` added while frame generation
+/// is on: vkd3d-proton 3.2.0 presents the swap chain with present timing, and AMD's
+/// frame generation proxy then shows white. `None` when nothing changes.
+fn vkd3d_disabled_extensions(existing: Option<&str>, framegen: bool) -> Option<String> {
+    const PRESENT_TIMING: &str = "VK_EXT_present_timing";
+    if !framegen {
+        return None;
+    }
+    let mut names: Vec<&str> = existing
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .collect();
+    if names.contains(&PRESENT_TIMING) {
+        return None;
+    }
+    names.push(PRESENT_TIMING);
+    Some(names.join(","))
+}
+
+unsafe extern "C" {
+    fn _putenv_s(name: *const std::ffi::c_char, value: *const std::ffi::c_char) -> std::ffi::c_int;
+}
+
+/// Sets `VKD3D_DISABLE_EXTENSIONS` (see [`vkd3d_disabled_extensions`]) before the host's
+/// device is made, when vkd3d-proton makes its instance. `_putenv_s` sets the value for both
+/// readers, GetEnvironmentVariableA and the C runtime's getenv (a probe under Proton: a value
+/// set with `std::env::set_var` is missed by getenv, and `_putenv_s`'s value is seen by both).
+pub(crate) fn disable_present_timing() {
+    let existing = std::env::var("VKD3D_DISABLE_EXTENSIONS").ok();
+    let Some(value) = vkd3d_disabled_extensions(existing.as_deref(), framegen_on()) else {
+        return;
+    };
+    let Ok(c_value) = std::ffi::CString::new(value.as_str()) else {
+        return;
+    };
+    // SAFETY: a nul-terminated name and value, both alive for the call.
+    if unsafe { _putenv_s(c"VKD3D_DISABLE_EXTENSIONS".as_ptr(), c_value.as_ptr()) } != 0 {
+        tracing::error!("frame generation: VKD3D_DISABLE_EXTENSIONS could not be set; VK_EXT_present_timing stays on");
+        return;
+    }
+    tracing::warn!(%value, "frame generation: VK_EXT_present_timing added to VKD3D_DISABLE_EXTENSIONS (vkd3d-proton's present timing makes AMD's frame generation proxy present white)");
+}
+
 /// The frame generation creation flags for an upscale context's: the motion
 /// vector and depth bits, at the same positions in both (HDR is not the
 /// upscale input's here but the back buffer's, which is not).
@@ -1522,5 +1567,16 @@ mod tests {
         assert_eq!(upscaler_label("3.1.6", false, true), "FSR 3.1.6+FG");
         assert_eq!(upscaler_label("FSR 4.1.2", false, false), "FSR 4.1.2");
         assert_eq!(upscaler_label("", true, false), "bilinear");
+    }
+
+    #[test]
+    fn present_timing_is_disabled_beside_the_others_only_with_frame_generation() {
+        assert_eq!(vkd3d_disabled_extensions(None, true), Some("VK_EXT_present_timing".to_owned()));
+        assert_eq!(
+            vkd3d_disabled_extensions(Some("VK_EXT_foo, VK_EXT_bar,"), true),
+            Some("VK_EXT_foo,VK_EXT_bar,VK_EXT_present_timing".to_owned())
+        );
+        assert_eq!(vkd3d_disabled_extensions(Some("VK_EXT_present_timing"), true), None);
+        assert_eq!(vkd3d_disabled_extensions(None, false), None);
     }
 }

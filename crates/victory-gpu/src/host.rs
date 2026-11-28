@@ -1190,6 +1190,8 @@ fn page_faults() -> u64 {
 fn create() -> windows::core::Result<Host> {
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
+        // vkd3d-proton reads its extension switches when its instance is made, so before any D3D12 call.
+        crate::ffx::disable_present_timing();
         // The debug layer only in builds with diagnostics.
         let debug = cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_DEBUG");
         if debug {
