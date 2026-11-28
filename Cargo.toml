@@ -18,6 +18,7 @@ victory-pe = { path = "crates/victory-pe" }
 victory-loader = { path = "crates/victory-loader" }
 victory-hle = { path = "crates/victory-hle" }
 victory-gpu = { path = "crates/victory-gpu" }
+victory-memfast = { path = "crates/victory-memfast" }
 victory-shader = { path = "crates/victory-shader" }
 victory-formats = { path = "crates/victory-formats" }
 victory-pipeline = { path = "crates/victory-pipeline" }

@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 victory-core.workspace = true
+victory-memfast.workspace = true
 victory-pe.workspace = true
 victory-loader.workspace = true
 victory-hle.workspace = true

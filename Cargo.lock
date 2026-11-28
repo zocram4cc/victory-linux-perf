@@ -640,6 +640,7 @@ dependencies = [
  "victory-game",
  "victory-hle",
  "victory-loader",
+ "victory-memfast",
  "victory-pe",
  "victory-shader",
  "walkdir",
@@ -713,6 +714,14 @@ dependencies = [
  "tracing",
  "victory-core",
  "victory-pe",
+ "windows-sys",
+]
+
+[[package]]
+name = "victory-memfast"
+version = "0.1.0"
+dependencies = [
+ "tracing",
  "windows-sys",
 ]
 

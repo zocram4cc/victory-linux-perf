@@ -169,6 +169,10 @@ enum Console {
 
 fn main() -> Result<()> {
     victory_core::logging::init("info");
+    // victory.exe's own memcmp (Wine's compares 8 bytes a step) or the C
+    // runtime's (`VICTORY_MEMFAST`); also keeps the crate, and with it the
+    // symbol, in the link.
+    victory_memfast::choose();
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if victory_hle::modules::audio::capture::child() {
