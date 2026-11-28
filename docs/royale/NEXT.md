@@ -36,3 +36,41 @@ Read first: [STATUS.md](STATUS.md) (setup, how to play, every tool), [CHECKPOINT
 ## Reference material (28 Nov)
 
 The user has legitimate access to the console SDK and keeps it locally. Rule: **reference only**. Never copy its code, headers, internal names or documentation text into this repository, PRs or anything public. Findings are written in our own words, as observations about how the console behaves, and our own code implements them. Nothing from the SDK is committed.
+
+
+## State after the unattended run of 28 Nov (to ~11:00)
+
+**Translator: 1,552 of 2,680 0x218 programs** (1,432 when the user left).
+- Unit tests: 216.
+- Differential tests against the console's own compiler: **33/33 compute cases equal**.
+- **13 good families, 228 native programs**, checked in game by automatic runs; the newest is `0x302dbfc0`, 125 programs.
+- Checkpoints: `2026-11-28-translator-1447`, `2026-11-28-translator-1530`.
+
+**Done in the run** (README section 6, steps 45-51; each with real data or a proof):
+- Heaps placed from the title's root signature flags. Collected in game for all 2,680 programs and checked against the code both ways.
+- The friend's lane-mask patch, reviewed and merged.
+- Waterfall proof: the RDNA2 wrexec retry and scalar accesses.
+- `ds_append` / `ds_consume`, checked with the console compiler.
+- DPP compares.
+- Buffer loads from tables in the code (+80; console-compiler case).
+- `buffer_atomic_sub` (console-compiler case).
+- Constant BVH descriptors.
+- `saddr` global accesses (by the ISA).
+- Integer `clamp` (console-compiler case).
+- The harness now measures with the game's host settings (RDNA, waves of 32 and 64).
+
+**What blocks most of the rest is the lane analysis** (`structure.rs`, `emit/wave.rs`): a value that is a descriptor dword on one path and a lane mask on another, joined. See `p4-handoff-lane-masks.md`.
+
+| blocker | programs |
+|---|---|
+| a descriptor's address or format read as data | 765 (mostly waterfall loops whose EXEC has no mask, and joins with dead descriptor dwords) |
+| a sampler's descriptor read as data | 90 (EXEC restores through reused registers) |
+| a whole-wave section step | 63 |
+| lane masks | 60 + 57 + 45 |
+| a constant buffer's descriptor read as data | 34 (EXEC masks through reused registers again) |
+
+**Next, in order:**
+1. **Lane masks for the EXEC the waterfall loops write** (`structure.rs`). That proves those loops and kills the dead back-edge values by construction: the largest single gain.
+2. **A proof that a dead descriptor dword reaching an EXEC restore or merge through a join is never read** on the paths that use EXEC. The runtime marker (`VICTORY_DEAD_MARKERS`) is ready to check any candidate rule in game.
+3. **The whole-wave section steps** with `src_scc` and a one-lane EXEC (`wave.rs`).
+4. **Then 0x1c8** (graphics, 10,206 descriptions).
