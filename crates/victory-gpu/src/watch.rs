@@ -763,6 +763,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
 
 /// [`ask_ahead`]; `held`: the caller holds everything ([`Asking::hold_all`]).
 fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
+    take_written();
     let mut pieces: Vec<(usize, usize)> = ranges
         .iter()
         // Not view memory known by its bits: the kernel would refuse the
@@ -1250,6 +1251,7 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    take_written();
     // Asked ahead with the submission's other ranges: the journal has it.
     // (The standing number changes only with the journal held alone, so its
     // notes are all in: a part at a time will do.)
@@ -1368,6 +1370,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 /// by their bits. `false` if something would have to be asked.
 pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64], ranged: u64) -> bool {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    take_written();
     // The bits first, then the journal, as in `writes`.
     let known = published(start, end);
     #[cfg(feature = "diagnostics")]
@@ -2661,6 +2664,7 @@ pub(crate) fn landed_beside(pages: &[usize], spans: &[(usize, usize)]) -> (u64, 
 /// Whether every write of the title's to 64 KiB block `block` so far is in
 /// the journal ([`PUBLISHED`]).
 pub(crate) fn block_published(block: usize) -> bool {
+    take_written();
     published(block * BLOCK, (block + 1) * BLOCK)
 }
 
@@ -2692,6 +2696,7 @@ pub(crate) fn written_since_taken(at: usize, len: usize) -> bool {
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
+    take_written();
     // A range whose first block the guards hold already (read-only by our
     // hand, or noted absent) is a view: no question to Windows. The
     // question walks the page tables to the end of the pages that share the
@@ -3035,26 +3040,35 @@ fn protect_alias(g: &Guards, block: usize, claims: Option<&mut Claims>) -> bool 
     }
     // Ahead of the protection.
     PROTECTED.set(block);
-    let mut old = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
-    // SAFETY: title view memory; only its protection changes.
-    let done = unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0;
+    let ours = match sync_guards() {
+        Some(s) => s.arm(block, block + 1),
+        None => {
+            let mut old = 0;
+            // SAFETY: title view memory; only its protection changes.
+            let done = unsafe {
+                VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old)
+            } != 0;
+            let ours = done && matches!(old, PAGE_READWRITE | PAGE_READONLY);
+            if done && !ours {
+                // Not for us to guard: as it was.
+                // SAFETY: as above.
+                unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, old, &mut old) };
+            }
+            ours
+        }
+    };
     #[cfg(feature = "diagnostics")]
     {
         tally(5, 1);
         tally(8, started.elapsed().as_nanos() as u64);
     }
-    if done && matches!(old, PAGE_READWRITE | PAGE_READONLY) {
+    if ours {
         g.protected.insert(block);
         #[cfg(feature = "diagnostics")]
         crate::faultbook::note(crate::faultbook::What::Alias, block, 0, 0);
         return true;
-    }
-    if done {
-        // Not for us to guard: as it was.
-        // SAFETY: as above.
-        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, old, &mut old) };
     }
     PROTECTED.clear(block);
     false
@@ -3177,25 +3191,38 @@ fn not_a_view(from: usize, to: usize, kind: u32, protection: u32) {
 fn protect_views(g: &Guards, from: usize, to: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
     let set = |from: usize, to: usize| {
-        let mut old = 0;
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
-        // SAFETY: title view memory; only its protection changes.
-        let mut done = unsafe {
-            VirtualProtect(
-                (from * BLOCK) as *const _,
-                (to - from) * BLOCK,
-                PAGE_READONLY,
-                &mut old,
-            ) != 0
+        let done = match sync_guards() {
+            Some(s) => s.arm(from, to),
+            None => {
+                let mut old = 0;
+                // SAFETY: title view memory; only its protection changes.
+                let mut done = unsafe {
+                    VirtualProtect(
+                        (from * BLOCK) as *const _,
+                        (to - from) * BLOCK,
+                        PAGE_READONLY,
+                        &mut old,
+                    ) != 0
+                };
+                if done && !matches!(old, PAGE_READWRITE | PAGE_READONLY) {
+                    // What is there is not for us to guard (code, or memory the
+                    // title protects itself): as it was.
+                    // SAFETY: as above.
+                    unsafe {
+                        VirtualProtect(
+                            (from * BLOCK) as *const _,
+                            (to - from) * BLOCK,
+                            old,
+                            &mut old,
+                        )
+                    };
+                    done = false;
+                }
+                done
+            }
         };
-        if done && !matches!(old, PAGE_READWRITE | PAGE_READONLY) {
-            // What is there is not for us to guard (code, or memory the
-            // title protects itself): as it was.
-            // SAFETY: as above.
-            unsafe { VirtualProtect((from * BLOCK) as *const _, (to - from) * BLOCK, old, &mut old) };
-            done = false;
-        }
         #[cfg(feature = "diagnostics")]
         {
             tally(5, (to - from) as u64);
@@ -3374,24 +3401,331 @@ fn unguard(g: &Guards, blocks: &[usize]) {
         g.clean.remove(block);
         PUBLISHED.clear(block);
     }
-    for &block in blocks {
-        let mut old = 0;
-        // SAFETY: a block we made read-only.
-        unsafe {
-            if VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) != 0
-                && !matches!(old, PAGE_READONLY | PAGE_READWRITE)
-            {
-                // Not what we left there: the address is other memory's
-                // (code's, say), which keeps its protection.
-                VirtualProtect((block * BLOCK) as *const _, BLOCK, old, &mut old);
+    if let Some(s) = sync_guards() {
+        s.disarm(blocks);
+        blocks.iter().for_each(|&block| PROTECTED.clear(block));
+    } else {
+        for &block in blocks {
+            let mut old = 0;
+            // SAFETY: a block we made read-only.
+            unsafe {
+                if VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) != 0
+                    && !matches!(old, PAGE_READONLY | PAGE_READWRITE)
+                {
+                    // Not what we left there: the address is other memory's
+                    // (code's, say), which keeps its protection.
+                    VirtualProtect((block * BLOCK) as *const _, BLOCK, old, &mut old);
+                }
             }
+            PROTECTED.clear(block);
         }
-        PROTECTED.clear(block);
     }
     #[cfg(feature = "diagnostics")]
     if !blocks.is_empty() {
         tally(8, started.elapsed().as_nanos() as u64);
     }
+}
+
+/// Under our Proton (`VICTORY_SYNC_GUARDS=0` turns it off): the guards arm and open view
+/// memory through a synchronous userfaultfd of Wine's instead of
+/// `VirtualProtect` (`NtSetInformationVirtualMemory` with Wine's private
+/// class `VmVictoryGuardInformation`). A write to an armed block blocks its
+/// thread in the kernel until Wine's handler thread lifts the block's
+/// protection and publishes the block in [`SyncRing`]; [`take_written`]
+/// takes it from there as a write fault ([`open_faulted`]). No signal, no
+/// exception handler, no memory lock of Wine's, and no title thread waits
+/// for the guards' claims. Natively a block is armed in ~1 µs and a write
+/// fault takes ~10 µs (`tools/uffd-sync-test.c`), against 100-150 µs for a
+/// change of protection and ~120 µs for a fault in the world (runs cp6,
+/// vxA1). `None` off Wine, switched off, or where Wine has no such class
+/// (another Proton's); the tests keep the guards they were written for
+/// unless the switch is `1`.
+fn sync_guards() -> Option<&'static SyncGuards> {
+    static SYNC: std::sync::OnceLock<Option<SyncGuards>> = std::sync::OnceLock::new();
+    SYNC.get_or_init(SyncGuards::new).as_ref()
+}
+
+/// Wine's `struct victory_guard_ring`: the blocks its handler published
+/// (`head`) after lifting their protection, of the write faults it read
+/// (`seen`); [`take_written`] takes them (`tail`). The entries follow.
+#[repr(C)]
+struct SyncRing {
+    head: std::sync::atomic::AtomicU64,
+    seen: std::sync::atomic::AtomicU64,
+    waits: std::sync::atomic::AtomicU64,
+    _pad1: [u64; 5],
+    tail: std::sync::atomic::AtomicU64,
+    _pad2: [u64; 7],
+    mask: u64,
+    _pad3: [u64; 7],
+}
+
+/// The ring's entries: 8 MiB, thousands of frames of the world's faults.
+const SYNC_ENTRIES: usize = 1 << 20;
+/// Wine's `VmVictoryGuardInformation` and its operations.
+const SYNC_CLASS: u32 = 0x5649_4347;
+const SYNC_SETUP: u32 = 1;
+const SYNC_REGISTER: u32 = 2;
+const SYNC_ARM: u32 = 3;
+const SYNC_DISARM: u32 = 4;
+
+/// `NtSetInformationVirtualMemory`.
+type SetInformationVirtualMemory = unsafe extern "system" fn(
+    process: windows_sys::Win32::Foundation::HANDLE,
+    class: u32,
+    count: usize,
+    ranges: *const SyncRange,
+    info: *const core::ffi::c_void,
+    size: u32,
+) -> i32;
+
+/// `MEMORY_RANGE_ENTRY`.
+#[repr(C)]
+struct SyncRange {
+    at: usize,
+    bytes: usize,
+}
+
+/// Wine's `struct victory_guard_info`.
+#[repr(C)]
+struct SyncInfo {
+    op: u32,
+    block: u32,
+    ring: u64,
+}
+
+struct SyncGuards {
+    ring: &'static SyncRing,
+    entries: *const std::sync::atomic::AtomicU64,
+    call: SetInformationVirtualMemory,
+}
+
+// SAFETY: the ring is the process's for its life, its entries atomics.
+unsafe impl Send for SyncGuards {}
+// SAFETY: as above.
+unsafe impl Sync for SyncGuards {}
+
+/// Blocks armed, arms refused, blocks opened and blocks taken from the ring.
+static SYNC_COUNTS: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+impl SyncGuards {
+    fn new() -> Option<Self> {
+        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let switch = std::env::var_os("VICTORY_SYNC_GUARDS");
+        let wanted = if cfg!(test) {
+            switch.is_some_and(|v| v == "1")
+        } else {
+            switch.is_none_or(|v| v != "0") && crate::pipeline::on_wine()
+        };
+        if !wanted {
+            return None;
+        }
+        // SAFETY: ntdll is in every process; the names end in NUL.
+        let call = unsafe {
+            GetProcAddress(
+                GetModuleHandleA(c"ntdll.dll".as_ptr().cast()),
+                c"NtSetInformationVirtualMemory".as_ptr().cast(),
+            )
+        }?;
+        // SAFETY: the function's signature (winternl.h).
+        let call: SetInformationVirtualMemory = unsafe { std::mem::transmute(call) };
+        let bytes = size_of::<SyncRing>() + SYNC_ENTRIES * 8;
+        // SAFETY: a plain allocation, never given back.
+        let ring = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                bytes,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        }
+        .cast::<SyncRing>();
+        if ring.is_null() {
+            return None;
+        }
+        // SAFETY: ours alone until Wine is told of it.
+        unsafe { (*ring).mask = (SYNC_ENTRIES - 1) as u64 };
+        let info = SyncInfo {
+            op: SYNC_SETUP,
+            block: BLOCK as u32,
+            ring: ring as u64,
+        };
+        // SAFETY: the info outlives the call; the ring the process.
+        let status = unsafe {
+            call(
+                GetCurrentProcess(),
+                SYNC_CLASS,
+                0,
+                std::ptr::null(),
+                (&raw const info).cast(),
+                size_of::<SyncInfo>() as u32,
+            )
+        };
+        if status != 0 {
+            tracing::warn!(
+                status = format_args!("{:#x}", status as u32),
+                "VICTORY_SYNC_GUARDS: this Wine has no synchronous guards (our Proton has): the guards change protections as before"
+            );
+            // SAFETY: ours, and Wine kept nothing of it.
+            unsafe { VirtualFree(ring.cast(), 0, MEM_RELEASE) };
+            return None;
+        }
+        tracing::info!(
+            "VICTORY_SYNC_GUARDS: the guards arm view memory through Wine's synchronous userfaultfd"
+        );
+        // SAFETY: the entries follow the header, as in Wine's struct.
+        let entries = unsafe { ring.add(1) }.cast::<std::sync::atomic::AtomicU64>();
+        // SAFETY: as above.
+        Some(SyncGuards {
+            ring: unsafe { &*ring },
+            entries,
+            call,
+        })
+    }
+
+    /// `op` for the byte ranges: whether Wine did every one.
+    fn op(&self, op: u32, ranges: &[SyncRange]) -> bool {
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let info = SyncInfo {
+            op,
+            block: 0,
+            ring: 0,
+        };
+        // SAFETY: the ranges and the info outlive the call.
+        unsafe {
+            (self.call)(
+                GetCurrentProcess(),
+                SYNC_CLASS,
+                ranges.len(),
+                ranges.as_ptr(),
+                (&raw const info).cast(),
+                size_of::<SyncInfo>() as u32,
+            ) == 0
+        }
+    }
+
+    /// Arms blocks `[from, to)`: whether all are. A view the runtime did not
+    /// tell of ([`title_memory_remapped`]) is not armed: registering it here
+    /// would take in memory beside it that is no view.
+    fn arm(&self, from: usize, to: usize) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let done = self.op(
+            SYNC_ARM,
+            &[SyncRange {
+                at: from * BLOCK,
+                bytes: (to - from) * BLOCK,
+            }],
+        );
+        SYNC_COUNTS[if done { 0 } else { 1 }].fetch_add((to - from) as u64, Relaxed);
+        done
+    }
+
+    /// Opens `blocks`, in runs. (A block whose view went is no error:
+    /// nothing is armed there.)
+    fn disarm(&self, blocks: &[usize]) {
+        let mut runs: Vec<SyncRange> = Vec::new();
+        for &block in blocks {
+            match runs.last_mut() {
+                Some(run) if run.at + run.bytes == block * BLOCK => run.bytes += BLOCK,
+                _ => runs.push(SyncRange {
+                    at: block * BLOCK,
+                    bytes: BLOCK,
+                }),
+            }
+        }
+        if !runs.is_empty() {
+            let _ = self.op(SYNC_DISARM, &runs);
+            SYNC_COUNTS[2].fetch_add(blocks.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Title memory `[at, at + len)` mapped anew: its write faults reported.
+    fn register(&self, at: usize, len: usize) {
+        let _ = self.op(SYNC_REGISTER, &[SyncRange { at, bytes: len }]);
+    }
+}
+
+/// [`sync_guards`]: takes the blocks Wine's handler saw written, each as a
+/// write fault ([`open_faulted`]), after waiting for those whose protection
+/// it may have lifted already (the faults it had read when this began):
+/// what was written before the call is known to the guards when it
+/// returns. Two loads when nothing was written. Called first by every answer
+/// about what was written ([`writes`], [`nothing_new`], [`ask_ahead`]),
+/// whose callers hold no claim and no lock of the guards'.
+fn take_written() {
+    use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+    let Some(s) = sync_guards() else {
+        return;
+    };
+    let ring = s.ring;
+    let seen = ring.seen.load(Acquire);
+    if ring.tail.load(Relaxed) == seen {
+        return;
+    }
+    static TAKING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = TAKING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let began = std::time::Instant::now();
+    let mut tail = ring.tail.load(Relaxed);
+    loop {
+        let head = ring.head.load(Acquire);
+        while tail < head {
+            // SAFETY: an entry of the ring, published (the head is past it).
+            let at = unsafe { &*s.entries.add((tail & ring.mask) as usize) }.load(Relaxed) as usize;
+            tail += 1;
+            open_faulted(at);
+            SYNC_COUNTS[3].fetch_add(1, Relaxed);
+        }
+        ring.tail.store(tail, Release);
+        if tail >= seen {
+            break;
+        }
+        if began.elapsed() > std::time::Duration::from_millis(100) {
+            tracing::error!(
+                tail,
+                seen,
+                "VICTORY_SYNC_GUARDS: Wine's handler published nothing for 100 ms"
+            );
+            break;
+        }
+        std::hint::spin_loop();
+    }
+    sync_say(s);
+}
+
+/// What the synchronous guards did so far, every 5 s at most.
+fn sync_say(s: &SyncGuards) {
+    use std::sync::atomic::Ordering::Relaxed;
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64;
+    let next = NEXT.load(Relaxed);
+    if now < next
+        || NEXT
+            .compare_exchange(next, now + 5000, Relaxed, Relaxed)
+            .is_err()
+    {
+        return;
+    }
+    let [armed, refused, opened, taken] = SYNC_COUNTS.each_ref().map(|c| c.load(Relaxed));
+    tracing::info!(
+        faults = s.ring.seen.load(Relaxed),
+        taken,
+        waits = s.ring.waits.load(Relaxed),
+        armed,
+        refused,
+        opened,
+        "synchronous guards so far: write faults Wine's handler read, blocks taken from its ring, times it waited for room; blocks armed, refused, opened"
+    );
 }
 
 /// Before our own write into title memory `[at, at + len)` through the
@@ -3820,6 +4154,15 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     forget_holes(at, len);
     crate::texback::remapped(at, len);
     open(&title_memory_changed(at, len), at, at.saturating_add(len));
+}
+
+/// [`sync_guards`]: the runtime showed title memory `[at, at + len)` as a
+/// view ([`crate::inplace::title_memory_view`], told of every view): its
+/// write faults are reported from now on, and the guards arm it as before.
+pub(crate) fn view_shown(at: usize, len: usize) {
+    if let Some(s) = sync_guards() {
+        s.register(at, len);
+    }
 }
 
 /// The runtime is about to unmap title memory `[at, at + len)`: it is
