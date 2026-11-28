@@ -231,28 +231,46 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
             }
         }
     }
-    let one = |i: usize| {
-        let (from, ranges, to) = work[i];
-        let mut to = to as *mut [u32; 2];
-        for &(a, b) in ranges.iter().filter(|r| short(r)) {
-            for offset in (a..b).step_by(4) {
-                // SAFETY: inside the copy's mapping (its CPU side, which
-                // the thread that asked, and waits, alone writes in these
-                // ranges) and inside the memory, which has room for every
-                // pair, a piece of work's behind the last one's.
-                unsafe {
-                    let word = ((from + offset) as *const u32).read_unaligned();
-                    to.write([offset as u32, word]);
-                    to = to.add(1);
-                }
-            }
-        }
-    };
-    crate::land::each_under(work.len(), &one);
     STATS[0].fetch_add(moves.iter().map(|m| m.2 as u64).sum(), Ordering::Relaxed);
     STATS[1].fetch_add(moves.len() as u64, Ordering::Relaxed);
     STATS[2].fetch_add(copies.iter().map(|c| u64::from(c.pairs.1)).sum(), Ordering::Relaxed);
-    crate::shadow::copy_all(moves);
+    // Chunk large moves into 64 KiB pieces and execute BOTH short-run pair
+    // packing and bulk moves in a single `wide_each` fan-out (one barrier
+    // instead of two).
+    const CHUNK: usize = 64 << 10;
+    let mut parts: Vec<(usize, usize, usize)> = Vec::with_capacity(moves.len());
+    for (src, dst, len) in moves {
+        let mut off = 0;
+        while off < len {
+            let n = CHUNK.min(len - off);
+            parts.push((src + off, dst + off, n));
+            off += n;
+        }
+    }
+    let n_work = work.len();
+    let total = n_work + parts.len();
+    if total > 0 {
+        crate::shadow::wide_each(total, |i| {
+            if i < n_work {
+                let (from, ranges, to) = work[i];
+                let mut to = to as *mut [u32; 2];
+                for &(a, b) in ranges.iter().filter(|r| short(r)) {
+                    for offset in (a..b).step_by(4) {
+                        // SAFETY: inside the copy's mapping and inside `memory`.
+                        unsafe {
+                            let word = ((from + offset) as *const u32).read_unaligned();
+                            to.write([offset as u32, word]);
+                            to = to.add(1);
+                        }
+                    }
+                }
+            } else {
+                let (src, dst, len) = parts[i - n_work];
+                // SAFETY: non-overlapping ranges alive until `wide_each` returns.
+                unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
+            }
+        });
+    }
     STATS[3].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
     Some(Own { memory, copies, used: at })
 }

@@ -4894,38 +4894,49 @@ mod thread_tests {
 /// `stride` bytes apart (no root arguments, so no root signature), made
 /// once.
 fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
+    thread_local! {
+        static LOCAL: std::cell::RefCell<Vec<((u32, u32), ID3D12CommandSignature)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    if let Some(sig) = LOCAL.with_borrow(|c| c.iter().find(|(k, _)| *k == (kind, stride)).map(|(_, s)| s.clone())) {
+        return Some(sig);
+    }
     static MADE: std::sync::Mutex<Vec<((u32, u32), ID3D12CommandSignature)>> =
         std::sync::Mutex::new(Vec::new());
-    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, s)) = made.iter().find(|(k, _)| *k == (kind, stride)) {
-        return Some(s.clone());
-    }
-    let argument = D3D12_INDIRECT_ARGUMENT_DESC {
-        Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
-        ..Default::default()
+    let sig = {
+        let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, s)) = made.iter().find(|(k, _)| *k == (kind, stride)) {
+            s.clone()
+        } else {
+            let argument = D3D12_INDIRECT_ARGUMENT_DESC {
+                Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
+                ..Default::default()
+            };
+            let desc = D3D12_COMMAND_SIGNATURE_DESC {
+                ByteStride: stride,
+                NumArgumentDescs: 1,
+                pArgumentDescs: &argument,
+                NodeMask: 0,
+            };
+            let mut signature: Option<ID3D12CommandSignature> = None;
+            // SAFETY: a description of one argument; no root arguments.
+            let result = unsafe {
+                crate::host::host()?.device.CreateCommandSignature(
+                    &desc,
+                    None::<&ID3D12RootSignature>,
+                    &mut signature,
+                )
+            };
+            if let Err(e) = result {
+                once!(error = %e, kind, stride, "host command signature refused");
+                return None;
+            }
+            let signature = signature?;
+            made.push(((kind, stride), signature.clone()));
+            signature
+        }
     };
-    let desc = D3D12_COMMAND_SIGNATURE_DESC {
-        ByteStride: stride,
-        NumArgumentDescs: 1,
-        pArgumentDescs: &argument,
-        NodeMask: 0,
-    };
-    let mut signature: Option<ID3D12CommandSignature> = None;
-    // SAFETY: a description of one argument; no root arguments.
-    let result = unsafe {
-        crate::host::host()?.device.CreateCommandSignature(
-            &desc,
-            None::<&ID3D12RootSignature>,
-            &mut signature,
-        )
-    };
-    if let Err(e) = result {
-        once!(error = %e, kind, stride, "host command signature refused");
-        return None;
-    }
-    let signature = signature?;
-    made.push(((kind, stride), signature.clone()));
-    Some(signature)
+    LOCAL.with_borrow_mut(|c| c.push(((kind, stride), sig.clone())));
+    Some(sig)
 }
 
 /// Gets what a shader reads or writes through a view ready: buffer data
