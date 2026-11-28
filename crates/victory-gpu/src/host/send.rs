@@ -267,12 +267,54 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
             } else {
                 let (src, dst, len) = parts[i - n_work];
                 // SAFETY: non-overlapping ranges alive until `wide_each` returns.
-                unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
+                unsafe { copy_wc(src as *const u8, dst as *mut u8, len) };
             }
         });
     }
     STATS[3].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
     Some(Own { memory, copies, used: at })
+}
+
+/// Copies `len` bytes from cached CPU memory `src` into write-combined upload
+/// memory `dst`. Uses 512-bit non-temporal streaming stores (`vmovntdq`) on
+/// AVX-512 CPUs to avoid RFO traffic and maximize WC write-combining bandwidth.
+#[inline]
+unsafe fn copy_wc(mut src: *const u8, mut dst: *mut u8, mut len: usize) {
+    #[cfg(target_feature = "avx512f")]
+    {
+        use std::arch::x86_64::{__m512i, _mm_sfence, _mm512_loadu_si512, _mm512_stream_si512};
+        if len >= 256 {
+            let mis = (dst as usize) & 63;
+            if mis != 0 {
+                let head = 64 - mis;
+                unsafe { std::ptr::copy_nonoverlapping(src, dst, head) };
+                src = unsafe { src.add(head) };
+                dst = unsafe { dst.add(head) };
+                len -= head;
+            }
+            while len >= 256 {
+                unsafe {
+                    let v0 = _mm512_loadu_si512(src as *const __m512i);
+                    let v1 = _mm512_loadu_si512(src.add(64) as *const __m512i);
+                    let v2 = _mm512_loadu_si512(src.add(128) as *const __m512i);
+                    let v3 = _mm512_loadu_si512(src.add(192) as *const __m512i);
+                    _mm512_stream_si512(dst as *mut __m512i, v0);
+                    _mm512_stream_si512(dst.add(64) as *mut __m512i, v1);
+                    _mm512_stream_si512(dst.add(128) as *mut __m512i, v2);
+                    _mm512_stream_si512(dst.add(192) as *mut __m512i, v3);
+                    src = src.add(256);
+                    dst = dst.add(256);
+                }
+                len -= 256;
+            }
+            if len > 0 {
+                unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
+            }
+            unsafe { _mm_sfence() };
+            return;
+        }
+    }
+    unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
 }
 
 impl Own {
