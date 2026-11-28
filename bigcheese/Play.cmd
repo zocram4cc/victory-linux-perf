@@ -171,6 +171,10 @@ rem generated frame between each two real ones. It doubles what you see, not
 rem how fast the game runs. FSR 4's needs an RX 9000 card: on an older card
 rem FSR 3's runs instead, by itself. 1 asks for FSR 3's on any card; 0 turns it off.
 if not defined VICTORY_FIDELITYFX_FRAMEGEN set "VICTORY_FIDELITYFX_FRAMEGEN=4"
+rem It starts off: F7 turns it on and off while playing. Off, nothing waits for
+rem it (18-22 real fps against 9.4 with it on, 16 GB PC, RX 9060 XT). Set
+rem VICTORY_FRAMEGEN_PAUSED=0 before this file to start with it on.
+if not defined VICTORY_FRAMEGEN_PAUSED set "VICTORY_FRAMEGEN_PAUSED=1"
 
 
 rem victory-amd's list of the pipelines the game needs first (faster first

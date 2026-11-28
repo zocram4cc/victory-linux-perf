@@ -348,6 +348,20 @@ pub(crate) fn ml_enabled() -> bool {
     api().is_some_and(|api| api.legacy_providers.is_none()) && !ML_FELL_BACK.load(Ordering::Relaxed)
 }
 
+/// `VICTORY_FRAMEGEN_AHEAD=1`: with frame generation the present's list is
+/// sent ahead like any other (`Host::present_planes`), and the card finishes
+/// the frame while the next one is prepared. Off (the default) it runs at
+/// once and every present waits for all the card's work first: 24 ms a frame
+/// in run t1128-2117-1-B, with the card idle 31 ms a frame behind it.
+pub(crate) fn ahead() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_FRAMEGEN_AHEAD").is_ok_and(|v| v.trim() == "1");
+        tracing::info!(on, "FidelityFX frame generation: presents sent ahead (VICTORY_FRAMEGEN_AHEAD)");
+        on
+    })
+}
+
 /// What frame generation needs of an upscaled frame (see
 /// `external::FrameInputs`), with the host copies of its depth and motion
 /// vectors, which it holds.
@@ -443,9 +457,27 @@ static ACTIVE_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::n
 /// stays, so a paused present is an ordinary one (as with no upscaled frame).
 static PAUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Whether F7 has paused frame generation.
+/// Whether F7 has paused frame generation. It starts paused with
+/// `VICTORY_FRAMEGEN_PAUSED=1` (F7 turns it on).
 pub(crate) fn paused() -> bool {
+    static START: std::sync::Once = std::sync::Once::new();
+    START.call_once(|| {
+        if std::env::var("VICTORY_FRAMEGEN_PAUSED").is_ok_and(|v| v.trim() == "1") {
+            PAUSED.store(true, Ordering::Relaxed);
+            tracing::info!("FidelityFX frame generation starts paused (VICTORY_FRAMEGEN_PAUSED=1): F7 turns it on");
+        }
+    });
     PAUSED.load(Ordering::Relaxed)
+}
+
+/// Whether a present with frame generation runs at once, after all the
+/// card's work ([`ahead`] off and not paused). Paused, a present is an
+/// ordinary one, sent ahead: F7 gives the frame rate back, not only the
+/// generated frames. (F7 is looked at first, so a present that turns it on
+/// again is already one that runs at once.)
+pub(crate) fn present_at_once() -> bool {
+    poll_key();
+    !ahead() && !paused()
 }
 
 /// F7 was pressed since the last call, with one of our windows in front:
@@ -716,6 +748,14 @@ impl Presentation {
     /// A new generator for (display, render, flags).
     fn renew(&mut self, chain: &IDXGISwapChain3, device: &ID3D12Device, key: ([u32; 2], [u32; 2], u32)) {
         self.disable(chain);
+        // The old generator goes only once nothing can use it: the proxy's
+        // queued frames call it back (`generate_user` points at it), and the
+        // lists sent ahead hold its prepares. It went before the wait, while
+        // the proxy could still call it.
+        let _ = self.proxy.dispatch(&mut header(SWAPCHAIN_WAIT));
+        if self.generator.is_some() {
+            crate::host::settle_for_present();
+        }
         self.generator = None;
         self.key = Some(key);
         self.next_id = 0;

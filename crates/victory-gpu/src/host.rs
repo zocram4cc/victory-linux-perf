@@ -10789,7 +10789,10 @@ impl Host {
             // Frame generation presents through its proxy from the one list
             // upstream runs it with, not one sent ahead: in a sent-ahead
             // list it crashed a run freeing objects (`bury`) after 4 minutes.
-            let read_now = read_now || p.framegen.is_some();
+            // (`VICTORY_FRAMEGEN_AHEAD=1`: sent ahead all the same, the
+            // generator kept until nothing in the air can use it. Paused
+            // with F7: an ordinary present, sent ahead.)
+            let read_now = read_now || p.framegen.is_some() && crate::framegen::present_at_once();
             let slot = if late_free_present() && !read_now {
                 let finished = FINISHED.load(Ordering::Acquire);
                 p.ahead.iter().position(|(_, flown)| *flown <= finished).or_else(|| {

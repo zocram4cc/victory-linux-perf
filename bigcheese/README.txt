@@ -135,10 +135,14 @@ Frame rate and AMD FSR
   doubles what you see, not how fast the game runs. FSR 4 frame generation
   needs an RX 9000 card; on an older card (RX 6000, RX 7000) FSR 3 frame
   generation runs instead, by itself (the F3 panel shows FG3).
-  F7 pauses frame generation and starts it again while playing (the window
-  title says which); with it paused, what you see is the game's own frames,
-  with no ghosting on the HUD. Play-No-FG.cmd (or
-  VICTORY_FIDELITYFX_FRAMEGEN=0) turns it off for the whole run.
+  Frame generation starts off: F7 turns it on and off while playing (the
+  window title and F3 panel say which). With it on, every frame waits for
+  the card to finish before it is shown, so the game itself runs at about
+  half the frame rate (16 GB PC, RX 9060 XT: 9.4 real fps on, 18-22 off);
+  it is worth it only where the real frame rate is high. Off, what you see
+  is the game's own frames, with no ghosting on the HUD.
+  VICTORY_FRAMEGEN_PAUSED=0 starts it on; Play-No-FG.cmd (or
+  VICTORY_FIDELITYFX_FRAMEGEN=0) leaves it out of the run altogether.
 - F3 shows the frame rate and the card's memory.
 
 
