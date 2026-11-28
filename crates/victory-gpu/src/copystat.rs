@@ -899,7 +899,10 @@ fn log_memory() {
     tracing::info!(
         "memory, more: views named whole in their records since the start: {} constant buffer \
          views, {} views of placed memory; of the view table's entries {} are constant buffer \
-         views and {} views of placed memory; shapes of placed views kept: {}; host lists: {} \
+         views and {} views of placed memory; shapes of placed views kept: {} (of 4,194,304; \
+         padding words left out: {}, {} placed views had one set; VICTORY_PLACED_PADDING=0 \
+         keeps them); entries of views no resource releases held by the cap: {}, freed by it \
+         so far: {} (VICTORY_OWNERLESS_VIEWS, unset: all kept); host lists: {} \
          made by the host, {} preludes made for them, private bytes grew {:.0} MB while \
          lists were made; twins of depth textures: {:.0} MB; host copies of \
          placed textures whose title memory is not mapped any more (estimate): {:.0} MB, of \
@@ -910,6 +913,10 @@ fn log_memory() {
         views[3],
         views[4],
         views[5],
+        if views[8] != 0 { "on" } else { "off" },
+        views[9],
+        views[10],
+        views[11],
         lists[0],
         lists[1],
         lists[2] as i64 as f64 / (1 << 20) as f64,
