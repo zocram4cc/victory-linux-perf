@@ -628,10 +628,11 @@ pub(crate) struct State {
     /// across `VICTORY_THIN` threads.
     dynamic_slab: Option<(usize, u32, u32)>,
     /// Root SRVs bound as one-view tables in this list: (title heap, title
-    /// address; 0 for none) → dynamic slot, and the host copy the slot
-    /// shows: later draws of the list bring that one up to date, whatever
-    /// copy the address would find by then (`shadow.rs` `tails`).
-    root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
+    /// address; 0 for none) → (dynamic slot, host copy, last refresh epoch).
+    root_srv_slots: std::collections::HashMap<(usize, u64), (u32, Option<std::sync::Arc<crate::shadow::Shadow>>, u64), std::hash::BuildHasherDefault<crate::host::AddressHash>>,
+    /// Direct table SRV entries already mirrored & made readable in this list:
+    /// handle → (record words, list epoch, tested depth, is tested depth).
+    direct_ready: std::collections::HashMap<u64, ([u32; 3], u64, usize, bool), std::hash::BuildHasherDefault<crate::host::AddressHash>>,
     /// Root UAVs bound as one-view tables in this list, likewise.
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
     /// The list ran and its dynamic slots were given back.
@@ -714,6 +715,7 @@ impl State {
             self.release_slots();
         }
         self.fresh_tables.clear();
+        self.direct_ready.clear();
         self.recording = 0;
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
@@ -1761,12 +1763,9 @@ impl State {
         if kind == USER_VIEW_BIAS {
             // The view begins on 16 bytes of the copy the address finds
             // (`root_uav`, `root_srv_table`).
-            // shortcut: found again here, not taken from the list's slot.
             return match self.roots_ref(compute).get(usize::from(slot)) {
                 Some(&Root::View(address)) => crate::shadow::find(address, 1).map_or(0, |s| {
-                    // SAFETY: a live buffer.
-                    let base = unsafe { s.buffer.GetGPUVirtualAddress() };
-                    ((s.gpu(address) - base) & 15) as u32
+                    (s.offset(address) & 15) as u32
                 }),
                 _ => 0,
             };
@@ -2431,20 +2430,25 @@ impl State {
             std::ptr::from_ref(heap) as usize,
             address.unwrap_or(0) | u64::from(biased) << 63,
         );
-        let (index, shadow) = match self.root_srv_slots.get(&key) {
-            Some((index, shadow)) => (*index, address.zip(shadow.clone())),
+        let list_epoch = list.epoch();
+        let index = match self.root_srv_slots.get_mut(&key) {
+            Some((index, shadow, refreshed_epoch)) => {
+                if *refreshed_epoch != list_epoch {
+                    if let (Some(a), Some(s)) = (address, shadow.as_ref()) {
+                        s.refresh(list, a, s.left(a));
+                    }
+                    *refreshed_epoch = list.epoch();
+                }
+                *index
+            }
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
                 let Some(index) = self.reserve_dynamic(host, 1) else {
                     return false;
                 };
-                self.root_srv_slots
-                    .insert(key, (index, shadow.as_ref().map(|(_, s)| s.clone())));
                 match &shadow {
                     Some((a, s)) => {
-                        // SAFETY: a live buffer.
-                        let base = unsafe { s.buffer.GetGPUVirtualAddress() };
-                        let offset = s.gpu(*a) - base;
+                        let offset = s.offset(*a);
                         if biased {
                             // From the 16 bytes below; the shader adds the
                             // rest (`victory_shader::emit::USER_VIEW_BIAS`).
@@ -2461,18 +2465,17 @@ impl State {
                             );
                             host.null_raw_at(index);
                         }
+                        s.refresh(list, *a, s.left(*a));
                     }
                     None => host.null_raw_at(index),
                 }
-                (index, shadow)
+                self.root_srv_slots.insert(
+                    key,
+                    (index, shadow.map(|(_, s)| s), list.epoch()),
+                );
+                index
             }
         };
-        // As for root descriptors (`root_view`): all that is left of the
-        // buffer is brought up to date. The first 1 MiB only left what lay
-        // past it stale (most mesh vertex streams reach further).
-        if let Some((a, s)) = &shadow {
-            s.refresh(list, *a, s.left(*a));
-        }
         let handle = host.gpu_handle(index);
         // SAFETY: an open list; the slot is in the bound view heap.
         unsafe {
@@ -4025,11 +4028,30 @@ impl State {
         }
     }
 
-    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
-        let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
+    fn table_entry(&mut self, list: &HostList, u: &UsedResource, compute: bool) {
+        let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
         };
         let handle = table + u64::from(u.table_offset_dwords) * 4;
+        let words = if u.kind == ResourceType::Srv {
+            let w = crate::descriptor::record_at(handle);
+            if let Some(words) = w {
+                let tested = TESTED_DEPTH.get();
+                if let Some(&(cw, cep, ctd, cis_d)) = self.direct_ready.get(&handle)
+                    && cw == words
+                    && cep == list.epoch()
+                    && ctd == tested.0
+                {
+                    if cis_d {
+                        TESTED_DEPTH.set((tested.0, true));
+                    }
+                    return;
+                }
+            }
+            w
+        } else {
+            None
+        };
         let Some(heap) = self.heap_of(handle) else {
             return;
         };
@@ -4037,12 +4059,23 @@ impl State {
             return;
         };
         if let Some(view) = host.mirror(index, handle, true) {
+            let depth_before = TESTED_DEPTH.get();
+            if u.kind == ResourceType::Srv {
+                TESTED_DEPTH.set((depth_before.0, false));
+            }
             readable(list, u.kind, &view);
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
                 host.texture_slot_tabled(index, true);
             } else {
                 host.slot_tabled(index);
+            }
+            if u.kind == ResourceType::Srv {
+                let is_depth = TESTED_DEPTH.get().1;
+                TESTED_DEPTH.set((depth_before.0, depth_before.1 || is_depth));
+                if let Some(words) = words {
+                    self.direct_ready.insert(handle, (words, list.epoch(), depth_before.0, is_depth));
+                }
             }
         }
     }
