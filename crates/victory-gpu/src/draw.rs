@@ -4456,7 +4456,9 @@ impl State {
     /// The stand-in for the indirect light after a dispatch of `p`
     /// (`crate::ambient`). Whether it recorded anything.
     fn ambient(&self, list: &HostList, p: &HostPipeline, role: crate::ambient::Role) -> bool {
-        use crate::ambient::{AIR, DEPTH, LIGHT, MISS_DEPTH, MISS_LIGHT, MissNote, RADIANCE, REFLECTIONS, Role, Views};
+        use crate::ambient::{
+            AIR, DEPTH, LIGHT, MISS_DEPTH, MISS_LIGHT, MissNote, RADIANCE, REFLECTIONS, Role, SCREEN_REFLECTIONS, Views,
+        };
         let Some(t) = p.stages.first().map(|s| s.translated()) else {
             return false;
         };
@@ -4602,6 +4604,7 @@ impl State {
             Role::Air => AIR,
             Role::Reflect => REFLECTIONS,
             Role::Miss => MISS_LIGHT,
+            Role::Screen => SCREEN_REFLECTIONS,
         };
         // Variants of the miss program bind the rays' image and the depth
         // at other places of their tables than the one found first
@@ -4689,7 +4692,7 @@ impl State {
                 };
                 Some((depth, [seen.Width as u32, seen.Height]))
             }
-            Role::Radiance | Role::Air | Role::Reflect => None,
+            Role::Radiance | Role::Air | Role::Reflect | Role::Screen => None,
         };
         // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT.)
         let format = if matches!(role, Role::Resolve | Role::Reflect) { 42 } else { 26 };
@@ -6011,9 +6014,12 @@ impl State {
         }
         // The stand-in for reflections after the program that gives the rays
         // that found nothing the sky's light (`crate::ambient`, `Role::Miss`):
-        // it is dispatched indirectly. (The other roles' programs are not.)
+        // it is dispatched indirectly, and so may the reflections' screen
+        // resolve be (`Role::Screen`, `VICTORY_REFLECT_FIX`). (The other
+        // roles' programs are not.)
         if kind == DISPATCH
-            && let Some(role @ crate::ambient::Role::Miss) = p.stages.first().and_then(|s| s.shader.ambient)
+            && let Some(role @ (crate::ambient::Role::Miss | crate::ambient::Role::Screen)) =
+                p.stages.first().and_then(|s| s.shader.ambient)
             && crate::ambient::on()
             && self.ambient(list, p, role)
         {

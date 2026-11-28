@@ -90,6 +90,11 @@ pub(crate) enum Role {
     /// Gives the reflection rays that found nothing the sky's light
     /// (`CS_RayMiss`, not `CS_RayMiss_Volumetrics` nor the screen probes').
     Miss,
+    /// (`VICTORY_REFLECT_FIX=1`) Resolves the title's reflections on screen
+    /// (`CS_ResolveScreenSpace`); right after it they are held to a part of
+    /// the light around, where the title's probes see no sky
+    /// ([`reflect_fix`]).
+    Screen,
 }
 
 /// The program's part in this, by its name in the container.
@@ -105,9 +110,50 @@ pub(crate) fn role(container: &[u8]) -> Option<Role> {
         Some(Role::Reflect)
     } else if is_miss(container) {
         Some(Role::Miss)
+    } else if reflect_fix() > 0.0 && has(b"CS_ResolveScreenSpace_") {
+        Some(Role::Screen)
     } else {
         None
     }
+}
+
+/// (`VICTORY_REFLECT_FIX=1`; off unless set) The most a reflection written
+/// by `CS_ResolveScreenSpace` may hold, as a part of the light around the
+/// pixel (`VICTORY_REFLECT_FIX_HOLD=<part>`, 0.5), plus [`reflect_sky`]
+/// times the diffuse light the title's own screen probes resolved there:
+/// where the probes see the sky (outdoors, open water) the bound is far
+/// above any reflection of it, indoors the sky the reflection fell back to
+/// is held to the room's light. It only lowers reflections brighter than
+/// that, scaling their colour. Needs no `VICTORY_AMBIENT`: without it the
+/// estimate is still made (the title's light is only read). A stand-in for
+/// the traced reflections; prior art from another fork's source (after a
+/// patch for a sibling of our fork point), where it is off by default and
+/// unproven. Beside `VICTORY_AMBIENT_REFLECT`, which holds what
+/// `CS_UpdateHistory` leaves of the reflections afterwards.
+pub(crate) fn reflect_fix() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| {
+        fix_part(std::env::var("VICTORY_REFLECT_FIX").ok().as_deref(), std::env::var("VICTORY_REFLECT_FIX_HOLD").ok().as_deref())
+    })
+}
+
+/// [`reflect_fix`] for the values of its two switches.
+fn fix_part(on: Option<&str>, hold: Option<&str>) -> f32 {
+    if on.map(str::trim) != Some("1") {
+        return 0.0;
+    }
+    hold.and_then(|v| v.trim().parse().ok()).filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.5)
+}
+
+/// (`VICTORY_REFLECT_FIX_SKY=<multiple>`, 4) How bright a reflection may be
+/// beside the hold, as a multiple of the diffuse light the title's screen
+/// probes resolved at the pixel ([`reflect_fix`]).
+fn reflect_sky() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let set = std::env::var("VICTORY_REFLECT_FIX_SKY").unwrap_or_default();
+        set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v >= 0.0).unwrap_or(4.0)
+    })
 }
 
 /// `CS_RayMiss_` and the eight hex digits of a variant's hash.
@@ -126,6 +172,9 @@ pub(crate) const DEPTH: (u8, u32) = (0, 464);
 pub(crate) const RADIANCE: (u8, u32) = (1, 16);
 /// Where the light the air scatters is.
 pub(crate) const AIR: (u8, u32) = (1, 32);
+/// (`VICTORY_REFLECT_FIX`) Where `CS_ResolveScreenSpace` writes its
+/// reflections: R11G11B10_FLOAT (checked by format at the hook).
+pub(crate) const SCREEN_REFLECTIONS: (u8, u32) = (1, 128);
 /// Where `CS_UpdateHistory` writes the reflections (R9G9B9E5 as 32-bit
 /// integers), as in Neptune_VI.
 pub(crate) const REFLECTIONS: (u8, u32) = (1, 40);
@@ -164,7 +213,7 @@ fn set() -> Set {
 /// Whether a stand-in is on (for the diffuse light or for reflections):
 /// set, and the title's rays find nothing.
 pub(crate) fn on() -> bool {
-    (set() != Set::Off || specular().is_some()) && !crate::pipeline::builder_runs()
+    (set() != Set::Off || specular().is_some() || reflect_fix() > 0.0) && !crate::pipeline::builder_runs()
 }
 
 /// `VICTORY_AMBIENT_SPECULAR=<share>[,<sky>]`: reflections whose rays found
@@ -288,7 +337,7 @@ fn shade() -> [f32; 2] {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=14, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
+#define RS "RootConstants(num32BitConstants=16, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), UAV(u3), UAV(u4)"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -303,6 +352,7 @@ cbuffer Set : register(b0) {
     float near; float tan_y; uint width; uint height;
     float follow; float most; float air; float cut;
     float held; uint leftover;
+    float fix_held; float sky;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -311,6 +361,11 @@ Texture2D<float> depth : register(t0);
 RWStructuredBuffer<float4> cells : register(u1);
 // Three a point: red, green and blue, each a mean and a direction.
 RWStructuredBuffer<float4> points : register(u2);
+// (`VICTORY_REFLECT_FIX`) A point each: the brightness of the diffuse light
+// the title's screen probes resolved there, before anything of ours.
+RWStructuredBuffer<float> probe : register(u3);
+// (`VICTORY_REFLECT_FIX`) In memory the CPU reads: pixels the hold lowered.
+RWByteAddressBuffer bounded : register(u4);
 static const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
 
 // R9G9B9E5, as the title keeps light in 32-bit integers.
@@ -629,7 +684,57 @@ void hold(uint3 at : SV_DispatchThreadID) {
     if (has > top) reflected[at.xy] = pack(c * (top / max(has, 1e-9)));
 }
 #endif
+
+#ifdef PROBE
+RWTexture2D<uint> probes : register(u0);
+[RootSignature(RS)]
+[numthreads(8, 2, 1)]
+void keep_probe(uint3 at : SV_DispatchThreadID) {
+    uint w, h;
+    probes.GetDimensions(w, h);
+    float sum = 0;
+    for (uint y = 0; y < 2; y++) for (uint x = 0; x < 2; x++) {
+        uint2 q = min(uint2((float2(at.xy) + (float2(x, y) + 0.5) / 2.0) * float2(w, h) / float2(PX, PY)), uint2(w - 1, h - 1));
+        sum += dot(unpack(probes[q]), LUMA);
+    }
+    probe[at.y * PX + at.x] = sum / 4.0;
+}
+#endif
+
+#ifdef SCREEN
+RWTexture2D<float3> refl : register(u0);
+groupshared uint lowered;
+// No brighter than `fix_held` of the light around (the estimate at the
+// nearest point with a fifth of the room's slow mean) plus `sky` times the
+// diffuse light the title's probes found there.
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void hold_screen(uint3 at : SV_DispatchThreadID, uint index : SV_GroupIndex) {
+    if (index == 0) lowered = 0;
+    GroupMemoryBarrierWithGroupSync();
+    uint w, h;
+    refl.GetDimensions(w, h);
+    if (at.x < w && at.y < h) {
+        uint2 q = min(uint2((float2(at.xy) + 0.5) / float2(w, h) * float2(PX, PY)), uint2(PX - 1, PY - 1));
+        uint at0 = (q.y * PX + q.x) * 3;
+        float3 around = float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
+        around = lerp(around, cells[CELLS].rgb, 0.2);
+        float cap = fix_held * dot(around, LUMA) + sky * probe[q.y * PX + q.x];
+        float3 c = refl[at.xy];
+        float has = dot(c, LUMA);
+        if (has > cap) {
+            refl[at.xy] = c * (cap / max(has, 1e-9));
+            InterlockedAdd(lowered, 1);
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (index == 0 && lowered > 0) bounded.InterlockedAdd(0, lowered);
+}
+#endif
 "#;
+
+/// Bytes of the probes' brightness at the points ([`reflect_fix`]).
+const PROBE_BYTES: u64 = 160 * 90 * 4;
 
 /// Bytes of the cells' buffer and of the points'.
 const CELLS: u64 = 64 * 36;
@@ -646,15 +751,26 @@ struct Pass {
     air: ID3D12PipelineState,
     hold: ID3D12PipelineState,
     miss: ID3D12PipelineState,
+    keep_probe: ID3D12PipelineState,
+    hold_screen: ID3D12PipelineState,
     cells: ID3D12Resource,
     points: ID3D12Resource,
+    probe: ID3D12Resource,
+    /// Pixels [`Role::Screen`]'s hold lowered, a word the card adds to and
+    /// we read ([`note_screen`]), and its mapping.
+    bounded: ID3D12Resource,
+    bounded_at: usize,
 }
 // SAFETY: D3D12 objects are free-threaded.
 unsafe impl Send for Pass {}
 // SAFETY: as above.
 unsafe impl Sync for Pass {}
 
-fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -> windows::core::Result<Pass> {
+fn make(
+    device: &ID3D12Device,
+    buffer: impl Fn(u64) -> Option<ID3D12Resource>,
+    mapped: impl Fn(u64) -> Option<(ID3D12Resource, *mut u8)>,
+) -> windows::core::Result<Pass> {
     let mut root: Option<ID3D12RootSignature> = None;
     let mut pipeline = |part: &str, entry| -> windows::core::Result<ID3D12PipelineState> {
         let code = crate::host::compile(&format!("#define {part}\n{SOURCE}"), entry, s!("cs_5_1"))?;
@@ -679,7 +795,10 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     let air = pipeline("AIR", s!("clear_air"))?;
     let hold = pipeline("HOLD", s!("hold"))?;
     let miss = pipeline("MISS", s!("miss_light"))?;
+    let keep_probe = pipeline("PROBE", s!("keep_probe"))?;
+    let hold_screen = pipeline("SCREEN", s!("hold_screen"))?;
     let made = |bytes| buffer(bytes).ok_or_else(windows::core::Error::empty);
+    let (bounded, bounded_at) = mapped(256).ok_or_else(windows::core::Error::empty)?;
     Ok(Pass {
         root: root.ok_or_else(windows::core::Error::empty)?,
         keep,
@@ -690,8 +809,13 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
         air,
         hold,
         miss,
+        keep_probe,
+        hold_screen,
         cells: made(CELL_BYTES)?,
         points: made(POINT_BYTES)?,
+        probe: made(PROBE_BYTES)?,
+        bounded,
+        bounded_at: bounded_at as usize,
     })
 }
 
@@ -699,7 +823,7 @@ fn pass() -> Option<&'static Pass> {
     static PASS: OnceLock<Option<Pass>> = OnceLock::new();
     PASS.get_or_init(|| {
         let host = host()?;
-        make(&host.device, |bytes| host.uav_buffer(bytes))
+        make(&host.device, |bytes| host.uav_buffer(bytes), |bytes| host.shared_buffer(bytes))
             .inspect_err(|e| tracing::warn!(error = %e, "no stand-in for the indirect light"))
             .ok()
     })
@@ -715,6 +839,57 @@ fn uav_barrier(list: &ID3D12GraphicsCommandList) {
 /// Whether the light of a frame has been kept: the estimate has something
 /// to begin with.
 static KEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// (`VICTORY_REFLECT_FIX`) Whether the probes' diffuse light has been kept
+/// once: before that every reflection, the sea's too, would be held to the
+/// room's light.
+static PROBE_KEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// (`VICTORY_REFLECT_FIX`) Since the last line: dispatches of
+/// `CS_ResolveScreenSpace` held, the pixels they covered, and those left as
+/// they were (no light or probes kept yet, or with a constant).
+static SCREEN_SAID: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// (`VICTORY_REFLECT_FIX`) Counts a dispatch of the screen resolve (`held`:
+/// followed by the hold, over `pixels`); every ten seconds an info line says
+/// how many, and how many pixels the hold lowered (a count the card keeps
+/// in mapped memory, read as it stands).
+fn note_screen(pass: &Pass, held: bool, pixels: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if held {
+        SCREEN_SAID[0].fetch_add(1, Relaxed);
+        SCREEN_SAID[1].fetch_add(pixels, Relaxed);
+    } else {
+        SCREEN_SAID[2].fetch_add(1, Relaxed);
+    }
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    static LOWERED: AtomicU64 = AtomicU64::new(0);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let now = std::time::Instant::now();
+    let Some(since) = *last else {
+        *last = Some(now);
+        return;
+    };
+    if now.duration_since(since).as_secs_f32() < 10.0 {
+        return;
+    }
+    *last = Some(now);
+    // SAFETY: the counter's mapped word, which lives as long as the pass.
+    let lowered = u64::from(unsafe { (pass.bounded_at as *const u32).read_volatile() });
+    let before = LOWERED.swap(lowered, Relaxed);
+    tracing::info!(
+        "reflections held (VICTORY_REFLECT_FIX={}, sky {}) in the last {:.0} s: {} dispatches of CS_ResolveScreenSpace \
+         followed, over {} pixels, {} pixels lowered; {} left as the title had them (no light or probes kept yet, or a \
+         constant VICTORY_AMBIENT)",
+        reflect_fix(),
+        reflect_sky(),
+        now.duration_since(since).as_secs_f32(),
+        SCREEN_SAID[0].swap(0, Relaxed),
+        SCREEN_SAID[1].swap(0, Relaxed),
+        lowered.wrapping_sub(before) & 0xffff_ffff,
+        SCREEN_SAID[2].swap(0, Relaxed),
+    );
+}
 
 /// What the passes read and write, as views in the heap the list has set.
 pub(crate) struct Views {
@@ -838,10 +1013,15 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     };
     // The share of the estimate, and the constant (for reflections: the
     // share of the title's sky kept); the light is kept for either stand-in.
+    // (`VICTORY_REFLECT_FIX` without the stand-in: the light is kept and the
+    // estimate made, and only the reflections are changed.)
+    let fix = reflect_fix() > 0.0;
     let (level, constant) = match (role, set(), specular()) {
         (Role::Miss, _, Some(s)) => (s.share, s.sky),
         (Role::Miss, _, None) => return false,
         (Role::Radiance, Set::Off, Some(_)) => (0.0, 0.0),
+        (Role::Radiance, Set::Off, None) if fix => (0.0, 0.0),
+        (Role::Resolve | Role::Screen, Set::Off, _) if fix => (1.0, 0.0),
         (_, Set::Off, _) => return false,
         (_, Set::Estimate(level), _) => (level, 0.0f32),
         (_, Set::Constant(level), _) => (0.0, level),
@@ -859,6 +1039,14 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     if role == Role::Reflect && reflect() == 0.0 {
         return false;
     }
+    // The hold needs the estimate (not a constant) and the probes' light.
+    if role == Role::Screen {
+        if !fix || constant > 0.0 || !PROBE_KEPT.load(Ordering::Relaxed) {
+            note_screen(pass, false, 0);
+            return false;
+        }
+        note_screen(pass, true, u64::from(views.size[0]) * u64::from(views.size[1]));
+    }
     static SAID: Mutex<u32> = Mutex::new(0);
     {
         let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
@@ -869,9 +1057,11 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     }
     list.keep(&pass.cells);
     list.keep(&pass.points);
+    list.keep(&pass.probe);
+    list.keep(&pass.bounded);
     let [strength, radius] = shade();
     let floats = [level, constant, strength, radius, 0.1, 0.45];
-    let mut words = [0u32; 14];
+    let mut words = [0u32; 16];
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
@@ -889,6 +1079,8 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[11] = if placed_already { -1.0f32 } else { cut() }.to_bits();
     words[12] = reflect().to_bits();
     words[13] = leftover();
+    words[14] = reflect_fix().to_bits();
+    words[15] = reflect_sky().to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -896,13 +1088,15 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     unsafe {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 14, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, 16, words.as_ptr().cast(), 0);
         if let Some(depth) = views.depth {
             l.SetComputeRootDescriptorTable(1, depth);
         }
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
         l.SetComputeRootUnorderedAccessView(4, pass.points.GetGPUVirtualAddress());
+        l.SetComputeRootUnorderedAccessView(5, pass.probe.GetGPUVirtualAddress());
+        l.SetComputeRootUnorderedAccessView(6, pass.bounded.GetGPUVirtualAddress());
         let run = |pso: &ID3D12PipelineState, x, y, z| {
             l.SetPipelineState(pso);
             l.Dispatch(x, y, z);
@@ -921,8 +1115,18 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                     run(&pass.place, 8, 9, 1);
                     run(&pass.gather, 20, 45, 1);
                 }
-                run(&pass.raise, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
+                // (`VICTORY_REFLECT_FIX`) The probes' own light, before the
+                // stand-in raises it.
+                if fix {
+                    run(&pass.keep_probe, 20, 45, 1);
+                    PROBE_KEPT.store(true, Ordering::Relaxed);
+                }
+                // (Without the stand-in: the estimate only, for the hold.)
+                if set() != Set::Off {
+                    run(&pass.raise, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
+                }
             }
+            Role::Screen => run(&pass.hold_screen, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1),
             Role::Miss => {
                 // The points afresh, from this frame's depth: the diffuse
                 // stand-in makes them later in the frame.
@@ -986,6 +1190,20 @@ mod tests {
         assert_eq!(role(b"..CS_UpdateHistory_1f2e3d4c.."), Some(Role::Reflect));
     }
 
+    /// `VICTORY_REFLECT_FIX`: off unless 1; the hold 0.5 unless a positive
+    /// number is given.
+    #[test]
+    fn the_screen_hold_is_off_unless_set() {
+        assert_eq!(fix_part(None, Some("0.25")), 0.0);
+        assert_eq!(fix_part(Some("0"), None), 0.0);
+        assert_eq!(fix_part(Some("1"), None), 0.5);
+        assert_eq!(fix_part(Some(" 1 "), Some("0.25")), 0.25);
+        assert_eq!(fix_part(Some("1"), Some("-1")), 0.5);
+        assert_eq!(fix_part(Some("1"), Some("x")), 0.5);
+        // Off in the tests: the screen resolve has no role.
+        assert_eq!(role(b"..CS_ResolveScreenSpace_1a2b3c4d_Wrapped.."), None);
+    }
+
     #[test]
     fn reflections_held() {
         assert_eq!(reflect_part(None), 0.0);
@@ -1016,6 +1234,6 @@ mod tests {
         let Some(host) = host() else {
             return;
         };
-        make(&host.device, |bytes| host.uav_buffer(bytes)).expect("the passes");
+        make(&host.device, |bytes| host.uav_buffer(bytes), |bytes| host.shared_buffer(bytes)).expect("the passes");
     }
 }
