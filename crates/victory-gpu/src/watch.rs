@@ -1056,7 +1056,7 @@ fn with_other_views(first: usize, last: usize, pages: &mut Vec<(usize, u16)>) {
 /// walking the pages between them costs less than another kernel call (a
 /// call that resets written pages costs 30-70 microseconds whatever the
 /// range).
-const AHEAD_GAP: usize = (1 << 20) / PAGE;
+const AHEAD_GAP: usize = (4 << 20) / PAGE;
 /// The most one asking covers (its answer needs 8 bytes per 4 KiB page).
 const AHEAD_MAX: usize = (1 << 30) / PAGE;
 /// Asks the kernel about many ranges `(start, end)` at once, before the
@@ -1391,8 +1391,21 @@ fn ask_rest(ranges: &[(usize, usize)], held: bool) {
         }
     }
     let mut ahead = held_ahead.take();
-    let answers = spread_each(alone_ranges.len(), |r| {
-        let (first, last) = alone_ranges[r];
+    // Split large single ranges (> 32 MiB) into parallel chunks so our
+    // lock-free `PAGEMAP_SCAN` in Wine runs across `victory-wide` threads
+    // instead of stalling 5+ ms on a single thread.
+    const CHUNK_PAGES: usize = (32 << 20) / PAGE;
+    let mut chunks: Vec<(usize, usize)> = Vec::with_capacity(alone_ranges.len());
+    for &(first, last) in &alone_ranges {
+        let mut p = first;
+        while p < last {
+            let next = (p + CHUNK_PAGES).min(last);
+            chunks.push((p, next));
+            p = next;
+        }
+    }
+    let answers = spread_each(chunks.len(), |r| {
+        let (first, last) = chunks[r];
         #[cfg(feature = "diagnostics")]
         let asking = std::time::Instant::now();
         let found = kernel_written(first, last);
@@ -1400,7 +1413,7 @@ fn ask_rest(ranges: &[(usize, usize)], held: bool) {
         alone(first * PAGE, last * PAGE, found.as_ref().map_or(0, Vec::len), asking.elapsed());
         found
     });
-    for (&(first, last), found) in alone_ranges.iter().zip(answers) {
+    for (&(first, last), found) in chunks.iter().zip(answers) {
         if let Some(pages) = found {
             written.extend(pages);
             ahead.push((first, last));
@@ -1689,16 +1702,6 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 /// by their bits. `false` if something would have to be asked.
 pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64], ranged: u64) -> bool {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    // The bits first, then the journal, as in `writes`.
-    let known = published(start, end);
-    #[cfg(feature = "diagnostics")]
-    if known {
-        crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
-    }
-    let j = journal();
-    if !known && !j.ahead.holds(first, last) {
-        return false;
-    }
     let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
         return false;
     };
@@ -1716,10 +1719,32 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
         }
         min
     };
-    // Per-page lock-free check against L2-resident `PAGE_MAX` for spans up to
-    // 4 MiB (64 pages): avoids `RwLock<Shard>` and `BTreeMap` even when `taken`
-    // has mixed timestamps (`floor` < individual page's `taken`).
-    if last - first <= 64 {
+    // The bits first, then the journal, as in `writes`.
+    let known = published(start, end);
+    #[cfg(feature = "diagnostics")]
+    if known {
+        crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
+    }
+    // Completely lock-free fast path when `known` (published view memory) and
+    // span <= 4 MiB: avoids acquiring `journal()` RwLock across all wide threads.
+    if known && last - first <= 64 {
+        let mut maybe_dirty = false;
+        for (idx, p) in (first..last).enumerate() {
+            let need = taken[idx].max(ranged);
+            if PAGE_MAX[p & PAGE_MAX_MASK].load(std::sync::atomic::Ordering::Acquire) > need {
+                maybe_dirty = true;
+                break;
+            }
+        }
+        if !maybe_dirty {
+            return true;
+        }
+    }
+    let j = journal();
+    if !known && !j.ahead.holds(first, last) {
+        return false;
+    }
+    if !known && last - first <= 64 {
         let mut maybe_dirty = false;
         for (idx, p) in (first..last).enumerate() {
             let need = taken[idx].max(ranged);

@@ -659,9 +659,10 @@ pub(super) struct Taken {
     /// The fills' places, lengths and places in the buffer between
     /// ([`late`]).
     sent: Vec<(usize, usize, u64)>,
-    /// The fills of the submission done on the CPU: upload memory, place,
-    /// length ([`late`]).
-    cpu: Vec<(usize, usize, usize)>,
+    /// The fills of the submission done on the CPU: digest of title bytes at
+    /// submission, place, length ([`late`]). Hashing from cached title RAM
+    /// avoids reading back from uncached write-combined (WC) upload memory.
+    cpu: Vec<(u128, usize, usize)>,
 }
 
 /// Places the title writes after the submission that reads them was sent.
@@ -786,20 +787,17 @@ mod late {
     }
 
     /// The submission has landed: the fills of it the CPU did when it was
-    /// sent (upload memory, place, length) compared with title memory now.
-    pub(super) fn landed_cpu(cpu: &[(usize, usize, usize)]) {
+    /// sent (digest at submission, place, length) compared with title memory now.
+    pub(super) fn landed_cpu(cpu: &[(u128, usize, usize)]) {
         let mut now = Vec::new();
-        for &(dst, src, len) in cpu {
+        for &(was, src, len) in cpu {
             now.clear();
             now.resize(len, 0);
             if !crate::host::read_into(src as *const u8, &mut now) {
                 continue;
             }
-            // SAFETY: the submission's upload memory, alive until its lists
-            // are reset, after this.
-            let read = unsafe { std::slice::from_raw_parts(dst as *const u8, len) };
             COUNTS[4].fetch_add(1, Ordering::Relaxed);
-            if now == read {
+            if crate::texture::digest(&now).0 == was {
                 continue;
             }
             COUNTS[5].fetch_add(1, Ordering::Relaxed);
@@ -1764,17 +1762,22 @@ impl Host {
         spent.end();
         let steps: std::collections::HashSet<(usize, usize), std::hash::BuildHasherDefault<AddressHash>> =
             chosen.iter().map(|&(i, _)| steps[i]).collect();
-        // The fills left to the CPU: done when the submission is prepared,
-        // now, into upload memory that holds them until its lists are reset.
+        // The fills left to the CPU: snapshot their digest from cached title
+        // memory now so `landed_cpu` never reads back from WC upload memory.
         let mut cpu = Vec::new();
         if late::on() {
+            let mut scratch = Vec::new();
             for list in runs {
                 let at = std::ptr::from_ref::<HostList>(list) as usize;
                 for (i, step) in list.deferred().copies.iter().enumerate() {
-                    if let &Step::Fill(dst, src, len, _) = step
+                    if let &Step::Fill(_dst, src, len, _) = step
                         && !steps.contains(&(at, i))
                     {
-                        cpu.push((dst, src, len));
+                        scratch.clear();
+                        scratch.resize(len, 0);
+                        if crate::host::read_into(src as *const u8, &mut scratch) {
+                            cpu.push((crate::texture::digest(&scratch).0, src, len));
+                        }
                     }
                 }
             }
@@ -1992,16 +1995,16 @@ mod tests {
         let memory = vec![0u8; 4 * 4096];
         let page = (memory.as_ptr() as usize).next_multiple_of(4096);
         let (kept, changed) = (page + 16, page + 4096 + 0xbd0);
-        // The upload memory each was filled into: the bytes as they were.
-        let upload = vec![0u8; 1024];
-        let up = upload.as_ptr() as usize;
-        let cpu = [(up, kept, 32), (up + 512, changed, 0x220)];
+        // The digests of the bytes as they were when sent.
+        let zero32 = crate::texture::digest(&[0u8; 32]).0;
+        let zero544 = crate::texture::digest(&[0u8; 0x220]).0;
+        let cpu = [(zero32, kept, 32), (zero544, changed, 0x220)];
         // SAFETY: inside `memory`.
         unsafe { *(changed as *mut u8).add(0x100) = 7 };
         late::landed_cpu(&cpu);
         assert!(!late::written(kept, kept + 32));
         assert!(late::written(changed, changed + 0x220));
-        drop((memory, upload));
+        drop(memory);
     }
 
     /// Only what is asked for is taken, all of it, and a step that stands
