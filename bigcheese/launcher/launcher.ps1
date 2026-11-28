@@ -142,7 +142,7 @@ function New-Check($parent, [string]$text, [string]$note, [int]$y, [bool]$on) {
     $c.BackColor = [System.Drawing.Color]::Transparent
     $c.Cursor = [System.Windows.Forms.Cursors]::Hand
     $parent.Controls.Add($c)
-    if ($note) { [void](New-Label $parent $note 34 ($y + 23) ($parent.Width - 48) 20 $small ([System.Drawing.Color]::Gainsboro)) }
+    if ($note) { $c.Tag = New-Label $parent $note 34 ($y + 23) ($parent.Width - 48) 20 $small ([System.Drawing.Color]::Gainsboro) }
     return $c
 }
 
@@ -204,6 +204,26 @@ foreach ($r in $seriesX, $seriesS) {
     $page2.Controls.Add($r)
 }
 if ($settings.console -eq 'series-s') { $seriesS.Checked = $true } else { $seriesX.Checked = $true }
+
+# Ray tracing with Series X on 16 GB of RAM ran the PC out of memory 40 s
+# after the start (29 Nov 2026: Windows' whole commit, RAM and page file,
+# used up); with Series S it played. So with both ticked it is off.
+$rtNote = $rt.Tag.Text
+function Update-RayTracing {
+    if ($ram16.Checked -and $seriesX.Checked) {
+        $rt.Checked = $false
+        $rt.Enabled = $false
+        $rt.Tag.Text = 'Not with Series X on 16 GB of RAM (runs out of memory).'
+        $rt.Tag.ForeColor = [System.Drawing.Color]::FromArgb(255, 170, 150)
+    } else {
+        $rt.Enabled = $true
+        $rt.Tag.Text = $rtNote
+        $rt.Tag.ForeColor = [System.Drawing.Color]::Gainsboro
+    }
+}
+$ram16.Add_CheckedChanged({ Update-RayTracing })
+$seriesX.Add_CheckedChanged({ Update-RayTracing })
+Update-RayTracing
 $saves = New-Button $page2 'Open saves folder' 14 280 ($page2.Width - 28) 32 $false
 $back = New-Button $page2 'Back' 14 322 110 44 $false
 $play = New-Button $page2 'PLAY' 134 322 ($page2.Width - 148) 44 $true
