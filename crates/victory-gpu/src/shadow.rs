@@ -180,6 +180,8 @@ pub(crate) struct Shadow {
     /// Mode 2 of [`dword_mode`]: the frame a refresh last found title bytes
     /// over a lately landed piece of it, plus one (0: never).
     title_over_landed: AtomicU64,
+    /// The frame shaders were last declared to write it, plus one (0: never).
+    declared_at: AtomicU64,
 }
 
 /// Whether the title's bytes that a refresh finds changed in a 64 KiB piece
@@ -4087,6 +4089,7 @@ impl Shadow {
             held_back: Mutex::default(),
             held_pieces: Mutex::default(),
             title_over_landed: AtomicU64::new(0),
+            declared_at: AtomicU64::new(0),
         }
     }
 
@@ -4126,6 +4129,7 @@ impl Shadow {
             return;
         }
         self.written.store(true, Ordering::Relaxed);
+        self.declared_at.store(crate::frame::current() + 1, Ordering::Relaxed);
         let len = len.min(self.left(address));
         // `VICTORY_WC_NO_BACK`: what shaders write in a copy of
         // write-combined title memory stays on the card.
@@ -5236,7 +5240,7 @@ impl Shadow {
     /// [`hold_back`]: a landing looks at offsets `[from, to)`, in pieces the
     /// compare found the card changed.
     fn note_landed_pieces(&self, from: usize, to: usize) {
-        if !(hold_back() || dword_mode() == 2) || from >= to {
+        if !(hold_back() || dword_mode() == 2 || crate::sheets::bytes_on()) || from >= to {
             return;
         }
         let start = self.start as usize;
@@ -5352,6 +5356,24 @@ impl Shadow {
             sent += runs.iter().map(|r| r.1 as u64).sum::<u64>();
         }
         sent
+    }
+
+    /// For the sheet watch's bytes (`crate::sheets::bytes_line`), of the 64
+    /// KiB piece that holds title address `at`: the frame a landing last
+    /// put shaders' bytes into it (noted with hold-back, the dword gate or the
+    /// bytes watch on, and kept for two frames once many are noted), whether
+    /// title bytes are held back in it now, and the frame shaders were last
+    /// declared to write the copy.
+    pub(crate) fn sheet_piece(&self, at: usize) -> (Option<u64>, bool, Option<u64>) {
+        let piece = at / PAGE;
+        let landed = self.landed_pieces.lock().unwrap_or_else(|e| e.into_inner()).get(&piece).copied();
+        let (from, to) = self.inside(piece * PAGE, PAGE);
+        let held = from < to && {
+            let back = self.held_back.lock().unwrap_or_else(|e| e.into_inner());
+            back.ranges.range(..to).next_back().is_some_and(|(_, &end)| end > from)
+        };
+        let declared = self.declared_at.load(Ordering::Relaxed).checked_sub(1);
+        (landed, held, declared)
     }
 
     /// Whether its landings are widened to dwords now ([`dword_mode`]).

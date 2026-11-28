@@ -245,9 +245,214 @@ pub fn line(at: u64, what: &str, d: &Draw) -> String {
     s
 }
 
+/// Whether a flagged draw's bytes are logged too
+/// (`VICTORY_RECORD_SHEETS_BYTES=1`, with `VICTORY_RECORD_SHEETS`; off
+/// unless set): [`bytes_line`].
+pub(crate) fn bytes_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| on() && std::env::var_os("VICTORY_RECORD_SHEETS_BYTES").is_some_and(|v| v == "1"))
+}
+
+/// Where a pre-skinned draw finds its positions, by its record's range word
+/// (the record's byte 0x54): which of the two buffers (bits 24-25), where in
+/// it (the low 24 bits x 16: a 32-byte header {count, 0xdeadbeef}, then the
+/// vertices), and how they are laid out (bit 29 float3, bit 28 10:10:10,
+/// else 24:24:16 in 8 bytes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Range {
+    pub second: bool,
+    pub offset: u64,
+    pub stride: usize,
+}
+
+impl Range {
+    pub fn of(word: u32) -> Range {
+        let stride = if word & 0x2000_0000 != 0 {
+            12
+        } else if word & 0x1000_0000 != 0 {
+            4
+        } else {
+            8
+        };
+        Range { second: (word >> 24) & 3 != 0, offset: u64::from(word << 4 & 0x0fff_fff0), stride }
+    }
+
+    pub fn kind(&self) -> &'static str {
+        match self.stride {
+            12 => "float3",
+            4 => "10:10:10",
+            _ => "24:24:16",
+        }
+    }
+
+    /// A vertex's position from its bytes, `None` for one hidden on purpose
+    /// (all ones).
+    pub fn decode(&self, raw: &[u8]) -> Option<[f32; 3]> {
+        let w = |k: usize| u32::from_le_bytes(raw[k * 4..k * 4 + 4].try_into().unwrap_or([0; 4]));
+        match self.stride {
+            12 => (!raw.iter().all(|&b| b == 0xff)).then(|| [0, 1, 2].map(|k| f32::from_bits(w(k)))),
+            4 => {
+                let d = w(0);
+                (d != u32::MAX).then(|| [0, 10, 20].map(|s| -3.0 + 6.0 * ((d >> s) & 1023) as f32 / 1023.0))
+            }
+            _ => {
+                let (d0, d1) = (w(0), w(1));
+                (d0 & d1 != u32::MAX).then(|| {
+                    [
+                        -3.0 + (d0 >> 8) as f32 * 6.0 / 16_777_216.0,
+                        -3.0 + ((d0 & 0xff) | (d1 & 0xffff) << 8) as f32 * 6.0 / 16_777_216.0,
+                        -3.0 + (d1 >> 16) as f32 * 6.0 / 65535.0,
+                    ]
+                })
+            }
+        }
+    }
+}
+
+/// The vertices of `positions` (decoded, `None` hidden) that are both far
+/// from the median (more than 1.0 in a coordinate) and lone (more than 0.5
+/// in a coordinate from both neighbours), as the census tool counts spikes.
+pub fn outliers(positions: &[Option<[f32; 3]>]) -> Vec<usize> {
+    let shown: Vec<[f32; 3]> = positions.iter().flatten().copied().collect();
+    if shown.len() < 3 {
+        return Vec::new();
+    }
+    let median: [f32; 3] = std::array::from_fn(|k| {
+        let mut v: Vec<f32> = shown.iter().map(|p| p[k]).filter(|x| x.is_finite()).collect();
+        v.sort_by(f32::total_cmp);
+        v.get(v.len() / 2).copied().unwrap_or(0.0)
+    });
+    let apart = |a: [f32; 3], b: [f32; 3]| (0..3).map(|k| (a[k] - b[k]).abs()).fold(0.0f32, |m, d| if d.is_nan() { f32::INFINITY } else { m.max(d) });
+    let mut out = Vec::new();
+    for (i, p) in positions.iter().enumerate() {
+        let Some(p) = *p else { continue };
+        if apart(p, median) <= 1.0 {
+            continue;
+        }
+        let near = |j: Option<usize>| j.and_then(|j| positions.get(j).copied().flatten()).is_some_and(|q| apart(p, q) <= 0.5);
+        if !near(i.checked_sub(1)) && !near(Some(i + 1)) {
+            out.push(i);
+        }
+    }
+    out
+}
+
+fn table(what: &str, name: &str) -> Option<u64> {
+    let at = what.find(name)? + name.len();
+    let hex = what[at..].strip_prefix("0x")?;
+    let end = hex.find(|c: char| !c.is_ascii_hexdigit()).unwrap_or(hex.len());
+    u64::from_str_radix(&hex[..end], 16).ok()
+}
+
+/// For a draw the watch flagged (`what` as [`region_for`] was told it): the
+/// position buffer it read, its range, up to 8 of the range's outlier
+/// vertices with their bytes as title memory holds them now and as the
+/// CPU's side of the copy holds them (what was last sent to the card; the
+/// card's own copy is not read: that would wait for the card), and of the
+/// 64 KiB piece the first lies in: frames since a landing put shaders' bytes
+/// into it, whether hold-back holds title bytes there, and whether shaders
+/// were declared to write the copy this frame. The record and the views are
+/// looked up now, a present after the draw: a slot the title wrote since
+/// shows its new view. None if it is no pre-skinned draw of these tables.
+#[cfg(windows)]
+pub fn bytes_line(what: &str) -> Option<String> {
+    let (t0, t1) = (table(what, "table0=")?, table(what, "table1=")?);
+    let range_of = |handle: u64| crate::descriptor::view(handle).and_then(|v| crate::descriptor::host::buffer_range(&v));
+    let (record, _) = range_of(t1)?;
+    let mut w = [0u8; 4];
+    if !crate::host::read_into((record + 0x54) as *const u8, &mut w) {
+        return Some(format!("record at {record:#x}: its range word cannot be read"));
+    }
+    let word = u32::from_le_bytes(w);
+    let r = Range::of(word);
+    let view = crate::descriptor::view(t0 + if r.second { 0xa80 } else { 0x420 })?;
+    let Some((shadow, base, _)) = crate::descriptor::host::buffer_copy(&view) else {
+        return Some(format!("range word {word:#010x}: positions-{} has no host copy", u8::from(r.second)));
+    };
+    let at = base + r.offset;
+    let mut head = [0u8; 8];
+    crate::host::read_into(at as *const u8, &mut head);
+    let count = u32::from_le_bytes(head[..4].try_into().unwrap_or([0; 4])) as usize;
+    let marker = u32::from_le_bytes(head[4..].try_into().unwrap_or([0; 4]));
+    let (start, len) = shadow.span();
+    let mut s = format!(
+        "range word {word:#010x}: positions-{} {base:#x} (copy {start:#x}+{len:#x}) +{:#x}, {}, header count {count} marker {marker:#x}",
+        u8::from(r.second),
+        r.offset,
+        r.kind()
+    );
+    let n = count.min(1 << 16);
+    let bytes = n * r.stride;
+    let first = (at + 32) as usize;
+    let mut title = vec![0u8; bytes];
+    let title_ok = crate::host::read_into(first as *const u8, &mut title);
+    let held = shadow.card_held(first - start as usize, bytes);
+    if held.len() < bytes {
+        s.push_str("; the copy holds less than the range (not in the card's memory, or cut)");
+        return Some(s);
+    }
+    let decode = |b: &[u8]| (0..n).map(|i| r.decode(&b[i * r.stride..(i + 1) * r.stride])).collect::<Vec<_>>();
+    let sent = outliers(&decode(&held));
+    let titles = if title_ok { outliers(&decode(&title)) } else { Vec::new() };
+    let mut all: Vec<usize> = sent.iter().chain(&titles).copied().collect();
+    all.sort_unstable();
+    all.dedup();
+    s.push_str(&format!(
+        "; outliers: {} as sent to the card, {} in title memory{}",
+        sent.len(),
+        titles.len(),
+        if title_ok { "" } else { " (title memory not read)" }
+    ));
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    for &i in all.iter().take(8) {
+        let k = i * r.stride..(i + 1) * r.stride;
+        s.push_str(&format!("; v{i} title {} sent {}", hex(&title[k.clone()]), hex(&held[k])));
+    }
+    if let Some(&i) = all.first() {
+        let (landed, holds, declared) = shadow.sheet_piece(first + i * r.stride);
+        let now = crate::frame::current();
+        s.push_str(&format!(
+            "; its piece: {}, hold-back {}, shaders declared to write the copy {}",
+            landed.map_or("no landing noted".to_owned(), |f| format!("landed {} frames ago", now.saturating_sub(f))),
+            if holds { "holds title bytes there" } else { "holds nothing there" },
+            declared.map_or("never".to_owned(), |f| match now.saturating_sub(f) {
+                0 => "this frame".to_owned(),
+                d => format!("{d} frames ago"),
+            }),
+        ));
+    }
+    Some(s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_range_word_names_buffer_place_and_layout() {
+        let r = Range::of(0x6001_0e88);
+        assert_eq!((r.second, r.offset, r.kind()), (false, 0x10e880, "float3"));
+        let r = Range::of(0x4101_4631);
+        assert_eq!((r.second, r.offset, r.kind()), (true, 0x146310, "24:24:16"));
+        assert_eq!(Range::of(0x1000_0000).kind(), "10:10:10");
+        assert_eq!(Range::of(0x6000_0000).decode(&[0xff; 12]), None, "hidden on purpose");
+        let p = Range::of(0x6000_0000).decode(&[0, 0, 0x80, 0x3f, 0, 0, 0, 0, 0, 0, 0, 0xc0]).unwrap();
+        assert_eq!(p, [1.0, 0.0, -2.0]);
+    }
+
+    #[test]
+    fn a_lone_far_vertex_is_an_outlier_and_a_run_of_far_ones_is_not() {
+        let near = |x: f32| Some([x, 0.0, 0.0]);
+        let mut v: Vec<Option<[f32; 3]>> = (0..20).map(|i| near(i as f32 * 0.01)).collect();
+        v[7] = Some([0.1, -1.0e34, 0.0]);
+        v[12] = None;
+        assert_eq!(outliers(&v), [7]);
+        // Two far vertices side by side are each other's neighbour.
+        v[13] = Some([3.0, 3.0, 3.0]);
+        v[14] = Some([3.0, 3.0, 3.1]);
+        assert_eq!(outliers(&v), [7]);
+        assert_eq!(table("p table0=0xa680000 table1=0xbf3d920 x", "table1="), Some(0xbf3d920));
+    }
 
     #[test]
     fn the_pre_skinned_programs_are_watched() {

@@ -283,6 +283,16 @@ fn note_sheets(presents: u64, jump: f32, draws: &[(u64, String, crate::sheets::D
         }
         tracing::info!(presents, "frame recorder: sheet: {}", crate::sheets::line(*at, what, d));
     }
+    // With the bytes (`VICTORY_RECORD_SHEETS_BYTES`): at most 4 draws a
+    // present and 12 presents a run, read in the present that flags them.
+    static PRESENTS: AtomicUsize = AtomicUsize::new(0);
+    if crate::sheets::bytes_on() && draws.iter().any(|d| d.2.jump() > jump) && PRESENTS.fetch_add(1, Ordering::Relaxed) < 12 {
+        for (at, what, d) in draws.iter().filter(|d| d.2.jump() > jump).take(4) {
+            if let Some(bytes) = crate::sheets::bytes_line(what) {
+                tracing::info!(presents, "frame recorder: sheet bytes: present {at}, largest jump {:.2}: {bytes}", d.jump());
+            }
+        }
+    }
 }
 
 /// What a submission reads of buffers, by id: parts of them (copied from),
