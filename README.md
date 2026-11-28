@@ -26,6 +26,10 @@ echo 'GAME=/path/to/your/dump' > run.conf
 the Windows SDK and VIctory itself. It names any tool it misses.
 Saves, caches and logs stay in `local/`.
 
+The first `play` prepares every pipeline from your dump before the game opens:
+several minutes and about 6 GiB of cache. If you interrupt it, run `play` again
+and it resumes.
+
 Settings go after the mode, or in `run.conf`:
 
 | Setting | Effect |

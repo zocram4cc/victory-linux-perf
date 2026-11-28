@@ -623,6 +623,26 @@ pub(crate) fn follow_texture(start: usize, end: usize, found: bool) {
     }
 }
 
+pub(crate) fn observe_texture(start: usize, end: usize) {
+    use std::sync::atomic::Ordering::{Acquire, AcqRel, Relaxed};
+    if !texture_versions() || end <= start { return; }
+    let mut follow = false;
+    {
+        let v = views();
+        visit_texture_pages(&v, start, end, |p, key, _, _| {
+            if p.version.load(Acquire) == 0 {
+                v.watched.lock().unwrap_or_else(|e| e.into_inner()).insert(key);
+                for &base in &p.shown { OBSERVED.set(base / K64); }
+                let _ = p.version.compare_exchange(0, next_version(), AcqRel, Acquire);
+            }
+            follow |= p.follow.load(Relaxed);
+        });
+    }
+    if follow && !crate::watch::guarded_clean(start, end) {
+        crate::watch::writes(start, end, true);
+    }
+}
+
 pub(crate) fn texture_stamp(start: usize, end: usize) -> Option<(u64, bool)> {
     use std::sync::atomic::Ordering::{Acquire, AcqRel};
     if !texture_versions() || end <= start { return None; }

@@ -42,7 +42,7 @@ static REFRESHED: AtomicU64 = AtomicU64::new(0);
 static CHANGED: AtomicU64 = AtomicU64::new(0);
 
 /// The build of the translator (the BLAKE3 of its sources, `build.rs`).
-const SOURCE: &str = env!("VICTORY_TRANSLATOR");
+pub(crate) const SOURCE: &str = env!("VICTORY_TRANSLATOR");
 
 /// How cached translations are keyed (`VICTORY_SHADER_KEY`).
 fn keyed_by_source() -> bool {
@@ -54,7 +54,7 @@ fn keyed_by_source() -> bool {
 /// (`VICTORY_SHADER_FRESH=1`; [`precompile`] always does).
 fn refresh_in_runs() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_SHADER_FRESH").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| crate::switch::on("VICTORY_PREPARE_PIPELINES") || std::env::var_os("VICTORY_SHADER_FRESH").is_some_and(|v| v == "1"))
 }
 
 /// Keeps translated shaders in `dir` from now on.
@@ -150,6 +150,9 @@ fn build() -> [u8; 32] {
     let records = victory_shader::emit::records();
     if records != 0 {
         hash.update(b"records");
+        if std::env::var_os("VICTORY_FAST_INLINE_CBV").is_some_and(|v| v == "1") {
+            hash.update(b"inline-cbv-branch-1");
+        }
         hash.update(&records.to_le_bytes());
         hash.update(&victory_shader::emit::RECORDS_REVISION.to_le_bytes());
         hash.update(&victory_shader::emit::record_twins().to_le_bytes());
@@ -212,6 +215,34 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     }
 }
 
+fn shader_input(build: &[u8;32], container: &[u8]) -> Vec<u8> {
+    let mut key = *build;
+    if victory_shader::emit::shadow_mask::applies_to(container) {
+        key = blake3::derive_key(victory_shader::emit::shadow_mask::REVISION, build);
+    }
+    if victory_shader::emit::write_pages::applies_to(container) {
+        key = blake3::derive_key(victory_shader::emit::write_pages::REVISION, build);
+    }
+    if victory_shader::emit::ray_probe::applies_to(container) {
+        key = blake3::derive_key(victory_shader::emit::ray_probe::REVISION, build);
+    }
+    [&key[..], container].concat()
+}
+
+pub(crate) fn on_disk(build: &[u8;32], container: &[u8]) -> bool {
+    let Some(cache) = CACHE.get() else { return false; };
+    let key = Translate { translate: |_: &[u8]| Err(String::new()), source: SOURCE, ran: AtomicBool::new(false) };
+    let input = shader_input(build,container);
+    let path = cache.path_for(&victory_pipeline::CacheKey::new(&key,&input));
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(path) else { return false; };
+    const END: usize = 8 + SOURCE.len();
+    let mut header = [0; END + 8];
+    if file.read_exact(&mut header).is_err() || &header[..4] != MAGIC || u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize != SOURCE.len() || header[8..END] != *SOURCE.as_bytes() { return false; }
+    let code = u32::from_le_bytes(header[END+4..].try_into().unwrap()) as u64;
+    code != 0 && file.metadata().is_ok_and(|m| m.len() >= (END + 8) as u64 + code)
+}
+
 /// `refresh`: an entry an earlier build of the translator made is
 /// translated again (and replaced) rather than served.
 fn cached(
@@ -233,17 +264,7 @@ fn cached_by(
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
     refresh: bool,
 ) -> Result<HostShader, String> {
-    let mut key = *build;
-    if victory_shader::emit::shadow_mask::applies_to(container) {
-        key = blake3::derive_key(victory_shader::emit::shadow_mask::REVISION, build);
-    }
-    if victory_shader::emit::write_pages::applies_to(container) {
-        key = blake3::derive_key(victory_shader::emit::write_pages::REVISION, build);
-    }
-    if victory_shader::emit::ray_probe::applies_to(container) {
-        key = blake3::derive_key(victory_shader::emit::ray_probe::REVISION, build);
-    }
-    let input = [&key[..], container].concat();
+    let input = shader_input(build,container);
     let converter = Translate {
         translate,
         source,

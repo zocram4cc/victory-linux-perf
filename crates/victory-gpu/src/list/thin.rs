@@ -299,7 +299,10 @@ fn back_list(kind: u32) -> This {
         unsafe { (*(back as *mut List)).kind = kind };
         return back as This;
     }
-    let list: This = Box::into_raw(super::boxed(kind, std::ptr::null(), false)).cast_const().cast();
+    let mut back = super::boxed(kind, std::ptr::null(), false);
+    static BORROW: OnceLock<bool> = OnceLock::new();
+    back.borrow_recording = *BORROW.get_or_init(|| crate::switch::on("VICTORY_BORROW_RECORDING"));
+    let list: This = Box::into_raw(back).cast_const().cast();
     super::close(list);
     list
 }

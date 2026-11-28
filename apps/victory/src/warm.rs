@@ -33,10 +33,16 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     }
     let began = Instant::now();
     victory_hle::known_pipelines::use_translations(dir.with_file_name("shaders"));
+    if known::prepared() && let Some(game) = victory_core::Config::load()?.game_dir {
+        seed_compute(&dir,&game)?;
+        known::seed_passes(&dir)?;
+    }
     let fingerprint = known::fingerprint();
+    let native = known::prepared().then(|| known::artifacts(&dir));
     let done_file = dir.join("warm-done.txt");
     let bad_file = dir.join("warm-bad.txt");
     let (keys, revised) = known::warm_catalog(&dir);
+    if known::prepared() && limit.is_none() && !keys.is_empty() { known::repair_shaders(&dir)?; }
     let revision = format!("{fingerprint}/{}", known::SHADOW_REVISION);
     let stamp = |n: usize| if revised.contains(&n) { &revision } else { &fingerprint };
     let listed = std::fs::read_to_string(&done_file).unwrap_or_default();
@@ -56,7 +62,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     let mut all: Vec<usize> = (0..keys.len())
         .filter(|&n| {
             let key = keys[n].as_str();
-            (again || !done.contains(&(stamp(n).as_str(), key))) && !bad.contains(key) && (!used || early.contains(key))
+            if let Some(native) = &native { !native.contains(key) } else { (again || !done.contains(&(stamp(n).as_str(), key))) && !bad.contains(key) && (!used || early.contains(key)) }
         })
         .collect();
     all.sort_by_key(|&n| (!early.contains(keys[n].as_str()), &keys[n]));
@@ -66,10 +72,11 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     println!(
         "{} pipelines known, {} made before ({fingerprint}), {} bad; {} to make, {jobs} processes",
         keys.len(),
-        keys.iter().enumerate().filter(|(n, k)| done.contains(&(stamp(*n).as_str(), k.as_str()))).count(),
-        bad.len(),
+        native.as_ref().map_or_else(|| keys.iter().enumerate().filter(|(n, k)| done.contains(&(stamp(*n).as_str(), k.as_str()))).count(), |n| keys.iter().filter(|k| n.contains(k.as_str())).count()),
+        if native.is_some() { 0 } else { bad.len() },
         all.len()
     );
+    let progress = AtomicUsize::new(0);
     let state = Mutex::new((Vec::<f64>::new(), 0usize, 0usize));
     let done_out = Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(&done_file)?);
     // (Read back by the runs: these are made beside the others, not before.)
@@ -87,15 +94,20 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
             state.0.push(ms);
             state.1 += usize::from(!there);
             let count = state.0.len();
-            if count.is_multiple_of(1000) {
-                println!("{count} of {}, {:.0} s", all.len(), began.elapsed().as_secs_f64());
+            let elapsed = began.elapsed();
+            let timed = native.is_some() && {
+                let period = elapsed.as_secs() as usize / 3;
+                period > progress.fetch_max(period, Ordering::Relaxed)
+            };
+            if count.is_multiple_of(1000) || timed || native.is_some() && count == 1 {
+                println!("{count} of {}, {:.0} s", all.len(), elapsed.as_secs_f64());
             }
             drop(state);
-            let _ = writeln!(lock(&done_out), "{} {}", stamp(n), keys[n]);
+            if native.is_none() { let _ = writeln!(lock(&done_out), "{} {}", stamp(n), keys[n]); }
         },
         |n, why| {
             println!("pipeline {n} {}: {why}", keys[n]);
-            let _ = writeln!(lock(&bad_out), "{} {why}", keys[n]);
+            if native.is_none() { let _ = writeln!(lock(&bad_out), "{} {why}", keys[n]); }
             lock(&state).2 += 1;
         },
     )?;
@@ -112,6 +124,75 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
         times.last().copied().unwrap_or(0.0),
         times.iter().sum::<f64>() / 1e3
     );
+    if native.is_some() {
+        let durable = if all.is_empty() { native.unwrap() } else { known::artifacts(&dir) };
+        let missing = keys.iter().filter(|k| !durable.contains(k.as_str())).count();
+        anyhow::ensure!(missing == 0 || limit.is_some(), "{missing} native pipelines still missing; rerun play to resume");
+        println!("{} of {} native pipelines on disk", keys.len()-missing, keys.len());
+    }
+    Ok(())
+}
+
+fn seed_compute(dir: &Path, game: &Path) -> Result<()> {
+    let files = [game.join("shaders.rpf"), game.join("XboxBvhBuilder.dll"), game.join("game_scarlett_master.exe")];
+    let present: Vec<_> = files.iter().filter(|p| p.is_file()).collect();
+    if present.is_empty() { return Ok(()); }
+    let mut source = blake3::Hasher::new();
+    source.update(b"all supported shader stages 1");
+    for path in &present {
+        let meta = std::fs::metadata(path)?;
+        source.update(path.as_os_str().as_encoded_bytes());
+        source.update(&meta.len().to_le_bytes());
+        source.update(&meta.modified()?.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos().to_le_bytes());
+    }
+    let signature = source.finalize().to_hex().to_string();
+    let passes = known::streamed_passes();
+    let manifest = dir.join(if passes { "material-sources-2.txt" } else { "compute-sources.txt" });
+    let previous = std::fs::read_to_string(&manifest).unwrap_or_default();
+    let mut lines = previous.lines();
+    if lines.next() == Some(signature.as_str())
+        && let Some(length) = lines.next().and_then(|v|v.parse::<u64>().ok())
+        && std::fs::metadata(dir.join("known-shaders.bin")).is_ok_and(|m|m.len() >= length && length != 0)
+    {
+        let known: HashSet<_> = known::keys(dir).into_iter().collect();
+        if lines.clone().next().is_some() && lines.all(|k| known.contains(k)) { return Ok(()); }
+    }
+    println!("Discovering pipeline recipes and shader programs in the game files");
+    let mut found = HashSet::new();
+    for path in present {
+        let data = std::fs::read(path)?;
+        let mut effects: std::collections::HashMap<(bool,String),[Vec<Vec<u8>>;2]> = Default::default();
+        for source in crate::shader::sources(&data) {
+            let Some(bytes) = source.bytes() else { continue; };
+            if let Some(key) = known::seed_compute(&bytes) { found.insert(key); }
+            if passes && let crate::shader::Source::Packed(record) = &source
+                && let Some(name) = record.name.and_then(|s| s.strip_suffix("_Wrapped"))
+                && let Some((effect,tag)) = name.rsplit_once('_')
+                && tag.len() == 8 && tag.bytes().all(|c| c.is_ascii_hexdigit())
+            {
+                let (water,stage) = match effect {
+                    "VS_WaterClip" => (true,0), "PS_WaterClipOcean" => (true,1),
+                    "VS_TAA2_UpscaleEntityMask" | "VS_TAA2_SpatialUpscale" => (false,0),
+                    "PS_TAA2_UpscaleEntityMask" | "PS_TAA2_SpatialUpscale" | "PS_TAA2_Blit" | "PS_TAA2_SpatialUpscaleWithDithering" => (false,1),
+                    _ => continue,
+                };
+                effects.entry((water,tag.to_owned())).or_default()[stage].push(bytes.into_owned());
+            }
+        }
+        for ((water,_),[vertex,pixel]) in effects {
+            for vs in &vertex { for ps in &pixel { found.extend(known::seed_screen(vs,ps,water)); } }
+        }
+    }
+    known::flush();
+    let persisted: HashSet<_> = known::keys(dir).into_iter().collect();
+    anyhow::ensure!(found.is_subset(&persisted),"could not save compute pipeline catalogue");
+    let mut entries: Vec<_> = found.into_iter().collect();
+    entries.sort_unstable();
+    let tmp = manifest.with_extension(format!("{}.tmp",std::process::id()));
+    let length = std::fs::metadata(dir.join("known-shaders.bin"))?.len();
+    std::fs::write(&tmp, format!("{signature}\n{length}\n{}\n",entries.join("\n")))?;
+    std::fs::rename(tmp,&manifest)?;
+    println!("{} pipelines discovered in the game files before starting the game",entries.len());
     Ok(())
 }
 
@@ -122,7 +203,7 @@ fn run_batches(
     each: impl Fn(usize, f64, bool) + Sync,
     bad: impl Fn(usize, String) + Sync,
 ) -> Result<()> {
-    let chunks: Vec<&[usize]> = all.chunks(AT_ONCE).collect();
+    let chunks: Vec<&[usize]> = all.chunks(if known::prepared() { 256 } else { AT_ONCE }).collect();
     let next = AtomicUsize::new(0);
     // Stop launching workers after a setup failure. In-flight workers can still report.
     let failure = OnceLock::new();
@@ -180,8 +261,72 @@ fn start_worker(these: &[usize]) -> Result<Child> {
         .with_context(|| format!("could not spawn {}", exe.display()))
 }
 
+/// Under Wine the postmortem debugger may inherit the worker's stdout. EOF
+/// then says nothing about the worker being alive. Conversely, closing stdout
+/// need not mean the process exited. Poll the pipe and the process separately;
+/// the no-progress deadline covers *both* and does not wait for a debugger.
+fn checkpoint_worker(mut worker: Child, mut each: impl FnMut(usize, f64, bool)) -> Result<Option<(usize, String)>> {
+    use std::ffi::c_void;
+    use std::io::Read;
+    use std::os::windows::io::AsRawHandle;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn PeekNamedPipe(pipe: *mut c_void, data: *mut c_void, capacity: u32, read: *mut u32, available: *mut u32, left: *mut u32) -> i32;
+    }
+    let mut out = worker.stdout.take().context("warm worker stdout unavailable")?;
+    let mut bytes = [0;8192];
+    let mut line = Vec::new();
+    let mut made = 0;
+    let mut last = Instant::now();
+    let mut status = None;
+    loop {
+        let mut available = 0u32;
+        // SAFETY: stdout stays live, the only requested output is one DWORD.
+        let open = unsafe { PeekNamedPipe(out.as_raw_handle(), std::ptr::null_mut(), 0, std::ptr::null_mut(), &mut available, std::ptr::null_mut()) } != 0;
+        if open && available > 0 {
+            let len = bytes.len().min(available as usize);
+            let n = out.read(&mut bytes[..len])?;
+            for &c in &bytes[..n] {
+                if c != b'\n' {
+                    line.push(c);
+                    continue;
+                }
+                if let Ok(record) = std::str::from_utf8(&line) {
+                    let mut words = record.split_ascii_whitespace();
+                    match words.next() {
+                        Some("at") => { last = Instant::now(); }
+                        Some("made") => if let (Some(index),Some(ms),Some(valid)) = (words.next().and_then(|v|v.parse().ok()), words.next().and_then(|v|v.parse().ok()), words.next()) {
+                            each(index, ms, valid == "1");
+                            made += 1;
+                            last = Instant::now();
+                        },
+                        _ => (),
+                    }
+                }
+                line.clear();
+            }
+        } else if let Some(exit) = status {
+            // Checked for buffered reports again *after* observing exit.
+            let exit: std::process::ExitStatus = exit;
+            return Ok((!exit.success()).then(|| (made,exit.to_string())));
+        } else if let Some(exit) = worker.try_wait()? {
+            status = Some(exit);
+            continue;
+        } else {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if last.elapsed() >= LONGEST {
+            // No blocking wait after TerminateProcess: a debugger can hold a
+            // faulting thread suspended even during its last instructions.
+            if worker.try_wait()?.is_none() { worker.kill().context("stopping unresponsive warm worker")?; }
+            return Ok(Some((made,format!("unresponsive for {} s",LONGEST.as_secs()))));
+        }
+    }
+}
+
 /// On abnormal exit, return the number of reports before the failure and the exit reason.
 fn child(mut process: Child, mut each: impl FnMut(usize, f64, bool)) -> Result<Option<(usize, String)>> {
+    if known::prepared() { return checkpoint_worker(process, each); }
     let Some(out) = process.stdout.take() else {
         let _ = process.kill();
         process.wait().context("warm worker stdout unavailable, failed to reap worker")?;

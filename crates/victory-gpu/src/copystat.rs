@@ -811,6 +811,7 @@ fn log_memory_map() {
 fn log_memory() {
     use std::sync::atomic::Ordering::Relaxed;
     let mb = |v: u64| v as f64 / (1 << 20) as f64;
+    let measured=crate::texture::action_memory::room_on().then(crate::clock::Instant::now);
     let (working, private) = process_memory();
     let (free, left) = system_memory();
     let copies = crate::shadow::memory();
@@ -1056,6 +1057,7 @@ fn log_memory() {
             category_text(fields)
         );
     }
+    if let Some(start)=measured { tracing::info!(us=start.elapsed().as_micros() as u64,frame=crate::frame::current(),"texture census duration"); }
 }
 
 /// Microseconds since the first call.
@@ -1116,7 +1118,7 @@ fn micros(t: windows_sys::Win32::Foundation::FILETIME) -> u64 {
 }
 
 /// This thread's processor time so far (user, kernel), in microseconds.
-fn thread_times() -> (u64, u64) {
+pub(crate) fn thread_times() -> (u64, u64) {
     use windows_sys::Win32::Foundation::FILETIME;
     use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
     let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
@@ -1238,6 +1240,7 @@ pub(crate) fn present_begins() {
 
 /// A frame was presented.
 pub(crate) fn presented() {
+    crate::frame::scripted_present();
     add(C::Frames, 1);
     PRESENTED_AT.store(now_us(), Relaxed);
     RECORDED_SINCE.store(false, Relaxed);

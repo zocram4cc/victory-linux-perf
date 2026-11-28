@@ -121,6 +121,8 @@ struct List {
     #[cfg(windows)]
     host: Option<crate::host::HostList>,
     #[cfg(windows)]
+    borrow_recording: bool,
+    #[cfg(windows)]
     state: std::sync::Mutex<crate::draw::State>,
     /// The parts of the recording before `host`, in order, each closed: the
     /// list is cut at its waits for memory values ([`cut`]).
@@ -267,6 +269,16 @@ fn fresh_list() -> Option<crate::host::HostList> {
     }
 }
 
+#[cfg(windows)]
+fn detach_host(list: &mut List) -> Option<crate::host::HostList> {
+    if list.borrow_recording && let Some(recorded) = list.host.take() {
+        return Some(recorded);
+    }
+    let empty = fresh_list()?;
+    empty.close();
+    if list.borrow_recording { Some(empty) } else { list.host.replace(empty) }
+}
+
 /// The host sides of lists whose submission has run (submissions are
 /// waited for; `ran` names the ones it ran, by their place in `lists`):
 /// what they held is let go, as before, and the host lists are reset and
@@ -404,16 +416,10 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             }
             continue;
         }
-        let Some(fresh) = fresh_list() else {
-            continue;
-        };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
-        let Some(host) = list.host.replace(fresh) else {
+        let Some(host) = detach_host(list) else {
             continue;
         };
         let earlier = std::mem::take(&mut list.earlier);
@@ -476,17 +482,11 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             order.push(i);
             continue;
         }
-        let Some(fresh) = fresh_list() else {
-            continue;
-        };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
         let list = this.cast_mut().cast::<List>();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let (host, uploads, state) = unsafe {
-            let Some(host) = (*list).host.replace(fresh) else {
+            let Some(host) = detach_host(&mut *list) else {
                 continue;
             };
             let uploads =
@@ -615,6 +615,8 @@ fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
             }
         }),
         #[cfg(windows)]
+        borrow_recording: false,
+        #[cfg(windows)]
         state: {
             let mut state = crate::draw::State::default();
             state.set_pipeline(pipeline);
@@ -685,12 +687,19 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
         list.earlier.clear();
         list.gate.clear();
+        if list.borrow_recording && list.host.is_none() {
+            list.host = fresh_list();
+            if list.host.is_none() {
+                crate::host::fail(format_args!("no command list for the next recording"));
+            }
+            list.state.lock().unwrap_or_else(|e| e.into_inner()).reset(pipeline);
+        } else {
+            with_state(this, |host, state| {
+                host.reset();
+                state.reset(pipeline);
+            });
+        }
     }
-    #[cfg(windows)]
-    with_state(this, |host, state| {
-        host.reset();
-        state.reset(pipeline);
-    });
     crate::pipeline::bound(pipeline);
     #[cfg(not(windows))]
     let _ = this;

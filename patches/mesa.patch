@@ -196,7 +196,7 @@ index 0000000..f099438
 +
 +#endif
 diff --git a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
-index ea78270..a3092af 100644
+index ea78270..2ec51a2 100644
 --- a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
 +++ b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
 @@ -22,8 +22,10 @@
@@ -210,7 +210,7 @@ index ea78270..a3092af 100644
  #include "util/u_atomic.h"
  #include "util/u_math.h"
  #include "util/u_memory.h"
-@@ -348,6 +350,676 @@ radv_amdgpu_global_bo_list_del(struct radv_amdgpu_winsys *ws, struct radv_amdgpu
+@@ -348,6 +350,833 @@ radv_amdgpu_global_bo_list_del(struct radv_amdgpu_winsys *ws, struct radv_amdgpu
     u_rwlock_wrunlock(&ws->global_bo_list.lock);
  }
  
@@ -227,10 +227,8 @@ index ea78270..a3092af 100644
 +   bool cpu;
 +};
 +
-+struct radv_amdgpu_um_range {
-+   uint64_t start;
-+   uint64_t end;
-+};
++#define RADV_AMDGPU_UM_STRIDE (2ull << 30)
++#define RADV_AMDGPU_UM_CHUNK  0xf0000000ull
 +
 +static simple_mtx_t radv_amdgpu_um_mutex = SIMPLE_MTX_INITIALIZER;
 +static struct radv_amdgpu_um *radv_amdgpu_um_first = NULL;
@@ -255,6 +253,9 @@ index ea78270..a3092af 100644
 +      u_rwlock_init(&um->bo_lock);
 +      um->refcount = 1;
 +      um->cookie = cookie;
++      const char *arena = getenv("RADV_VUM_MIRROR_ARENA");
++      const char *ordered = getenv("VICTORY_MIRROR_ARENA");
++      um->arena_requested = arena && !strcmp(arena, "1") && ordered && !strcmp(ordered, "1");
 +      rb_tree_init(&um->aliases);
 +      list_inithead(&um->mirrors);
 +      um->next = radv_amdgpu_um_first;
@@ -302,6 +303,8 @@ index ea78270..a3092af 100644
 +   u_rwlock_destroy(&um->bo_lock);
 +   free(um->bos);
 +   free(um->dirty);
++   if (um->arena_handle)
++      ac_drm_va_range_free(um->arena_handle);
 +   free(um);
 +}
 +
@@ -422,23 +425,36 @@ index ea78270..a3092af 100644
 +   if (um->zero_bo)
 +      return VK_SUCCESS;
 +
-+   return ws->base.buffer_create(&ws->base, RADV_AMDGPU_UM_ZERO_SIZE, 2 * 1024 * 1024, RADEON_DOMAIN_VRAM,
-+                                 RADEON_FLAG_NO_CPU_ACCESS | RADEON_FLAG_READ_ONLY |
-+                                    RADEON_FLAG_NO_INTERPROCESS_SHARING | RADEON_FLAG_PREFER_LOCAL_BO,
-+                                 RADV_BO_PRIORITY_VIRTUAL, 0, &um->zero_bo);
++   struct radeon_winsys_bo *bo;
++   VkResult result = ws->base.buffer_create(&ws->base, RADV_AMDGPU_UM_ZERO_SIZE, 2 * 1024 * 1024, RADEON_DOMAIN_VRAM,
++                                            RADEON_FLAG_CPU_ACCESS | RADEON_FLAG_READ_ONLY |
++                                               RADEON_FLAG_NO_INTERPROCESS_SHARING | RADEON_FLAG_PREFER_LOCAL_BO,
++                                            RADV_BO_PRIORITY_VIRTUAL, 0, &bo);
++   if (result != VK_SUCCESS)
++      return result;
++   void *ptr = radv_buffer_map(&ws->base, bo);
++   if (!ptr) {
++      ws->base.buffer_destroy(&ws->base, bo);
++      return VK_ERROR_MEMORY_MAP_FAILED;
++   }
++   memset(ptr, 0, RADV_AMDGPU_UM_ZERO_SIZE);
++   __atomic_thread_fence(__ATOMIC_SEQ_CST);
++   ws->base.buffer_unmap(&ws->base, bo, false);
++   um->zero_bo = bo;
++   return VK_SUCCESS;
 +}
 +
 +static int
 +radv_amdgpu_um_mirror_zero(struct radv_amdgpu_winsys *ws, struct radv_amdgpu_um *um,
-+                           struct radv_amdgpu_winsys_bo *mirror, uint64_t offset, uint64_t size, uint32_t ops)
++                           uint64_t base_va, uint64_t offset, uint64_t size, uint32_t ops)
 +{
 +   const uint32_t zero_handle = radv_amdgpu_winsys_bo(um->zero_bo)->bo_handle;
 +
 +   while (size > 0) {
 +      const uint64_t within = offset % RADV_AMDGPU_UM_ZERO_SIZE;
 +      const uint64_t chunk = MIN2(size, RADV_AMDGPU_UM_ZERO_SIZE - within);
-+      int r = radv_amdgpu_bo_va_op(ws, zero_handle, within, chunk, mirror->base.va + offset, RADEON_FLAG_READ_ONLY, 0,
-+                                   ops);
++      int r = radv_amdgpu_bo_va_op(ws, zero_handle, within, chunk, base_va + offset, RADEON_FLAG_READ_ONLY,
++                                   0, ops);
 +      if (r)
 +         return r;
 +
@@ -450,35 +466,143 @@ index ea78270..a3092af 100644
 +}
 +
 +static int
++radv_amdgpu_um_write(struct radv_amdgpu_winsys *ws, struct radv_amdgpu_um *um, uint64_t base_va,
++                     uint64_t offset, uint64_t size, struct radv_amdgpu_winsys_bo *bo, uint64_t bo_offset)
++{
++   if (!bo)
++      return radv_amdgpu_um_mirror_zero(ws, um, base_va, offset, size, AMDGPU_VA_OP_REPLACE);
++
++   return radv_amdgpu_bo_va_op(ws, bo->bo_handle, bo_offset, size, base_va + offset, bo->flags & RADEON_FLAG_GL2_BYPASS,
++                               0, AMDGPU_VA_OP_REPLACE);
++}
++
++static struct radv_amdgpu_um_range
++radv_amdgpu_um_chunk(struct radv_amdgpu_um *um, unsigned i)
++{
++   const uint64_t base = um->space_start + i * RADV_AMDGPU_UM_STRIDE;
++   return (struct radv_amdgpu_um_range){base, MIN2(base + RADV_AMDGPU_UM_CHUNK, um->space_end)};
++}
++
++static void
++radv_amdgpu_um_arena_coverage(struct radv_amdgpu_um *um)
++{
++   um->arena_count = 0;
++   for (uint64_t bits = um->arena_mask; bits; bits &= bits - 1) {
++      const struct radv_amdgpu_um_range r = radv_amdgpu_um_chunk(um, __builtin_ctzll(bits));
++      if (um->arena_count && um->arena_ranges[um->arena_count - 1].end >= r.start)
++         um->arena_ranges[um->arena_count - 1].end = r.end;
++      else
++         um->arena_ranges[um->arena_count++] = r;
++   }
++}
++
++static struct radv_amdgpu_um_range
++radv_amdgpu_um_arena_exclusive(struct radv_amdgpu_um *um, unsigned i, uint64_t pad)
++{
++   struct radv_amdgpu_um_range r = radv_amdgpu_um_chunk(um, i);
++   r.end += pad;
++   if (i && (um->arena_mask & (1ull << (i - 1))))
++      r.start = radv_amdgpu_um_chunk(um, i - 1).end + pad;
++   if (i < 63 && (um->arena_mask & (1ull << (i + 1))))
++      r.end = MIN2(r.end, radv_amdgpu_um_chunk(um, i + 1).start);
++   return r;
++}
++
++static int
++radv_amdgpu_um_arena_drop(struct radv_amdgpu_winsys *ws, struct radv_amdgpu_um *um, unsigned i)
++{
++   const struct radv_amdgpu_um_range r = radv_amdgpu_um_arena_exclusive(um, i, RADV_AMDGPU_UM_PAD);
++   const struct radv_amdgpu_um_range content = radv_amdgpu_um_arena_exclusive(um, i, 0);
++   int result = 0;
++   if (r.start < r.end)
++      result = radv_amdgpu_bo_va_op(ws, 0, 0, r.end - r.start, um->arena_va + (r.start - um->space_start), 0, 0,
++                                    AMDGPU_VA_OP_CLEAR);
++   const uint64_t end = MIN2(content.end, r.start);
++   if (content.start < end) {
++      int zero = radv_amdgpu_um_mirror_zero(ws, um, um->arena_va, content.start - um->space_start, end - content.start,
++                                           AMDGPU_VA_OP_REPLACE);
++      if (zero)
++         result = zero;
++   }
++   return result;
++}
++
++static int
++radv_amdgpu_um_arena_fill(struct radv_amdgpu_winsys *ws, struct radv_amdgpu_um *um, unsigned i)
++{
++   const struct radv_amdgpu_um_range r = radv_amdgpu_um_arena_exclusive(um, i, RADV_AMDGPU_UM_PAD);
++   const struct radv_amdgpu_um_range content = radv_amdgpu_um_arena_exclusive(um, i, 0);
++   if (r.start < r.end) {
++      int err = radv_amdgpu_um_mirror_zero(ws, um, um->arena_va, r.start - um->space_start, r.end - r.start,
++                                           AMDGPU_VA_OP_MAP);
++      if (err)
++         return err;
++   }
++   if (content.start >= content.end)
++      return 0;
++   for (struct radv_amdgpu_um_alias *alias = radv_amdgpu_um_first_overlap(um, content.start, content.end); alias;
++        alias = radv_amdgpu_um_next_overlap(alias, content.end)) {
++      const uint64_t from = MAX2(content.start, alias->start);
++      const uint64_t to = MIN2(content.end, alias->start + alias->size);
++      int err = radv_amdgpu_um_write(ws, um, um->arena_va, from - um->space_start, to - from, alias->bo,
++                                    alias->bo_offset + from - alias->start);
++      if (err)
++         return err;
++   }
++   return 0;
++}
++
++static bool
++radv_amdgpu_um_arena_window(struct radv_amdgpu_winsys *ws, struct radv_amdgpu_um *um, uint64_t start, uint64_t size)
++{
++   if (!um->arena_requested || !um->space_end || (um->space_start & 0x1fffff) || start < um->space_start ||
++       start >= um->space_end || um->space_end - um->space_start > 64 * RADV_AMDGPU_UM_STRIDE)
++      return false;
++   const uint64_t offset = start - um->space_start;
++   if (offset % RADV_AMDGPU_UM_STRIDE || size != MIN2(RADV_AMDGPU_UM_CHUNK, um->space_end - start) ||
++       (um->arena_mask & (1ull << (offset / RADV_AMDGPU_UM_STRIDE))))
++      return false;
++   if (!um->arena_handle && ac_drm_va_range_alloc(ws->dev, amdgpu_gpu_va_range_general,
++                                                  um->space_end - um->space_start + RADV_AMDGPU_UM_PAD,
++                                                  MAX2(ws->info.pte_fragment_size, 2 * 1024 * 1024), 0,
++                                                  &um->arena_va, &um->arena_handle, AMDGPU_VA_RANGE_HIGH)) {
++      um->arena_requested = false;
++      return false;
++   }
++   return true;
++}
++
++static int
 +radv_amdgpu_um_mirrors_update(struct radv_amdgpu_winsys *ws, struct radv_amdgpu_um *um, uint64_t start, uint64_t size,
 +                              struct radv_amdgpu_winsys_bo *bo, uint64_t bo_offset)
 +{
 +   const uint64_t end = start + size;
 +   int result = 0;
-+
++   for (unsigned i = 0; i < um->arena_count; ++i) {
++      const struct radv_amdgpu_um_range r = um->arena_ranges[i];
++      if (r.start >= end)
++         break;
++      const uint64_t from = MAX2(start, r.start);
++      const uint64_t to = MIN2(end, r.end);
++      if (from < to) {
++         int err = radv_amdgpu_um_write(ws, um, um->arena_va, from - um->space_start, to - from, bo,
++                                       bo_offset + (from - start));
++         if (err)
++            result = err;
++      }
++   }
 +   list_for_each_entry (struct radv_amdgpu_winsys_bo, mirror, &um->mirrors, um_mirror_link) {
 +      const uint64_t from = MAX2(start, mirror->um_mirror_start);
 +      const uint64_t to = MIN2(end, mirror->um_mirror_start + mirror->base.size);
-+      int r;
-+
-+      if (from >= to)
-+         continue;
-+
-+      if (bo) {
-+         r = radv_amdgpu_bo_va_op(ws, bo->bo_handle, bo_offset + (from - start), to - from,
-+                                  mirror->base.va + (from - mirror->um_mirror_start), bo->flags & RADEON_FLAG_GL2_BYPASS,
-+                                  0, AMDGPU_VA_OP_REPLACE);
-+      } else {
-+         r = radv_amdgpu_um_mirror_zero(ws, um, mirror, from - mirror->um_mirror_start, to - from,
-+                                        AMDGPU_VA_OP_REPLACE);
-+      }
-+
-+      if (r) {
-+         fprintf(stderr, "radv/amdgpu: Failed to update a unified memory mirror (%d).\n", r);
-+         result = r;
++      if (from < to) {
++         int err = radv_amdgpu_um_write(ws, um, mirror->base.va, from - mirror->um_mirror_start, to - from, bo,
++                                       bo_offset + (from - start));
++         if (err)
++            result = err;
 +      }
 +   }
-+
++   if (result)
++      fprintf(stderr, "radv/amdgpu: Failed to update a unified memory mirror (%d).\n", result);
 +   return result;
 +}
 +
@@ -642,6 +766,10 @@ index ea78270..a3092af 100644
 +      if (!size || ((size | start) & 4095))
 +         return VK_ERROR_MEMORY_MAP_FAILED;
 +      simple_mtx_lock(&um->lock);
++      if (um->arena_handle && (um->space_start != start || um->space_end != start + size)) {
++         simple_mtx_unlock(&um->lock);
++         return VK_ERROR_MEMORY_MAP_FAILED;
++      }
 +      um->space_start = start;
 +      um->space_end = start + size;
 +      simple_mtx_unlock(&um->lock);
@@ -811,7 +939,11 @@ index ea78270..a3092af 100644
 +      goto fail;
 +   }
 +
-+   if (ac_drm_va_range_alloc(ws->dev, amdgpu_gpu_va_range_general, size + RADV_AMDGPU_UM_PAD,
++   bo->um_arena = radv_amdgpu_um_arena_window(ws, um, start, size);
++   if (bo->um_arena) {
++      va = um->arena_va + (start - um->space_start);
++      va_handle = NULL;
++   } else if (ac_drm_va_range_alloc(ws->dev, amdgpu_gpu_va_range_general, size + RADV_AMDGPU_UM_PAD,
 +                             MAX2(ws->info.pte_fragment_size, 2 * 1024 * 1024), 0, &va, &va_handle,
 +                             AMDGPU_VA_RANGE_HIGH)) {
 +      FREE(bo);
@@ -827,7 +959,20 @@ index ea78270..a3092af 100644
 +   bo->um_mirror = true;
 +   bo->um_mirror_start = start;
 +
-+   if (radv_amdgpu_um_mirror_zero(ws, um, bo, 0, size + RADV_AMDGPU_UM_PAD, AMDGPU_VA_OP_MAP)) {
++   if (bo->um_arena) {
++      const unsigned chunk = (start - um->space_start) / RADV_AMDGPU_UM_STRIDE;
++      if (radv_amdgpu_um_arena_fill(ws, um, chunk)) {
++         radv_amdgpu_um_arena_drop(ws, um, chunk);
++         FREE(bo);
++         result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
++         goto fail;
++      }
++      um->arena_mask |= 1ull << chunk;
++      radv_amdgpu_um_arena_coverage(um);
++      goto ready;
++   }
++
++   if (radv_amdgpu_um_mirror_zero(ws, um, va, 0, size + RADV_AMDGPU_UM_PAD, AMDGPU_VA_OP_MAP)) {
 +      radv_amdgpu_bo_va_op(ws, 0, 0, size + RADV_AMDGPU_UM_PAD, va, 0, 0, AMDGPU_VA_OP_CLEAR);
 +      ac_drm_va_range_free(va_handle);
 +      FREE(bo);
@@ -855,6 +1000,7 @@ index ea78270..a3092af 100644
 +      }
 +   }
 +
++ready:
 +   simple_mtx_unlock(&um->lock);
 +
 +   radv_amdgpu_log_bo(ws, bo, false);
@@ -873,6 +1019,17 @@ index ea78270..a3092af 100644
 +   struct radv_amdgpu_um *um = ws->um;
 +
 +   simple_mtx_lock(&um->lock);
++   if (bo->um_arena) {
++      const unsigned chunk = (bo->um_mirror_start - um->space_start) / RADV_AMDGPU_UM_STRIDE;
++      um->arena_mask &= ~(1ull << chunk);
++      int r = radv_amdgpu_um_arena_drop(ws, um, chunk);
++      if (r)
++         fprintf(stderr, "radv/amdgpu: Failed to retire a unified memory window (%d).\n", r);
++      radv_amdgpu_um_arena_coverage(um);
++      simple_mtx_unlock(&um->lock);
++      FREE(bo);
++      return;
++   }
 +   list_del(&bo->um_mirror_link);
 +   simple_mtx_unlock(&um->lock);
 +
@@ -887,7 +1044,7 @@ index ea78270..a3092af 100644
  static void
  radv_amdgpu_winsys_virtual_bo_destroy(struct radeon_winsys *_ws, struct radeon_winsys_bo *_bo)
  {
-@@ -355,6 +1027,11 @@ radv_amdgpu_winsys_virtual_bo_destroy(struct radeon_winsys *_ws, struct radeon_w
+@@ -355,6 +1184,11 @@ radv_amdgpu_winsys_virtual_bo_destroy(struct radeon_winsys *_ws, struct radeon_w
     struct radv_amdgpu_winsys_bo *bo = radv_amdgpu_winsys_bo(_bo);
     int r;
  
@@ -899,7 +1056,7 @@ index ea78270..a3092af 100644
     r = radv_amdgpu_virtual_bo_clear_mapping(ws, bo);
     if (r) {
        fprintf(stderr, "radv/amdgpu: Failed to clear a PRT VA region (%d).\n", r);
-@@ -377,6 +1054,8 @@ radv_amdgpu_winsys_bo_destroy(struct radeon_winsys *_ws, struct radeon_winsys_bo
+@@ -377,6 +1211,8 @@ radv_amdgpu_winsys_bo_destroy(struct radeon_winsys *_ws, struct radeon_winsys_bo
        return;
     }
  
@@ -908,7 +1065,7 @@ index ea78270..a3092af 100644
     if (bo->cpu_map)
        munmap(bo->cpu_map, bo->base.size);
  
-@@ -815,6 +1494,11 @@ radv_amdgpu_winsys_bo_from_ptr(struct radeon_winsys *_ws, void *pointer, uint64_
+@@ -815,6 +1651,11 @@ radv_amdgpu_winsys_bo_from_ptr(struct radeon_winsys *_ws, void *pointer, uint64_
      */
     *out_bo = NULL;
  
@@ -920,7 +1077,7 @@ index ea78270..a3092af 100644
     bo = CALLOC_STRUCT(radv_amdgpu_winsys_bo);
     if (!bo)
        return VK_ERROR_OUT_OF_HOST_MEMORY;
-@@ -1212,7 +1896,7 @@ radv_amdgpu_winsys_bo_make_resident(struct radeon_winsys *_ws, struct radeon_win
+@@ -1212,7 +2053,7 @@ radv_amdgpu_winsys_bo_make_resident(struct radeon_winsys *_ws, struct radeon_win
     /* Do not add the BO to the global list if it's a local BO because the
      * kernel maintains a list for us.
      */
@@ -929,7 +1086,7 @@ index ea78270..a3092af 100644
        return VK_SUCCESS;
  
     /* Do not add the BO twice to the global list if the allbos debug
-@@ -1324,6 +2008,8 @@ radv_amdgpu_bo_init_functions(struct radv_amdgpu_winsys *ws)
+@@ -1324,6 +2165,8 @@ radv_amdgpu_bo_init_functions(struct radv_amdgpu_winsys *ws)
     ws->base.buffer_virtual_bind = radv_amdgpu_winsys_bo_virtual_bind;
     ws->base.buffer_get_flags_from_fd = radv_amdgpu_bo_get_flags_from_fd;
     ws->base.buffer_make_resident = radv_amdgpu_winsys_bo_make_resident;
@@ -939,10 +1096,10 @@ index ea78270..a3092af 100644
     ws->base.dump_bo_log = radv_amdgpu_dump_bo_log;
     ws->base.bo_wait_for_idle = radv_amdgpu_bo_wait_for_idle;
 diff --git a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.h b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.h
-index 5458cf0..9549691 100644
+index 5458cf0..7cb3839 100644
 --- a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.h
 +++ b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.h
-@@ -37,6 +37,14 @@ struct radv_amdgpu_winsys_bo {
+@@ -37,6 +37,15 @@ struct radv_amdgpu_winsys_bo {
     void *cpu_map;
  
     bool emulate_sparse_residency;
@@ -952,12 +1109,13 @@ index 5458cf0..9549691 100644
 +   struct radv_amdgpu_winsys *um_ws;
 +   uint32_t um_aliases;
 +   bool um_mirror;
++   bool um_arena;
 +   uint64_t um_mirror_start;
 +   struct list_head um_mirror_link;
  };
  
  static inline struct radv_amdgpu_winsys_bo *
-@@ -47,4 +55,13 @@ radv_amdgpu_winsys_bo(struct radeon_winsys_bo *bo)
+@@ -47,4 +56,13 @@ radv_amdgpu_winsys_bo(struct radeon_winsys_bo *bo)
  
  void radv_amdgpu_bo_init_functions(struct radv_amdgpu_winsys *ws);
  
@@ -1061,7 +1219,7 @@ index 8d06821..7ded882 100644
  
     ws->chain_ib = !BITSET_TEST(debug_flags, RADV_DEBUG_NO_IB_CHAINING);
 diff --git a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_winsys.h b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_winsys.h
-index bf1236b..e186645 100644
+index bf1236b..3b780bc 100644
 --- a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_winsys.h
 +++ b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_winsys.h
 @@ -13,6 +13,7 @@
@@ -1072,10 +1230,15 @@ index bf1236b..e186645 100644
  #include "util/rwlock.h"
  #include "util/simple_mtx.h"
  #include "ac_gpu_info.h"
-@@ -37,6 +38,25 @@ struct radv_amdgpu_alloc_tracker {
+@@ -37,6 +38,36 @@ struct radv_amdgpu_alloc_tracker {
     uint32_t refcount;
  };
  
++struct radv_amdgpu_um_range {
++   uint64_t start;
++   uint64_t end;
++};
++
 +struct radv_amdgpu_um {
 +   struct radv_amdgpu_um *next;
 +   simple_mtx_t lock;
@@ -1093,12 +1256,18 @@ index bf1236b..e186645 100644
 +   struct radv_amdgpu_um_range *dirty;
 +   uint32_t dirty_count;
 +   uint32_t dirty_capacity;
++   bool arena_requested;
++   amdgpu_va_handle arena_handle;
++   uint64_t arena_va;
++   uint64_t arena_mask;
++   struct radv_amdgpu_um_range arena_ranges[64];
++   unsigned arena_count;
 +};
 +
  struct radv_amdgpu_winsys {
     struct radeon_winsys base;
     ac_drm_device *dev;
-@@ -53,6 +73,7 @@ struct radv_amdgpu_winsys {
+@@ -53,6 +84,7 @@ struct radv_amdgpu_winsys {
     uint64_t perftest;
  
     struct radv_amdgpu_alloc_tracker *alloc_tracker;

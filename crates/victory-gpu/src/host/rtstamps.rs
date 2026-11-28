@@ -67,6 +67,7 @@ struct Pending {
     /// The pipeline (its state object's address) and its name.
     pso: usize,
     frame: u64,
+    weight: u64,
 }
 
 #[derive(Default)]
@@ -132,6 +133,10 @@ pub(crate) fn before(list: &ID3D12GraphicsCommandList) -> Option<usize> {
     if !on() {
         return None;
     }
+    start(list)
+}
+
+fn start(list: &ID3D12GraphicsCommandList) -> Option<usize> {
     let ring = ring()?;
     let pair = (NEXT.fetch_add(1, Relaxed) as usize) % PAIRS;
     // SAFETY: an open list; the query is inside the heap.
@@ -139,8 +144,41 @@ pub(crate) fn before(list: &ID3D12GraphicsCommandList) -> Option<usize> {
     Some(pair)
 }
 
+pub(crate) struct Scope<'a>(&'a ID3D12GraphicsCommandList, usize, &'static str, u64);
+
+impl Drop for Scope<'_> {
+    fn drop(&mut self) {
+        after_weighted(self.0, Some(self.1), Kind::Other, self.2.as_ptr() as usize, self.2, self.3);
+    }
+}
+
+pub(crate) fn port<'a>(get: impl FnOnce() -> &'a ID3D12GraphicsCommandList, label: &'static str) -> Option<Scope<'a>> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_PORT_TIMES").is_some_and(|v| v == "1")) {
+        return None;
+    }
+    let list = get();
+    start(list).map(|pair| Scope(list, pair, label, 1))
+}
+
+pub(crate) fn sample<'a>(get: impl FnOnce() -> &'a ID3D12GraphicsCommandList, label: &'static str) -> Option<Scope<'a>> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_PASS_SAMPLE").is_some_and(|v| v == "1")) { return None; }
+    let mut x = SEQ.fetch_add(1, Relaxed);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+    if x >> 59 != 0 { return None; }
+    let list = get();
+    start(list).map(|pair| Scope(list, pair, label, 32))
+}
+
 /// The second stamp of the dispatch just recorded, and its pair read back.
-pub(crate) fn after(list: &ID3D12GraphicsCommandList, pair: Option<usize>, kind: Kind, pso: usize, name: &str) {
+pub(crate) fn after(list: &ID3D12GraphicsCommandList, pair: Option<usize>, kind: Kind, pso: usize, name: &str) { 
+    after_weighted(list, pair, kind, pso, name, 1);
+}
+
+fn after_weighted(list: &ID3D12GraphicsCommandList, pair: Option<usize>, kind: Kind, pso: usize, name: &str, weight: u64) {
     let (Some(pair), Some(ring)) = (pair, RING.get().and_then(Option::as_ref)) else {
         return;
     };
@@ -157,6 +195,7 @@ pub(crate) fn after(list: &ID3D12GraphicsCommandList, pair: Option<usize>, kind:
     }
     sums.pending.push(Pending {
         pair,
+        weight,
         kind,
         pso,
         frame: crate::frame::current(),
@@ -193,11 +232,11 @@ fn read(ring: &Ring, sums: &mut Sums, now: u64) {
             at.write_volatile(0);
             at.add(1).write_volatile(0);
         }
-        let took = end.saturating_sub(start);
+        let took = end.saturating_sub(start).saturating_mul(p.weight);
         let k = sums.kinds.entry(p.kind).or_default();
-        *k = (k.0 + 1, k.1 + took);
+        *k = (k.0 + p.weight, k.1 + took);
         let e = sums.pipelines.entry(p.pso).or_insert((p.kind, 0, 0));
-        *e = (e.0, e.1 + 1, e.2 + took);
+        *e = (e.0, e.1 + p.weight, e.2 + took);
     }
 }
 

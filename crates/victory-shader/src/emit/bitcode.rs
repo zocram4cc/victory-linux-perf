@@ -222,6 +222,7 @@ pub(crate) struct Module {
     func_ids: HashMap<String, u32>,
     insts: Vec<Inst>,
     blocks: Vec<Block>,
+    shortcuts: Vec<(usize, usize, usize, V)>,
     mds: Vec<MdDef>,
     named: Vec<(String, Vec<Md>)>,
     /// See [`Tag`]: by instruction.
@@ -389,6 +390,42 @@ impl Module {
     pub fn new_block(&mut self) -> usize {
         self.blocks.push(Block::default());
         self.blocks.len() - 1
+    }
+
+    pub fn cursor(&self, block: usize) -> usize {
+        self.blocks[block].body.len()
+    }
+
+    pub fn shortcut(&mut self, block: usize, start: usize, cond: V, yes: [V; 4], no: [V; 4]) -> [V; 4] {
+        self.shortcuts.push((block, start, self.cursor(block), cond));
+        [0, 1, 2, 3].map(|n| self.select(block, cond, yes[n], no[n]))
+    }
+
+    pub fn finish_shortcuts(&mut self) {
+        for (head, start, end, cond) in std::mem::take(&mut self.shortcuts).into_iter().rev() {
+            let (slow, join) = (self.new_block(), self.new_block());
+            let old = self.blocks[head].term;
+            for &succ in successors(old).iter() {
+                for &id in &self.blocks[succ].phis {
+                    if let Op::Phi(incoming) = &mut self.insts[id as usize].op {
+                        for (_, pred) in incoming.iter_mut() {
+                            if *pred == head { *pred = join; }
+                        }
+                    }
+                }
+            }
+            let mut rest = self.blocks[head].body.split_off(end);
+            self.blocks[join].body = rest.split_off(4);
+            for &id in &rest {
+                let Op::Select(_, fast, cold) = self.insts[id as usize].op else { unreachable!() };
+                self.insts[id as usize].op = Op::Phi(vec![(fast, head), (cold, slow)]);
+            }
+            self.blocks[join].phis = rest;
+            self.blocks[join].term = old;
+            self.blocks[slow].body = self.blocks[head].body.split_off(start);
+            self.blocks[slow].term = Some(Term::Br(join));
+            self.blocks[head].term = Some(Term::CondBr(cond, join, slow));
+        }
     }
 
     pub fn type_of(&self, v: V) -> Ty {

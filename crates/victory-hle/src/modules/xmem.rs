@@ -33,6 +33,8 @@ use windows_sys::core::BOOL;
 
 use crate::{HleModule, hle_export};
 
+mod bind;
+
 const MIB: usize = 1 << 20;
 
 /// Whether we run under Wine (its ntdll exports `wine_get_version`).
@@ -198,7 +200,7 @@ pub extern "system" fn XMemVirtualAlloc(
         victory_gpu::title_memory_allocated(at as usize, size);
     }
     if !at.is_null() && spanned {
-        victory_gpu::um::span(at as usize, size);
+        victory_gpu::um::reservation(at as usize, size, reserved && flags & (0x20 | GRAPHICS) == 0x21);
     }
     if !at.is_null() && backed {
         back(at as usize, asked_size.next_multiple_of(4096), asked & 0x400 != 0);
@@ -488,7 +490,7 @@ fn hide(at: usize, len: usize, unified: bool) -> bool {
     }
 }
 
-fn show_unified(base: usize, len: usize, id: u32, index: usize, own: bool) -> bool {
+fn reserve_alias(base: usize, len: usize, own: bool) -> bool {
     let commit = || {
         counted(Call::Map, || unsafe {
             VirtualAlloc2(
@@ -516,6 +518,11 @@ fn show_unified(base: usize, len: usize, id: u32, index: usize, own: bool) -> bo
         );
         return false;
     }
+    true
+}
+
+fn show_unified(base: usize, len: usize, id: u32, index: usize, own: bool) -> bool {
+    if !reserve_alias(base, len, own) { return false; }
     if !victory_gpu::um::alias(id, (index * PAGE) as u64, len, base) {
         tracing::warn!(address = format_args!("{base:#x}"), len, "unified pages not shown by the driver");
         unsafe { VirtualFree(base as *mut c_void, len, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) };
@@ -1373,6 +1380,18 @@ pub extern "system" fn XMemMapPhysicalPages(
     // until it is committed. A read of title memory in place must not fall
     // into that gap (`victory_gpu::title_memory_remapping`).
     let _changing = victory_gpu::title_memory_remapping();
+    if bind::on() && base % PAGE == 0 && (1..=GROUP).contains(&n) {
+        let ops = match &pages {
+            Some(numbers) => {
+                let table = page_table();
+                numbers.iter().enumerate().map(|(i, p)| table.pages.get(p).cloned().map(|s| Op::new(base + i * PAGE, Some(s)))).collect::<Option<Vec<_>>>()
+            }
+            None => Some((0..n).map(|i| Op::new(base + i * PAGE, None)).collect()),
+        };
+        if let Some(ops) = ops && ops.iter().all(|op| bind::mode(&physical, op).is_some()) {
+            return if bind::apply(&mut physical, ops) { address } else { std::ptr::null_mut() };
+        }
+    }
     unmap(&mut physical, base, n * PAGE);
     let Some(pages) = pages else {
         return address;
@@ -1424,6 +1443,21 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
             .collect();
         if wanted.iter().all(|w| w.0 % PAGE == 0) {
             return scatter(&wanted).into();
+        }
+    }
+    if bind::on() && n > 1 {
+        let wanted: Vec<(usize, usize)> = (0..n).map(|i| unsafe { (*addresses.add(i) as usize, if pages.is_null() { 0 } else { *pages.add(i) }) }).collect();
+        if wanted.iter().all(|(at, _)| at % PAGE == 0) {
+            let mut i = 0;
+            while i < n {
+                let (base, page) = wanted[i];
+                let mut j = i + 1;
+                while j < n && j - i < GROUP && wanted[j].0 == base + (j - i) * PAGE && (wanted[j].1 == 0) == (page == 0) { j += 1; }
+                let numbers = (page != 0).then(|| wanted[i..j].iter().map(|v| v.1).collect::<Vec<_>>());
+                if XMemMapPhysicalPages(base as *mut _, j - i, numbers.as_ref().map_or(std::ptr::null(), |v| v.as_ptr())).is_null() { return 0; }
+                i = j;
+            }
+            return 1;
         }
     }
     for i in 0..n {
@@ -1738,7 +1772,11 @@ impl Op {
 /// the pages goes, then the system calls, then what is there now is noted.
 /// With [`PHYSICAL`] and the change of mapping (`title_memory_remapping`)
 /// held.
-fn change(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
+fn change(physical: &mut Physical, ops: Vec<Op>) -> bool {
+    if bind::on() { bind::apply(physical, ops) } else { change_pages(physical, ops) }
+}
+
+fn change_pages(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
     for op in &mut ops {
         let there = physical
             .views

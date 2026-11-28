@@ -10,6 +10,9 @@ use windows_sys::Win32::System::Memory as mem;
 
 use crate::inplace::Placed;
 
+mod cpu_reservation;
+pub(crate) use cpu_reservation::{cpu_ask, cpu_pointer};
+
 const K64: usize = 64 << 10;
 
 pub const CELL: usize = 4 << 20;
@@ -186,6 +189,7 @@ struct State {
     pools: Vec<Option<Pool>>,
     views: BTreeMap<usize, (usize, u32)>,
     spans: BTreeMap<usize, usize>,
+    cpu_spans: BTreeMap<usize, usize>,
     mirrors: BTreeMap<usize, (ID3D12Heap, ID3D12Resource, u64)>,
     foreign: BTreeMap<usize, usize>,
     phases: BTreeMap<(usize, u64), ID3D12Resource>,
@@ -233,6 +237,40 @@ static MIRROR_BUFFER: [AtomicUsize; 64] = [const { AtomicUsize::new(0) }; 64];
 static MIRROR_HEAP: [AtomicUsize; 64] = [const { AtomicUsize::new(0) }; 64];
 static SHOWN: [AtomicU64; PAGES / 64] = [const { AtomicU64::new(0) }; PAGES / 64];
 static CARD: [AtomicU64; PAGES / 64] = [const { AtomicU64::new(0) }; PAGES / 64];
+// The alias ABI installs 4 KiB pages, including partial console (64 KiB)
+// pages. Counting the enclosing console page would misattribute its RAM
+// neighbours to the BAR and would not prove a complete GPU mapping.
+const PTE: usize = 4096;
+static VRAM_PTES: [AtomicU64; SPACE.1 / (64 * PTE)] = [const { AtomicU64::new(0) }; SPACE.1 / (64 * PTE)];
+
+fn pte_words(a: usize, b: usize) -> impl Iterator<Item = (usize, u64)> {
+    let (first, end) = (a / PTE, b.div_ceil(PTE));
+    (first / 64..end.div_ceil(64)).map(move |i| {
+        let lo = first.saturating_sub(i * 64);
+        let hi = (end - i * 64).min(64);
+        (i, (u64::MAX << lo) & (u64::MAX >> (64 - hi)))
+    })
+}
+
+fn mark_vram(at: usize, len: usize, set: bool) {
+    let (a, b) = (at.max(SPACE.0), at.saturating_add(len).min(SPACE.1));
+    if a >= b { return; }
+    for (i, mask) in pte_words(a, b) {
+        if mask == u64::MAX {
+            VRAM_PTES[i].store(if set { mask } else { 0 }, Ordering::Release);
+        } else if set {
+            VRAM_PTES[i].fetch_or(mask, Ordering::Release);
+        } else {
+            VRAM_PTES[i].fetch_and(!mask, Ordering::Release);
+        }
+    }
+}
+
+fn on_card(at: usize) -> bool {
+    let page = at / PTE;
+    VRAM_PTES[page / 64].load(Ordering::Acquire) & (1u64 << (page % 64)) != 0
+}
+
 static REFUSED: AtomicBool = AtomicBool::new(false);
 
 fn pages(at: usize, len: usize) -> std::ops::Range<usize> {
@@ -517,6 +555,7 @@ fn load() -> Option<Um> {
             pools: Vec::new(),
             views: BTreeMap::new(),
             spans: BTreeMap::new(),
+            cpu_spans: BTreeMap::new(),
             mirrors: BTreeMap::new(),
             foreign: BTreeMap::new(),
             phases: BTreeMap::new(),
@@ -691,8 +730,11 @@ pub fn alias(id: u32, offset: u64, len: usize, at: usize) -> bool {
     if vram {
         VRAM_LOW.fetch_min(at, Ordering::Relaxed);
         VRAM_HIGH.fetch_max(at + len, Ordering::Relaxed);
+        // The winsys accepted this mapping with aligned address, offset and size.
+        mark_vram(at, len, true);
+        if crate::texture::action_memory::on() { tracing::info!(start=at, bytes=len, physical=id, "IBS card map"); }
     }
-    want(at, len);
+    want_visible(&state, at, len);
     let first = state.views.is_empty();
     state.views.insert(at, (len, id));
     if first {
@@ -740,6 +782,8 @@ fn forget(um: &Um, state: &mut State, at: usize, len: usize) {
         };
         if pool.vram {
             mark(&CARD, from, to - from, false);
+            mark_vram(from, to - from, false);
+            if crate::texture::action_memory::on() { tracing::info!(start=from, bytes=to-from, "IBS card unmap"); }
             pool.places.retain(|&(place, _)| place != base);
             pool.places.extend(left.into_iter().flatten());
             card(pool);
@@ -765,6 +809,37 @@ pub fn unalias(at: usize, len: usize) -> bool {
     done
 }
 
+fn want_visible(state: &State, at: usize, len: usize) {
+    if state.cpu_spans.is_empty() {
+        want(at, len);
+        return;
+    }
+    let end = at.saturating_add(len);
+    let mut p = at;
+    if let Some((&base, &bytes)) = state.cpu_spans.range(..=at).next_back() {
+        p = p.max(base.saturating_add(bytes).min(end));
+    }
+    if p >= end { return; }
+    for (&base, &bytes) in state.cpu_spans.range(p..end) {
+        if base > p { want(p, base - p); }
+        p = p.max(base.saturating_add(bytes));
+    }
+    if p < end { want(p, end - p); }
+}
+
+pub fn reservation(at: usize, len: usize, cpu: bool) {
+    static ONLY: OnceLock<bool> = OnceLock::new();
+    if !cpu || !*ONLY.get_or_init(|| crate::switch::on("VICTORY_CPU_RESERVATIONS")) {
+        span(at, len);
+        return;
+    }
+    let Some(um) = get() else { return; };
+    let mut state = um.state();
+    state.cpu_spans.insert(at, len);
+    cpu_reservation::registered(at, len, true);
+    tracing::info!(start = format_args!("{at:#x}"), bytes = len, "CPU-only physical page reservation does not need a graphics mirror");
+}
+
 pub fn span(at: usize, len: usize) {
     let Some(um) = get() else {
         return;
@@ -781,6 +856,7 @@ pub fn span_gone(at: usize) {
         return;
     };
     let mut state = um.state();
+    if let Some(len) = state.cpu_spans.remove(&at) { cpu_reservation::registered(at, len, false); }
     if let Some(len) = state.spans.remove(&at) {
         recover(&state, at, len);
     }
@@ -788,6 +864,80 @@ pub fn span_gone(at: usize) {
 
 pub fn holds(at: usize, len: usize) -> bool {
     inside(at, len) && marked(&SHOWN, at, len).all(|shown| shown)
+}
+
+pub(crate) fn measure_reads() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_READERS").is_some_and(|v| v == "1"))
+}
+
+type Site = std::panic::Location<'static>;
+static SITES: [std::sync::atomic::AtomicPtr<Site>; 512] = [const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; 512];
+static SITE_BYTES: [AtomicU64; 512] = [const { AtomicU64::new(0) }; 512];
+
+pub(crate) fn count_read(from: &'static Site, at: usize, len: usize) {
+    if !measure_reads() { return; }
+    let a = at.max(VRAM_LOW.load(Ordering::Relaxed)).max(SPACE.0);
+    let b = at.saturating_add(len).min(VRAM_HIGH.load(Ordering::Relaxed)).min(SPACE.1);
+    if a >= b { return; }
+    let n = if a / PTE == (b-1) / PTE {
+        if !on_card(a) { return; }
+        b-a
+    } else {
+        let leading = (PTE - a%PTE)%PTE;
+        let trailing = b%PTE;
+        let (lo, hi) = (a+leading, b-trailing);
+        let whole = if lo < hi {
+            pte_words(lo, hi).map(|(i,mask)| (VRAM_PTES[i].load(Ordering::Acquire)&mask).count_ones() as usize * PTE).sum::<usize>()
+        } else { 0 };
+        whole + usize::from(leading != 0 && on_card(a)) * leading + usize::from(trailing != 0 && on_card(b-1)) * trailing
+    };
+    if n == 0 { return; }
+    let addr = std::ptr::from_ref(from).cast_mut();
+    for j in 0..SITES.len() {
+        let i = (((addr as usize) >> 4) + j) % SITES.len();
+        let old = SITES[i].load(Ordering::Acquire);
+        if old == addr || (old.is_null() && SITES[i].compare_exchange(old, addr, Ordering::AcqRel, Ordering::Acquire).is_ok()) {
+            SITE_BYTES[i].fetch_add(n as u64,Ordering::Relaxed);
+            return;
+        }
+    }
+}
+
+fn read_counts(now: u64) {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let prev = LAST.load(Ordering::Relaxed);
+    if now < prev+1000 || LAST.compare_exchange(prev,now,Ordering::AcqRel,Ordering::Relaxed).is_err() { return; }
+    let mut callers = String::new();
+    use std::fmt::Write;
+    for (site,n) in SITES.iter().zip(&SITE_BYTES) {
+        let ptr = site.load(Ordering::Acquire);
+        let count = n.swap(0,Ordering::Relaxed);
+        if !ptr.is_null() && count != 0 {
+            let loc = unsafe { &*ptr };
+            let _ = write!(callers," {}:{}={count}",loc.file().rsplit("src/").next().unwrap_or(loc.file()),loc.line());
+        }
+    }
+    tracing::info!(frame=crate::frame::current(),"CPU bytes read from card by caller:{callers}");
+}
+
+pub(crate) fn resident(at: usize,len: usize) -> bool {
+    let end = at.saturating_add(len);
+    len != 0 && at >= VRAM_LOW.load(Ordering::Relaxed) && end <= VRAM_HIGH.load(Ordering::Relaxed)
+        && inside(at,len) && pte_words(at,end).all(|(i,mask)| VRAM_PTES[i].load(Ordering::Acquire)&mask == mask)
+}
+
+/// Unlike `dedicated_vram`, includes pages shared through another title alias.
+/// A span crossing pools can still be used directly when its whole GPU mirror exists.
+pub(crate) fn touches_card(at: usize, len: usize) -> bool {
+    let a = at.max(VRAM_LOW.load(Ordering::Relaxed)).max(SPACE.0);
+    let b = at.saturating_add(len).min(VRAM_HIGH.load(Ordering::Relaxed)).min(SPACE.1);
+    a < b && pte_words(a,b).any(|(i,mask)| VRAM_PTES[i].load(Ordering::Acquire)&mask != 0)
+}
+
+pub(crate) fn card_pages(at: usize, len: usize) -> usize {
+    if len == 0 || !inside(at, len) { return 0; }
+    marked(&CARD, at, len).filter(|&card| card).count()
 }
 
 pub(crate) fn dedicated_vram(at: usize, len: usize) -> bool {
@@ -898,6 +1048,18 @@ pub(crate) fn piece_end(start: u64) -> u64 {
 }
 
 fn mirror(state: &mut State, chunk: usize) -> Option<()> {
+    static ARENA: OnceLock<bool> = OnceLock::new();
+    if *ARENA.get_or_init(|| crate::switch::on("VICTORY_MIRROR_ARENA")) {
+        let first = state.mirrors.last_key_value().map_or(0, |(&n, _)| n + 1);
+        for n in first..=chunk {
+            mirror_piece(state, n)?;
+        }
+        return state.mirrors.contains_key(&chunk).then_some(());
+    }
+    mirror_piece(state, chunk)
+}
+
+fn mirror_piece(state: &mut State, chunk: usize) -> Option<()> {
     use windows::core::Interface;
     if state.mirrors.contains_key(&chunk) {
         return Some(());
@@ -966,7 +1128,7 @@ pub(crate) fn phase_buffer(heap: &ID3D12Heap, steps: u64) -> Option<ID3D12Resour
 }
 
 pub(crate) fn placeable(start: u64, len: u64) -> bool {
-    !REFUSED.load(Ordering::Acquire) && covers(start, len)
+    !cpu_ask(start, len, "placed copy range") && !REFUSED.load(Ordering::Acquire) && covers(start, len)
 }
 
 fn mirrored(chunk: usize) -> Option<(ID3D12Heap, ID3D12Resource, u64)> {
@@ -983,6 +1145,7 @@ fn mirrored(chunk: usize) -> Option<(ID3D12Heap, ID3D12Resource, u64)> {
 }
 
 pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
+    if cpu_ask(start, len, "placed buffer") { return None; }
     if !REFUSED.load(Ordering::Acquire) && covers(start, len) {
         let chunk = (start as usize - SPACE.0) / STRIDE;
         let base = SPACE.0 + chunk * STRIDE;
@@ -1265,12 +1428,14 @@ pub(crate) fn check(host: &crate::host::Host) {
 
 pub(crate) fn line() -> Option<String> {
     get()?;
+    if measure_reads() { read_counts(crate::host::now_ms()); }
     static LAST: AtomicU64 = AtomicU64::new(0);
     let now = crate::host::now_ms();
     let last = LAST.load(Ordering::Relaxed);
     if now < last + 10_000 || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
         return None;
     }
+    cpu_reservation::report();
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
     let (pools, views) = {
         let state = get()?.state();

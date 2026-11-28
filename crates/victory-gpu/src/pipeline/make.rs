@@ -88,7 +88,7 @@ impl Pending {
             } else {
                 let _building = crate::timeline::span("pipeline: build a host pipeline");
                 let began = Instant::now();
-                let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+                let made = super::prepared::restoring(&self.key, || HostPipeline::new(&self.shaders, self.graphics.as_deref()));
                 super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
                 made
             };
@@ -113,7 +113,7 @@ static BAD_KEYS: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(N
 fn bad_keys<R>(f: impl FnOnce(&mut std::collections::HashSet<String>) -> R) -> R {
     let mut keys = BAD_KEYS.lock().unwrap_or_else(|e| e.into_inner());
     let keys = keys.get_or_insert_with(|| {
-        if std::env::var_os("VICTORY_WARM_BAD").is_some_and(|v| v == "0") {
+        if super::prepared::enabled() || std::env::var_os("VICTORY_WARM_BAD").is_some_and(|v| v == "0") {
             return Default::default();
         }
         let listed = super::library::folder()
@@ -416,8 +416,24 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
 /// that is making it); whether it has a host pipeline.
 pub(crate) fn now(p: &Arc<Pending>) -> bool {
-    p.make();
+    if one_compiler() {
+        start(p, REQUESTED);
+        join(p, Duration::from_secs(8));
+    } else {
+        p.make();
+    }
     p.made.get().is_some_and(|made| made.is_some())
+}
+
+fn one_compiler() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| super::prepared::enabled() || crate::switch::on("VICTORY_PSO_SINGLE_FLIGHT"))
+}
+
+fn join(p: &Pending, budget: Duration) {
+    let (lock, done) = &DONE;
+    let held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = done.wait_timeout_while(held, budget, |_| p.made.get().is_none()).unwrap_or_else(|e| e.into_inner());
 }
 
 pub(crate) fn ready_for_dispatch(p: &Arc<Pending>) -> Option<&HostPipeline> {
@@ -432,7 +448,7 @@ pub(crate) fn ready_for_dispatch(p: &Arc<Pending>) -> Option<&HostPipeline> {
     static SINCE: Mutex<Option<(u64, Instant)>> = Mutex::new(None);
     let frame = crate::frame::current();
     let began = Instant::now();
-    {
+    let left = {
         let mut since = SINCE.lock().unwrap_or_else(|e| e.into_inner());
         let first = match *since {
             Some((of, first)) if of == frame => first,
@@ -441,11 +457,15 @@ pub(crate) fn ready_for_dispatch(p: &Arc<Pending>) -> Option<&HostPipeline> {
                 began
             }
         };
-        if began.duration_since(first) >= MOST {
-            return None;
-        }
+        let left = MOST.saturating_sub(began.duration_since(first));
+        if left.is_zero() { return None; }
+        left
+    };
+    if one_compiler() {
+        join(p, left);
+    } else {
+        p.make();
     }
-    p.make();
     let took = began.elapsed();
     let n = WAITED.fetch_add(1, Ordering::Relaxed) + 1;
     if n <= 64 || n.is_power_of_two() {
@@ -462,8 +482,11 @@ pub(crate) fn ready_for_dispatch(p: &Arc<Pending>) -> Option<&HostPipeline> {
 
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).
-pub(crate) fn early(p: &Arc<Pending>) {
-    if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
+pub(crate) fn early(p: &Arc<Pending>, compute: bool) {
+    static READY_COMPUTE: OnceLock<bool> = OnceLock::new();
+    let prepare = compute && super::prepared::enabled()
+        && *READY_COMPUTE.get_or_init(|| crate::switch::on("VICTORY_READY_COMPUTE"));
+    if !p.shaders.is_empty() && (super::library::wanted_early(&p.key) || prepare) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, EARLY);
     }

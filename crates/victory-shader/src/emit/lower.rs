@@ -1540,6 +1540,11 @@ fn own_bits_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_OWN_BITS").is_none_or(|v| v != "0"))
 }
 
+fn fast_cbv() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FAST_INLINE_CBV").is_some_and(|v| v == "1"))
+}
+
 pub fn raw_typed_loads() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_RAW_TYPED_LOADS").is_none_or(|v| v != "0"))
@@ -8119,6 +8124,10 @@ impl<'a> Lower<'a> {
 
     fn view_handle(&mut self, src: &Source, index: V, sampler: bool, nonuniform: bool, props: (u32, u32)) -> Result<V, Why> {
         if super::shader::records() != 0 && !sampler {
+            if props.0 == 11 && self.cur == self.s.entry && fast_cbv() && self.used_kind(src).is_some_and(|u| u.kind == ResourceType::Cbv) {
+                let [lo, hi, len, _] = self.fast_cbv_range(index);
+                return Ok(self.address_handle(lo, hi, Some(len), nonuniform, 0));
+            }
             return self.record_handle(index, nonuniform, props);
         }
         let (index, bounded) = self.raw_twin(src, index, sampler, props);
@@ -8157,14 +8166,8 @@ impl<'a> Lower<'a> {
         words
     }
 
-    fn record_range(&mut self, locator: V) -> [V; 4] {
-        use super::shader::{RECORDS_ENTRIES, RECORD_TAG};
-        let key = (self.cur, locator);
-        if let Some(&range) = self.record_ranges.get(&key) {
-            return range;
-        }
-        let [tag, first, second, _] = self.record_load(locator);
-        let table = match self.records_table {
+    fn records_table_handle(&mut self) -> V {
+        match self.records_table {
             Some(h) => h,
             None => {
                 let entry = self.s.entry;
@@ -8173,7 +8176,42 @@ impl<'a> Lower<'a> {
                 self.records_table = Some(h);
                 h
             }
-        };
+        }
+    }
+
+    fn fast_cbv_range(&mut self, locator: V) -> [V; 4] {
+        let c = self.cur;
+        let key = (c, locator);
+        if let Some(&range) = self.record_ranges.get(&key) { return range; }
+        let [tag, first, second, _] = self.record_load(locator);
+        self.records_table_handle();
+        let [zero, one, k8, k15, k30, low14, low15, small, valid_tag] = [0, 1, 8, 15, 30, 0x3fff, 0x7fff, 0x4000, super::shader::RECORD_TAG].map(|v| self.s.m.i32(v));
+        let kind = self.s.m.bin(c, Bin::LShr, second, k30);
+        let inline = self.s.m.cmp(c, pred::EQ, kind, one);
+        let hi = self.s.m.bin(c, Bin::And, second, low15);
+        let code = self.s.m.bin(c, Bin::LShr, second, k15);
+        let code = self.s.m.bin(c, Bin::And, code, low15);
+        let plain = self.s.m.cmp(c, pred::IULT, code, small);
+        let units = self.s.m.bin(c, Bin::And, code, low14);
+        let bytes = self.s.m.bin(c, Bin::Shl, units, k8);
+        let len = self.s.m.select(c, plain, code, bytes);
+        let valid = self.s.m.cmp(c, pred::EQ, tag, valid_tag);
+        let len = self.s.m.select(c, valid, len, zero);
+        let at = self.s.m.cursor(c);
+        let other = self.record_range(locator);
+        let out = self.s.m.shortcut(c, at, inline, [first, hi, len, zero], other);
+        self.record_ranges.insert(key, out);
+        out
+    }
+
+    fn record_range(&mut self, locator: V) -> [V; 4] {
+        use super::shader::{RECORDS_ENTRIES, RECORD_TAG};
+        let key = (self.cur, locator);
+        if let Some(&range) = self.record_ranges.get(&key) {
+            return range;
+        }
+        let [tag, first, second, _] = self.record_load(locator);
+        let table = self.records_table_handle();
         let c = self.cur;
         let i32t = self.s.t.i32;
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);

@@ -157,6 +157,8 @@ pub(crate) const CLAMPED: D3D12_GLOBAL_BARRIER = D3D12_GLOBAL_BARRIER {
 
 #[cfg(windows)]
 pub(crate) unsafe fn record(list: &ID3D12GraphicsCommandList7, barrier: &D3D12_GLOBAL_BARRIER) {
+    #[cfg(feature = "diagnostics")]
+    let _sample = crate::host::rtstamps::sample(|| list, "port: named barrier");
     unsafe {
         list.Barrier(&[D3D12_BARRIER_GROUP {
             Type: D3D12_BARRIER_TYPE_GLOBAL,

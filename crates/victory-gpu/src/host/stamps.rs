@@ -81,12 +81,9 @@ fn times(taken: usize) -> Vec<(u64, u64)> {
     let (Some(Some(stamps)), Some(host)) = (STAMPS.get(), host()) else {
         return Vec::new();
     };
-    let (mut card, mut pc) = (0, 0);
+    let Ok((card, pc)) = calibration(&host.queue) else { return Vec::new() };
     // SAFETY: plain queries; the mapping holds twice `MOST` tick counts.
     let (frequency, back) = unsafe {
-        if host.queue.GetClockCalibration(&mut card, &mut pc).is_err() {
-            return Vec::new();
-        }
         let frequency = host.queue.GetTimestampFrequency().unwrap_or(0);
         (frequency, std::slice::from_raw_parts(stamps.back as *const u64, 2 * MOST))
     };
@@ -106,6 +103,26 @@ fn times(taken: usize) -> Vec<(u64, u64)> {
             (from, to) => (place(from), place(to)),
         })
         .collect()
+}
+
+pub(super) fn calibration(queue: &ID3D12CommandQueue) -> windows::core::Result<(u64, u64)> {
+    let (mut gpu, mut cpu) = (0, 0);
+    if !crate::switch::on("VICTORY_TIMELINE_CLOCK") && !super::spans::feeding() {
+        unsafe { queue.GetClockCalibration(&mut gpu, &mut cpu)? };
+        return Ok((gpu, cpu));
+    }
+    let mut best = (u64::MAX, 0, 0, 0);
+    for _ in 0..5 {
+        let before = crate::timeline::ticks();
+        unsafe { queue.GetClockCalibration(&mut gpu, &mut cpu)? };
+        let after = crate::timeline::ticks();
+        if (before..=after).contains(&cpu) { return Ok((gpu, cpu)); }
+        let width = after.saturating_sub(before);
+        if width < best.0 { best = (width, gpu, before + width / 2, cpu); }
+    }
+    let (window, gpu, qpc, driver) = best;
+    tracing::info!(window, delta = qpc.abs_diff(driver), late = qpc > driver, "aligned GPU timestamps to the measured QPC window");
+    Ok((gpu, qpc))
 }
 
 impl Host {
@@ -136,13 +153,12 @@ impl Host {
                 list.Close()?;
                 lists.push(list.cast()?);
             }
-            let (mut card, mut pc) = (0, 0);
-            self.queue.GetClockCalibration(&mut card, &mut pc)?;
+            let calibrated = calibration(&self.queue)?;
             Ok(Stamps {
                 lists,
                 back: back as usize,
                 _kept: (allocator, heap, buffer),
-                calibrated: (card, pc),
+                calibrated,
             })
         }
     }

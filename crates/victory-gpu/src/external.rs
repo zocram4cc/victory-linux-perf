@@ -64,6 +64,8 @@ pub fn record<R>(list: This, f: impl FnOnce(&Recording<'_>) -> R) -> Option<R> {
     let list = crate::list::thin::for_external(list)?;
     let mut out = None;
     crate::list::with_state(list, |host, state| {
+        #[cfg(feature = "diagnostics")]
+        let _port = crate::host::rtstamps::port(|| &host.list, "port: external upscale");
         out = Some(f(&Recording(host)));
         state.external_compute();
     });

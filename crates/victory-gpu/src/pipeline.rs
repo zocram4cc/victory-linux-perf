@@ -594,11 +594,21 @@ fn hand_out(
     #[cfg(windows)]
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
     #[cfg(windows)]
-    known::note(host.key(), &shaders, host.graphics.as_deref());
-    #[cfg(windows)]
-    make::early(&host);
+    {
+        known::note(host.key(), &shaders, host.graphics.as_deref());
+        prepared::at_creation(host.key(), &shaders, host.graphics.as_deref());
+        if variants::enabled() && let Some(g) = host.graphics.as_deref()
+            && let Some(state) = variants::alternate(g, shaders.len() == 2 && shaders[0].stage == "mesh" && shaders[1].stage == "pixel")
+        {
+            let v = make::Pending::new(shaders.clone(),Some(Box::new(state)));
+            known::note(v.key(),&shaders,v.graphics.as_deref());
+            prepared::at_creation(v.key(),&shaders,v.graphics.as_deref());
+        }
+    }
     #[cfg(windows)]
     let builder = of_builder(&shaders);
+    #[cfg(windows)]
+    make::early(&host, !builder && shaders.len() == 1 && shaders[0].stage == "compute");
     #[cfg(windows)]
     if builder {
         // Another stage: the group is looked at again at its next dispatch.
@@ -786,6 +796,10 @@ pub(crate) mod host;
 pub mod known;
 #[cfg(windows)]
 mod library;
+#[cfg(windows)]
+mod prepared;
+#[cfg(windows)]
+mod variants;
 #[cfg(windows)]
 mod make;
 

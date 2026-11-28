@@ -54,6 +54,41 @@ fn parse_ms(spec: &str) -> Option<Duration> {
     Some(Duration::from_nanos((ms * 1e6).round() as u64))
 }
 
+#[cfg(all(windows, feature = "diagnostics"))]
+static WORLD: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+#[cfg(all(windows, feature = "diagnostics"))]
+pub fn scripted_world() -> Option<std::time::Duration> {
+    WORLD.get().map(std::time::Instant::elapsed)
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn scripted_present() {
+    static RANGE: std::sync::LazyLock<Option<(u64,u64)>> = std::sync::LazyLock::new(|| {
+        std::env::var_os("VICTORY_KEYS_WORLD")?;
+        let raw = std::env::var("VICTORY_KEYS_WORLD_DRAWS").ok()?;
+        let (lo,hi) = raw.split_once(':')?;
+        let limits = (lo.parse().ok()?, hi.parse().ok()?);
+        (limits.0 <= limits.1).then_some(limits)
+    });
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    static FRAMES: AtomicU64 = AtomicU64::new(0);
+    static MATCHES: AtomicU64 = AtomicU64::new(0);
+    let Some((min,max)) = *RANGE else { return };
+    if WORLD.get().is_none() && FRAMES.fetch_add(1, Ordering::Relaxed) % 16 == 0 {
+        let draws = crate::draw::drawn();
+        let prior = LAST.swap(draws, Ordering::Relaxed);
+        let mean = draws.saturating_sub(prior) / 16;
+        if prior != 0 && (min..=max).contains(&mean) {
+            if MATCHES.fetch_add(1, Ordering::Relaxed) == 1 {
+                WORLD.get_or_init(|| { tracing::info!(mean, "scripted world ready"); std::time::Instant::now() });
+            }
+        } else {
+            MATCHES.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
 struct Clock {
     start: Instant,
     interval: Duration,

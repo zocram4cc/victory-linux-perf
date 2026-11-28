@@ -1044,12 +1044,17 @@ struct Waiting {
 /// which order (no host heap needed, so it is tested without one).
 #[derive(Default)]
 pub(crate) struct TextureQueue {
+    calendar: Calendar,
     slots: std::collections::BTreeMap<u32, Waiting>,
     writes: u64,
     /// Slots held back because the card had no room for the host copy
     /// they need ([`TextureQueue::hold`]), each with the write it was
     /// held as.
     held: std::collections::BTreeMap<u32, u64>,
+    sleepers: std::collections::BTreeSet<(u64, u32)>,
+    active: std::collections::HashSet<u32>,
+    release_frame: Option<u64>,
+    last_woken: (u64,u32),
     /// Which slots are in `slots`, for those who only want one out
     /// ([`Queued`]).
     queued: std::sync::Arc<Queued>,
@@ -1091,15 +1096,71 @@ impl Queued {
 /// others: the frame each was written in, the slot and its write's number.
 type Due = [Vec<(u64, u32, u64)>; 2];
 
+/// Scheduling metadata only; reads no texture bytes. Keys carry all the
+/// data needed to serve the original due/census in one prefix walk. `write`
+/// is unique, so the old `in_order` gives exactly the same priority.
+#[derive(Default)]
+struct Calendar {
+    entries: std::collections::BTreeSet<(u64,u32,u64,u64,u8)>,
+    counts: [u64;3],
+}
+fn calendar_on()->bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CALENDAR").is_some_and(|v|v=="1"))
+}
+impl Calendar {
+    fn key(slot:u32,w:&Waiting)->(u64,u32,u64,u64,u8) {
+        let class=if w.mapped>0 {2} else if w.looks>0 {1} else {0};
+        (w.due, slot, w.write, w.written, class)
+    }
+    fn add(&mut self,slot:u32,w:&Waiting) {
+        let k=Self::key(slot,w);
+        self.entries.insert(k);
+        self.counts[k.4 as usize]+=1;
+    }
+    fn erase(&mut self,slot:u32,w:&Waiting) {
+        let k=Self::key(slot,w);
+        self.entries.remove(&k);
+        self.counts[k.4 as usize]-=1;
+    }
+    fn pass(&self,frame:u64,draw:bool)->(Due,[u64;5]) {
+        let mut due=Due::default();
+        let mut c=[self.entries.len() as u64,0,self.counts[1],self.counts[2],0];
+        for &(_,index,write,written,class) in self.entries.range(..=(frame,u32::MAX,u64::MAX,u64::MAX,u8::MAX)) {
+            if draw { due[usize::from(class==0)].push((written,index,write)); }
+            c[1]+=1;c[4]=c[4].max(frame.saturating_sub(written));
+        }
+        (due,c)
+    }
+}
+
+pub(crate) struct TextureLease<'a>(&'a HostHeap, u32);
+impl Drop for TextureLease<'_> {
+    fn drop(&mut self) { self.0.textures.lock().unwrap_or_else(|e| e.into_inner()).active.remove(&self.1); }
+}
+
 impl TextureQueue {
-    fn insert(&mut self, index: u32, waiting: Waiting) {
-        if self.slots.insert(index, waiting).is_none() {
-            self.queued.set(index, true);
+    fn forget_hold(&mut self, index: u32) {
+        if crate::resource::stream_admission() && let Some(write) = self.held.remove(&index) {
+            self.sleepers.remove(&(write, index));
         }
     }
 
+    fn insert(&mut self, index: u32, waiting: Waiting) {
+        self.forget_hold(index);
+        let old=self.slots.insert(index,waiting);
+        if calendar_on() {
+            if let Some(w)=&old {self.calendar.erase(index,w);}
+            self.calendar.add(index,&waiting);
+        }
+        if old.is_none(){self.queued.set(index,true);}
+    }
+
     fn take_out(&mut self, index: u32) -> bool {
-        let was = self.slots.remove(&index).is_some();
+        self.forget_hold(index);
+        let old=self.slots.remove(&index);
+        if calendar_on() && let Some(w)=&old { self.calendar.erase(index,w); }
+        let was=old.is_some();
         if was {
             self.queued.set(index, false);
         }
@@ -1181,6 +1242,19 @@ impl TextureQueue {
         self.slots.get_mut(&index).filter(|w| w.write == write)
     }
 
+    fn edit_wait(&mut self, index:u32, write:u64, edit:impl FnOnce(&mut Waiting))->bool {
+        let Some(w)=self.slots.get_mut(&index).filter(|w|w.write==write) else {return false;};
+        if calendar_on() {
+            let old=*w;
+            edit(w);
+            if Calendar::key(index,&old)!=Calendar::key(index,w) {
+                self.calendar.erase(index,&old);
+                self.calendar.add(index,w);
+            }
+        } else {edit(w);}
+        true
+    }
+
     /// Slot `index` is up to date: out of the queue until written again.
     fn done(&mut self, index: u32, write: u64) {
         if self.same(index, write).is_some() {
@@ -1191,11 +1265,11 @@ impl TextureQueue {
     /// Nothing to upload at slot `index` now: looked at again after 1, 2,
     /// 4, ... frames, at most `most`.
     fn later(&mut self, index: u32, write: u64, frame: u64, most: u64) {
-        if let Some(w) = self.same(index, write) {
+        self.edit_wait(index, write, |w| {
             w.due = frame + (1u64 << w.looks.min(16)).min(most.max(1));
             w.looks = w.looks.saturating_add(1);
             w.away = crate::host::now_ms();
-        }
+        });
     }
 
     /// The card has no room for the host copy slot `index` needs: it is
@@ -1209,32 +1283,52 @@ impl TextureQueue {
     /// to date, and the ones whose memory went, which is what lets host
     /// copies go and makes room.)
     fn hold(&mut self, index: u32, write: u64, due: u64) {
-        if let Some(w) = self.same(index, write) {
-            w.due = w.due.max(due);
-            self.held.insert(index, write);
+        let streaming = crate::resource::stream_admission();
+        let due = if streaming { u64::MAX } else { due };
+        if self.edit_wait(index,write,|w|w.due=w.due.max(due)) {
+            self.held.insert(index,write);
+            if streaming { self.sleepers.insert((write,index)); }
         }
     }
 
     /// The card has room again at `frame`: the slots held back for lack of
     /// it are due now, as if they had never been held. Returns how many.
     fn room(&mut self, frame: u64) -> usize {
+        self.sleepers.clear();
         let held = std::mem::take(&mut self.held);
         let mut back = 0;
         for (index, write) in held {
-            if let Some(w) = self.same(index, write) {
-                w.due = w.due.min(frame);
-                back += 1;
-            }
+            if self.edit_wait(index,write,|w|w.due=w.due.min(frame)) { back+=1; }
         }
         back
+    }
+
+    fn wake(&mut self, frame: u64, room: bool, wanted: &[(u32, u64)]) {
+        for &(index, observed) in wanted {
+            if let Some(&write) = self.held.get(&index) && write <= observed {
+                self.forget_hold(index);
+                self.edit_wait(index, write, |w| w.due = frame);
+            }
+        }
+        if self.release_frame.replace(frame) == Some(frame) { return; }
+        let limit = if room { 192 } else { 32 };
+        for _ in 0..limit {
+            use std::ops::Bound::{Excluded,Unbounded};
+            let next = self.sleepers.range((Excluded(self.last_woken),Unbounded)).next().or_else(|| self.sleepers.first()).copied();
+            let Some((write,index)) = next else { break };
+            self.last_woken = (write,index);
+            self.sleepers.remove(&(write,index));
+            self.held.remove(&index);
+            self.edit_wait(index, write, |w| w.due = frame);
+        }
     }
 
     /// Slot `index` was uploaded with `mapped` bytes of its memory there,
     /// not all of it: looked at again from frame `due`.
     fn partly(&mut self, index: u32, write: u64, due: u64, mapped: u64) {
-        if let Some(w) = self.same(index, write) {
+        self.edit_wait(index, write, |w| {
             (w.due, w.looks, w.mapped) = (due, 0, mapped.max(1));
-        }
+        });
     }
 
     /// Slot `index` was uploaded whole from memory `at` (address, bytes)
@@ -1243,10 +1337,10 @@ impl TextureQueue {
     /// `looks`-th such look; `uploaded` is the upload's frame).
     #[allow(clippy::too_many_arguments)]
     fn recheck(&mut self, index: u32, write: u64, due: u64, at: (u64, u64), print: u64, looks: u8, uploaded: u64, watch: Option<u64>) {
-        if let Some(w) = self.same(index, write) {
+        self.edit_wait(index, write, |w| {
             (w.due, w.looks, w.mapped) = (due, 1, 0);
             w.checked = (at.0, at.1, print, looks, uploaded, watch);
-        }
+        });
     }
 
     /// What [`TextureQueue::recheck`] noted of slot `index`, if it is
@@ -2048,6 +2142,16 @@ impl HostHeap {
         self.texture_slots_wanted(frame, max, &[])
     }
 
+    pub(crate) fn wake_texture_stream(&self, frame: u64, room: bool, wanted: &[(u32,u64)]) {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).wake(frame, room, wanted);
+    }
+
+    pub(crate) fn lease_texture(&self, frame: u64, index: u32, write: u64) -> Option<TextureLease<'_>> {
+        let mut q = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        if !q.slots.get(&index).is_some_and(|w| w.write == write && w.due <= frame) || !q.active.insert(index) { return None; }
+        Some(TextureLease(self,index))
+    }
+
     pub(crate) fn material_stamp(&self) -> u64 {
         self.textures.lock().unwrap_or_else(|e| e.into_inner()).writes
     }
@@ -2059,7 +2163,9 @@ impl HostHeap {
                 let w = textures.slots.get(&slot)?;
                 (w.due <= frame && w.write <= stamp && !textures.held.contains_key(&slot)).then_some((slot, w.write))
             }).collect();
-            (if max == 0 { Due::default() } else { textures.all_due(frame) }, textures.census(frame), priority)
+            let (due,census)=if calendar_on() { textures.calendar.pass(frame,max!=0) }
+                else {(if max==0 { Due::default() } else {textures.all_due(frame)}, textures.census(frame))};
+            (due,census,priority)
         };
         let mut order = TextureQueue::in_order(due, max, frame);
         if !priority.is_empty() {
@@ -3062,6 +3168,8 @@ impl HostHeap {
             if slot.as_ref().map(Interface::as_raw) == resource.as_ref().map(Interface::as_raw) {
                 return;
             }
+            #[cfg(feature = "diagnostics")]
+            if crate::gpuvm::on() { crate::gpuvm::publish(std::ptr::from_ref(self) as usize,index,resource.as_ref()); }
             std::mem::replace(&mut *slot, resource)
         };
         // A running submission may still read the old resource through
@@ -3933,6 +4041,7 @@ fn write_view_address(data: usize, index: u32, view: Option<&View>) {
         return;
     }
     let address = view.and_then(view_address).unwrap_or(0);
+    crate::um::cpu_pointer(address, 1, "descriptor shader pointer");
     let at = (data + VIEW_ADDRESSES as usize) as *mut u32;
     // SAFETY: inside the mapping (`SLOT_STRIDES_BYTES`); shaders read it
     // while we write (each dword is one the slot had or has).
@@ -4156,6 +4265,7 @@ fn mirrored_srv(
         return None;
     }
     let start = address + own.FirstElement * element;
+    if crate::um::cpu_ask(start, u64::from(own.NumElements) * element, "typed SRV") { return None; }
     let (buffer, offset) = crate::um::mirror_at(start, u64::from(own.NumElements) * element)?;
     if !offset.is_multiple_of(element) {
         return None;
@@ -4197,6 +4307,7 @@ fn mirrored_uav(
         return None;
     }
     let start = address + own.FirstElement * element;
+    if crate::um::cpu_ask(start, u64::from(own.NumElements) * element, "typed UAV") { return None; }
     let (buffer, offset) = crate::um::mirror_at(start, u64::from(own.NumElements) * element)?;
     if !offset.is_multiple_of(element) {
         return None;

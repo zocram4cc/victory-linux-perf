@@ -211,11 +211,15 @@ fn row(at: usize, view: Option<&View>) {
     }
     let words = match view.map(|view| (kind(view), view)) {
         Some((Kind::Buffer, view)) => match range(view) {
-            Some((start, len)) => [start as u32, (start >> 32) as u32, len.min(u64::from(u32::MAX)) as u32, crate::descriptor::host::slot_word(view)],
+            Some((start, len)) => {
+                crate::um::cpu_pointer(start, len, "raw address in record");
+                [start as u32, (start >> 32) as u32, len.min(u64::from(u32::MAX)) as u32, crate::descriptor::host::slot_word(view)]
+            },
             None => [0; 4],
         },
         Some((Kind::Structure, view)) => {
             let at = crate::descriptor::host::view_address(view).unwrap_or(0);
+            crate::um::cpu_pointer(at, 1, "acceleration structure");
             [at as u32, (at >> 32) as u32, u32::MAX, 0]
         }
         _ => [0; 4],

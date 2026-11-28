@@ -42,7 +42,7 @@ const STAGES: [&str; 8] =
 /// `VICTORY_PIPELINE_BOOK=1`: the pipelines the title creates are kept.
 fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_BOOK").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| super::prepared::enabled() || std::env::var_os("VICTORY_PIPELINE_BOOK").is_some_and(|v| v == "1"))
 }
 
 struct Book {
@@ -145,20 +145,20 @@ fn flush_book(book: &Mutex<Book>) {
     let _writer = WRITER.lock().unwrap_or_else(|e| e.into_inner());
     let (dir, mut new, added) = {
         let mut book = book.lock().unwrap_or_else(|e| e.into_inner());
-        if book.added == 0 {
+        if book.added == 0 && book.new[0].is_empty() {
             return;
         }
         (book.dir.clone(), std::mem::take(&mut book.new), std::mem::take(&mut book.added))
     };
     for (file, bytes) in [SHADERS, PIPELINES].into_iter().zip(&mut new) {
-        if bytes.is_empty() {
+        if bytes.is_empty() && !prepared() {
             continue;
         }
         let written = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(dir.join(file))
-            .and_then(|f| append_bytes(f, bytes));
+            .and_then(|mut f| { append_bytes(&mut f, bytes)?; if prepared() { f.sync_data()?; } Ok(()) });
         if let Err(e) = written {
             let mut book = book.lock().unwrap_or_else(|e| e.into_inner());
             for (mut older, newer) in new.into_iter().zip(&mut book.new) {
@@ -260,11 +260,162 @@ pub fn warm_catalog(dir: &Path) -> (Vec<String>, HashSet<usize>) {
 
 /// What a driver's cached pipelines depend on besides the title's: the
 /// translator with its settings, and the driver.
-pub fn fingerprint() -> String {
+pub fn prepared() -> bool { super::prepared::enabled() }
+
+pub fn artifacts(dir: &Path) -> HashSet<String> { super::prepared::inventory(dir) }
+
+pub fn seed_compute(bytes: &[u8]) -> Option<String> {
+    let size = u32::from_le_bytes(bytes.get(24..28)?.try_into().ok()?) as usize;
+    let bytes = bytes.get(..size)?;
+    let container = victory_shader::Container::parse(bytes).ok()?;
+    let part = container.part(victory_shader::FourCC::DXIL).or_else(|| container.part(victory_shader::FourCC::ACCC))?;
+    if u16::from_le_bytes(part.data.get(2..4)?.try_into().ok()?) != 5 {
+        use victory_shader::HwStage;
+        let recorder = book()?;
+        let hash = *blake3::hash(bytes).as_bytes();
+        let mut book = recorder.book.lock().unwrap_or_else(|e| e.into_inner());
+        if !book.shaders.contains(&hash) && let Some(stage) = victory_shader::native_programs(part.data).ok()?.into_iter().find_map(|p| match p.stage {
+            HwStage::Vs => Some(0), HwStage::Ps => Some(1), HwStage::Cs => Some(5), HwStage::Ms => Some(7), _ => None,
+        }) {
+            book.shaders.insert(hash);
+            book.new[0].push(stage);
+            book.new[0].extend(hash);
+            book.new[0].extend((bytes.len() as u32).to_le_bytes());
+            book.new[0].extend_from_slice(bytes);
+        }
+        return None;
+    }
+    let shaders = vec![super::shader("compute", bytes)];
+    let pending = super::make::Pending::new(shaders.clone(),None);
+    note(pending.key(), &shaders, None);
+    Some(pending.key().to_owned())
+}
+
+pub fn streamed_passes() -> bool { super::variants::enabled() }
+
+pub fn seed_screen(vs: &[u8], ps: &[u8], water: bool) -> Vec<String> {
+    let shaders = vec![super::shader("vertex",vs),super::shader("pixel",ps)];
+    let states = if water { vec![super::variants::water()] } else {
+        [DXGI_FORMAT_R8G8B8A8_UNORM,DXGI_FORMAT_R11G11B10_FLOAT].map(super::variants::output).into()
+    };
+    states.into_iter().map(|g| {
+        let p = super::make::Pending::new(shaders.clone(),Some(Box::new(g)));
+        note(p.key(), &shaders, p.graphics.as_deref());
+        p.key().to_owned()
+    }).collect()
+}
+
+pub fn seed_passes(dir: &Path) -> std::io::Result<()> {
+    if !streamed_passes() { return Ok(()); }
+    let Some(recorder) = book() else { return Err(std::io::Error::other("no local pipeline catalogue")); };
+    let mut book = recorder.book.lock().unwrap_or_else(|e| e.into_inner());
+    let mut count = 0;
+    walk_pipelines(dir, |_, e| {
+        let Some(&stages) = e.get(16) else { return; };
+        let at = 17 + usize::from(stages) * 33;
+        if e.get(at) != Some(&1) { return; }
+        let mesh_pixel = stages == 2 && e[17] == 7 && e[50] == 1;
+        let Some(v) = GraphicsState::get(&e[at+1..]).as_ref().and_then(|g| super::variants::alternate(g, mesh_pixel)) else { return; };
+        let mut h = blake3::Hasher::new();
+        for pair in e[17..at].chunks_exact(33) {
+            let Some(stage) = STAGES.get(usize::from(pair[0])) else { return; };
+            h.update(stage.as_bytes());
+            let hash = blake3::Hash::from_bytes(pair[1..].try_into().unwrap()).to_hex();
+            h.update(&hash.as_bytes()[..16]);
+        }
+        h.update(v.describe().as_bytes());
+        let key: [u8;16] = h.finalize().as_bytes()[..16].try_into().unwrap();
+        if !book.keys.insert(key) { return; }
+        let mut bytes = key.to_vec();
+        bytes.extend_from_slice(&e[16..=at]);
+        v.put(&mut bytes);
+        book.new[1].extend((bytes.len() as u32).to_le_bytes());
+        book.new[1].extend(bytes);
+        book.added += 1;
+        count += 1;
+    });
+    drop(book);
+    if count != 0 { flush(); println!("{count} streamed material passes discovered before starting the game"); }
+    Ok(())
+}
+
+pub fn repair_shaders(dir: &Path) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let build = crate::shader_cache::translation();
+    let data = std::fs::read(dir.join(SHADERS))?;
+    let mut ranges = Vec::new();
+    let mut pos = 0usize;
+    while pos < data.len() {
+        let header = data.get(pos..pos + 37).ok_or_else(|| std::io::Error::other("incomplete shader catalogue header"))?;
+        let n = u32::from_le_bytes(header[33..].try_into().unwrap()) as usize;
+        pos += 37;
+        let bytes = data.get(pos..pos + n).ok_or_else(|| std::io::Error::other("incomplete shader catalogue record"))?;
+        ranges.push(bytes);
+        pos += n;
+    }
+    let next = AtomicUsize::new(0);
+    let repaired = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..super::prepared::jobs().min(ranges.len())).map(|_| scope.spawn(|| -> std::io::Result<()> {
+            while let Some(bytes) = ranges.get(next.fetch_add(1,Ordering::Relaxed)) {
+                if !crate::shader_cache::on_disk(&build,bytes) {
+                    crate::shader_cache::precompile(bytes).map_err(std::io::Error::other)?;
+                    if !crate::shader_cache::on_disk(&build,bytes) { return Err(std::io::Error::other("shader translation not saved")); }
+                    let n = repaired.fetch_add(1,Ordering::Relaxed)+1;
+                    if n == 1 || n.is_multiple_of(500) { println!("{n} shader translations repaired"); }
+                }
+            }
+            Ok(())
+        })).collect();
+        for w in workers { w.join().map_err(|_| std::io::Error::other("shader worker stopped"))??; }
+        Ok(())
+    })
+}
+
+pub fn prepare_start() -> std::io::Result<()> {
+    if prepared() { super::prepared::warm()?; }
+    Ok(())
+}
+
+// Bump when lowering an unchanged graphics recipe or shader binding layout
+// would produce a different D3D12 pipeline descriptor/root signature. A
+// renderer rebuild, display size and logging are not native PSO inputs.
+const DESCRIPTOR_ABI: u32 = 1;
+
+pub fn fingerprint() -> String { fingerprint_for(false) }
+
+pub(super) fn matching_old_fingerprint() -> Option<String> {
+    (DESCRIPTOR_ABI == 1).then(|| fingerprint_for(true))
+}
+
+fn fingerprint_for(old: bool) -> String {
     let mut h = blake3::Hasher::new();
     h.update(&crate::shader_cache::translation());
     if let Some(host) = crate::host::host() {
         h.update(&host.driver().to_le_bytes());
+        if prepared() {
+            h.update(crate::shader_cache::SOURCE.as_bytes());
+            h.update(&host.adapter_id());
+            if let Some(id) = super::library::native_id() { h.update(&id); }
+            if old {
+                // Only to identify an already populated directory made from
+                // these exact inputs by the old executable. Not the live key.
+                h.update(include_bytes!("host.rs"));
+                for name in ["VICTORY_LIMIT_EXITS","VICTORY_GPU_WRITE_PAGES","VICTORY_CAPTURE_RAY_INTERSECTIONS"] {
+                    if let Some(v) = std::env::var_os(name) { h.update(name.as_bytes()); h.update(v.as_encoded_bytes()); }
+                }
+                if let Some(value) = std::env::var_os("VICTORY_ROOT_SRV_DIRECT") { h.update(value.as_encoded_bytes()); }
+            } else {
+                h.update(b"native D3D12 descriptor ABI");
+                h.update(&DESCRIPTOR_ABI.to_le_bytes());
+                h.update(&[
+                    u8::from(std::env::var_os("VICTORY_LIMIT_EXITS").is_none_or(|v| v != "0")),
+                    u8::from(std::env::var_os("VICTORY_GPU_WRITE_PAGES").is_none_or(|v| v != "0")),
+                    u8::from(victory_shader::emit::ray_probe::enabled()),
+                    u8::from(super::host::bounded_root_srvs()),
+                ]);
+            }
+        }
     }
     h.finalize().to_hex()[..16].to_owned()
 }
@@ -272,6 +423,7 @@ pub fn fingerprint() -> String {
 /// The translations of earlier runs are in `dir` (the pipeline library is
 /// not used: what is made here is the driver's to keep).
 pub fn use_translations(dir: PathBuf) {
+    if super::prepared::enabled() { super::library::use_pipeline_cache(dir.with_file_name("pipelines")); }
     crate::shader_cache::use_shader_cache(dir);
 }
 
@@ -301,8 +453,9 @@ pub fn make(dir: &Path, which: &[usize], mut each: impl FnMut(usize, Option<(f64
         let Some(entry) = entries.get(n) else { continue };
         each(*n, None);
         let began = crate::clock::Instant::now();
-        let made = parse(entry, &mut read)
-            .and_then(|(shaders, g)| HostPipeline::new(&shaders, g.as_deref()))
+        let key: String = entry.iter().take(16).map(|b| format!("{b:02x}")).collect();
+        let made = super::prepared::with(&key, || parse(entry, &mut read)
+            .and_then(|(shaders, g)| HostPipeline::new(&shaders, g.as_deref())))
             .is_some();
         each(*n, Some((began.elapsed().as_secs_f64() * 1e3, made)));
     }

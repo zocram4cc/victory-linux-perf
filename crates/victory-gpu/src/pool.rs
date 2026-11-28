@@ -133,19 +133,41 @@ impl Ripe {
 static UNRIPE: AtomicU64 = AtomicU64::new(0);
 
 /// The free ranges of a block: start and length, never two that touch.
-struct Ranges(BTreeMap<u64, u64>);
+struct Ranges(BTreeMap<u64, u64>, Option<(u64, u64)>);
+
+fn fast_lookup() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_FIRST_FIT").is_some_and(|v| v == "1"))
+}
 
 impl Ranges {
     fn new(size: u64) -> Ranges {
-        Ranges(BTreeMap::from([(0, size)]))
+        Ranges(BTreeMap::from([(0, size)]), None)
     }
 
     /// The lowest place for `len` bytes at a multiple of `align`.
     fn take(&mut self, len: u64, align: u64) -> Option<u64> {
-        let (start, size, at) = self.0.iter().find_map(|(&start, &size)| {
+        let find = |(&start, &size): (&u64, &u64)| {
             let at = start.next_multiple_of(align);
             (at + len <= start + size).then_some((start, size, at))
-        })?;
+        };
+        let found = if fast_lookup() {
+            // After a miss, max is an upper bound for this alignment and
+            // every multiple. A take only shrinks holes; give() can grow
+            // exactly one hole. First-fit order and addresses do not change.
+            if self.1.is_some_and(|(a,max)| align.is_multiple_of(a) && len > max) { return None; }
+            let mut max = 0;
+            let hit = self.0.iter().find_map(|entry| {
+                let (&start,&size) = entry;
+                let at = start.next_multiple_of(align);
+                let usable = (start+size).saturating_sub(at);
+                max = max.max(usable);
+                (len <= usable).then_some((start,size,at))
+            });
+            if hit.is_none() { self.1 = Some((align,max)); }
+            hit
+        } else { self.0.iter().find_map(find) };
+        let (start, size, at) = found?;
         self.0.remove(&start);
         if at > start {
             self.0.insert(start, at - start);
@@ -165,6 +187,9 @@ impl Ranges {
         }
         if let Some(size) = self.0.remove(&(start + len)) {
             len += size;
+        }
+        if let Some((align,max)) = &mut self.1 {
+            *max = (*max).max((start + len).saturating_sub(start.next_multiple_of(*align)));
         }
         self.0.insert(start, len);
     }
@@ -229,6 +254,10 @@ impl<B: Clone> Pool<B> {
         ripe: Ripe,
         mut make: impl FnMut() -> Option<B>,
     ) -> Option<(Piece, B, bool)> {
+        self.take_piece(len, align, now, ripe, true, &mut make)
+    }
+
+    fn take_piece(&mut self, len: u64, align: u64, now: u64, ripe: Ripe, grow: bool, mut make: impl FnMut() -> Option<B>) -> Option<(Piece, B, bool)> {
         // With blocks made ahead, what would be an allocation of its own (and
         // new when the card first reads it) lies in one of those too.
         if len == 0 || len > if ripe.ahead > 0 { BLOCK } else { BLOCK / 2 } {
@@ -238,14 +267,14 @@ impl<B: Clone> Pool<B> {
         let mut found = None;
         for (i, block) in self.blocks.iter_mut().enumerate() {
             if let Some(block) = block
-                && ripe.is(block)
+                && ripe.is(block) && (grow || block.made <= ripe.finished)
                 && let Some(start) = block.free.take(len, align)
             {
                 found = Some((i, start));
                 break;
             }
         }
-        if found.is_none() && ripe.ahead > 0 {
+        if grow && found.is_none() && ripe.ahead > 0 {
             // The one that has been there the longest.
             let mut unripe: Vec<(u64, usize)> =
                 self.blocks.iter().enumerate().filter_map(|(i, b)| Some((b.as_ref()?.made, i))).collect();
@@ -254,13 +283,14 @@ impl<B: Clone> Pool<B> {
         }
         let (i, start) = match found {
             Some(found) => found,
+            None if !grow => return None,
             None => {
                 let memory = self.grow(now, &mut make)?;
                 let i = self.add(memory, ripe.started);
                 (i, self.blocks[i].as_mut()?.free.take(len, align)?)
             }
         };
-        if ripe.ahead > 0 {
+        if grow && ripe.ahead > 0 {
             if !ripe.is(self.blocks[i].as_ref()?) {
                 let n = UNRIPE.fetch_add(1, Ordering::Relaxed) + 1;
                 if n.is_power_of_two() {
@@ -401,7 +431,7 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
         if speculative && !crate::residency::allow_staging_growth(false) {
             return None;
         }
-        let (buffer, data) = host.upload_buffer(BLOCK)?;
+        let (buffer, data) = host.texture_staging(BLOCK)?;
         crate::host::name(&buffer, || "staging of textures (a block)".into());
         Some(Upload(buffer, data))
     })?;
@@ -649,9 +679,35 @@ pub(crate) unsafe fn texture(
     desc: *const D3D12_RESOURCE_DESC,
     state: D3D12_RESOURCE_STATES,
 ) -> Option<ID3D12Resource> {
-    if !on() {
-        return None;
+    unsafe { texture_with_growth(device, desc, state, true) }
+}
+
+pub(crate) fn allocation_info(device: &ID3D12Device, desc: D3D12_RESOURCE_DESC) -> D3D12_RESOURCE_ALLOCATION_INFO {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let ask = || unsafe { device.GetResourceAllocationInfo(0, &[desc]) };
+    if !*ENABLED.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_ALLOCATION_INFO").is_some_and(|v| v == "1")) {
+        return ask();
     }
+    type Cache = std::collections::HashMap<[u64; 8], D3D12_RESOURCE_ALLOCATION_INFO>;
+    static CACHE: std::sync::LazyLock<std::sync::RwLock<Cache>> = std::sync::LazyLock::new(Default::default);
+    let key = [
+        device.as_raw() as u64, desc.Alignment, desc.Width,
+        u64::from(desc.Height) | u64::from(desc.DepthOrArraySize) << 32 | u64::from(desc.MipLevels) << 48,
+        u64::from(desc.Dimension.0 as u32) | u64::from(desc.Format.0 as u32) << 32,
+        u64::from(desc.SampleDesc.Count) | u64::from(desc.SampleDesc.Quality) << 32,
+        u64::from(desc.Layout.0 as u32), u64::from(desc.Flags.0 as u32),
+    ];
+    if let Some(info) = CACHE.read().unwrap_or_else(|e| e.into_inner()).get(&key) { return *info; }
+    let info = ask();
+    if info.SizeInBytes != u64::MAX {
+        let mut cache = CACHE.write().unwrap_or_else(|e| e.into_inner());
+        if cache.len() < 8192 { cache.insert(key, info); }
+    }
+    info
+}
+
+pub(crate) unsafe fn texture_with_growth(device: &ID3D12Device, desc: *const D3D12_RESOURCE_DESC, state: D3D12_RESOURCE_STATES, grow: bool) -> Option<ID3D12Resource> {
+    if !on() { return None; }
     // Small textures lie at multiples of 4 KiB where the host allows it
     // (the top mip is 64 KiB at most) and [`small_placement`] says so: 64 KiB
     // each otherwise.
@@ -659,16 +715,16 @@ pub(crate) unsafe fn texture(
     let mut d = unsafe { *desc };
     d.Alignment = if small_placement() { u64::from(D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT) } else { 0 };
     // SAFETY: plain queries.
-    let mut info = unsafe { device.GetResourceAllocationInfo(0, &[d]) };
+    let mut info = allocation_info(device, d);
     if info.SizeInBytes == u64::MAX || info.Alignment != d.Alignment {
         d.Alignment = 0;
-        info = unsafe { device.GetResourceAllocationInfo(0, &[d]) };
+        info = allocation_info(device, d);
     }
     if info.SizeInBytes == u64::MAX {
         return None;
     }
     #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
-    let (piece, heap, again) = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
+    let (piece, heap, again) = lock(&TEXTURES).take_piece(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), grow, || {
         let desc = D3D12_HEAP_DESC {
             SizeInBytes: BLOCK,
             Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },

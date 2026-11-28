@@ -458,21 +458,32 @@ fn library() -> Option<&'static Library> {
         .as_ref()
 }
 
+fn create_native_library(device: &ID3D12Device1, bytes: &[u8]) -> windows::core::Result<ID3D12PipelineLibrary1> {
+    let data = if bytes.is_empty() { std::ptr::null() } else { bytes.as_ptr() };
+    let mut library: Option<ID3D12PipelineLibrary> = None;
+    unsafe {
+        (Interface::vtable(device).CreatePipelineLibrary)(
+        device.as_raw(), data.cast(), bytes.len(), &ID3D12PipelineLibrary::IID, (&raw mut library).cast(),
+        ).ok()?;
+    }
+    library.ok_or_else(windows::core::Error::empty)?.cast()
+}
+
+pub(super) fn native_id() -> Option<Vec<u8>> {
+    let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
+    let library = create_native_library(&device, &[]).ok()?;
+    let size = unsafe { library.GetSerializedSize() };
+    if size == 0 || size > 1 << 20 { return None; }
+    let mut buf = vec![0; size];
+    unsafe { library.Serialize(&mut buf) }.ok()?;
+    Some(buf)
+}
+
 /// The library in `blob`, or an empty one if the host rejects the blob (an
 /// adapter or driver change, damage).
 fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
-    let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
-        let data = if bytes.is_empty() { std::ptr::null() } else { bytes.as_ptr() };
-        let mut library: Option<ID3D12PipelineLibrary> = None;
-        unsafe {
-            (Interface::vtable(device).CreatePipelineLibrary)(
-                device.as_raw(), data.cast(), bytes.len(), &ID3D12PipelineLibrary::IID, (&raw mut library).cast(),
-            ).ok()?;
-        }
-        library.ok_or_else(windows::core::Error::empty)?.cast()
-    };
     if !blob.bytes().is_empty() {
-        match make(blob.bytes()) {
+        match create_native_library(device, blob.bytes()) {
             Ok(library) => {
                 let bytes = blob.bytes().len();
                 BLOB.store(bytes as u64, Ordering::Relaxed);
@@ -496,7 +507,7 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     // The rejected bytes are let go (a mapped file is unmapped) before the
     // empty library is made: nothing reads them any more.
     drop(blob);
-    let library = make(&[]).inspect_err(|e| tracing::warn!(error = %e, "empty pipeline library rejected")).ok()?;
+    let library = create_native_library(device, &[]).inspect_err(|e| tracing::warn!(error = %e, "empty pipeline library rejected")).ok()?;
     Some(Library {
         library,
         _blob: Blob::None,
@@ -520,11 +531,12 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
 pub(crate) fn pipeline(
     name: &str,
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
-    create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
+    create: impl Fn(D3D12_CACHED_PIPELINE_STATE) -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
+    if super::prepared::active() { return super::prepared::pipeline(name, create); }
     let create = || {
         let _creating = crate::timeline::span("pipeline: create a PSO in the driver");
-        create()
+        create(D3D12_CACHED_PIPELINE_STATE::default())
     };
     let wide = HSTRING::from(name);
     let Some(library) = library() else {

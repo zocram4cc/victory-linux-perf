@@ -16,6 +16,9 @@
 //! (every mip and array slice), depth and stencil planes are not.
 
 pub(crate) mod ahead;
+pub(crate) mod action_memory;
+mod card;
+pub(crate) mod stamps;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -47,6 +50,10 @@ pub(crate) struct Staging {
     #[cfg(feature = "diagnostics")]
     size: u64,
     data: *mut u8,
+    from_recheck: std::sync::atomic::AtomicBool,
+    card_plan: std::sync::OnceLock<Option<Arc<card::Plan>>>,
+    card_hot: std::sync::atomic::AtomicBool,
+    card_missed: std::sync::atomic::AtomicBool,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     layout: victory_formats::texture::Layout,
@@ -101,6 +108,9 @@ pub(crate) struct Staging {
 /// (memory not watched), or the write-watch asking it was detiled after.
 #[derive(Default)]
 struct Last {
+    card: Option<card::Ready>,
+    card_version: Option<u64>,
+    card_checked: u64,
     hash: Option<Digest>,
     asked: u64,
     /// The frame a partly mapped texture was last read in.
@@ -330,6 +340,8 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     if !new_source && before.is_none() {
         return true;
     }
+    #[cfg(feature = "diagnostics")]
+    let _port = crate::host::rtstamps::port(|| &list.list, "port: alias copy");
     card_writes(list, placed, to, None);
     crate::list::ensure_state(list, placed, COPY_DEST);
     let part = |texture: &ID3D12Resource, index: usize| D3D12_TEXTURE_COPY_LOCATION {
@@ -423,6 +435,53 @@ fn restore(list: &HostList, source: This, before: Option<u32>) {
 fn no_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
+}
+
+fn cost_profile() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_COSTS").is_some_and(|v| v == "1"))
+}
+
+thread_local! {
+    static COST: std::cell::Cell<Option<[u64; 4]>> = const { std::cell::Cell::new(None) };
+    static READ_PROFILE: std::cell::Cell<[u64; 6]> = const { std::cell::Cell::new([0; 6]) };
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) struct ReadProfile(u64, usize, usize);
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn read_profile(src: usize, len: usize) -> Option<ReadProfile> {
+    if len < 64 << 10 || !cost_profile() || !COST.with(|c| c.get().is_some()) { return None; }
+    let pages = crate::um::card_pages(src, len);
+    let class = if pages == 0 { 0 } else if crate::um::dedicated_vram(src, len) { 2 } else { 1 };
+    let (u, k) = crate::copystat::thread_times();
+    Some(ReadProfile(u + k, class, len))
+}
+
+#[cfg(feature = "diagnostics")]
+impl Drop for ReadProfile {
+    fn drop(&mut self) {
+        let (u, k) = crate::copystat::thread_times();
+        READ_PROFILE.with(|c| {
+            let mut v = c.get(); v[self.1] += self.2 as u64; v[self.1 + 3] += (u + k).saturating_sub(self.0); c.set(v);
+        });
+    }
+}
+
+pub(crate) struct Cost(usize, Option<crate::clock::Instant>);
+
+pub(crate) fn cost(n: usize) -> Cost {
+    Cost(n, (cost_profile() && COST.with(|v| v.get().is_some())).then(crate::clock::Instant::now))
+}
+
+impl Drop for Cost {
+    fn drop(&mut self) {
+        if let Some(at) = self.1.as_ref() {
+            let us = at.elapsed().as_micros() as u64;
+            COST.with(|v| v.set(v.get().map(|mut c| { c[self.0] += us; c })));
+        }
+    }
 }
 
 /// Whether a refresh that does not wait ([`no_wait`]) and finds a page
@@ -731,6 +790,7 @@ fn once() -> bool {
 /// cryptographic one, which took 0.27 ms a megabyte, four times the detiling
 /// it was to spare; nobody makes up textures to collide.)
 pub(crate) fn digest(bytes: &[u8]) -> Digest {
+    let _cost = cost(2);
     const K: [u64; 8] = [
         0xa076_1d64_78bd_642f,
         0xe703_7ed1_a0b4_28db,
@@ -860,6 +920,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         copy,
         resource: resource as usize,
         on_demand,
+        card: None,
     });
 }
 
@@ -881,6 +942,7 @@ fn claim_upload(
 /// before deciding whether `HostList::prelude` must record `CopyTextureRegion`.
 #[derive(Clone)]
 pub(crate) struct PreludeUpload {
+    card: Option<card::Ready>,
     pub(crate) staging: Arc<Staging>,
     pub(crate) copy: Arc<crate::resource::HostTexture>,
     resource: usize,
@@ -896,7 +958,7 @@ impl PreludeUpload {
     /// Called on the submitting thread after `self.staging.refresh()` has
     /// completed for this submission. Returns `Some(first_upload)` when the
     /// list's prelude must record `CopyTextureRegion` into `self.copy.texture`.
-    pub(crate) fn finish_refresh(&self) -> Option<(bool, u32)> {
+    pub(crate) fn finish_refresh(&mut self) -> Option<(bool, u32)> {
         use std::sync::atomic::Ordering::Relaxed;
         let Some(first_upload) = claim_upload(&self.staging.uploaded, &self.staging.dirty) else {
             #[cfg(feature = "diagnostics")]
@@ -905,6 +967,7 @@ impl PreludeUpload {
         };
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexUploads, 1);
+        if card::on() { self.card = self.staging.last.lock().unwrap_or_else(|e| e.into_inner()).card.clone(); }
         // A host copy that took the place of one with fewer levels: the slots
         // that show that one are made again once this upload has run.
         if self.staging.first == self.staging.level0 && self.copy.grown.swap(false, Relaxed) {
@@ -939,6 +1002,7 @@ impl PreludeUpload {
     /// `D3D12_RESOURCE_STATE_COPY_DEST`.
     pub(crate) fn record(&self, host_list: &HostList, cmd_list: &ID3D12GraphicsCommandList, levels: u32) {
         let texture = &self.copy.texture;
+        if self.staging.from_recheck.load(std::sync::atomic::Ordering::Relaxed) { action_memory::add(10,1); }
         // A host copy made whole from the store (`crate::texstore`): its larger
         // levels, once, before the ones from title memory.
         let prefill = self.copy.prefill.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -949,6 +1013,9 @@ impl PreludeUpload {
         }
         // The staging buffer lives as long as `self.staging`, which the list's
         // deferred steps hold until the list is reset after GPU completion.
+        let (buffer, base) = if let Some(card) = &self.card {
+            (card.record(cmd_list), 0)
+        } else { (&self.staging.buffer, self.staging.base) };
         for (i, footprint) in self.staging.footprints.iter().enumerate() {
             if i < 32 && levels & (1 << i) == 0 { continue; }
             let to = D3D12_TEXTURE_COPY_LOCATION {
@@ -961,18 +1028,17 @@ impl PreludeUpload {
             };
             let from = D3D12_TEXTURE_COPY_LOCATION {
                 // SAFETY: as above.
-                pResource: unsafe { std::mem::transmute_copy(&self.staging.buffer) },
+                pResource: unsafe { std::mem::transmute_copy(buffer) },
                 Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
                 Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-                        Offset: self.staging.base + footprint.Offset,
-                        ..*footprint
-                    },
+                    PlacedFootprint: if let Some(card) = &self.card { card.footprint(i,*footprint) }
+                        else { D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: base + footprint.Offset, ..*footprint } },
                 },
             };
             // SAFETY: an open prelude list; both locations name live resources.
             unsafe { cmd_list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
         }
+        if let Some(card) = &self.card { card.done(cmd_list); }
     }
 }
 
@@ -1005,7 +1071,7 @@ fn prefill_levels(
     if total as usize > bytes.len() {
         return false;
     }
-    let Some((buffer, data)) = host.upload_buffer(total) else {
+    let Some((buffer, data)) = host.texture_staging(total) else {
         return false;
     };
     // SAFETY: the mapping holds `total` bytes.
@@ -1224,7 +1290,7 @@ impl Staging {
         }
         let tail = (self.layout.first_tail_mip as usize).min(mips.len());
         let there = |from: u64, to: u64| {
-            to > from && to <= limit && committed(self.memory.wrapping_add(from as usize), (to - from) as usize)
+            to > from && to <= limit && gpu_mapped(self.memory.wrapping_add(from as usize), (to - from) as usize)
         };
         let mut held = 0u32;
         for (level, m) in mips.iter().enumerate().take(tail) {
@@ -1351,29 +1417,45 @@ impl Staging {
 
     /// Detiles the texture memory into the staging buffer if it changed
     /// since the last time (and is mapped at all).
-    pub(crate) fn refresh(&self) {
+    pub(crate) fn refresh(&self) { self.refresh_for_queue(true); }
+
+    fn refresh_for_queue(&self, direct: bool) {
         use std::sync::atomic::Ordering::Relaxed;
         let started = crate::clock::Instant::now();
         let _texture = crate::timeline::span("a texture's refresh");
-        let read = self.refresh_now();
+        let read = self.refresh_now(direct);
         let preparing = &crate::host::PREPARING;
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
     }
 
     /// Returns the bytes of title memory read.
-    fn refresh_now(&self) -> usize {
+    fn refresh_now(&self, direct: bool) -> usize {
         let whole = crate::clock::Instant::now();
-        let read = self.refresh_timed();
-        REFRESH_WAITS[3].fetch_add(whole.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        if cost_profile() { COST.with(|v| v.set(Some([0; 4]))); READ_PROFILE.set([0; 6]); }
+        let read = self.refresh_timed(direct);
+        let us = whole.elapsed().as_micros() as u64;
+        if self.from_recheck.load(std::sync::atomic::Ordering::Relaxed) { action_memory::add(8,us); action_memory::add(9,read as u64); }
+        if card::on() && us >= 2000 { self.card_hot.store(true, std::sync::atomic::Ordering::Relaxed); }
+        REFRESH_WAITS[3].fetch_add(us, std::sync::atomic::Ordering::Relaxed);
+        if cost_profile() {
+            let parts = COST.with(|v| v.take().unwrap_or_default());
+            if us >= 4_000 {
+                let reads = READ_PROFILE.get();
+                tracing::info!(us, ?parts, ?reads, read, addr = ?self.memory, span = self.read, format = ?self.layout.desc,
+                    card = crate::um::dedicated_vram(self.memory as usize, self.read), "slow texture refresh");
+            }
+        }
         read
     }
 
-    fn refresh_timed(&self) -> usize {
+    fn refresh_timed(&self, direct: bool) -> usize {
         let size = self.read;
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
+        if direct && card::prepare(self,last) { return 0; }
+        if last.card.take().is_some() { *last = Last::default(); }
         let alone = self.once.load(std::sync::atomic::Ordering::Relaxed);
         if alone && last.hash.is_some() {
             return 0;
@@ -1512,7 +1594,7 @@ impl Staging {
             last.partial = None;
             last.checked_vram = Some(crate::frame::current());
         }
-        if vram || through_copy() {
+        if vram || through_copy() || (card::on() && crate::um::touches_card(start, size)) {
             return with_title(self.memory, size, |tiled| {
                 let hash = digest(tiled);
                 #[cfg(feature = "diagnostics")]
@@ -1533,6 +1615,7 @@ impl Staging {
         // SAFETY: committed memory of the texture's layout size, and it
         // stays committed while `_mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
+        if crate::um::measure_reads() { crate::um::count_read(std::panic::Location::caller(), start, size); }
         let hash = digest(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
@@ -1679,6 +1762,7 @@ impl Staging {
     }
 
     fn detile_part(&self, tiled: &[u8], i: usize, footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT, rows: u32, held: u32) -> bool {
+        let _cost = cost(3);
         let (mip, slice) = self.part(i);
         let f = footprint.Footprint;
         let pitch = f.RowPitch as usize;
@@ -1718,6 +1802,11 @@ pub(crate) fn unstage(resource: This) {
 }
 
 /// Where a staged title texture's memory is: address and bytes.
+pub(crate) fn track_resend(resource: This) {
+    let map = STAGING.lock().unwrap_or_else(|e|e.into_inner());
+    if let Some(s)=map.as_ref().and_then(|m|m.get(&(resource as usize))) { s.from_recheck.store(true,std::sync::atomic::Ordering::Relaxed); }
+}
+
 pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64)> {
     let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let (at, len) = map.as_ref()?.get(&(resource as usize))?.memory();
@@ -1732,13 +1821,41 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
     fingerprint_blank(at, len).0
 }
 
+pub(crate) fn snapshot_checks() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CHECK_SNAPSHOT").is_some_and(|v| v == "1"))
+}
+
+fn snapshot_print(bytes: &[u8], full: Option<Digest>) -> (u64, bool) {
+    const WINDOW: usize = 16 << 10;
+    let len = bytes.len();
+    let (print, blank) = if len <= 3 * WINDOW {
+        (full.unwrap_or_else(|| digest(bytes)).0, all_zero(bytes))
+    } else {
+        let mut print = 0u128;
+        let mut blank = true;
+        for offset in [0, (len / 2) & !0xfff, len - WINDOW] {
+            let window = &bytes[offset..offset + WINDOW];
+            print = print.rotate_left(37) ^ digest(window).0;
+            blank &= all_zero(window);
+        }
+        (print, blank)
+    };
+    ((print as u64 ^ (print >> 64) as u64) | 1, blank)
+}
+
 /// [`fingerprint`], and whether every byte it read was zero: memory the
 /// title has mapped but not filled yet (a texture's pages are committed,
 /// then streamed or decompressed into later). Such a texture is shown
 /// black for as long as its host copy keeps those zeros.
 pub(crate) fn fingerprint_blank(at: u64, len: u64) -> (u64, bool) {
-    let _ = crate::inplace::texture_stamp(at as usize, at.saturating_add(len) as usize);
-    crate::inplace::follow_texture(at as usize, at.saturating_add(len) as usize, false);
+    if let Some(result) = stamps::query(at,len) { return result; }
+    if snapshot_checks() {
+        crate::inplace::observe_texture(at as usize, at.saturating_add(len) as usize);
+    } else {
+        let _ = crate::inplace::texture_stamp(at as usize, at.saturating_add(len) as usize);
+        crate::inplace::follow_texture(at as usize, at.saturating_add(len) as usize, false);
+    }
     const WINDOW: usize = 16 << 10;
     thread_local! {
         static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -1818,32 +1935,50 @@ fn staged_from(resource: This) -> u32 {
 /// byte, and a texture uploaded again costs a staging buffer, a detiling and
 /// a copy more than this look.) `VICTORY_TEXTURE_SAME=0`: not asked.
 pub(crate) fn unchanged(resource: This, first: u32) -> bool {
+    compare_source(resource, first, false).0
+}
+
+pub(crate) type SourcePrint = ((u64, u64), (u64, bool));
+
+pub(crate) fn compare_source(resource: This, first: u32, check: bool) -> (bool, Option<SourcePrint>) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SAME").is_none_or(|v| v != "0")) {
-        return false;
+        return (false, None);
     }
     let Some(copy) = crate::resource::made_copy(resource) else {
-        return false;
+        return (false, None);
     };
     let Some((from, held)) = *copy.holds.lock().unwrap_or_else(|e| e.into_inner()) else {
-        return false;
+        return (false, None);
     };
     let Some((memory, desc)) = crate::resource::texture_memory(resource) else {
-        return false;
+        return (false, None);
     };
     let Some(layout) = crate::resource::texture_layout(&desc) else {
-        return false;
+        return (false, None);
     };
     let layout = &layout.planes[0].layout;
     if from > crate::resource::read_from(layout, first).max(copy.base) {
-        return false;
+        return (false, None);
     }
     let size = layout.bytes_from(from) as usize;
+    if card::on() && crate::um::touches_card(memory as usize,size) { return (false, None); }
+    let check_len = if check && !crate::um::touches_card(memory as usize, size) {
+        let bytes = layout.bytes_from(crate::resource::read_from(layout, first)) as usize;
+        (bytes <= size).then_some(bytes)
+    } else { None };
+    if let Some(n) = check_len {
+        crate::inplace::observe_texture(memory as usize, (memory as usize).saturating_add(n));
+    }
     with_read(size, |read| {
-        if crate::host::read_there(memory, read) == 0 {
-            return false;
-        }
-        digest(read) == held
+        let got = crate::host::read_there(memory, read);
+        if got == 0 { return (false, None); }
+        let hash = digest(read);
+        if hash != held { return (false, None); }
+        let print = check_len.filter(|_| got == size).map(|n| {
+            ((memory as u64, n as u64), snapshot_print(&read[..n], (n == size).then_some(hash)))
+        });
+        (true, print)
     })
 }
 
@@ -1869,12 +2004,20 @@ pub(crate) fn staged(resource: This, ask: bool) -> Option<(u64, bool)> {
         let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
         map.as_ref()?.get(&(resource as usize))?.clone()
     };
-    Some((s.read as u64, !ask || committed(s.memory, s.read)))
+    Some((s.read as u64, !ask || gpu_mapped(s.memory, s.read)))
 }
 
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
 /// unmapped until their pages arrive).
+/// For consumers asking if GPU backing exists, not for validation of a CPU load.
+/// A physical VRAM alias can be absent from the CPU working set while resident.
+pub(crate) fn gpu_mapped(at: *const u8, len: usize) -> bool {
+    (card::on() && crate::um::resident(at as usize, len)) || committed(at, len)
+}
+
+#[track_caller]
 pub(crate) fn committed(at: *const u8, len: usize) -> bool {
+    let _cost = cost(0);
     if by_query() {
         return committed_by_query(at, len);
     }
@@ -1907,6 +2050,7 @@ fn by_query() -> bool {
 /// trimmed), and a one-byte read through the kernel says.
 /// A page that is committed and may not be read counts as not there, which
 /// is what the callers ask for: they read or write the memory next.
+#[track_caller]
 fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
     use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -1976,6 +2120,7 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     }
     let start = at as usize;
     let end = start.saturating_add(len);
+    if card::on() && crate::um::resident(start,len) { return len as u64; }
     // Streamed textures lie in views of physical pages, of which the runtime
     // knows which are there: one look, where the host was asked for every
     // 64 KiB of the texture (and once more for each that is not there).
@@ -2101,7 +2246,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
                 crate::residency::note_staging_deferred();
                 return None;
             }
-            let (buffer, data) = host.upload_buffer(total)?;
+            let (buffer, data) = host.texture_staging(total)?;
             crate::host::name(&buffer, || {
                 format!(
                     "staging of {resource:?} {}x{}x{} f{}",
@@ -2117,6 +2262,10 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     let s = Arc::new(Staging {
         buffer,
         base,
+        from_recheck: Default::default(),
+        card_plan: Default::default(),
+        card_hot: Default::default(),
+        card_missed: Default::default(),
         _piece: piece,
         #[cfg(feature = "diagnostics")]
         size: total,

@@ -1252,8 +1252,9 @@ mod host {
     /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
     #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, Duration, u8)>)> = LazyLock::new(|| {
-            let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
+        type Keys = Vec<(Duration, Duration, u8)>;
+        fn parse(name: &str) -> Keys {
+            let list = std::env::var(name).unwrap_or_default();
             let keys = list.split(',').filter_map(|entry| {
                 let (at, key) = entry.split_once(':')?;
                 let vk = match key.trim() {
@@ -1277,14 +1278,14 @@ mod host {
                 };
                 Some((from, to, vk))
             });
-            (Instant::now(), keys.collect())
-        });
-        let (start, keys) = &*SCRIPT;
-        let now = start.elapsed();
-        keys.iter()
-            .filter(|&&(from, to, _)| (from..to).contains(&now))
-            .map(|&(_, _, vk)| vk)
-            .collect()
+            keys.collect()
+        }
+        static SCRIPT: LazyLock<(Instant, Keys, Keys)> = LazyLock::new(|| (Instant::now(), parse("VICTORY_KEYS"), parse("VICTORY_KEYS_WORLD")));
+        let (start, boot, world) = &*SCRIPT;
+        let (now, keys) = if !world.is_empty() && let Some(t) = victory_gpu::frame::scripted_world() {
+            (t, world)
+        } else { (start.elapsed(), boot) };
+        keys.iter().filter(|&&(from, to, _)| (from..to).contains(&now)).map(|&(_, _, vk)| vk).collect()
     }
 
     /// The foreground window is one of ours (the title's or our fallback).

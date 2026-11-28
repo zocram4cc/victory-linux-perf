@@ -382,6 +382,7 @@ pub(crate) struct HostPipeline {
     pub(crate) compute: bool,
     /// A mesh pipeline (graphics without vertex input).
     pub(crate) mesh: bool,
+    pub(crate) depth_writes: bool,
     pub(crate) pso: ID3D12PipelineState,
     pub(crate) root: ID3D12RootSignature,
     /// Vertex, then pixel stage, or the compute stage.
@@ -627,7 +628,10 @@ impl HostPipeline {
                 // SAFETY: the description points at live data.
                 |library, name| unsafe { library.LoadComputePipeline(name, &desc) },
                 // SAFETY: as above.
-                || unsafe { host.device.CreateComputePipelineState(&desc) },
+                |cache| unsafe {
+                    let local = D3D12_COMPUTE_PIPELINE_STATE_DESC { CachedPSO: cache, ..std::ptr::read(&desc) };
+                    host.device.CreateComputePipelineState(&local)
+                },
             );
             let pso = match made {
                 Ok(pso) => pso,
@@ -641,6 +645,7 @@ impl HostPipeline {
             crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: true,
+                depth_writes: false,
                 mesh: false,
                 pso,
                 root,
@@ -670,6 +675,12 @@ impl HostPipeline {
         } else {
             false
         };
+        let d = &g.depth;
+        let writes_stencil = |op: &D3D12_DEPTH_STENCILOP_DESC| {
+            [op.StencilFailOp, op.StencilDepthFailOp, op.StencilPassOp].iter().any(|&v| v != D3D12_STENCIL_OP_KEEP)
+        };
+        let depth_writes = d.DepthEnable.as_bool() && d.DepthWriteMask != D3D12_DEPTH_WRITE_MASK_ZERO
+            || d.StencilEnable.as_bool() && d.StencilWriteMask != 0 && (writes_stencil(&d.FrontFace) || writes_stencil(&d.BackFace));
         let state = g.describe();
         if mesh.is_some() {
             // "triangles": the stream names its topology since it did not
@@ -694,6 +705,7 @@ impl HostPipeline {
             crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: false,
+                depth_writes,
                 mesh: true,
                 pso,
                 root,
@@ -714,7 +726,7 @@ impl HostPipeline {
         if g.topology.0 == RECTANGLES {
             let ps = stages.get(1).and_then(|(s, _)| s.translated());
             let vs = &stages[0].0.translated()?.host.dxil;
-            match victory_shader::emit::rect_list_gs(vs, ps.map(|t| &t.host.dxil[..])) {
+            match super::prepared::rectangle(vs, ps.map(|t| &t.host.dxil[..])) {
                 Ok(gs) => rect_gs = Some(gs),
                 Err(e) => tracing::warn!(error = %e, ?shaders, "no rectangle geometry stage"),
             }
@@ -776,7 +788,10 @@ impl HostPipeline {
                 // SAFETY: the description points at live data.
                 |library, name| unsafe { library.LoadGraphicsPipeline(name, desc) },
                 // SAFETY: as above.
-                || unsafe { host.device.CreateGraphicsPipelineState(desc) },
+                |cache| unsafe {
+                    let local = D3D12_GRAPHICS_PIPELINE_STATE_DESC { CachedPSO: cache, ..std::ptr::read(desc) };
+                    host.device.CreateGraphicsPipelineState(&local)
+                },
             )
         };
         let mut made = make(&desc, &name(rect_gs.as_ref()));
@@ -810,6 +825,7 @@ impl HostPipeline {
         );
         Some(HostPipeline {
             compute: false,
+            depth_writes,
             mesh: false,
             pso,
             root,
@@ -856,21 +872,27 @@ struct Sub<T>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE, T);
 
 fn stream_pipeline<S>(
     device: &ID3D12Device,
-    stream: &mut S,
+    stream: S,
     name: &str,
 ) -> windows::core::Result<ID3D12PipelineState> {
     use windows::core::Interface;
-    let desc = D3D12_PIPELINE_STATE_STREAM_DESC {
-        SizeInBytes: size_of::<S>(),
-        pPipelineStateSubobjectStream: std::ptr::from_mut(stream).cast(),
-    };
+    #[repr(C)]
+    struct Native<S> { stream: S, cache: Sub<D3D12_CACHED_PIPELINE_STATE> }
+    let mut native = Native { stream, cache: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO, Default::default()) };
+    let base = std::ptr::addr_of_mut!(native).cast();
+    let desc = D3D12_PIPELINE_STATE_STREAM_DESC { SizeInBytes: size_of::<S>(), pPipelineStateSubobjectStream: base };
+    let native = std::ptr::addr_of_mut!(native);
     let device = device.cast::<ID3D12Device2>()?;
     super::library::pipeline(
         name,
         // SAFETY: the stream holds whole subobjects pointing at live data.
         |library, name| unsafe { library.LoadPipeline(name, &desc) },
         // SAFETY: as above.
-        || unsafe { device.CreatePipelineState(&desc) },
+        |cache| unsafe {
+            (*native).cache.1 = cache;
+            let len = if cache.CachedBlobSizeInBytes == 0 { size_of::<S>() } else { size_of::<Native<S>>() };
+            device.CreatePipelineState(&D3D12_PIPELINE_STATE_STREAM_DESC { SizeInBytes: len, pPipelineStateSubobjectStream: base })
+        },
     )
 }
 
@@ -926,14 +948,14 @@ fn graphics_depth_bounds_pipeline(
         samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, d.SampleDesc),
     };
     if d.GS.pShaderBytecode.is_null() {
-        let mut stream = base;
-        stream_pipeline(device, &mut stream, name)
+        let stream = base;
+        stream_pipeline(device, stream, name)
     } else {
-        let mut stream = StreamGs {
+        let stream = StreamGs {
             base,
             gs: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS, d.GS),
         };
-        stream_pipeline(device, &mut stream, name)
+        stream_pipeline(device, stream, name)
     }
 }
 
@@ -973,7 +995,7 @@ fn mesh_pipeline(
         topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
     }
     let build = |depth: Sub<_>| {
-        let mut stream = Stream {
+        let stream = Stream {
             root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
@@ -989,10 +1011,10 @@ fn mesh_pipeline(
                 D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
             ),
         };
-        stream_pipeline(device, &mut stream, name)
+        stream_pipeline(device, stream, name)
     };
     if depth_bounds {
-        let mut stream = Stream {
+        let stream = Stream {
             root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
@@ -1008,7 +1030,7 @@ fn mesh_pipeline(
                 D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
             ),
         };
-        stream_pipeline(device, &mut stream, name)
+        stream_pipeline(device, stream, name)
     } else {
         build(Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth))
     }

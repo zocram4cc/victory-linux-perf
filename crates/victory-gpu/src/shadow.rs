@@ -89,6 +89,8 @@ pub(crate) struct Shadow {
     /// With [`cards`], for a big title buffer: `buffer` is in the card's
     /// own memory, and this is the rest of the copy.
     card: Option<Card>,
+    // Separate card copy the UMA backing already replaced (not physical bytes).
+    saved_card: u64,
     /// A window of title memory outside buffers, not a title buffer's copy.
     window: bool,
     /// Of a copy with two sides: only the dwords the title changed go up,
@@ -302,6 +304,15 @@ fn card_room_kept_on() -> bool {
 /// turned down for want of room, since the start, and their bytes: their
 /// copies stay in the PC's memory for as long as the title keeps the
 /// buffers, so no room is kept for them any more.
+static SATISFIED: AtomicU64 = AtomicU64::new(0);
+
+fn account_uma() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UMA_WORKING_SET").is_some_and(|v| v == "1"))
+}
+
+pub(crate) fn satisfied() -> u64 { SATISFIED.load(Ordering::Relaxed) }
+
 static CARD_REFUSED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// The bytes of the card's memory the texture queue leaves free for card
@@ -317,7 +328,7 @@ pub(crate) fn card_room_kept() -> u64 {
     // no texture was made any more with 5 GB of the card free (session
     // play-1125-0127: 1,453 passes refused, the ground and people black).
     const SEEN: u64 = 1 << 30;
-    card_limits().1.min(SEEN).saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
+    card_limits().1.min(SEEN).saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed)).saturating_sub(if account_uma() { satisfied() } else { 0 })
 }
 
 /// The copies in the card's memory.
@@ -2634,6 +2645,7 @@ static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::Ato
 impl Drop for Shadow {
     fn drop(&mut self) {
         if self.place.is_some() {
+            if self.saved_card != 0 { SATISFIED.fetch_sub(self.saved_card,Ordering::Relaxed); }
             // Never counted with the copies (`Shadow::placed`).
             crate::inplace::gone(self.window, self.len);
             return;
@@ -3230,6 +3242,7 @@ impl Shadow {
                 NEXT.fetch_add(1, Ordering::Relaxed)
             },
             card: None,
+            saved_card: 0,
             window: false,
             changes_only: Default::default(),
             mapped: false,
@@ -5273,7 +5286,12 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // Renderer port 1 (`crate::port`, `VICTORY_PORT_CONSTANTS=1`): the
         // title's 32-bit graphics heap in place, big or not.
         if let Some(placed) = crate::um::place_for(key.0, len, false) {
-            entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
+            let mut direct = Shadow::placed(placed, key.0, len, false);
+            if (account_uma() || crate::texture::action_memory::room_on()) && cards() && (card_limits().0..1 << 30).contains(&size) {
+                direct.saved_card = size;
+                SATISFIED.fetch_add(size,Ordering::Relaxed);
+            }
+            entry.shadow = Some(Arc::new(direct));
             return entry.shadow.clone();
         }
         if let Some(placed) = crate::port::place_for(key.0, len, false) {

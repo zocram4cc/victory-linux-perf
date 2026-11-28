@@ -71,7 +71,7 @@ static STACK: AtomicPtr<[usize; DEPTH]> = AtomicPtr::new(std::ptr::null_mut());
 static NEXT_STACK: AtomicUsize = AtomicUsize::new(0);
 
 /// [`ticks`] per second.
-pub(super) fn frequency() -> u64 {
+pub(crate) fn frequency() -> u64 {
     static TICKS: OnceLock<u64> = OnceLock::new();
     *TICKS.get_or_init(|| {
         let mut ticks = 0;

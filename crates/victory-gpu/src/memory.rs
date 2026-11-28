@@ -71,6 +71,7 @@ use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "diagnostics")]
 pub(crate) mod ray_probe;
+pub(crate) mod card;
 
 use victory_shader::emit::{MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY};
 use windows::Win32::Graphics::Direct3D12::*;
@@ -134,6 +135,7 @@ pub(crate) enum Use {
 
 /// A page of title memory in an arena.
 struct Held {
+    card: Option<usize>,
     /// Where in the arena's memory, and the arena's place in `copies`.
     at: usize,
     copy: usize,
@@ -163,6 +165,7 @@ struct Memory {
     faults: (ID3D12Resource, *mut u32, u64),
     /// Copy `n` is `copies[n - 1]`.
     copies: Vec<Arc<Shadow>>,
+    card_pages: Vec<(u64,ID3D12Resource)>,
     /// Places of title buffers' copies among `copies`.
     numbers: HashMap<usize, usize>,
     /// Arenas: place in `copies`, address.
@@ -187,7 +190,7 @@ struct Memory {
     faulted: usize,
     /// Per host view heap (by address): the first slot of its run, and how
     /// many copies have their view there.
-    heaps: HashMap<usize, (u32, u32)>,
+    heaps: HashMap<usize, (u32, u32, usize)>,
     /// The frame the faults were last read in.
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
@@ -257,6 +260,7 @@ impl Memory {
             directory: (entries as *mut u32, directory),
             faults: (faults, data.cast::<u32>(), gpu),
             copies: Vec::new(),
+            card_pages: Vec::new(),
             numbers: HashMap::new(),
             arenas: Vec::new(),
             pages: HashMap::new(),
@@ -321,7 +325,7 @@ impl Memory {
         if let Some(&n) = self.numbers.get(&key) {
             return Some(n);
         }
-        if self.copies.len() >= COPIES as usize {
+        if self.copies.len() >= COPIES as usize - self.card_pages.len() {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(COPIES, "title memory by address: no number left for another copy; its pages read zeros"));
             return None;
@@ -437,9 +441,19 @@ impl Memory {
 
     /// `page` is held at `at` in the arena that is `copy`.
     fn hold(&mut self, page: u64, at: usize, copy: usize) {
-        self.pages.insert(page, Held { at, copy, taken: 0, looked: u64::MAX, born: self.frame, owners: 0, theirs: false });
+        let card = if card::on() && crate::um::resident((page*PAGE) as usize,PAGE as usize) && crate::um::covers(page*PAGE,PAGE) {
+            self.card_pages.iter().position(|(v,_)|*v==page).or_else(||{
+                if self.card_pages.len()>=card::LIMIT || self.card_pages.len()+self.copies.len()>=COPIES as usize {return None;}
+                let buffer=card::page()?;
+                let i=self.card_pages.len();
+                self.card_pages.push((page,buffer));
+                Some(i)
+            })
+        } else { None };
+        self.pages.insert(page, Held { at, copy, card, taken: 0, looked: u64::MAX, born: self.frame, owners: 0, theirs: false });
         self.order.push(page);
-        fill(self.entry(page), copy, at as u64 - self.copies[copy].span().0);
+        if let Some(i)=card { fill(self.entry(page), COPIES as usize-1-i,0); }
+        else { fill(self.entry(page), copy, at as u64 - self.copies[copy].span().0); }
     }
 
     /// The packed structure at `address` is gone: the pages it alone had are
@@ -560,6 +574,10 @@ impl Memory {
                 continue;
             }
             let never = std::mem::replace(&mut held.taken, now.max(1)) == 0;
+            if let Some(i)=held.card {
+                card::add(&self.card_pages[i].1,page*PAGE,0,PAGE as usize,never);
+                continue;
+            }
             let shadow = &self.copies[held.copy];
             let base = held.at - shadow.span().0 as usize;
             let mut title = [0u8; PIECE];
@@ -668,6 +686,7 @@ impl Memory {
     /// or not.
     fn take(&mut self, page: u64, from: usize, to: usize, whole: bool) {
         let Some(held) = self.pages.get(&page) else { return };
+        if let Some(i)=held.card { card::add(&self.card_pages[i].1,page*PAGE,from,to,whole); return; }
         let shadow = &self.copies[held.copy];
         let base = held.at - shadow.span().0 as usize;
         let mut title = [0u8; PIECE];
@@ -710,6 +729,11 @@ impl Memory {
         let mut made = 0;
         let all = faults_all();
         for &page in &pages {
+            let addr = page * PAGE;
+            if crate::um::cpu_ask(addr, PAGE, "shader page-directory fault") {
+                let committed = crate::texture::committed(addr as *const u8, PAGE as usize);
+                crate::um::cpu_ask(addr, PAGE, if committed { "fault on committed CPU page" } else { "fault on an uncommitted CPU page" });
+            }
             self.stats.distinct.insert(page);
             if self.copy_of(page).is_some() {
                 continue;
@@ -719,7 +743,7 @@ impl Memory {
                     made += 1;
                     self.faulted += 1;
                     self.bring(page, page + 1);
-                }
+                } else { crate::texture::action_memory::fault(page); }
             } else {
                 self.stats.left += 1;
             }
@@ -996,7 +1020,9 @@ pub(crate) fn ready(
     if m.frame != frame {
         m.frame = frame;
         m.refused.clear();
+        let timed = crate::texture::action_memory::on().then(crate::clock::Instant::now);
         m.take_faults();
+        if let Some(at)=timed { crate::texture::action_memory::add(11,at.elapsed().as_micros() as u64); }
         m.look_again();
         m.report();
         #[cfg(feature = "diagnostics")]
@@ -1110,7 +1136,7 @@ pub(crate) fn ready(
         *sum += n;
     }
     let key = std::ptr::from_ref(heap) as usize;
-    let (base, made) = match m.heaps.get(&key) {
+    let (base, made, card_made) = match m.heaps.get(&key) {
         Some(&run) => run,
         None => {
             // Held for the heap's life: not given back with a list's slots.
@@ -1119,14 +1145,18 @@ pub(crate) fn ready(
             for n in 0..=COPIES {
                 heap.null_raw_uav_at(base + n);
             }
-            (base, 0)
+            (base, 0, 0)
         }
     };
     for (n, shadow) in m.copies.iter().enumerate().skip(made as usize) {
         let (_, len) = shadow.span();
         heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, shadow.offset(shadow.span().0), len);
     }
-    m.heaps.insert(key, (base, m.copies.len() as u32));
+    for (i,(_,buffer)) in m.card_pages.iter().enumerate().skip(card_made) {
+        heap.raw_uav_at(base+COPIES-i as u32,buffer,0,PAGE);
+    }
+    if !m.card_pages.is_empty(){ list.arena_uses.store(true,std::sync::atomic::Ordering::Release); }
+    m.heaps.insert(key, (base, m.copies.len() as u32,m.card_pages.len()));
     // Every copy by every list that has come to by-address memory, whoever
     // numbered it: an arena another list made while this one was being
     // recorded was brought up to date by that list's submission alone, which

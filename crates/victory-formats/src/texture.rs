@@ -615,6 +615,35 @@ impl Layout {
         Ok(base + row + (self.column(flips, m, x) ^ u64::from(xor)))
     }
 
+    /// Factored version of `offset` for a whole subresource. The GPU reconstructs
+    /// each element address as `row.base + (columns[x] ^ row.xor)`. Rows of a
+    /// volume follow in depth order; an array subresource has only one slice.
+    pub fn gpu_axes(&self, mip: u32, slice: u32) -> Option<(Vec<u32>, Vec<[u32; 2]>)> {
+        let m = self.mips.get(mip as usize)?;
+        let volume = self.desc.dimension == Dimension::Tex3d;
+        if (volume && slice != 0) || slice >= self.slices || !self.addressable() { return None; }
+        let n = self.desc.element_bytes;
+        let xs = (0..m.width).map(|x| match &self.flips {
+            Some(f) => u32::try_from(self.column(f, m, x)).ok(),
+            None => x.checked_mul(n),
+        }).collect::<Option<Vec<_>>>()?;
+        let depth = if volume { m.depth } else { 1 };
+        let h = m.height.checked_mul(depth)?;
+        if h.div_ceil(4) > 65535 { return None; }
+        let mut ys = Vec::with_capacity(h as usize);
+        for z in slice..slice.checked_add(depth)? {
+            let base = self.slice_size.checked_mul(u64::from(self.split(z).0))?.checked_add(m.offset)?;
+            for y in 0..m.height {
+                let (b, k) = match &self.flips {
+                    Some(f) => self.row(f, m, y, z),
+                    None => (u64::from(y) * u64::from(m.pitch) * u64::from(n), 0),
+                };
+                ys.push([u32::try_from(base.checked_add(b)?).ok()?, k]);
+            }
+        }
+        Some((xs, ys))
+    }
+
     /// The part of an address that depends on the row and the slice: whole
     /// blocks, and the bits it XORs into the block offset (y, slice and the
     /// base swizzle). `z` is the array slice or depth slice: thick blocks

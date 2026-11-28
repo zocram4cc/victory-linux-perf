@@ -179,6 +179,9 @@ enum Console {
 }
 
 fn main() -> Result<()> {
+    if std::env::var_os("VICTORY_PREPARE_PIPELINES").is_some_and(|v| v != "0") {
+        unsafe { std::env::set_var("VKD3D_SHADER_CACHE_PATH", "0"); }
+    }
     victory_core::logging::init("info");
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]

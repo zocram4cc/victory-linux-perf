@@ -1345,6 +1345,8 @@ fn words_for(view: View) -> [u32; 2] {
             View::Constant(address, size) => {
                 #[cfg(windows)]
                 let size = &if *size >= 1 << 14 && crate::records::on() { size.next_multiple_of(256).min(((1 << 14) - 1) << 8) } else { *size };
+                #[cfg(windows)]
+                crate::um::cpu_pointer(*address, u64::from(*size), "inline constant descriptor");
                 if let Some(words) = constant_words(*address, *size) {
                     NAMED_WHOLE[0].fetch_add(1, Relaxed);
                     return words;
@@ -1352,6 +1354,12 @@ fn words_for(view: View) -> [u32; 2] {
             }
             View::Placed(unordered, resource, desc) => {
                 let (shape, address) = shape_of(*unordered, resource, desc);
+                #[cfg(windows)]
+                if resource[0] == 1 {
+                    if let Some((offset, len)) = crate::descriptor::host::buffer_range(&view) {
+                        crate::um::cpu_pointer(address.saturating_add(offset), len, "inline placed buffer descriptor");
+                    }
+                } else { crate::um::cpu_ask(address, 1, "inline placed texture descriptor"); }
                 if address >> PLACED_ADDRESS_BITS == 0 {
                     // Nearly every placed view has a shape seen before.
                     let known = shape_seen(&shape).or_else(|| views_read().shape_index.get(&shape).copied());

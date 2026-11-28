@@ -127,6 +127,7 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
     super::PICKING.set(None);
     let Some(staging) = staging.filter(|s| {
         !s.on_demand && s.first == s.level0 && !s.uploaded.load(Relaxed) && s.once.load(Relaxed)
+            && (!super::card::on() || !crate::um::touches_card(s.memory as usize,s.read))
     }) else {
         copy.ahead.store(LISTED, Relaxed);
         return turned_down();
@@ -240,7 +241,9 @@ impl Worker {
 
     fn copy(&self, jobs: &[Arc<Job>], value: u64) -> windows::core::Result<()> {
         for job in jobs {
-            job.staging.refresh();
+            // The source could have been remapped to CARD since claim().
+            // This COPY list reads CPU staging, never a direct-queue plan.
+            job.staging.refresh_for_queue(false);
         }
         // SAFETY: this worker's allocator and list, whose last submission has
         // run; the jobs hold what the list names until after the wait.

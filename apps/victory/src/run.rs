@@ -68,6 +68,7 @@ pub fn run(
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
+    if execute { victory_hle::known_pipelines::prepare_start()?; }
     let image = if let Some(preset) = fsr {
         anyhow::ensure!(matches!(console, Console::SeriesX), "FSR 4K requires Series X mode");
         fsr_4k::prepare_fsr_4k(&mut prepared, preset)?;
