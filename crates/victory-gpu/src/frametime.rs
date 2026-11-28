@@ -100,7 +100,7 @@ texture_refresh_ms,card_passes,card_compares,card_sent_mb,card_ranges,\
 card_pieces,card_fetched,card_fetched_mb,card_waits,card_wait_ms,\
 twins_into_depth,twins_into_colour,depth_planes,ram_mb,cpu_pct,map_n,map_ms,map_mb,\
 unmap_n,unmap_ms,unmap_mb,split_n,split_ms,alias_n,alias_ms,alias_mb,lock_wait_ms,\
-lock_hold_ms,shown_fps\n";
+lock_hold_ms,shown_fps,upscaler\n";
 
 /// The `#` block a dump starts with: the machine and the switches, so a file
 /// from another PC can be compared and reproduced. `pandas.read_csv(...,
@@ -339,6 +339,14 @@ pub(crate) fn rate_text(fps: f64, shown: Option<f64>) -> String {
     }
 }
 
+/// The frame rate line with the upscaler named after it, when there is one.
+pub(crate) fn with_upscaler(rate: String, upscaler: Option<&str>) -> String {
+    match upscaler {
+        Some(upscaler) => format!("{rate}  {upscaler}"),
+        None => rate,
+    }
+}
+
 /// One summary interval's figures: times per frame in ms, sizes per frame in
 /// MB, counts per frame.
 #[derive(Default)]
@@ -386,6 +394,9 @@ pub(crate) struct Row {
     /// Presents a second, generated ones included ([`crate::ffx::shown_total`]);
     /// the same as `fps` without frame generation.
     pub shown_fps: f64,
+    /// The upscaler the frame rate lines name ([`crate::ffx::upscaler_label`]);
+    /// empty without FidelityFX.
+    pub upscaler: String,
 }
 
 /// The header line: the column names (the line after the `#` block).
@@ -407,7 +418,7 @@ fn write_row(out: &mut impl Write, t_ms: u128, r: &Row) -> std::io::Result<()> {
          {card_waits:.3},{card_wait_ms:.3},{twins_into_depth:.3},{twins_into_colour:.3},\
          {depth_planes:.3},{ram_mb:.3},{cpu_pct:.3},{map_n:.3},{map_ms:.3},{map_mb:.3},\
          {unmap_n:.3},{unmap_ms:.3},{unmap_mb:.3},{split_n:.3},{split_ms:.3},{alias_n:.3},\
-         {alias_ms:.3},{alias_mb:.3},{lock_wait_ms:.3},{lock_hold_ms:.3},{shown_fps:.3}",
+         {alias_ms:.3},{alias_mb:.3},{lock_wait_ms:.3},{lock_hold_ms:.3},{shown_fps:.3},{upscaler}",
         frame = r.frame,
         frames = r.frames,
         fps = r.fps,
@@ -458,6 +469,7 @@ fn write_row(out: &mut impl Write, t_ms: u128, r: &Row) -> std::io::Result<()> {
         lock_wait_ms = r.remaps.lock_wait.ms,
         lock_hold_ms = r.remaps.lock_hold.ms,
         shown_fps = r.shown_fps,
+        upscaler = r.upscaler.replace(',', ";"),
     )
 }
 
@@ -487,19 +499,19 @@ mod tests {
         card_pieces,card_fetched,card_fetched_mb,card_waits,card_wait_ms,\
         twins_into_depth,twins_into_colour,depth_planes,ram_mb,cpu_pct,map_n,map_ms,map_mb,\
         unmap_n,unmap_ms,unmap_mb,split_n,split_ms,alias_n,alias_ms,alias_mb,lock_wait_ms,\
-        lock_hold_ms,shown_fps";
+        lock_hold_ms,shown_fps,upscaler";
 
     #[test]
     fn header_then_row_carry_the_columns() {
         let mut out = Vec::new();
         write_header(&mut out).unwrap();
-        let row = Row { fps: 24.6, shown_fps: 49.2, draws: 3.0, ..Row::default() };
+        let row = Row { fps: 24.6, shown_fps: 49.2, draws: 3.0, upscaler: "FSR 3.1.6+FG".to_owned(), ..Row::default() };
         write_row(&mut out, 1_700_000_000_000, &row).unwrap();
         let text = String::from_utf8(out).unwrap();
         let mut lines = text.lines();
         assert_eq!(lines.next(), Some(COLUMNS));
         let names: Vec<&str> = COLUMNS.split(',').collect();
-        assert_eq!(names.len(), 51);
+        assert_eq!(names.len(), 52);
         let values: Vec<&str> = lines.next().unwrap_or_default().split(',').collect();
         assert_eq!(values.len(), names.len(), "one value per column: {values:?}");
         let at = |name: &str| values[names.iter().position(|n| *n == name).unwrap()];
@@ -507,6 +519,7 @@ mod tests {
         assert_eq!(at("fps"), "24.600");
         assert_eq!(at("draws"), "3.000");
         assert_eq!(at("shown_fps"), "49.200");
+        assert_eq!(at("upscaler"), "FSR 3.1.6+FG");
     }
 
     #[test]
@@ -519,5 +532,11 @@ mod tests {
     fn rate_text_names_real_and_shown_frames() {
         assert_eq!(rate_text(24.6, Some(49.2)), "24.6 FPS real / 49.2 shown");
         assert_eq!(rate_text(24.6, None), "24.6 FPS");
+    }
+
+    #[test]
+    fn the_frame_line_names_the_upscaler() {
+        assert_eq!(with_upscaler("24.6 FPS real / 49.2 shown".to_owned(), Some("FSR 3.1.6+FG")), "24.6 FPS real / 49.2 shown  FSR 3.1.6+FG");
+        assert_eq!(with_upscaler("40.1 FPS".to_owned(), None), "40.1 FPS");
     }
 }

@@ -296,28 +296,49 @@ pub extern "C" fn ffxCreateContext(
     // The console's version and provider descriptions name console builds;
     // the PC loader picks the newest upscaler the GPU runs, the FSR 4.1.2
     // version named with `VICTORY_FFX_FSR4=1`.
-    let fsr4 = fsr4_on() && !FSR4_REFUSED.load(Ordering::Relaxed);
-    let mut r = create_upscale(api, context, &mut upscale, device, fsr4);
+    let versions = offered_versions(api, device);
+    static OFFERED: std::sync::Once = std::sync::Once::new();
+    OFFERED.call_once(|| {
+        let list = versions.iter().map(|(id, name)| format!("{id:#x} {name}")).collect::<Vec<_>>().join(", ");
+        tracing::warn!(versions = %list, "ffx: upscaler versions the loader offers on this device");
+        log_device_features();
+    });
+    let pin = if fsr4_on() && !FSR4_REFUSED.load(Ordering::Relaxed) {
+        let pin = pick_fsr4(&versions);
+        if pin.is_none() {
+            FSR4_REFUSED.store(true, Ordering::Relaxed);
+            tracing::warn!("ffx: FSR 4 not available on this driver stack: the loader offers no FSR 4 upscaler for this device (list above); the title's upscaler is made");
+        }
+        pin
+    } else {
+        None
+    };
+    let fsr4 = pin.is_some();
+    let mut r = create_upscale(api, context, &mut upscale, device, pin);
     let refused = fallback_to_legacy(fsr4, r);
     if refused {
         FSR4_REFUSED.store(true, Ordering::Relaxed);
-        tracing::warn!(result = r, "ffx: FSR 4.1.2 upscaler refused (VICTORY_FFX_FSR4=1): the title's upscaler is made instead, for the rest of the run");
+        tracing::warn!(result = r, "ffx: FSR 4 not available on this driver stack: the FSR 4 context was refused (VICTORY_FFX_FSR4=1); the title's upscaler is made instead, for the rest of the run");
         // SAFETY: the title's out pointer, checked for null.
         unsafe { *context = std::ptr::null_mut() };
-        r = create_upscale(api, context, &mut upscale, device, false);
+        r = create_upscale(api, context, &mut upscale, device, None);
     }
     if r == OK && framegen_on() {
         let mut fg = FRAMEGEN.lock().unwrap_or_else(|e| e.into_inner());
         (fg.upscale_flags, fg.max_render) = (upscale.flags, upscale.max_render);
     }
     let provider = provider_name(context);
+    *PROVIDER.lock().unwrap_or_else(|e| e.into_inner()) = provider.clone();
     tracing::info!(
         render = ?upscale.max_render, upscale = ?upscale.max_upscale, flags = upscale.flags, result = r, provider,
         fsr4_asked = fsr4_on(), fsr4_refused = refused,
         "ffx: upscale context on the host GPU"
     );
-    if fsr4 && !refused && r == OK {
-        tracing::warn!(provider, "ffx: FSR 4.1.2 version named (VICTORY_FFX_FSR4=1); the upscaler the loader picked is the provider named here");
+    if let Some(id) = pin
+        && !refused
+        && r == OK
+    {
+        tracing::warn!(asked = format!("{id:#x}"), provider, "ffx: FSR 4 asked by version id (VICTORY_FFX_FSR4=1); the context's provider is named here");
     }
     r
 }
@@ -338,9 +359,9 @@ fn fallback_to_legacy(fsr4: bool, r: ReturnCode) -> bool {
     fsr4 && r != OK
 }
 
-/// The upscale context made on the host device, with the FSR 4.1.2 version
-/// named if `fsr4`.
-fn create_upscale(api: &Api, context: *mut *mut c_void, upscale: &mut CreateUpscale, device: *mut c_void, fsr4: bool) -> ReturnCode {
+/// The upscale context made on the host device; with `pin` (an FSR 4 id the
+/// loader offered) the 4.1.2 version is named and the context pinned to it.
+fn create_upscale(api: &Api, context: *mut *mut c_void, upscale: &mut CreateUpscale, device: *mut c_void, pin: Option<u64>) -> ReturnCode {
     let mut dx12 = BackendDx12 {
         header: header(BACKEND_DX12),
         device,
@@ -349,9 +370,126 @@ fn create_upscale(api: &Api, context: *mut *mut c_void, upscale: &mut CreateUpsc
         header: header(CREATE_UPSCALE_VERSION),
         version: FFX_UPSCALER_VERSION,
     };
-    link_upscale(upscale, &mut version, &mut dx12, fsr4);
+    let mut over = OverrideVersion {
+        header: header(OVERRIDE_VERSION),
+        version_id: pin.unwrap_or(0),
+    };
+    link_upscale(upscale, &mut version, &mut dx12, pin.is_some());
+    if pin.is_some() {
+        over.header.next = upscale.next;
+        upscale.next = (&raw mut over).cast();
+    }
     // SAFETY: the SDK's call with a chain that outlives it.
     unsafe { (api.create)(context, (&raw mut *upscale).cast(), std::ptr::null()) }
+}
+
+/// The id of the newest FSR 4 upscaler among the versions the loader offers
+/// (`ffxQueryDescGetVersions`): names "4.x" or "FSR 4.x", driver ones
+/// (" *") too.
+fn pick_fsr4(versions: &[(u64, String)]) -> Option<u64> {
+    let version = |name: &str| name.trim_start_matches("FSR ").to_owned();
+    versions
+        .iter()
+        .filter(|(_, name)| version(name).starts_with('4'))
+        .max_by_key(|(_, name)| version(name))
+        .map(|(id, _)| *id)
+}
+
+/// What the frame rate lines name as the upscaler: "FSR <provider>",
+/// "bilinear" in simple mode, "+FG" while the frame generation swap chain
+/// presents.
+pub(crate) fn upscaler_label(provider: &str, simple: bool, framegen: bool) -> String {
+    let name = if simple {
+        "bilinear".to_owned()
+    } else if provider.starts_with("FSR") {
+        provider.to_owned()
+    } else {
+        format!("FSR {provider}")
+    };
+    if framegen { format!("{name}+FG") } else { name }
+}
+
+/// The provider of the last upscale context made.
+static PROVIDER: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// The upscaler the frame rate lines name; `None` without FidelityFX.
+pub(crate) fn active_upscaler() -> Option<String> {
+    if simple_mode() {
+        return Some(upscaler_label("", true, false));
+    }
+    let provider = PROVIDER.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    (!provider.is_empty()).then(|| upscaler_label(&provider, false, !SWAP_CHAIN.load(Ordering::Acquire).is_null() && framegen_ready()))
+}
+
+/// `ffxOverrideVersion`: the context made with exactly this version.
+#[repr(C)]
+struct OverrideVersion {
+    header: Header,
+    version_id: u64,
+}
+const OVERRIDE_VERSION: u64 = 5;
+
+/// The upscaler versions the loader offers for `device` (`ffxQueryDescGetVersions`).
+fn offered_versions(api: &Api, device: *mut c_void) -> Vec<(u64, String)> {
+    let mut count = 0u64;
+    let mut q = GetVersions {
+        kind: QUERY_GET_VERSIONS,
+        next: std::ptr::null_mut(),
+        create_kind: CREATE_UPSCALE,
+        device,
+        count: &raw mut count,
+        ids: std::ptr::null_mut(),
+        names: std::ptr::null_mut(),
+    };
+    // SAFETY: a version query without a context; it writes the count.
+    if unsafe { (api.query)(std::ptr::null_mut(), (&raw mut q).cast()) } != OK || count == 0 {
+        return Vec::new();
+    }
+    let mut ids = vec![0u64; count as usize];
+    let mut names = vec![std::ptr::null::<i8>(); count as usize];
+    (q.ids, q.names) = (ids.as_mut_ptr(), names.as_mut_ptr());
+    // SAFETY: arrays of the count it gave.
+    if unsafe { (api.query)(std::ptr::null_mut(), (&raw mut q).cast()) } != OK {
+        return Vec::new();
+    }
+    ids.into_iter()
+        .zip(names)
+        .take(count as usize)
+        .map(|(id, name)| {
+            // SAFETY: the loader's nul-terminated names, or null.
+            let name = if name.is_null() { String::new() } else { unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy().into_owned() };
+            (id, name)
+        })
+        .collect()
+}
+
+/// The host device's features FSR 4 needs, once: the highest shader model
+/// (6.6 needed), wave operations and lane counts, native 16-bit operations.
+fn log_device_features() {
+    use windows::Win32::Graphics::Direct3D12::*;
+    let Some(host) = crate::host::host() else { return };
+    let model = |asked: i32| {
+        let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL { HighestShaderModel: D3D_SHADER_MODEL(asked) };
+        // SAFETY: a feature structure of the requested type and size.
+        unsafe { host.device.CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, (&raw mut sm).cast(), size_of_val(&sm) as u32) }
+            .ok()
+            .map(|()| sm.HighestShaderModel.0)
+    };
+    let shader_model = model(0x68).or_else(|| model(0x66)).map_or("refused".to_owned(), |sm| format!("{sm:#x}"));
+    let mut waves = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    let mut options4 = D3D12_FEATURE_DATA_D3D12_OPTIONS4::default();
+    // SAFETY: feature structures of the requested types and sizes.
+    unsafe {
+        let _ = host.device.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, (&raw mut waves).cast(), size_of_val(&waves) as u32);
+        let _ = host.device.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS4, (&raw mut options4).cast(), size_of_val(&options4) as u32);
+    }
+    tracing::warn!(
+        shader_model,
+        wave_ops = waves.WaveOps.as_bool(),
+        lanes = ?(waves.WaveLaneCountMin, waves.WaveLaneCountMax),
+        native_16bit = options4.Native16BitShaderOpsSupported.as_bool(),
+        "ffx: the host device as FSR 4 sees it"
+    );
 }
 
 /// The upscaler version the loader chose for a context, for the log.
@@ -964,7 +1102,7 @@ pub(crate) fn framegen_swap_chain(
     let swap_chain = unsafe { windows::Win32::Graphics::Dxgi::IDXGISwapChain4::from_raw(out) };
     SWAP_CHAIN.store(out, Ordering::Release);
     PRESENTED.store(0, Ordering::Release);
-    tracing::info!("ffx: presenting through AMD's frame generation swap chain");
+    tracing::warn!(context = !CONTEXT.load(Ordering::Acquire).is_null(), "ffx: presenting through AMD's frame generation swap chain");
     swap_chain.cast().ok()
 }
 
@@ -1003,6 +1141,27 @@ pub(crate) fn shown_total() -> Option<u32> {
 /// not failed: the window's swap chain is then the frame generation one.
 pub(crate) fn framegen_ready() -> bool {
     !FAILED.load(Ordering::Relaxed) && !CONTEXT.load(Ordering::Acquire).is_null()
+}
+
+/// Whether the window's swap chain is the frame generation one: asked, and
+/// the context made (never without it).
+pub(crate) fn framegen_swap_chain_wanted(asked: bool, ready: bool) -> bool {
+    asked && ready
+}
+
+/// Frame generation off for the run, the window's swap chain made plain again.
+pub(crate) fn framegen_fail(why: &str) {
+    if !FAILED.swap(true, Ordering::Relaxed) {
+        tracing::warn!("ffx: frame generation off for the run: {why}; presenting through the plain swap chain");
+    }
+}
+
+/// `VICTORY_FRAMEGEN_UI=1`: the interface plane is copied beside the scene and
+/// registered with the SDK; without it the frame is composed as without frame
+/// generation, and the interface is interpolated with the scene.
+pub(crate) fn framegen_ui() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FRAMEGEN_UI").is_some_and(|v| v == "1"))
 }
 
 /// Presents through the frame generation swap chain with no context, not
@@ -1339,5 +1498,29 @@ mod tests {
         assert!(fallback_to_legacy(true, ERROR));
         assert!(!fallback_to_legacy(true, OK));
         assert!(!fallback_to_legacy(false, ERROR));
+    }
+
+    #[test]
+    fn the_frame_generation_swap_chain_is_never_made_without_a_context() {
+        assert!(!framegen_swap_chain_wanted(true, false));
+        assert!(!framegen_swap_chain_wanted(false, true));
+        assert!(framegen_swap_chain_wanted(true, true));
+    }
+
+    #[test]
+    fn the_fsr4_version_is_picked_from_what_the_loader_offers() {
+        let offered = [(0x30_1006, "3.1.6".to_owned()), (0x40_1002, "4.1.2".to_owned()), (0x20_3004, "2.3.4".to_owned())];
+        assert_eq!(pick_fsr4(&offered), Some(0x40_1002));
+        assert_eq!(pick_fsr4(&offered[..1]), None);
+        let driver = [(0x30_1006, "3.1.6".to_owned()), (0x8000_0000 | 0x40_1003, "FSR 4.1.3 *".to_owned())];
+        assert_eq!(pick_fsr4(&driver), Some(0x8000_0000 | 0x40_1003));
+    }
+
+    #[test]
+    fn the_upscaler_label_names_the_provider_and_frame_generation() {
+        assert_eq!(upscaler_label("3.1.6", false, false), "FSR 3.1.6");
+        assert_eq!(upscaler_label("3.1.6", false, true), "FSR 3.1.6+FG");
+        assert_eq!(upscaler_label("FSR 4.1.2", false, false), "FSR 4.1.2");
+        assert_eq!(upscaler_label("", true, false), "bilinear");
     }
 }

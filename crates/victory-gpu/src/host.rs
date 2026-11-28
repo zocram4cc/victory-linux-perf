@@ -10335,6 +10335,8 @@ impl Meter {
             _ => None,
         };
         self.shown = shown_now;
+        let upscaler = crate::ffx::active_upscaler();
+        let upscaler_row = upscaler.clone().unwrap_or_default();
         // `VICTORY_FRAMETIME_DUMP`: the worst and mean frame of this interval,
         // measured at each present, are taken here, where the interval ends;
         // the rest of its row is made with the counters, by the meter's thread.
@@ -10549,11 +10551,12 @@ impl Meter {
                 cpu_pct,
                 remaps,
                 shown_fps: shown_fps.unwrap_or(fps),
+                upscaler: upscaler_row,
             };
             crate::frametime::record(&row);
             // On-screen figures (`VICTORY_DEBUG_HUD=1`): the same row the dump
             // writes (the HUD has a thread of its own: this only hands it the text).
-            let rate = crate::frametime::rate_text(row.fps, shown_fps);
+            let rate = crate::frametime::with_upscaler(crate::frametime::rate_text(row.fps, shown_fps), Some(row.upscaler.as_str()).filter(|u| !u.is_empty()));
             crate::debug_hud::update(HWND(hud_window as *mut _), || {
                 format!(
                     "{rate}   {ms:.1} ms/frame   {draws:.0} draws/frame\n\
@@ -10791,7 +10794,7 @@ impl Meter {
             Some(shown) => format!("{fps:.0} fps real / {shown:.0} shown"),
             None => format!("{fps:.0} fps"),
         };
-        let text = format!(" | VIctory {rate} {ms:.1} ms/frame {draws:.0} draws/frame");
+        let text = format!(" | VIctory {} {ms:.1} ms/frame {draws:.0} draws/frame", crate::frametime::with_upscaler(rate, upscaler.as_deref()));
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,
@@ -10892,11 +10895,13 @@ impl Host {
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         if crate::ffx::framegen_on() {
             crate::ffx::framegen_display(width, height, format.0);
-            if presenter.as_ref().is_some_and(|p| !p.framegen) && crate::ffx::framegen_ready() {
+            let wanted = crate::ffx::framegen_swap_chain_wanted(true, crate::ffx::framegen_ready());
+            if presenter.as_ref().is_some_and(|p| p.framegen != wanted) {
                 settle_now(WHY_SYNC);
-                tracing::info!("ffx: frame generation context made: the window's swap chain is made again as the frame generation one");
+                tracing::warn!(wanted, "ffx: frame generation: the window's swap chain is made again as the {} one", if wanted { "frame generation" } else { "plain" });
                 *presenter = None;
-            } else if !crate::ffx::framegen_ready() {
+            }
+            if !wanted {
                 crate::ffx::framegen_plain_present();
             }
         }
@@ -10997,7 +11002,7 @@ impl Host {
             copy.keep(texture);
             let list = &copy.list;
             let fg_ui = match planes {
-                Some((over, over_state, _, _)) if p.framegen => {
+                Some((over, over_state, _, _)) if p.framegen && crate::ffx::framegen_ui() => {
                     let over_desc = over.GetDesc();
                     let back = (format, width, height);
                     let fits = framegen::copyable((desc.Format, width, height), back)
@@ -11008,7 +11013,7 @@ impl Host {
                 }
                 _ => None,
             };
-            let interpolate = !p.framegen || planes.is_none() || fg_ui.is_some();
+            let interpolate = !p.framegen || planes.is_none() || fg_ui.is_some() || !crate::ffx::framegen_ui();
             let composed = if let Some((over, over_state, base_fmt, over_fmt)) = planes.filter(|_| fg_ui.is_none()) {
                 copy.keep(over);
                 if let Some(composer) = p.composer.as_mut() {
@@ -11169,6 +11174,9 @@ impl Host {
             }
             let mut showing = crate::timeline::span("the host's Present");
             let status = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            if p.framegen && status.is_err() {
+                crate::ffx::framegen_fail(&format!("the frame generation swap chain did not present ({status:?})"));
+            }
             if p.framegen {
                 crate::ffx::framegen_after_present(p.swap_chain.GetLastPresentCount().ok());
             }
@@ -11214,7 +11222,7 @@ impl Host {
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
                 ..Default::default()
             };
-            let swap = (crate::ffx::framegen_on() && crate::ffx::framegen_ready())
+            let swap = crate::ffx::framegen_swap_chain_wanted(crate::ffx::framegen_on(), crate::ffx::framegen_ready())
                 .then(|| crate::ffx::framegen_swap_chain(hwnd, &desc, &factory, &self.queue))
                 .flatten();
             let fg = swap.is_some();
