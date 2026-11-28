@@ -216,3 +216,28 @@ Now it **reads them from the title's own root signature**.
 - No more phantom sampler heap in programs that index none.
 
 **Result:** 1,432 → 1,434, none lost. The main gain is that every program's heaps now come from the title's data.
+
+## The biggest wall: waterfall loops over a per-lane heap index (28 Nov, ~07:00), in progress
+
+**"A descriptor's address or format read as data" (751 programs).** A sample of 300 failure sites, each disassembled at its offset: **166 are the back-edge branch of a loop** (`s_cbranch_scc1` backwards). Example: `218_0000000f00416300` near 0x306c:
+
+```
+v_readfirstlane_b32 s10, v6        ; the first active lane's heap index
+v_cmpx_eq_i32_e32  s10, v6         ; keep the lanes with that index
+s_lshl_b32         s10, s10, 5
+s_load_dwordx8     s[32:39], s[42:43], s10   ; its image descriptor from the view heap
+image_load         v[6:8], v9, s[32:39] …    ; results over v6..v8, active lanes only
+s_andn2_wrexec_b32 s16, s16        ; drop the served lanes; SCC = some lane left
+s_cbranch_scc1     <loop>
+```
+
+A **waterfall over a per-lane heap index**. The translator runs such a loop once for every lane, each lane with its own descriptor. Here, though, the resource analysis did not prove the loop (`Waterfall::compares` empty). Each lane's index in v6 meets the image_load's results on the back edge, and the join carries a value with no host meaning.
+
+**Found and fixed so far** (`VICTORY_WHY_WATERFALL=1`, `VICTORY_WHY_DEFER=1`, `WHY-DEAD` with the joined argument's definition):
+1. The proof only knew loops that retry with `s_cbranch_execnz`. The console compiler uses RDNA2's **`s_andn2_wrexec_b*` + `s_cbranch_scc1`**. It is now accepted when the branch reads exactly the SCC that wrexec writes, and the retrying lanes are the EXEC it writes.
+2. **Scalar accesses** in the loop (`s_buffer_load`) read no EXEC. They now take the EXEC last written before them in the block.
+3. `descriptor_only` follows `v_readfirstlane_b32` and accepts the waterfall compares the analysis recognized.
+
+**What still stops it:** the lane analysis (`structure.rs`) has no lane mask for the EXEC these loops write (select checks 1 and 3 in `Tracer::waterfall`, 17 accesses in the example). No count change yet; 1,434, none lost.
+
+**Next:** have `structure.rs` give a mask for the EXEC written by the loop's `v_cmpx` and wrexec. This is the lane-mask area the friend took, so it is worth asking him: the example and the diagnostics above reproduce it.
