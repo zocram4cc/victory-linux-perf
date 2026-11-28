@@ -11,6 +11,33 @@ branch `xtx-2026-11-27`.
 
 ## 2026-11-28
 
+### Placed-view leak fixed (`VICTORY_PLACED_PAD_IGNORE=1`, `VICTORY_OWNERLESS_VIEWS=1048576`, `-FrameGen`)
+From trustno1-coder/VIctory-NVIDIA (4eead67, 144aca0, 89fd936; their PR #58), by way of
+[Op-lite/OP-lite](https://github.com/Op-lite/OP-lite) e5e7120e; ported by hand, with their three
+tests. Views the title places in memory are named by a "shape" (the description without the
+address), at most 4,194,304 of them. The title writes the same view with other garbage in the
+description's padding words and in the view words its kind does not use, so every write was a new
+shape; once they were full (about half an hour of play), every placed view became a table entry
+kept for good, ~15,000 a second (16.7 GB after 70 minutes on trustno1's runs, the frame rate
+halved). Now those words are left out of the shape, and entries of views no resource releases are
+capped at a million, oldest freed first (a descriptor names its view for a frame or a few).
+Both off by default in the code. Not measured over a long session here; an hour-long session
+of 2026-11-28 here fell from 33 rendered fps in its first minutes to a median of 27 after ~50.
+
+### mimalloc as the allocator (`--features mimalloc`, build time, off): no gain here
+From Op-lite/OP-lite e5e7120e (they measured about -5 ms a frame in busy scenes on an RTX 4080
+SUPER): mimalloc (MIT) in place of the Windows heap. Release builds, the user's save at 70 % (a heavy
+spot: 8,500-9,200 draws a frame), `-FrameGen` settings: mimalloc 24.8 standing / 21.4 walking
+(rendered median over the run 23.3) and 24.8 / 22.9 (24.0); the Windows heap 25.6 / 25.6 (25.4),
+its walk through a lighter scene (6,700 draws). No gain within run-to-run spread; left as a
+build feature, not the default.
+
+### Tried, not ported: OP-lite's faster guards and lists kept open
+`VICTORY_GUARDS_FAST` takes the title's write faults out of the guards' lock: here renderer port 6
+(`VICTORY_PORT_GUARD`, in `-FrameGen`) already shares that lock, and the lock waits are 1.6 ms a
+frame over all threads. `VICTORY_LISTS_OPEN` spares the title's thread a close and reset of the
+fresh host list at each submit: with list threads (`VICTORY_THIN=1`) that is not on its path.
+
 ### Ten list threads below normal priority (`VICTORY_THIN_PRIORITY=-1`, `-FrameGen`)
 The threads that translate list calls run at the Windows priority given (-2 to 2; unset: as
 before). Eight at normal priority fell to about 3.5 fps: they took the title's own threads' turns.

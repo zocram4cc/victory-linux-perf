@@ -46,6 +46,8 @@ windows-core = { workspace = true, optional = true }
 tempfile.workspace = true
 
 [features]
+# mimalloc as the global allocator (it lives in victory-gpu).
+mimalloc = ["victory-gpu/mimalloc"]
 # Debugging switches (scripted keys and the like).
 diagnostics = [
     "victory-gpu/diagnostics", "victory-loader/diagnostics", "dep:windows-core",

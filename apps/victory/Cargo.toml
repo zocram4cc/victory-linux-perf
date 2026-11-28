@@ -33,6 +33,9 @@ diagnostics = [
     "victory-loader/diagnostics",
     "victory-shader/diagnostics",
 ]
+# mimalloc (MIT) as the global allocator instead of the Windows heap (from
+# Op-lite/OP-lite e5e7120e): `cargo build --release -p victory --features mimalloc`.
+mimalloc = ["victory-hle/mimalloc"]
 
 [lints]
 workspace = true

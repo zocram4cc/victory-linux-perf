@@ -58,6 +58,9 @@ if ($FrameGen) {
         VICTORY_UNDER_THREADS = '3'; VICTORY_LAND_THREADS = '3'
         VICTORY_POOL_DISCARD = '1'; VICTORY_FILL_TITLE = '1'; VICTORY_PARTIAL_DELTA = '1'
         VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_WIDE_BACK = '1'
+        # The placed-view leak fix (from trustno1 by way of OP-lite): after about half an hour
+        # the shapes of placed views filled up and every placed view was kept for good.
+        VICTORY_PLACED_PAD_IGNORE = '1'; VICTORY_OWNERLESS_VIEWS = '1048576'
     }
     foreach ($k in $ryuki.Keys) { $settings[$k] = $ryuki[$k] }
     $console = @('--console', 'series-s')

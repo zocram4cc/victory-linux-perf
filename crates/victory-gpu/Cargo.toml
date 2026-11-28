@@ -16,6 +16,7 @@ victory-core.workspace = true
 victory-formats.workspace = true
 victory-pipeline.workspace = true
 victory-shader = { workspace = true, features = ["host"] }
+mimalloc = { version = "0.1", default-features = false, optional = true }
 
 [build-dependencies]
 blake3.workspace = true
@@ -26,6 +27,9 @@ tempfile.workspace = true
 [features]
 # Debugging switches (frame capture, the host debug layer, per-draw data).
 diagnostics = []
+# mimalloc instead of the Windows heap as the global allocator (from Op-lite/OP-lite
+# e5e7120e): directly, or under the diagnostics build's counting allocator.
+mimalloc = ["dep:mimalloc"]
 
 [lints]
 workspace = true

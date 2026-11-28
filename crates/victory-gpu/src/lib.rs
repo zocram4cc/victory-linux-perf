@@ -30,6 +30,11 @@ mod compose;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
+/// mimalloc as the global allocator (`mimalloc` feature, from Op-lite/OP-lite e5e7120e) where
+/// the counting allocator in `copystat` (which forwards to it) is not built.
+#[cfg(all(feature = "mimalloc", not(all(windows, feature = "diagnostics"))))]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod faultbook;
 #[cfg(windows)]
