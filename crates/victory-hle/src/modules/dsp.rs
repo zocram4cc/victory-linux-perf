@@ -9,11 +9,15 @@
 //! the title checks it one block later and treats a late command as an
 //! overrun. Commands complete when submitted here.
 //!
-//! The transforms themselves are not computed: the hardware takes impulse
-//! responses already in its own partitioned frequency-domain layout, which
-//! is not known. Outputs are silence, so reverb returns are dry.
-// shortcut: no convolution or block transform; outputs are zeros. Needs the
-// coprocessor's impulse response and spectrum layouts to do better.
+//! With `VICTORY_DSP_CONVOLVE=1` (off unless set), mono convolutions of
+//! 1024-frame blocks, the only kind the title has been seen to use, are
+//! computed here ([`convolve`]): reverb, and the speakers in the world (TVs,
+//! phone calls), whose sound goes through the DSP alone. Otherwise outputs
+//! are silence, so reverb returns are dry. The impulse response layout it
+//! reads is a reading of the title's responses from another tree (prior art
+//! eca45ac), not a published definition.
+// shortcut: stereo and 512-frame convolutions and the other block transforms
+// are not computed; their outputs are zeros. Without the switch, none are.
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
@@ -23,6 +27,33 @@ use std::sync::Mutex;
 use super::xasync::E_INVALIDARG;
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleModule, hle_export};
+
+mod convolve;
+
+/// Whether mono convolutions are computed (`VICTORY_DSP_CONVOLVE=1`; off
+/// unless set: the layout of the responses and the gain are readings from
+/// one session in another tree, not known from a definition).
+fn convolve_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DSP_CONVOLVE").is_some_and(|v| v == "1"))
+}
+
+/// The most floats of an impulse response read: 64 MiB of them, far past
+/// any the title was seen to pass (a bound on a length the title gives).
+const IR_FLOATS_MOST: u32 = 1 << 24;
+
+/// What the computed convolutions are scaled by: `VICTORY_DSP_GAIN`, else 2.
+/// The hardware's own scaling is not known. With the textbook 1/2048 of the
+/// inverse FFT, TVs and phone calls sounded quiet next to the rest of the
+/// mix; twice that sounded right by ear.
+const GAIN: f32 = 2.0;
+
+fn gain() -> f32 {
+    static GAIN_SET: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *GAIN_SET.get_or_init(|| {
+        std::env::var("VICTORY_DSP_GAIN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(GAIN)
+    })
+}
 
 const E_POINTER: HRESULT = 0x8000_4003_u32 as i32;
 const E_OUTOFMEMORY: HRESULT = 0x8007_000E_u32 as i32;
@@ -62,6 +93,8 @@ pub struct Stream {
     frames: u32,
     channels: u32,
     status: Box<Status>,
+    /// Set for a stream whose convolution is computed.
+    convolver: Option<convolve::Convolver>,
 }
 
 /// One block of work.
@@ -136,6 +169,17 @@ pub extern "system" fn XDspActivate(
     status: *mut *const Status,
     stream: *mut *mut Stream,
 ) -> HRESULT {
+    activate(dsp, desc, status, stream, convolve_on())
+}
+
+/// [`XDspActivate`], with mono convolutions computed if `convolve`.
+fn activate(
+    dsp: *mut Dsp,
+    desc: *const StreamDesc,
+    status: *mut *const Status,
+    stream: *mut *mut Stream,
+    convolve: bool,
+) -> HRESULT {
     if status.is_null() || stream.is_null() {
         return E_POINTER;
     }
@@ -148,11 +192,26 @@ pub extern "system" fn XDspActivate(
         return E_INVALIDARG;
     }
     let (kind, options, frames, channels) = (desc.kind, desc.options, desc.frames, desc.channels);
+    let (ir, ir_floats) = (desc.ir, desc.ir_floats);
+    let convolver = if convolve
+        && kind == CONVOLUTION
+        && channels == 1
+        && frames == 0x400
+        && !ir.is_null()
+        && ir_floats <= IR_FLOATS_MOST
+    {
+        // SAFETY: the title's description says the impulse response holds this many floats.
+        convolve::Convolver::new(unsafe { std::slice::from_raw_parts(ir, ir_floats as usize) })
+    } else {
+        None
+    };
     tracing::debug!(
         kind,
         options,
         frames,
         channels,
+        ir_floats,
+        computed = convolver.is_some(),
         "audio DSP stream activated"
     );
     {
@@ -174,6 +233,7 @@ pub extern "system" fn XDspActivate(
             reserved: 0,
             result: S_OK,
         }),
+        convolver,
     });
     // SAFETY: checked non-null.
     unsafe {
@@ -195,7 +255,8 @@ pub extern "system" fn XDspDeactivate(stream: *mut Stream) -> HRESULT {
     S_OK
 }
 
-/// Completes the command at once: its output block is silence.
+/// Completes the command at once: its output block is the convolution where
+/// it is computed, silence otherwise.
 pub extern "system" fn XDspSubmitCommand(
     stream: *mut Stream,
     command: *const Command,
@@ -206,8 +267,14 @@ pub extern "system" fn XDspSubmitCommand(
     }
     // SAFETY: a stream from `XDspActivate`, the title's command.
     let (stream, command) = unsafe { (&mut *stream, &*command) };
-    if !command.output.is_null() {
-        let samples = (stream.frames * stream.channels) as usize;
+    let samples = (stream.frames * stream.channels) as usize;
+    if !command.output.is_null() && !command.input.is_null() && let Some(convolver) = stream.convolver.as_mut() {
+        // SAFETY: the title's input and output buffers each hold one block of the stream.
+        let (input, output) = unsafe {
+            (std::slice::from_raw_parts(command.input, samples), std::slice::from_raw_parts_mut(command.output, samples))
+        };
+        convolver.process(input, output, command.gains[0] * gain());
+    } else if !command.output.is_null() {
         // SAFETY: the title's output buffer holds one block of the stream.
         unsafe { std::ptr::write_bytes(command.output, 0, samples) };
     }
@@ -308,6 +375,47 @@ mod tests {
             XDspActivate(dsp, &transform, &mut status, &mut stream),
             S_OK
         );
+        assert_eq!(XDspDeactivate(stream), S_OK);
+        assert_eq!(XDspDisconnect(dsp), S_OK);
+    }
+
+    #[test]
+    fn a_mono_convolution_is_computed() {
+        let mut base = vec![0u8; 0x10_0000];
+        let mut dsp = std::ptr::null_mut();
+        assert_eq!(XDspConnectWithMaximumStreamLimit(base.as_mut_ptr().cast(), 0x10_0000, 24, 0x80, 1, &mut dsp), S_OK);
+        // a response of one sample, 0.5, two samples late
+        let ir = convolve::layout(&[0.0, 0.0, 0.5]);
+        let desc = StreamDesc {
+            kind: CONVOLUTION,
+            options: 0,
+            frames: 0x400,
+            channels: 1,
+            ir_floats: ir.len() as u32,
+            ir: ir.as_ptr(),
+        };
+        // Off unless set: silence.
+        let (mut status, mut stream) = (std::ptr::null(), std::ptr::null_mut());
+        if !convolve_on() {
+            assert_eq!(XDspActivate(dsp, &desc, &mut status, &mut stream), S_OK);
+            let input = vec![0.5f32; 0x400];
+            let mut output = vec![1f32; 0x400];
+            let command = Command { gains: [1.0, 1.0], input: input.as_ptr(), output: output.as_mut_ptr(), reserved: 0 };
+            let mut ticket = 0;
+            assert_eq!(XDspSubmitCommand(stream, &command, &mut ticket), S_OK);
+            assert!(output.iter().all(|&v| v == 0.0), "silence without the switch");
+            assert_eq!(XDspDeactivate(stream), S_OK);
+        }
+        assert_eq!(activate(dsp, &desc, &mut status, &mut stream, true), S_OK);
+        let input: Vec<f32> = (0..0x400).map(|i| (i % 7) as f32 / 7.0).collect();
+        let mut output = vec![0f32; 0x400];
+        let command = Command { gains: [1.0, 1.0], input: input.as_ptr(), output: output.as_mut_ptr(), reserved: 0 };
+        let mut ticket = 0;
+        assert_eq!(XDspSubmitCommand(stream, &command, &mut ticket), S_OK);
+        for n in 2..0x400 {
+            let want = input[n - 2] * 0.5 * gain();
+            assert!((output[n] - want).abs() < 1e-4, "sample {n}: {} vs {want}", output[n]);
+        }
         assert_eq!(XDspDeactivate(stream), S_OK);
         assert_eq!(XDspDisconnect(dsp), S_OK);
     }
