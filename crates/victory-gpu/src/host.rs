@@ -13223,7 +13223,8 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         // Past it: the longest idle ones, enough to come down.
         assert_eq!(vram_keep(100 * gib, 88 * gib), (5_000, 8 * gib));
         assert_eq!(vram_keep(100 * gib, 95 * gib), (3_000, 19 * gib));
-        assert_eq!(vram_keep(100 * gib, 120 * gib), (3_000, 36 * gib));
+        // Over budget the short line is still used − 76 % of budget (120 − 76).
+        assert_eq!(vram_keep(100 * gib, 120 * gib), (3_000, 44 * gib));
         assert_eq!(vram_keep(0, 7).0, 5_000);
     }
 
