@@ -2,6 +2,8 @@
 
 # RAZDA4A XEN
 
+https://x.com/crossducking
+
 Direct3D 12 Windows runtime layer targeting **16 GB RAM**, **6-core CPUs**, **8–16 GB GPUs**, and **Windows 10**.
 
 No game files, assets, or executables are included. You must supply your own copy of *The Great Car-Borrowing Simulator from the Starry Studio*.
