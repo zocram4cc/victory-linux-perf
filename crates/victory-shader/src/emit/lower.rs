@@ -1845,7 +1845,7 @@ impl<'a> Lower<'a> {
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
         let raw_typed_loads = raw_typed_loads()
-            && super::shader::raw_views() != 0
+            && (super::shader::raw_views() != 0 || super::shader::records() != 0)
             && x.native.stage == HwStage::Cs
             && writes_uavs
             && insts().any(|i| i.name() == "s_barrier")

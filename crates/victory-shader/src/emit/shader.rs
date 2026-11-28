@@ -112,7 +112,7 @@ pub const RECORD_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 pub const RECORD_SLOTS: u32 = (1 << 20) - 1;
 pub const RECORDS_ENTRIES: u32 = 1 << 20;
 pub const RECORDS_SHAPES: u32 = 1 << 22;
-pub const RECORDS_REVISION: u32 = 7;
+pub const RECORDS_REVISION: u32 = 8;
 pub const RECORD_TWINS: u32 = 1 << 21;
 
 static RECORDS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
