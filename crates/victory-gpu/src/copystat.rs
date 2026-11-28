@@ -947,11 +947,12 @@ fn log_memory() {
     {
         let (taken, lazy) = crate::list::taken_at_reset();
         tracing::info!(
-            "memory, host lists: {} taken at a reset (made new {}, none to take {}) (VICTORY_LIST_LAZY={})",
+            "memory, host lists: {} taken at a reset (made new {}, none to take {}) (VICTORY_LIST_LAZY={}); {}",
             taken[0],
             taken[1],
             taken[2],
-            u8::from(lazy)
+            u8::from(lazy),
+            crate::kept::text()
         );
     }
     // What the line above leaves open: what is alive of the buffers "made

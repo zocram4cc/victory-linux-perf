@@ -116,6 +116,13 @@ if not defined VICTORY_INPLACE_MB set "VICTORY_INPLACE_MB=1536"
 if not defined VICTORY_THIN_THREADS set "VICTORY_THIN_THREADS=4"
 if not defined VICTORY_UNDER_THREADS set "VICTORY_UNDER_THREADS=3"
 if not defined VICTORY_LAND_THREADS set "VICTORY_LAND_THREADS=3"
+rem Less of the PC's RAM held (from LibsMQG/hle-d3d12-amd, 28 Nov 2026): our
+rem command lists hold a driver list only while they record (about 400 fewer,
+rem 1-2 MB each), and tables and read buffers a burst grew are given back.
+rem His windows-on-the-card share (VICTORY_WINDOWS_BAR_PCT) is left off here:
+rem it takes card memory from textures, which a 16 GB card is short of.
+if not defined VICTORY_LIST_LAZY set "VICTORY_LIST_LAZY=1"
+if not defined VICTORY_SHRINK_KEPT set "VICTORY_SHRINK_KEPT=1"
 
 rem --- victory-amd's installer settings (eikkapine) ---
 if not defined VICTORY_LOG set "VICTORY_LOG=info"
