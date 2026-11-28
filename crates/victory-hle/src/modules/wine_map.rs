@@ -755,12 +755,14 @@ pub(crate) fn zero_copy(base: usize, len: usize) -> bool {
 
 /// Before the title frees `[at, at + len)` (`len` 0: the allocation at
 /// `at`): a reservation [`zero_copy`] made there goes, what is in place in
-/// it first. The bytes of the one released, if any.
+/// it first, then every flight is settled ([`victory_gpu::title_memory_quiesce`]).
+/// The bytes of the one released, if any. From the title's own calls.
 pub(crate) fn zero_copy_freeing(at: usize, len: usize) -> Option<usize> {
     let mut made = ZERO_COPY.lock().unwrap_or_else(|e| e.into_inner());
     let end = if len == 0 { at + 1 } else { at.saturating_add(len) };
     let i = made.iter().position(|z| z.0 < end && at < z.0 + z.1)?;
     let (base, bytes, memfd, handle) = made.swap_remove(i);
+    drop(made);
     if (at, len) != (base, 0) && (at, len) != (base, bytes) {
         // shortcut: part of it freed; the whole goes from the card's side,
         // and copies of the rest would miss writes (the host watches none
@@ -769,6 +771,8 @@ pub(crate) fn zero_copy_freeing(at: usize, len: usize) -> Option<usize> {
     }
     victory_gpu::title_memory_zero_copy(base, bytes, None);
     TRACKED.lock().unwrap_or_else(|e| e.into_inner()).retain(|t| t.0 != base);
+    // Nothing in the air reads it or lands in it once it is gone.
+    victory_gpu::title_memory_quiesce();
     if let Some(direct) = DIRECT.as_ref() {
         direct.let_go(memfd, handle);
     }

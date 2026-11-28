@@ -3878,6 +3878,16 @@ impl Shadow {
                     kept.1 = true;
                 } else {
                     KEPT_BYTES.fetch_sub(self.len, Ordering::Relaxed);
+                    static REFUSED: AtomicU64 = AtomicU64::new(0);
+                    let n = REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n.is_power_of_two() {
+                        tracing::info!(
+                            refused = n,
+                            kept_mb = KEPT_BYTES.load(Ordering::Relaxed) >> 20,
+                            most_mb = kept_most() >> 20,
+                            "snapshots: one not kept, over VICTORY_KEEP_SNAPSHOTS_MB"
+                        );
+                    }
                 }
             }
             if kept.1 {

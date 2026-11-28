@@ -919,7 +919,7 @@ static ZERO_COPY_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 static ZERO_COPY_HEAPS: std::sync::Mutex<Vec<(usize, ID3D12Heap)>> = std::sync::Mutex::new(Vec::new());
 /// Regions made and their bytes, buffers and windows placed, bytes placed,
 /// placements refused, askings answered "not watched".
-static ZERO_COPY_STATS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+static ZERO_COPY_STATS: [AtomicU64; 18] = [const { AtomicU64::new(0) }; 18];
 
 /// `VICTORY_ZERO_COPY_TRACK=1` (off by default; read here): zero-copy memory
 /// is not placed but keeps its copies (big ones in the card's memory, read
@@ -958,6 +958,30 @@ pub(crate) fn zero_copy_written(at: usize, end: usize) -> Option<Option<Vec<usiz
     ZERO_COPY_STATS[if told { 7 } else { 6 }].fetch_add(1, Ordering::Relaxed);
     ZERO_COPY_STATS[8].fetch_add(out.len() as u64, Ordering::Relaxed);
     Some(told.then_some(out))
+}
+
+/// Before the runtime gives up zero-copy memory (the title frees it): what
+/// the title submitted so far goes to the card and every flight is settled,
+/// so that no submission still to run reads it in place and no landing puts
+/// bytes into it once it is gone. From the title's own calls only.
+/// After FiveNine/clankerVI 949b4625b's `title_memory_quiesce`.
+pub fn title_memory_quiesce() {
+    crate::queue::before_sync();
+    crate::host::settle_everything();
+}
+
+/// Diagnostics: a copy's refresh of `[from, to)` took `us` and put in
+/// `bytes`; counted apart where it lies in zero-copy memory.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn zero_copy_refreshed(from: usize, to: usize, us: u64, bytes: u64) {
+    if !ZERO_COPY_ANY.load(Ordering::Relaxed) {
+        return;
+    }
+    let inside = ZERO_COPY.read().unwrap_or_else(|e| e.into_inner()).iter().any(|r| r.0 < to && from < r.1);
+    let at = if inside { 9 } else if cover(from, to - from) != Cover::None { 15 } else { 12 };
+    ZERO_COPY_STATS[at].fetch_add(1, Ordering::Relaxed);
+    ZERO_COPY_STATS[at + 1].fetch_add(us, Ordering::Relaxed);
+    ZERO_COPY_STATS[at + 2].fetch_add(bytes, Ordering::Relaxed);
 }
 
 /// Whether any zero-copy memory was made ([`ZERO_COPY`]).
@@ -1056,7 +1080,8 @@ fn zero_copy_say() {
     tracing::info!(
         "zero copy (VICTORY_ZERO_COPY), since the start: {} regions of title memory made memfds ({} MB); placed in them {} title buffers and {} windows ({} MB, \
          no copy, no asking, no copy-back); {} refused (copies); {} askings about such memory answered \"not watched\"; \
-         tracked (VICTORY_ZERO_COPY_TRACK): {} askings answered by the runtime's scanner, {} pages of 4 KiB found written",
+         tracked (VICTORY_ZERO_COPY_TRACK): {} askings answered by the runtime's scanner, {} pages of 4 KiB found written; \
+         copies' refreshes (diagnostics) in such memory {} ({} ms, {} MB), in view memory {} ({} ms, {} MB), elsewhere {} ({} ms, {} MB)",
         s[0],
         s[1] >> 20,
         s[2],
@@ -1065,7 +1090,16 @@ fn zero_copy_say() {
         s[5],
         s[6],
         s[7],
-        s[8]
+        s[8],
+        s[9],
+        s[10] / 1000,
+        s[11] >> 20,
+        s[15],
+        s[16] / 1000,
+        s[17] >> 20,
+        s[12],
+        s[13] / 1000,
+        s[14] >> 20
     );
 }
 

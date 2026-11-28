@@ -3874,6 +3874,12 @@ pub(crate) fn settle_now(why: usize) {
     host.settle(&mut submitted, why);
 }
 
+/// [`settle_now`] for title memory given up under what the card may hold in
+/// place (`inplace::title_memory_quiesce`).
+pub(crate) fn settle_everything() {
+    settle_now(WHY_MOST);
+}
+
 /// [`settle_now`] at a present, and for a fence the title blocks on.
 pub(crate) fn settle_for_present() {
     settle_now(WHY_SYNC);
@@ -9252,6 +9258,8 @@ impl Batch {
         let us = started.elapsed().as_micros() as u64;
         #[cfg(feature = "diagnostics")]
         crate::copystat::range(from, to - from, us, 0);
+        #[cfg(feature = "diagnostics")]
+        crate::inplace::zero_copy_refreshed(from, to, us, copied as u64);
         tally(&PREPARING, &TOTAL_PREPARING, 0, us, Ordering::Relaxed);
         tally(&PREPARING, &TOTAL_PREPARING, 1, copied as u64, Ordering::Relaxed);
     }
