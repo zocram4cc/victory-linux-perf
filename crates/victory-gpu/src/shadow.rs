@@ -492,7 +492,128 @@ fn window_card_most() -> u64 {
 /// to about 10 real fps; at 90 it used 12.7 GB of the card and held 17.
 fn window_card_percent() -> u64 {
     static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *PERCENT.get_or_init(|| window_card_percent_of(std::env::var("VICTORY_WINDOW_CARD_PERCENT").ok().as_deref()))
+    *PERCENT.get_or_init(|| {
+        let asked = window_card_percent_of(std::env::var("VICTORY_WINDOW_CARD_PERCENT").ok().as_deref());
+        if textures_first() { asked.min(textures_first_percent()) } else { asked }
+    })
+}
+
+/// (VIctory-BigCheese) Textures first on the card (`VICTORY_TEXTURES_FIRST`;
+/// on unless `0`). Windows outside buffers (our copies of title memory) went
+/// to the card up to the windows' line (90 in the 16 GB launcher), while
+/// textures shown on screen were let go from 85 % on
+/// (`crate::resource::slot_evict`), their slots blank until made again:
+/// textures went black whenever the card filled, on 16 GB and 12 GB cards
+/// alike (a 32 GB PC with an RX 6700 XT too). With it:
+/// - windows go to the card only under [`textures_first_percent`] (78);
+/// - over it and 4 points more, windows on the card move to the PC's memory
+///   at their next use ([`demote_now`]), before any texture goes;
+/// - the texture rules count the card memory windows hold there as free
+///   (they are on their way out) until the card is over 95 % of its budget
+///   ([`windows_on_card_bytes`]).
+pub(crate) fn textures_first() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_TEXTURES_FIRST").is_none_or(|v| v != "0");
+        tracing::info!(
+            on,
+            "textures first on the card (VICTORY_TEXTURES_FIRST): windows under {} % of its budget, moved to the PC's memory over {} %",
+            textures_first_percent(),
+            textures_first_percent() + 4
+        );
+        on
+    })
+}
+
+/// The windows' line under [`textures_first`], in percent of the card's
+/// budget (`VICTORY_TEXTURES_FIRST_PERCENT`, 78 unless set; 50 to 90).
+fn textures_first_percent() -> u64 {
+    static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PERCENT.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURES_FIRST_PERCENT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(78, |p| p.clamp(50, 90))
+    })
+}
+
+/// Bytes of card memory windows hold now: those in card memory the CPU maps
+/// and the card sides of the others. With [`textures_first`] the texture
+/// rules count them as free: they move to the PC's memory first.
+pub(crate) fn windows_on_card_bytes() -> u64 {
+    WINDOW_MAPPED_BYTES.load(Ordering::Relaxed) + WINDOW_CARD_BYTES.load(Ordering::Relaxed)
+}
+
+/// Under [`textures_first`], whether the card is over the line where
+/// windows on it move to the PC's memory (set once a second by
+/// [`let_go_idle`], [`note_demote_room`]).
+static DEMOTE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Of this second: which second, and the bytes of windows moved down in it.
+static DEMOTE_SECOND: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Since the start: windows moved down to the PC's memory and their bytes.
+static DEMOTED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Notes whether windows on the card are to move down ([`DEMOTE`]), from the
+/// card's budget and use (`[budget, used, ..]`).
+fn note_demote_room(video: Option<[u64; 4]>) {
+    let over = textures_first()
+        && windows_on_card_bytes() > 0
+        && video.is_some_and(|[budget, used, ..]| used > window_card_line(budget, (textures_first_percent() + 4).min(95)));
+    DEMOTE.store(over, Ordering::Relaxed);
+}
+
+/// The most bytes of windows moved down to the PC's memory a second
+/// (`VICTORY_WINDOW_DEMOTE_MB`, 256 unless set): each is a new buffer and a
+/// window's bytes to copy again.
+fn window_demote_per_second() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_WINDOW_DEMOTE_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(256) << 20
+    })
+}
+
+/// Whether `shadow` is to move down to the PC's memory now: on the card, the
+/// card over the line ([`DEMOTE`]), and this second's bytes not spent.
+/// Spends them when it is.
+fn demote_now(shadow: &Shadow) -> bool {
+    if !DEMOTE.load(Ordering::Relaxed) || !shadow.demotable() {
+        return false;
+    }
+    let second = crate::host::coarse_ms() / 1000;
+    if DEMOTE_SECOND[0].swap(second, Ordering::Relaxed) != second {
+        DEMOTE_SECOND[1].store(0, Ordering::Relaxed);
+    }
+    if DEMOTE_SECOND[1].fetch_add(shadow.len, Ordering::Relaxed) + shadow.len > window_demote_per_second() {
+        DEMOTE_SECOND[1].fetch_sub(shadow.len, Ordering::Relaxed);
+        return false;
+    }
+    true
+}
+
+/// Counts a window moved down to the PC's memory, and says so now and then.
+fn note_demoted(len: u64) {
+    let n = DEMOTED[0].fetch_add(1, Ordering::Relaxed) + 1;
+    let bytes = DEMOTED[1].fetch_add(len, Ordering::Relaxed) + len;
+    if n.is_power_of_two() || n % 1000 == 0 {
+        tracing::info!(
+            "windows moved from the card to the PC's memory for textures (VICTORY_TEXTURES_FIRST): {n} so far, {} MB",
+            bytes >> 20
+        );
+    }
+}
+
+/// A window of title memory `[start, start + len)` in the PC's memory alone
+/// (the card reads it there), for one moved down ([`demote_now`]).
+fn pc_window(start: u64, len: u64) -> Option<Arc<Shadow>> {
+    let (buffer, data) = host()?.shared_buffer(len)?;
+    crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} (moved off the card)"));
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    let mut shadow = Shadow::new(buffer, data, gpu, start, len);
+    shadow.window = true;
+    Some(Arc::new(shadow))
 }
 
 /// [`window_card_percent`] for the switch's value: a whole number, clamped
@@ -608,7 +729,10 @@ fn window_mapped_pct() -> Option<u64> {
 fn window_mapped_limits(budget: u64) -> (u64, u64) {
     let most = window_mapped_most();
     match window_mapped_pct() {
-        Some(pct) if budget >= 10 << 30 => (most.min(budget / 100 * pct), budget / 100 * 92),
+        Some(pct) if budget >= 10 << 30 => (
+            most.min(budget / 100 * pct),
+            if textures_first() { window_card_line(budget, window_card_percent()) } else { budget / 100 * 92 },
+        ),
         _ => (most, window_card_line(budget, window_card_percent())),
     }
 }
@@ -3454,6 +3578,7 @@ pub(crate) fn let_go_idle() {
         // past it.
         let video = host().and_then(|h| h.video_memory());
         note_promote_room(video);
+        note_demote_room(video);
         let mapped_idle_ms = match video {
             Some([budget, used, ..]) if used < window_card_line(budget, window_card_percent()) => idle_ms.max(60_000),
             _ => idle_ms,
@@ -3554,6 +3679,17 @@ impl Shadow {
     /// copy keeps it until it is reset, and reads what it was given then.
     fn promotable(&self) -> bool {
         self.only_in_pc() && crate::host::references(&self.buffer) == 1
+    }
+
+    /// Whether the window may move down to the PC's memory
+    /// ([`textures_first`]): on the card (mapped there or with a side
+    /// there), not in place, and its buffer held by the copy alone (as
+    /// [`Self::promotable`], for the same reasons).
+    fn demotable(&self) -> bool {
+        self.window
+            && (self.mapped || self.card.is_some())
+            && self.place.is_none()
+            && crate::host::references(&self.buffer) == 1
     }
 
     /// The title memory the copy is of: its start and length.
@@ -6066,6 +6202,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         };
         if let Some(shadow) = key.and_then(|key| map.get(&key))
             && !(window_promote() && PROMOTE_ROOM.load(Ordering::Relaxed) && shadow.promotable())
+            && !(DEMOTE.load(Ordering::Relaxed) && shadow.demotable())
         {
             note(shadow);
             return Some(shadow.clone());
@@ -6085,6 +6222,17 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         named
     };
     if let Some(shadow) = map.get(&(start, len)) {
+        // The card full under textures first: a new window in the PC's
+        // memory takes this one's place in the table; this one, with its
+        // card memory, goes when let go.
+        if demote_now(shadow)
+            && let Some(moved) = pc_window(start, len)
+        {
+            note_demoted(len);
+            note(&moved);
+            map.insert((start, len), moved.clone());
+            return Some(moved);
+        }
         // Room on the card again: a new window there takes this one's place
         // in the table (`window_promote`); this one goes when let go.
         if promote_now(shadow)

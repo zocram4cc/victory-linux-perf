@@ -2214,6 +2214,7 @@ pub(crate) fn let_go_idle() {
         .get_or_init(|| !matches!(std::env::var("VICTORY_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
     let (idle_ms, most) = match memory {
         Some([budget, used, ..]) if keep => {
+            let used = textures_first_used(budget, used);
             let used = used.saturating_sub(crate::pool::texture_room())
                 + crate::shadow::card_room_kept()
                 + targets_room_kept()
@@ -2324,6 +2325,20 @@ pub(crate) fn let_go_idle() {
     }
 }
 
+/// The card's `used` bytes of `budget` as the texture rules see them: with
+/// textures first (`crate::shadow::textures_first`) less the card memory
+/// windows hold, which move to the PC's memory before a texture goes, until
+/// the card is over 95 % of its budget (then they count again, and textures
+/// go as before). Without it, `used`.
+#[cfg(windows)]
+fn textures_first_used(budget: u64, used: u64) -> u64 {
+    if crate::shadow::textures_first() && used <= budget / 100 * 95 {
+        used.saturating_sub(crate::shadow::windows_on_card_bytes())
+    } else {
+        used
+    }
+}
+
 /// Counts of [`slot_evict`]: textures let go though slots showed them,
 /// their bytes, slots put back to waiting, textures made again since, of
 /// them those back within [`FAST_BACK_MS`] (bad victims), (unused), and
@@ -2427,6 +2442,7 @@ fn slot_evict(video: Option<[u64; 4]>, idle_ms: u64, frames: u64) {
     let (Some((high, low, cap)), Some([budget, used, ..])) = (slot_evict_settings(), video) else {
         return;
     };
+    let used = textures_first_used(budget, used);
     // Frames by time, a point a sweep, two minutes of them at most: what
     // frame "`idle_ms` ago" was, for the slots' table stamps.
     static RING: std::sync::Mutex<std::collections::VecDeque<(u64, u64)>> =
