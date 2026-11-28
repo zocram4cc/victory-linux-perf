@@ -8611,6 +8611,9 @@ struct Batch {
     /// flush of this submission, and the range (from, to), until a step of ours
     /// writes title memory there ([`Batch::title_written_at`]).
     once: ByCopy<(usize, usize)>,
+    /// The last range of `ahead` that [`Batch::add`] found an address in:
+    /// (copy, from, to), copy 0 for none.
+    last_ahead: (usize, usize, usize),
 }
 
 /// Whether the copies that a submission's shaders write are brought up to
@@ -9164,7 +9167,11 @@ impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
-        if self.ahead.get(&key).is_some_and(|ranges| ranges.iter().any(|&(from, to)| from <= address && end <= to)) {
+        if self.last_ahead.0 == key && self.last_ahead.1 <= address && end <= self.last_ahead.2 {
+            return;
+        }
+        if let Some(&(from, to)) = self.ahead.get(&key).and_then(|ranges| ranges.iter().find(|&&(from, to)| from <= address && end <= to)) {
+            self.last_ahead = (key, from, to);
             return;
         }
         // (`VICTORY_REFRESH_ONCE=1`) Brought up to date by a flush of this
@@ -9213,7 +9220,11 @@ impl Batch {
         // From here on it is refreshed around what the shaders write. (What
         // is in front of all the steps was, up to here.)
         if !self.front {
-            self.ahead.remove(&(std::sync::Arc::as_ptr(shadow) as usize));
+            let key = std::sync::Arc::as_ptr(shadow) as usize;
+            self.ahead.remove(&key);
+            if self.last_ahead.0 == key {
+                self.last_ahead.0 = 0;
+            }
         }
         let Some(at) = self.index.remove(&(std::sync::Arc::as_ptr(shadow) as usize)) else {
             return;
@@ -9267,6 +9278,7 @@ impl Batch {
     fn title_written(&mut self) {
         self.flush();
         self.ahead.clear();
+        self.last_ahead.0 = 0;
         self.once.clear();
         self.textures.clear();
     }
@@ -9277,6 +9289,7 @@ impl Batch {
     fn title_written_at(&mut self, at: usize, len: usize) {
         self.flush();
         self.ahead.clear();
+        self.last_ahead.0 = 0;
         if refresh_once() != Once::Off {
             self.once.retain(|_, entry| trim_once(entry, at, len));
         }
@@ -9484,6 +9497,7 @@ impl Batch {
             .into_iter()
             .filter_map(|(key, from, to)| Some((copies.get(&key)?.clone(), from, to)))
             .collect();
+        self.last_ahead.0 = 0;
         for (shadow, from, to) in &due {
             self.ahead.insert(std::sync::Arc::as_ptr(shadow) as usize, vec![(*from, *to)]);
         }
