@@ -274,7 +274,7 @@ mod tests {
                 let mine = [Site { window: 0x1100, ..*site }];
                 assert_eq!(apply(place, 0x10000, &raw const *marks as usize, &mine), [Hooked::Done]);
                 assert_eq!(*((place + 0x1100 + site.store) as *const u8), 0xe9);
-                let (plain, hooked): (F, F) = (std::mem::transmute(plain), std::mem::transmute(hooked));
+                let (plain, hooked): (F, F) = (std::mem::transmute::<usize, F>(plain), std::mem::transmute::<usize, F>(hooked));
                 let record: [u8; 32] = std::array::from_fn(|k| k as u8 ^ 0x5a);
                 // In the heap: slot 0x40 + 3 of its start.
                 let table = heap.add(0x2000 + 0x40 * 32);

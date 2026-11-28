@@ -718,6 +718,12 @@ fn runs_most() -> usize {
 /// (`VICTORY_SUBMIT_FRAMES`; 1: the frame before is sent, this one may not be;
 /// 0: both are).
 fn frames_most() -> usize {
+    // In-run A/B (diagnostics): `VICTORY_AB=<s>,VICTORY_SUBMIT_FRAMES2`: two
+    // frames in the line in its phases, the setting below in the others.
+    #[cfg(feature = "diagnostics")]
+    if crate::ab::pick("VICTORY_SUBMIT_FRAMES2") == Some(true) {
+        return 2;
+    }
     static MOST: OnceLock<usize> = OnceLock::new();
     *MOST.get_or_init(|| number("VICTORY_SUBMIT_FRAMES").unwrap_or(1))
 }

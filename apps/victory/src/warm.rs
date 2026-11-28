@@ -26,6 +26,29 @@ fn folder() -> Result<PathBuf> {
     Ok(cfg.cache_subdir("shaders")?.with_file_name("pipelines"))
 }
 
+fn select_pipelines(
+    keys: &[String],
+    done: &HashSet<&str>,
+    bad: &HashSet<String>,
+    early: &HashSet<&str>,
+    again: bool,
+    used: bool,
+    limit: Option<usize>,
+) -> Vec<usize> {
+    // Those earlier runs drew with first, the others in no order (by key).
+    let mut all: Vec<usize> = (0..keys.len())
+        .filter(|&n| {
+            let key = keys[n].as_str();
+            (again || !done.contains(key))
+                && (again || !bad.contains(key))
+                && (!used || early.contains(key))
+        })
+        .collect();
+    all.sort_by_key(|&n| (!early.contains(keys[n].as_str()), &keys[n]));
+    all.truncate(limit.unwrap_or(usize::MAX));
+    all
+}
+
 pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, these: Option<String>) -> Result<()> {
     let dir = folder()?;
     if let Some(these) = these {
@@ -35,7 +58,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     victory_hle::known_pipelines::use_translations(dir.with_file_name("shaders"));
     let fingerprint = known::fingerprint();
     let done_file = dir.join("warm-done.txt");
-    let bad_file = dir.join("warm-bad.txt");
+    let bad_file = dir.join(known::WARM_BAD_FILE);
     let keys = known::keys(&dir);
     let listed = std::fs::read_to_string(&done_file).unwrap_or_default();
     let mut done: HashSet<&str> = HashSet::new();
@@ -46,19 +69,15 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
             done.insert(key);
         }
     }
-    let bad = std::fs::read_to_string(&bad_file).unwrap_or_default();
-    let bad: HashSet<&str> = bad.lines().filter_map(|l| l.split(' ').next()).collect();
+    let bad: HashSet<String> = if known::bad_list_disabled() {
+        HashSet::new()
+    } else {
+        let text = std::fs::read_to_string(&bad_file).unwrap_or_default();
+        known::parse_bad_keys(&text, &fingerprint)
+    };
     let early = std::fs::read_to_string(dir.join("early-pipelines.txt")).unwrap_or_default();
     let early: HashSet<&str> = early.lines().collect();
-    // Those earlier runs drew with first, the others in no order (by key).
-    let mut all: Vec<usize> = (0..keys.len())
-        .filter(|&n| {
-            let key = keys[n].as_str();
-            (again || !done.contains(key)) && !bad.contains(key) && (!used || early.contains(key))
-        })
-        .collect();
-    all.sort_by_key(|&n| (!early.contains(keys[n].as_str()), &keys[n]));
-    all.truncate(limit.unwrap_or(usize::MAX));
+    let all = select_pipelines(&keys, &done, &bad, &early, again, used, limit);
     let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
     let jobs = jobs.unwrap_or(cores * 2 / 3).max(1);
     println!(
@@ -93,7 +112,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
         },
         |n, why| {
             println!("pipeline {n} {}: {why}", keys[n]);
-            let _ = writeln!(lock(&bad_out), "{} {why}", keys[n]);
+            let _ = writeln!(lock(&bad_out), "{}", known::format_bad_entry(&keys[n], &fingerprint, &why));
             lock(&state).2 += 1;
         },
     )?;
@@ -345,5 +364,48 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("worker unavailable"));
+    }
+
+    #[test]
+    fn select_pipelines_skips_current_bad_and_retries_on_again_or_new_fingerprint() {
+        let hex_key = |c: char| c.to_string().repeat(32);
+        let (k_done, k_bad_current, k_bad_old, k_legacy_bad, k_fresh) = (
+            hex_key('0'),
+            hex_key('1'),
+            hex_key('2'),
+            hex_key('3'),
+            hex_key('4'),
+        );
+        let keys = vec![
+            k_done.clone(),
+            k_bad_current.clone(),
+            k_bad_old.clone(),
+            k_legacy_bad.clone(),
+            k_fresh.clone(),
+        ];
+        let done = HashSet::from([k_done.as_str()]);
+        let early = HashSet::from([k_bad_current.as_str(), k_fresh.as_str()]);
+        let current_entry = known::format_bad_entry(&k_bad_current, "1111111111111111", "exit code: 0xc0000005");
+        assert_eq!(current_entry.split(' ').next(), Some(k_bad_current.as_str()));
+        let old_entry = known::format_bad_entry(&k_bad_old, "0000000000000000", "hung for 180 s");
+        let bad_text = format!(
+            "# comment\n\
+             {current_entry}\n\
+             {old_entry}\n\
+             {k_legacy_bad} legacy crash\n"
+        );
+        let bad = known::parse_bad_keys(&bad_text, "1111111111111111");
+        assert_eq!(bad, HashSet::from([k_bad_current.clone(), k_legacy_bad]));
+
+        // Early non-done/non-bad first (k_fresh = 4), then stale-fingerprint k_bad_old (2).
+        assert_eq!(select_pipelines(&keys, &done, &bad, &early, false, false, None), vec![4, 2]);
+        // --again retries done and bad pipelines (early indices 1, 4 first, then 0, 2, 3).
+        assert_eq!(select_pipelines(&keys, &done, &bad, &early, true, false, None), vec![1, 4, 0, 2, 3]);
+        assert_eq!(select_pipelines(&keys, &done, &bad, &early, true, true, None), vec![1, 4]);
+        // Simulating VICTORY_WARM_BAD=0 clears bad while still honoring done.
+        assert_eq!(
+            select_pipelines(&keys, &done, &HashSet::new(), &early, false, false, None),
+            vec![1, 4, 2, 3]
+        );
     }
 }

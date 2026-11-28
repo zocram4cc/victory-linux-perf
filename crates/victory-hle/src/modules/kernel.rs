@@ -434,6 +434,89 @@ pub extern "system" fn SetThreadPriority(thread: *mut c_void, priority: i32) -> 
     unsafe { windows_sys::Win32::System::Threading::SetThreadPriority(thread, priority) }
 }
 
+/// The title's sleeps, by milliseconds asked: 0, 1, 2-3, 4-7, 8-15, 16-31,
+/// 32 and more; and per bucket the microseconds asked and slept.
+static SLEEPS: [[std::sync::atomic::AtomicU64; 3]; 7] =
+    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 3] }; 7];
+static SLEEPS_LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Sleeps of 1 to this many milliseconds made a yield (`Sleep(0)`), or 0:
+/// as asked (`VICTORY_SLEEP_SHORT=<ms>`; A/B-able, then 2 unless set). The
+/// timeline of 27 Nov had the title's sleeps on the frame's critical path,
+/// 5-8 ms a frame; Wine sleeps at least what is asked and wakes late.
+fn sleep_short() -> u32 {
+    static MS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let ms = *MS.get_or_init(|| std::env::var("VICTORY_SLEEP_SHORT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
+    match victory_gpu::ab_pick("VICTORY_SLEEP_SHORT") {
+        Some(true) => if ms == 0 { 2 } else { ms },
+        Some(false) => 0,
+        None => ms,
+    }
+}
+
+/// Sleeps longer than this many milliseconds made this long, or 0: as asked
+/// (`VICTORY_SLEEP_CAP=<ms>`; A/B-able, then 4 unless set). The title's
+/// SleepEx was on the critical path of the TV scene's frames (27 Nov), and
+/// it sleeps 8-31 ms some 130 times a second.
+fn sleep_cap() -> u32 {
+    static MS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let ms = *MS.get_or_init(|| std::env::var("VICTORY_SLEEP_CAP").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
+    match victory_gpu::ab_pick("VICTORY_SLEEP_CAP") {
+        Some(true) => if ms == 0 { 4 } else { ms },
+        Some(false) => 0,
+        None => ms,
+    }
+}
+
+/// The title's `Sleep`: [`SleepEx`] not alertable.
+pub extern "system" fn Sleep(ms: u32) {
+    SleepEx(ms, 0);
+}
+
+/// The title's `SleepEx`: counted (the log's "the title's sleeps" line every
+/// 10 s), and short ones made yields with [`sleep_short`].
+pub extern "system" fn SleepEx(ms: u32, alertable: i32) -> u32 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let short = sleep_short();
+    let mut asked = if ms != 0 && ms != u32::MAX && ms <= short { 0 } else { ms };
+    let cap = sleep_cap();
+    if cap != 0 && asked != u32::MAX && asked > cap {
+        asked = cap;
+    }
+    let started = std::time::Instant::now();
+    // SAFETY: a plain call.
+    let r = unsafe { windows_sys::Win32::System::Threading::SleepEx(asked, alertable) };
+    let slept = started.elapsed().as_micros() as u64;
+    let bucket = match ms { 0 => 0, 1 => 1, 2..=3 => 2, 4..=7 => 3, 8..=15 => 4, 16..=31 => 5, _ => 6 };
+    SLEEPS[bucket][0].fetch_add(1, Relaxed);
+    SLEEPS[bucket][1].fetch_add(u64::from(ms.min(1_000_000)) * 1000, Relaxed);
+    SLEEPS[bucket][2].fetch_add(slept, Relaxed);
+    let now = crate::modules::kernel::process_ms();
+    let last = SLEEPS_LOGGED.load(Relaxed);
+    if now >= last + 10_000 && SLEEPS_LOGGED.compare_exchange(last, now, Relaxed, Relaxed).is_ok() && last != 0 {
+        let secs = (now - last) as f64 / 1000.0;
+        let part = |b: usize| {
+            let n = SLEEPS[b][0].swap(0, Relaxed);
+            let a = SLEEPS[b][1].swap(0, Relaxed);
+            let s = SLEEPS[b][2].swap(0, Relaxed);
+            format!("{:.0}/s asked {:.1} ms slept {:.1} ms", n as f64 / secs, a as f64 / 1000.0 / secs, s as f64 / 1000.0 / secs)
+        };
+        tracing::info!(
+            "the title's sleeps per second (VICTORY_SLEEP_SHORT={short}): 0 ms: {}; 1: {}; 2-3: {}; 4-7: {}; 8-15: {}; 16-31: {}; 32+: {}",
+            part(0), part(1), part(2), part(3), part(4), part(5), part(6)
+        );
+    } else if last == 0 {
+        let _ = SLEEPS_LOGGED.compare_exchange(0, now.max(1), Relaxed, Relaxed);
+    }
+    r
+}
+
+/// Milliseconds since the process started (for rate-limited log lines).
+pub(crate) fn process_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "kernel",
@@ -445,8 +528,12 @@ pub(crate) fn module() -> HleModule {
             "api-ms-win-core-debug-*",
             "api-ms-win-core-errorhandling-*",
             "api-ms-win-crt-runtime-*",
+            // (Only Sleep and SleepEx are ours there: the rest goes to the host.)
+            "api-ms-win-core-synch-*",
         ],
         exports: vec![
+            hle_export!(Sleep),
+            hle_export!(SleepEx),
             hle_export!(__p___argc),
             hle_export!(__p___argv),
             hle_export!(GetModuleHandleW),

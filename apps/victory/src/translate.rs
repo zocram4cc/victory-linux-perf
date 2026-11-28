@@ -154,6 +154,13 @@ struct Checks {
     host: Option<(Host, emit::HostShader)>,
 }
 
+/// Worker threads for `--jobs`: every logical core when it is not given, as
+/// its help says, `--warm` included, and never fewer than one.
+fn worker_threads(jobs: Option<usize>) -> usize {
+    jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()))
+        .max(1)
+}
+
 /// `translate --warm <file>`: the containers whose hash the file names are
 /// translated into the run's shader cache, on `jobs` threads; nothing is
 /// made on the GPU. A run of the title then finds them there instead of
@@ -179,7 +186,7 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>, wave: Option<
     let cfg = victory_core::Config::load()?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let paths = crate::default_paths(paths)?;
-    let threads = jobs.unwrap_or(4).max(1);
+    let threads = worker_threads(jobs);
     let began = std::time::Instant::now();
     let done = Mutex::new(HashSet::new());
     let counts = [const { AtomicUsize::new(0) }; 5];
@@ -285,8 +292,7 @@ pub fn run(
         .map(|(v, p)| (v.trim().to_owned(), p.trim().to_owned()))
         .collect();
     let kept = std::sync::Arc::new(Mutex::new(Vec::new()));
-    let threads =
-        jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+    let threads = worker_threads(jobs);
     let seen = Mutex::new(HashSet::new());
     let total = Mutex::new(Tally::default());
     for root in &paths {
@@ -412,8 +418,7 @@ pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>, list: Option<PathBuf
     let cfg = victory_core::Config::load()?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let paths = crate::default_paths(paths)?;
-    let threads =
-        jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+    let threads = worker_threads(jobs);
     let started = std::time::Instant::now();
     let seen = Mutex::new(HashSet::new());
     let done = AtomicUsize::new(0);
@@ -977,6 +982,16 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
+    /// No `--jobs` is every logical core on the three paths, `--warm`
+    /// included, and never fewer than one worker.
+    #[test]
+    fn jobs_is_at_least_one_worker_and_every_core_by_default() {
+        let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+        assert_eq!(super::worker_threads(None), cores);
+        assert_eq!(super::worker_threads(Some(0)), 1);
+        assert_eq!(super::worker_threads(Some(3)), 3);
+    }
+
     /// Shader dumps are game-derived, so a dump directory in the repo is refused.
     #[test]
     fn emit_dump_inside_repo_is_refused() {

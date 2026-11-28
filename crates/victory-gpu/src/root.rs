@@ -78,6 +78,45 @@ fn host_export(cache: &OnceLock<Option<usize>>, name: &CStr) -> Option<usize> {
     })
 }
 
+/// The host's serializer refused a description the title made for the
+/// console's, whose serializer takes it (a flag the host runtime does not
+/// know: Windows 10's in-box runtime refuses the directly indexed heap
+/// flags, #168). The title then has a failure and no blob, which its code
+/// may not check, so the refusal is logged with the host's reason.
+fn note_refusal(hr: HRESULT, flags: u32, error: *mut *mut c_void) {
+    if hr >= 0 {
+        return;
+    }
+    // SAFETY: `error` is the title's out pointer, nulled before the host's
+    // call; the host put its blob there or left it null.
+    let blob = (!error.is_null())
+        .then(|| unsafe { *error })
+        .filter(|b| !b.is_null());
+    #[cfg(windows)]
+    let why = blob.and_then(|b| {
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::core::Interface;
+        // SAFETY: the host's blob, alive until the title releases it.
+        unsafe { ID3DBlob::from_raw_borrowed(&b) }.map(crate::pipeline::host::blob_text)
+    });
+    #[cfg(not(windows))]
+    let why = blob.map(|_| String::new());
+    tracing::warn!(
+        hr = format_args!("{hr:#x}"),
+        flags = format_args!("{flags:#x}"),
+        why = why.as_deref().unwrap_or(""),
+        "host refused the title's root signature"
+    );
+}
+
+/// Nulls the title's error out pointer, so a refusal's blob is the host's.
+fn clear(error: *mut *mut c_void) {
+    if !error.is_null() {
+        // SAFETY: the title's out pointer.
+        unsafe { *error = std::ptr::null_mut() };
+    }
+}
+
 fn without_console_flags(desc: Desc) -> Desc {
     if desc.flags & CONSOLE_FLAGS != 0 {
         tracing::debug!(
@@ -107,15 +146,13 @@ pub extern "system" fn serialize(
         tracing::warn!("no host d3d12.dll to serialize root signatures");
         return E_NOTIMPL;
     };
+    let desc = without_console_flags(desc);
+    clear(error);
     // SAFETY: the export has this signature; it takes what the title passed.
-    unsafe {
-        std::mem::transmute::<usize, Serialize>(address)(
-            &without_console_flags(desc),
-            version,
-            blob,
-            error,
-        )
-    }
+    let hr =
+        unsafe { std::mem::transmute::<usize, Serialize>(address)(&desc, version, blob, error) };
+    note_refusal(hr, desc.flags, error);
+    hr
 }
 
 /// `d3d12_xs!D3D12SerializeVersionedRootSignature`.
@@ -137,8 +174,12 @@ pub extern "system" fn serialize_versioned(
         desc: without_console_flags(desc.desc),
         ..desc
     };
+    clear(error);
     // SAFETY: the export has this signature; it takes what the title passed.
-    unsafe { std::mem::transmute::<usize, SerializeVersioned>(address)(&desc, blob, error) }
+    let hr =
+        unsafe { std::mem::transmute::<usize, SerializeVersioned>(address)(&desc, blob, error) };
+    note_refusal(hr, desc.desc.flags, error);
+    hr
 }
 
 type Deserialize =
@@ -548,6 +589,43 @@ mod tests {
         let read = unsafe { &*deserializer.GetRootSignatureDesc() };
         assert_eq!((read.NumParameters, read.Flags.0), (0, 1));
         slot::<extern "system" fn(This) -> u32>(blob, 0x10)(blob);
+    }
+
+    /// A flag the host runtime does not know: the title gets the host's
+    /// failure, no blob and the host's reason, as from Windows 10's in-box
+    /// runtime for the directly indexed heap flags (#168).
+    #[cfg(windows)]
+    #[test]
+    fn host_refusals_reach_the_title() {
+        use crate::object::E_INVALIDARG;
+        let desc = VersionedDesc {
+            version: 2,
+            desc: Desc {
+                parameter_count: 0,
+                parameters: std::ptr::null(),
+                sampler_count: 0,
+                samplers: std::ptr::null(),
+                flags: 0x0080_0001,
+            },
+        };
+        let mut blob = std::ptr::null_mut();
+        let mut error = std::ptr::dangling_mut::<c_void>();
+        assert_eq!(
+            serialize_versioned(&desc, &mut blob, &mut error),
+            E_INVALIDARG
+        );
+        assert!(blob.is_null());
+        assert!(!error.is_null());
+        let error = error.cast_const().cast::<Object>();
+        let data = slot::<extern "system" fn(This) -> *const u8>(error, 0x18)(error);
+        let size = slot::<extern "system" fn(This) -> usize>(error, 0x20)(error);
+        // SAFETY: the host's blob, `size` bytes.
+        let text = String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(data, size) });
+        assert!(
+            text.contains("Unsupported bit-flag set (root signature flags 800001)"),
+            "{text}"
+        );
+        slot::<extern "system" fn(This) -> u32>(error, 0x10)(error);
     }
 
     /// Version 1.0 through the versioned entry point, with a console flag.

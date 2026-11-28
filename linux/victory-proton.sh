@@ -35,7 +35,10 @@ for kv in VICTORY_TEXTURE_NO_WAIT=1 VICTORY_RELAY=2 VICTORY_WIDE_BACK=1 VICTORY_
     VICTORY_THIN=1 VICTORY_JOIN_PARTS=8 VICTORY_UPLOAD_AHEAD=1 \
     VICTORY_PORT_DESCRIPTORS=1 VICTORY_PORT_GUARD=1 VICTORY_PORT_JOURNAL=1 VICTORY_PORT_CBV=1 \
     VICTORY_PORT_CONSTANTS=1 VICTORY_COPY_COMPARE=1 VICTORY_ONE_PAD=0 VICTORY_FRAME_INTERVAL_MS=0 \
-    VICTORY_CARD_BUFFERS_MIN_KB=64 VICTORY_COMPUTE_WAIT_MS=500; do
+    VICTORY_CARD_BUFFERS_MIN_KB=64 VICTORY_COMPUTE_WAIT_MS=500 \
+    VICTORY_STORE_BESIDE=1 VICTORY_CARD_BUFFERS_MB=1024 VICTORY_TEXTURE_MAX_DIM=2048 \
+    VICTORY_TEXTURE_MAX=0 VICTORY_TEXTURE_ROOM_PERCENT=72 VICTORY_PAD_FOCUS=1 NO_COLOR=1 \
+    VICTORY_BAKE_TEXTURES_MS=10000 VICTORY_EARLY_TEXTURES_MS=40 VICTORY_SOFT_VIEWS=copies; do
     k=${kv%%=*}
     [ -z "${!k+x}" ] && export "$kv"
 done
@@ -50,6 +53,27 @@ export RADV_DEBUG="${RADV_DEBUG-}"
 # anonymous memory; the patch backs the title's 32-bit heap with private pages).
 # VICTORY_FRAME_INTERVAL_MS=0: the title's own 30 fps cap off (frame and sim
 # rate patched to "no limit"; plays normally). 33.333 puts the cap back.
+# VICTORY_STORE_BESIDE=1: a title store that faults on a guarded block is done
+#   through our own view instead of opening the block (two protection changes
+#   under Wine's process-wide lock each): ~1.9 ms a frame here.
+# VICTORY_CARD_BUFFERS_MB=1024: at most 1 GiB of buffer copies in the card's
+#   memory, VICTORY_TEXTURE_MAX_DIM=2048 the largest BC textures' top level
+#   left out: VRAM headroom (a desktop compositor can crash when VRAM is full).
+# VICTORY_TEXTURE_MAX=0: RYUKI's adaptive texture cap off (unset: 1024, then
+#   512/256 as VRAM fills; sharper pictures with it off).
+# VICTORY_TEXTURE_ROOM_PERCENT=72: textures picked by index made only up to
+#   72 % of the card's budget (code default 90). Turning the camera filled
+#   VRAM to 18.2-18.9 of 20.5 GB on an RX 7900 XT; with 72 the peak was
+#   15.7 GB, same fps, textures still sharp. 16 GB cards may want less.
+# VICTORY_PAD_FOCUS=1: pads read only while the game window has focus.
+# VICTORY_SOFT_VIEWS=copies: views of the title's page-mapping copies kept in the
+#   runtime's books until touched: turning the camera the title remaps ~5,000
+#   pages a second, and Wine's map/unmap calls for them were expensive. Turning:
+#   -5.1 ms a frame (2+2 runs), 0 differing pages in verify mode.
+# VICTORY_BAKE_TEXTURES_MS=10000, VICTORY_EARLY_TEXTURES_MS=40: the title bakes its
+#   characters' skin from textures while it loads; what is not on the card then
+#   is baked as nothing for the session. Bake draws wait up to 10 s for their
+#   sources (code default 1.5 s). For the faces; not measured yet.
 # VICTORY_ONE_PAD=0: the fork's keyboard stand-in pad is not merged with real
 # pads (an analog keyboard's gamepad mode would get every key twice).
 # Devices that pretend to be joysticks can steer on their own: list them as

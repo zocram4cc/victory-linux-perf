@@ -499,6 +499,90 @@ pub(crate) fn shown_runs(at: usize, len: usize) -> Vec<(usize, usize)> {
     runs
 }
 
+/// Whether any mapped view of physical pages overlaps `[start, end)`.
+pub(crate) fn has_view_in(start: usize, end: usize) -> bool {
+    if start >= end {
+        return false;
+    }
+    let v = views();
+    if let Some((&base, view)) = v.views.range(..=start).next_back()
+        && base.saturating_add(view.0) > start
+    {
+        return true;
+    }
+    v.views.range(start..end).next().is_some()
+}
+
+/// Splits 64 KiB block range `[first, last)` into sub-ranges `(s, e)` that each
+/// lie wholly within a single `MapViewOfFile3` view recorded in [`VIEWS`] (so
+/// one `VirtualProtect` call succeeds under Wine's `find_view` without failing
+/// across view boundaries). Empty if no recorded view overlaps `[first, last)`.
+pub(crate) fn view_block_slices(first: usize, last: usize) -> Vec<(usize, usize)> {
+    if first >= last {
+        return Vec::new();
+    }
+    let start = first * K64;
+    let end = last * K64;
+    let v = views();
+    let first_view = v.views.range(..=start).next_back();
+    let rest = v.views.range(start.saturating_add(1)..end);
+    let mut out = Vec::new();
+    for (&base, &(bytes, _, _)) in first_view.into_iter().chain(rest) {
+        let from = base.max(start);
+        let to = base.saturating_add(bytes).min(end);
+        if from < to {
+            let s = from / K64;
+            let e = to.div_ceil(K64).min(last);
+            if s < e {
+                out.push((s, e));
+            }
+        }
+    }
+    out
+}
+
+/// Groups sorted 64 KiB block numbers `blocks` into contiguous runs `(from, to)`
+/// such that each run lies inside a single `MapViewOfFile3` view (or is a
+/// contiguous run of blocks outside recorded views). Under Wine, a single
+/// `VirtualProtect` succeeds on each such view run and never wastes a lock
+/// attempting to span two separate `file_view`s.
+pub(crate) fn single_view_runs(blocks: &[usize]) -> Vec<(usize, usize)> {
+    if blocks.is_empty() {
+        return Vec::new();
+    }
+    let v = views();
+    let view_end_of = |block: usize| -> Option<usize> {
+        let addr = block * K64;
+        let (&base, &(bytes, _, _)) = v.views.range(..=addr).next_back()?;
+        let end = base.saturating_add(bytes);
+        (end > addr).then(|| end.div_ceil(K64))
+    };
+    let mut runs = Vec::new();
+    let mut i = 0;
+    while i < blocks.len() {
+        let from = blocks[i];
+        let limit = view_end_of(from);
+        let mut to = from + 1;
+        let mut j = i + 1;
+        while j < blocks.len() && blocks[j] == to {
+            match limit {
+                Some(lim) if to < lim => {
+                    to += 1;
+                    j += 1;
+                }
+                None if view_end_of(to).is_none() => {
+                    to += 1;
+                    j += 1;
+                }
+                _ => break,
+            }
+        }
+        runs.push((from, to));
+        i = j;
+    }
+    runs
+}
+
 /// How the views cover `[at, at + len)`.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) enum Cover {
@@ -1526,5 +1610,27 @@ pub(crate) mod tests {
             views_gone(view as usize, 3 * K64);
             mem::VirtualFree(base as *mut c_void, 0, mem::MEM_RELEASE);
         }
+    }
+
+    #[test]
+    fn view_slices_and_runs_split_at_separate_view_boundaries() {
+        let base = 0x8_4000_0000usize;
+        // View A: 3 contiguous blocks; View B: 2 adjacent blocks (separate MapViewOfFile3);
+        // 2-block hole; View C: 2 blocks.
+        title_memory_view(base, 3 * K64, 99, 0);
+        title_memory_view(base + 3 * K64, 2 * K64, 99, 10 * K64 as u64);
+        title_memory_view(base + 7 * K64, 2 * K64, 99, 20 * K64 as u64);
+
+        let b = base / K64;
+        assert_eq!(view_block_slices(b, b + 9), vec![(b, b + 3), (b + 3, b + 5), (b + 7, b + 9)]);
+        assert_eq!(
+            single_view_runs(&[b, b + 1, b + 2, b + 3, b + 4, b + 7, b + 8]),
+            vec![(b, b + 3), (b + 3, b + 5), (b + 7, b + 9)]
+        );
+        assert!(has_view_in(base + K64, base + 2 * K64));
+        assert!(!has_view_in(base + 5 * K64, base + 7 * K64));
+
+        views_gone(base, 9 * K64);
+        assert!(!has_view_in(base, base + 9 * K64));
     }
 }

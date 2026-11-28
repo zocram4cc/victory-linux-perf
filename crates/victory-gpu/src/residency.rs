@@ -19,6 +19,11 @@ const MIB: u64 = 1 << 20;
 /// `VICTORY_RESIDENCY=1`: the memory budgets of this module (off by default).
 pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
+    // In-run A/B (diagnostics): `VICTORY_AB=<s>,VICTORY_RESIDENCY` flips it by phase.
+    #[cfg(feature = "diagnostics")]
+    if let Some(now) = crate::ab::pick("VICTORY_RESIDENCY") {
+        return now;
+    }
     *ON.get_or_init(|| std::env::var_os("VICTORY_RESIDENCY").is_some_and(|v| v == "1"))
 }
 const GIB: u64 = 1 << 30;

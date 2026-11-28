@@ -17,14 +17,20 @@ use windows_sys::Win32::Foundation::{
 };
 
 use windows_sys::Win32::System::Diagnostics::Debug::{
-    AddVectoredExceptionHandler, CONTEXT, EXCEPTION_POINTERS, M128A, RtlLookupFunctionEntry,
-    RtlVirtualUnwind, SetUnhandledExceptionFilter, UNW_FLAG_NHANDLER,
+    AddVectoredExceptionHandler, CONTEXT, EXCEPTION_POINTERS, IMAGE_RUNTIME_FUNCTION_ENTRY, M128A,
+    ReadProcessMemory, RtlLookupFunctionEntry, RtlVirtualUnwind, SetUnhandledExceptionFilter,
+    UNW_FLAG_NHANDLER,
 };
 use windows_sys::Win32::System::LibraryLoader::{
     GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
     GetModuleFileNameW, GetModuleHandleExW,
 };
-use windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits;
+use windows_sys::Win32::System::Memory::{
+    MEM_COMMIT, MEM_IMAGE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+    PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
+    VirtualQuery,
+};
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentThreadStackLimits};
 
 const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
 /// Frames listed per report.
@@ -115,6 +121,8 @@ pub fn report_crashes() {
         unsafe { report_unhandled(info) };
         EXCEPTION_CONTINUE_SEARCH
     }
+    // Read the switch now, not first inside a handler.
+    unwind_checks_enabled();
     // SAFETY: registers handlers that only read the exception they are
     // given; the title's own filter, once it sets one, takes the place of
     // ours and calls `report_unhandled` first.
@@ -640,13 +648,14 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
 /// Return addresses of the faulting thread's frames, from the faulting
 /// instruction up, by the unwind data of each image (the Windows loader
 /// registered it for title images too). Code without unwind data (our
-/// thunks, leaf functions) is taken to have its return address at `rsp`.
+/// thunks, leaf functions) is taken to have its return address at `rsp`;
+/// with `VICTORY_UNWIND_CHECKS` on (the default), only at the first frame.
 fn unwind(context: CONTEXT) -> Vec<u64> {
     let (mut low, mut high) = (0, 0);
     // SAFETY: writes the current thread's stack bounds.
     unsafe { GetCurrentThreadStackLimits(&mut low, &mut high) };
     let mut frames = Vec::with_capacity(MAX_FRAMES);
-    unwind_into(context, low, high, &mut frames);
+    unwind_into(context, low, high, &mut frames, unwind_checks_enabled());
     frames
 }
 
@@ -654,10 +663,26 @@ fn unwind(context: CONTEXT) -> Vec<u64> {
 #[repr(C, align(16))]
 pub(crate) struct Aligned16(pub(crate) CONTEXT);
 
+/// Whether the stack walk checks each code address, unwind record and stack
+/// range before it reads them. Read once: [`report_crashes`] reads it before
+/// title code runs, so the exception handler and a walk of a suspended
+/// thread never take the environment's lock.
+pub(crate) fn unwind_checks_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // VICTORY_UNWIND_CHECKS=0 selects the original stack walk for A/B runs.
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UNWIND_CHECKS").is_none_or(|value| value != "0"))
+}
+
 /// [`unwind`] for any thread of the process, its stack being `low..high`;
 /// pushes no more than `MAX_FRAMES`, so it does not allocate when `frames`
 /// has that capacity (another thread may be suspended holding the heap).
-pub(crate) fn unwind_into(context: CONTEXT, low: usize, high: usize, frames: &mut Vec<u64>) {
+pub(crate) fn unwind_into(
+    context: CONTEXT,
+    low: usize,
+    high: usize,
+    frames: &mut Vec<u64>,
+    checks: bool,
+) {
     // `RtlVirtualUnwind` writes the context with 16-byte aligned stores, and
     // windows-sys declares `CONTEXT` without that alignment: a by-value copy on
     // the stack can land 8 bytes off and fault (seen in a debug build).
@@ -667,19 +692,56 @@ pub(crate) fn unwind_into(context: CONTEXT, low: usize, high: usize, frames: &mu
     while frames.len() < MAX_FRAMES {
         // Stop where reading the stack would fault inside this handler.
         let rsp = context.Rsp as usize;
-        if rsp < low || rsp + 8 > high {
+        if rsp < low || rsp.checked_add(8).is_none_or(|end| end > high) {
             break;
         }
+        // With checks, code must be executable. Code outside an image (our
+        // thunks and stubs, made with `VirtualAlloc`) has no unwind data and
+        // is only taken at the first frame, by the leaf rule below.
+        let code_image = if checks {
+            let Some(region) = readable_region(context.Rip as usize) else {
+                break;
+            };
+            let in_image = region.Type == MEM_IMAGE;
+            if !executable(&region) || (!in_image && frames.len() != 1) {
+                break;
+            }
+            in_image.then_some(region.AllocationBase as usize)
+        } else {
+            None
+        };
         let mut image = 0;
-        // SAFETY: looks up the function table entry covering `Rip`, if any.
-        let entry = unsafe { RtlLookupFunctionEntry(context.Rip, &mut image, null_mut()) };
+        let entry = if checks && code_image.is_none() {
+            null_mut()
+        } else {
+            // SAFETY: looks up the function table entry covering `Rip`, if any.
+            unsafe { RtlLookupFunctionEntry(context.Rip, &mut image, null_mut()) }
+        };
         if entry.is_null() {
-            // SAFETY: `rsp` is inside this thread's stack.
-            context.Rip = unsafe { (rsp as *const u64).read() };
+            context.Rip = if checks {
+                let mut address = [0; 8];
+                if frames.len() != 1
+                    || readable_range(rsp, rsp + 8, None).is_none()
+                    || !read_memory(rsp, &mut address)
+                {
+                    break;
+                }
+                u64::from_le_bytes(address)
+            } else {
+                // SAFETY: `rsp` is inside this thread's stack.
+                unsafe { (rsp as *const u64).read_unaligned() }
+            };
             context.Rsp += 8;
         } else {
+            if checks
+                && (code_image != Some(image as usize)
+                    || stack_reads_end(context, image as usize, entry, low, high).is_none())
+            {
+                break;
+            }
             let (mut data, mut frame) = (null_mut(), 0);
-            // SAFETY: `entry` belongs to `image`; the context is our copy.
+            // SAFETY: `entry` belongs to `image` and the context is our aligned copy.
+            // The checked path bounds the stack reads and checks the image ranges above.
             unsafe {
                 RtlVirtualUnwind(
                     UNW_FLAG_NHANDLER,
@@ -693,11 +755,286 @@ pub(crate) fn unwind_into(context: CONTEXT, low: usize, high: usize, frames: &mu
                 )
             };
         }
-        if context.Rip == 0 {
+        if context.Rip == 0 || (checks && (context.Rsp <= rsp as u64 || context.Rsp >= high as u64))
+        {
             break;
         }
         frames.push(context.Rip);
     }
+}
+
+struct UnwindInfo {
+    stack_bytes: usize,
+    save_end: usize,
+    saves_xmm: bool,
+    frame: u8,
+    chained_rva: Option<usize>,
+}
+
+/// Bounds the stack accesses described by one x64 UNWIND_INFO record.
+fn parse_unwind_info(bytes: &[u8]) -> Option<UnwindInfo> {
+    let &[version_flags, prolog, count, frame] = bytes.get(..4)? else {
+        return None;
+    };
+    let flags = version_flags >> 3;
+    let chained = flags == 4;
+    let register = frame & 15;
+    if !matches!(version_flags & 7, 1 | 2)
+        || (!chained && flags > 3)
+        || (register == 0 && frame != 0)
+        || (register != 0 && !nonvolatile(register))
+    {
+        return None;
+    }
+    let count = usize::from(count);
+    let tail = 4 + count.next_multiple_of(2) * 2;
+    let chained_rva = if chained {
+        Some(u32::from_le_bytes(bytes.get(tail + 8..tail + 12)?.try_into().ok()?) as usize)
+    } else {
+        // The handler RVA, when present, follows the padded unwind codes.
+        bytes.get(..tail + usize::from(flags != 0) * 4)?;
+        None
+    };
+    let mut codes = bytes.get(4..4 + count * 2)?;
+    let mut stack_bytes: usize = 0;
+    let mut save_end = 0;
+    let mut saves_xmm = false;
+    let mut sets_frame = false;
+    let mut previous_offset = prolog;
+    while !codes.is_empty() {
+        let offset = codes[0];
+        if offset > previous_offset {
+            return None;
+        }
+        previous_offset = offset;
+        let (op, info) = (codes[1] & 15, codes[1] >> 4);
+        codes = &codes[2..];
+        let (extra, growth) = match op {
+            // Chained records can add saves but cannot move RSP.
+            0 if !chained && nonvolatile(info) && (info != register || sets_frame) => (0, 8),
+            1 if !chained && info == 0 => (2, unwind_operand(codes, 2)? * 8),
+            1 if !chained && info == 1 => (4, unwind_operand(codes, 4)?),
+            2 if !chained => (0, (usize::from(info) + 1) * 8),
+            3 if !chained && info == 0 && register != 0 && !sets_frame => {
+                sets_frame = true;
+                (0, 0)
+            }
+            4 | 5 | 8 | 9 => {
+                let xmm = op >= 8;
+                let valid_register = if xmm {
+                    info >= 6
+                } else {
+                    nonvolatile(info) && (info != register || sets_frame)
+                };
+                if !valid_register {
+                    return None;
+                }
+                let width = if xmm { 16 } else { 8 };
+                let extra = if op & 1 == 0 { 2 } else { 4 };
+                let mut offset = unwind_operand(codes, extra)?;
+                if extra == 2 {
+                    offset *= width;
+                }
+                if !offset.is_multiple_of(width) {
+                    return None;
+                }
+                save_end = save_end.max(offset.checked_add(width)?);
+                saves_xmm |= xmm;
+                (extra, 0)
+            }
+            // The machine frame holds the saved RIP and RSP, with an optional error code.
+            10 if !chained && info <= 1 && codes.is_empty() => (0, 40 + usize::from(info) * 8),
+            _ => return None,
+        };
+        if !growth.is_multiple_of(8) {
+            return None;
+        }
+        stack_bytes = stack_bytes.checked_add(growth)?;
+        codes = codes.get(extra..)?;
+    }
+    if !chained && sets_frame != (register != 0) {
+        return None;
+    }
+    Some(UnwindInfo {
+        stack_bytes,
+        save_end,
+        saves_xmm,
+        frame,
+        chained_rva,
+    })
+}
+
+fn unwind_operand(bytes: &[u8], width: usize) -> Option<usize> {
+    let mut value = [0; 4];
+    value[..width].copy_from_slice(bytes.get(..width)?);
+    Some(u32::from_le_bytes(value) as usize)
+}
+
+fn nonvolatile(register: u8) -> bool {
+    matches!(register, 3 | 5..=7 | 12..=15)
+}
+
+fn frame_register(context: &CONTEXT, register: u8) -> Option<usize> {
+    Some(match register {
+        3 => context.Rbx,
+        5 => context.Rbp,
+        6 => context.Rsi,
+        7 => context.Rdi,
+        12 => context.R12,
+        13 => context.R13,
+        14 => context.R14,
+        15 => context.R15,
+        _ => return None,
+    } as usize)
+}
+
+fn readable_region(address: usize) -> Option<MEMORY_BASIC_INFORMATION> {
+    let mut region = MEMORY_BASIC_INFORMATION::default();
+    // SAFETY: queries metadata for an address and writes only our local buffer.
+    let read = unsafe { VirtualQuery(address as *const _, &mut region, size_of_val(&region)) };
+    let readable = matches!(
+        region.Protect & 0xff,
+        PAGE_READONLY
+            | PAGE_READWRITE
+            | PAGE_WRITECOPY
+            | PAGE_EXECUTE_READ
+            | PAGE_EXECUTE_READWRITE
+            | PAGE_EXECUTE_WRITECOPY
+    );
+    (read != 0 && region.State == MEM_COMMIT && region.Protect & PAGE_GUARD == 0 && readable)
+        .then_some(region)
+}
+
+fn executable(region: &MEMORY_BASIC_INFORMATION) -> bool {
+    matches!(
+        region.Protect & 0xff,
+        PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY
+    )
+}
+
+fn readable_range(mut start: usize, end: usize, image: Option<usize>) -> Option<()> {
+    while start < end {
+        let region = readable_region(start)?;
+        if image
+            .is_some_and(|base| region.Type != MEM_IMAGE || region.AllocationBase as usize != base)
+        {
+            return None;
+        }
+        start = (region.BaseAddress as usize).checked_add(region.RegionSize)?;
+    }
+    Some(())
+}
+
+fn read_memory(address: usize, bytes: &mut [u8]) -> bool {
+    // SAFETY: Windows copies into our slice and reports failure for unreadable memory.
+    unsafe {
+        ReadProcessMemory(
+            GetCurrentProcess(),
+            address as *const _,
+            bytes.as_mut_ptr().cast(),
+            bytes.len(),
+            null_mut(),
+        ) != 0
+    }
+}
+
+fn read_image(image: usize, address: usize, bytes: &mut [u8]) -> Option<()> {
+    readable_range(address, address.checked_add(bytes.len())?, Some(image))?;
+    read_memory(address, bytes).then_some(())
+}
+
+fn stack_reads_end(
+    context: &CONTEXT,
+    image: usize,
+    entry: *const IMAGE_RUNTIME_FUNCTION_ENTRY,
+    low: usize,
+    high: usize,
+) -> Option<usize> {
+    let mut function = [0; 12];
+    read_image(image, entry as usize, &mut function)?;
+    let pc = context.Rip as usize;
+    let rva = pc.checked_sub(image)?;
+    let begin = unwind_operand(&function, 4)?;
+    let end = unwind_operand(&function[4..], 4)?;
+    if !(begin..end).contains(&rva) {
+        return None;
+    }
+
+    let mut instruction = [0; 8];
+    read_image(image, pc, &mut instruction)?;
+    // Version 1 can simulate an epilogue directly from code. These prefixes can
+    // move RSP by amounts that the unwind record alone does not establish.
+    let opcode = if matches!(instruction[0], 0x40..=0x4f) {
+        instruction[1]
+    } else {
+        instruction[0]
+    };
+    if matches!(opcode, 0x58..=0x5f)
+        || (matches!(instruction[0], 0x48..=0x4f)
+            && (opcode == 0x8d && instruction[2] & 0x38 == 0x20
+                || matches!(opcode, 0x81 | 0x83) && instruction[2] == 0xc4))
+    {
+        return None;
+    }
+
+    let mut unwind_rva = unwind_operand(&function[8..], 4)?;
+    let rsp = context.Rsp as usize;
+    let mut frame = None;
+    let mut save_end = 0;
+    // A limit also stops cycles in damaged chained records.
+    for _ in 0..32 {
+        if unwind_rva == 0 || !unwind_rva.is_multiple_of(4) {
+            return None;
+        }
+        let address = image.checked_add(unwind_rva)?;
+        let mut header = [0; 4];
+        read_image(image, address, &mut header)?;
+        let flags = header[0] >> 3;
+        let size = 4
+            + usize::from(header[2]).next_multiple_of(2) * 2
+            + match flags {
+                0 => 0,
+                1..=3 => 4,
+                4 => 12,
+                _ => return None,
+            };
+        let mut bytes = [0; 4 + 256 * 2 + 12];
+        let bytes = &mut bytes[..size];
+        read_image(image, address, bytes)?;
+        let info = parse_unwind_info(bytes)?;
+        if *frame.get_or_insert(info.frame) != info.frame {
+            return None;
+        }
+        // Windows subtracts the scaled offset from the register to recover
+        // the fixed frame base. In a partial prologue it may use RSP instead.
+        let base = if info.frame == 0 {
+            rsp
+        } else {
+            let register = frame_register(context, info.frame & 15)?;
+            if !(low..high).contains(&register) {
+                return None;
+            }
+            register.checked_sub(usize::from(info.frame >> 4) * 16)?
+        };
+        if !(low..high).contains(&base)
+            || (info.saves_xmm && (!base.is_multiple_of(16) || !rsp.is_multiple_of(16)))
+        {
+            return None;
+        }
+        save_end = save_end.max(info.save_end);
+        if let Some(next) = info.chained_rva {
+            unwind_rva = next;
+            continue;
+        }
+        let span = info.stack_bytes.checked_add(8)?.max(save_end);
+        let end = rsp.max(base).checked_add(span)?;
+        if end > high {
+            return None;
+        }
+        readable_range(rsp.min(base), end, None)?;
+        return Some(end);
+    }
+    None
 }
 
 /// `module+rva`, or the bare address.
@@ -781,6 +1118,103 @@ mod tests {
     /// A frame we expect [`unwind`] to report: the helper it is in, and the
     /// helper's name for the message.
     type Expected = (&'static str, fn() -> Captured);
+
+    #[test]
+    fn bounds_unwind_allocations_and_saves() {
+        // SET_FPREG rbp,16; ALLOC_SMALL 32; PUSH_NONVOL rbp.
+        let info = parse_unwind_info(&[1, 9, 3, 0x15, 9, 3, 5, 0x32, 1, 0x50, 0, 0]).unwrap();
+        assert_eq!(info.frame, 0x15);
+        assert_eq!(info.stack_bytes, 40);
+
+        // SAVE_XMM128 xmm6 at 48; ALLOC_LARGE (scaled) 64.
+        let info = parse_unwind_info(&[1, 9, 4, 0, 9, 0x68, 3, 0, 5, 1, 8, 0]).unwrap();
+        assert_eq!(info.stack_bytes, 64);
+        assert_eq!(info.save_end, 64);
+        assert!(info.saves_xmm);
+
+        // SAVE_NONVOL_FAR rbx at 256; ALLOC_LARGE (unscaled) 128.
+        let info =
+            parse_unwind_info(&[1, 9, 6, 0, 9, 0x35, 0, 1, 0, 0, 5, 0x11, 128, 0, 0, 0]).unwrap();
+        assert_eq!(info.stack_bytes, 128);
+        assert_eq!(info.save_end, 264);
+    }
+
+    #[test]
+    fn bounds_machine_frames_and_reads_chained_rva_after_padding() {
+        for (op, size) in [(0x0a, 40), (0x1a, 48)] {
+            let info = parse_unwind_info(&[1, 0, 1, 0, 0, op, 0, 0]).unwrap();
+            assert_eq!(info.stack_bytes, size);
+        }
+        // One save consumes two slots, and adding a second far save uses
+        // three more slots, so the chained function entry starts after padding.
+        let info = parse_unwind_info(&[
+            0x21, 9, 5, 0, 9, 0x34, 4, 0, 5, 0x65, 40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x34,
+            0x12, 0, 0,
+        ])
+        .unwrap();
+        assert_eq!(info.save_end, 48);
+        assert_eq!(info.chained_rva, Some(0x1234));
+    }
+
+    #[test]
+    fn rejects_unwind_codes_without_known_stack_bounds() {
+        for bytes in [
+            &[3, 0, 0, 0][..],               // Unsupported version.
+            &[1, 1, 1, 0, 1, 6, 0, 0],       // Unsupported opcode.
+            &[1, 1, 1, 0, 1, 0x11, 0, 0],    // Allocation operand cut short.
+            &[1, 1, 1, 0, 1, 0x34, 0, 0],    // Save operand cut short.
+            &[1, 1, 1, 0x15, 1, 0x02, 0, 0], // Missing frame setup.
+            &[0x21, 0, 0, 0, 0, 0, 0, 0],    // Chained entry cut short.
+        ] {
+            assert!(parse_unwind_info(bytes).is_none(), "{bytes:?}");
+        }
+    }
+
+    #[test]
+    fn stops_at_a_pc_outside_an_image() {
+        let pc = unwinds_like_the_system_walk as *const () as u64;
+        let stack = [pc, pc];
+        let low = stack.as_ptr() as usize;
+        // SAFETY: zeroed is a valid CONTEXT. Only RIP and RSP are used in this test.
+        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+        context.Rip = low as u64;
+        context.Rsp = low as u64;
+        let mut frames = Vec::with_capacity(MAX_FRAMES);
+        unwind_into(context, low, low + size_of_val(&stack), &mut frames, true);
+        assert_eq!(frames, [low as u64]);
+    }
+
+    #[test]
+    fn takes_the_caller_of_a_first_frame_in_our_own_stub_memory() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_RELEASE, MEM_RESERVE, VirtualAlloc, VirtualFree,
+        };
+        // Executable memory outside any image, as our thunks and stubs are made.
+        // SAFETY: reserves and commits one fresh page; nothing runs in it.
+        let stub = unsafe {
+            VirtualAlloc(
+                null_mut(),
+                4096,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_EXECUTE_READWRITE,
+            )
+        };
+        assert!(!stub.is_null());
+        let pc = unwinds_like_the_system_walk as *const () as u64;
+        let stack = [pc, pc];
+        let low = stack.as_ptr() as usize;
+        // SAFETY: zeroed is a valid CONTEXT. Only RIP and RSP are used in this test.
+        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+        context.Rip = stub as u64;
+        context.Rsp = low as u64;
+        let mut frames = Vec::with_capacity(MAX_FRAMES);
+        unwind_into(context, low, low + size_of_val(&stack), &mut frames, true);
+        // SAFETY: frees the page reserved above.
+        unsafe { VirtualFree(stub, 0, MEM_RELEASE) };
+        // The caller comes from the leaf rule; the walk may stop after it,
+        // since the rest of the caller's frame is not in `stack`.
+        assert!(frames.starts_with(&[stub as u64, pc]), "{frames:x?}");
+    }
 
     /// The runtime function entry start covering `at`: the image base the
     /// lookup writes, plus the entry's `BeginAddress`. Asking the system for

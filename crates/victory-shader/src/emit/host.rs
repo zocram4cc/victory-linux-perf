@@ -235,6 +235,22 @@ impl Host {
         Some((waves.WaveLaneCountMax, rdna))
     }
 
+    /// Whether the adapter runs 32-lane waves. A pipeline that declares
+    /// `WaveSize(32)` cannot be made on a host that runs 64-lane waves only
+    /// (GCN cards such as Polaris).
+    pub fn runs_wave32(&self) -> bool {
+        let mut waves = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: a feature structure of the requested type and size.
+        unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut waves).cast(),
+                size_of_val(&waves) as u32,
+            )
+        }
+        .is_ok_and(|()| (waves.WaveLaneCountMin..=waves.WaveLaneCountMax).contains(&32))
+    }
+
     /// The root signature translated shaders expect: user data per stage
     /// at `b0`, immediate samplers per stage at `s<n>`, heaps directly
     /// indexed.

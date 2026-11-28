@@ -1019,6 +1019,50 @@ fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
     unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }.to_vec()
 }
 
+/// The heaps translated shaders index directly (shader model 6.6): every
+/// host pipeline's root signature carries both flags.
+pub(crate) const DIRECTLY_INDEXED: D3D12_ROOT_SIGNATURE_FLAGS = D3D12_ROOT_SIGNATURE_FLAGS(
+    D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED.0
+        | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED.0,
+);
+
+/// The text of a D3D blob (the serializer's reason for a refusal).
+pub(crate) fn blob_text(blob: &ID3DBlob) -> String {
+    // SAFETY: the blob's own buffer, read before the blob is released.
+    let text = unsafe {
+        std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
+    };
+    String::from_utf8_lossy(text)
+        .trim_end_matches(['\0', '\n'])
+        .to_owned()
+}
+
+/// Why the D3D12 runtime in use refuses to serialize an empty root
+/// signature with `flags`; `None` if it serializes it. It is the runtime
+/// (`d3d12.dll`, or the Agility SDK's `D3D12Core.dll`), not the card or its
+/// driver, that knows the flags: Windows 10's in-box runtime stops at shader
+/// model 6.5 and refuses the directly indexed heap flags with "Unsupported
+/// bit-flag set", so every host pipeline is refused there.
+pub(crate) fn runtime_refuses(flags: D3D12_ROOT_SIGNATURE_FLAGS) -> Option<String> {
+    let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+        Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
+        Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
+            Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
+                Flags: flags,
+                ..Default::default()
+            },
+        },
+    };
+    let mut blob: Option<ID3DBlob> = None;
+    let mut error: Option<ID3DBlob> = None;
+    // SAFETY: an empty description; both blobs are owned here.
+    let made = unsafe { D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut error)) };
+    match made {
+        Ok(()) => None,
+        Err(e) => Some(error.as_ref().map_or_else(|| e.to_string(), blob_text)),
+    }
+}
+
 fn root_signature(
     device: &ID3D12Device,
     params: &[D3D12_ROOT_PARAMETER1],
@@ -1038,9 +1082,7 @@ fn root_signature(
                 pParameters: params.as_ptr(),
                 NumStaticSamplers: samplers.len() as u32,
                 pStaticSamplers: samplers.as_ptr(),
-                Flags: input
-                    | D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
-                    | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED,
+                Flags: input | DIRECTLY_INDEXED,
             },
         },
     };
@@ -1051,11 +1093,7 @@ fn root_signature(
         let mut error: Option<ID3DBlob> = None;
         if let Err(e) = D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut error)) {
             if let Some(error) = error {
-                let text = std::slice::from_raw_parts(
-                    error.GetBufferPointer().cast::<u8>(),
-                    error.GetBufferSize(),
-                );
-                tracing::warn!("root signature: {}", String::from_utf8_lossy(text));
+                tracing::warn!("root signature: {}", blob_text(&error));
             }
             return Err(e);
         }
@@ -1172,6 +1210,48 @@ mod tests {
         b
     }
 
+    /// The runtime's refusal reads as #168's log does. A device that reports
+    /// shader model 6.6 comes from a runtime that knows 6.6, so that runtime
+    /// serializes the directly indexed heaps. The converse does not hold: the
+    /// runtime knows the flags whatever the card supports.
+    #[test]
+    fn the_runtime_refuses_flags_it_does_not_know() {
+        let unknown = D3D12_ROOT_SIGNATURE_FLAGS(0x80_0000);
+        let why = runtime_refuses(unknown).expect("an unknown flag serialized");
+        assert_eq!(
+            why,
+            "Unsupported bit-flag set (root signature flags 800000)."
+        );
+        assert_eq!(
+            runtime_refuses(D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT),
+            None
+        );
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let mut model = D3D12_FEATURE_DATA_SHADER_MODEL {
+            HighestShaderModel: D3D_SHADER_MODEL_6_6,
+        };
+        // SAFETY: the query writes the structure of the given size.
+        let sm66 = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_SHADER_MODEL,
+                (&raw mut model).cast(),
+                size_of_val(&model) as u32,
+            )
+        }
+        .is_ok()
+            && model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0;
+        let flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT | DIRECTLY_INDEXED;
+        if sm66 {
+            assert_eq!(runtime_refuses(flags), None);
+        }
+        if sm66 {
+            assert!(root_signature(&host.device, &[], &[], false).is_ok());
+            assert!(root_signature(&host.device, &[], &[], true).is_ok());
+        }
+    }
+
     #[test]
     fn integer_targets_do_not_blend() {
         let t = targets(&[
@@ -1210,7 +1290,7 @@ mod tests {
 
     const VS: &str = "float4 main(uint i : SV_VertexID) : SV_Position {
         float2 p = float2((i << 1) & 2, i & 2);
-        return float4(p * 2.0 - 1.0, 0.5, 1.0);
+        return float4(p * 2.0 - 1.0, 0.75, 1.0);
     }";
 
     /// A graphics pipeline with `DepthBoundsTestEnable` loads back from the
@@ -1235,14 +1315,15 @@ mod tests {
         let (root, root_blob) = root_signature(&host.device, &[], &[], false).unwrap();
 
         let mut g = GraphicsState::default();
-        // Subobject 21 (`DEPTH_STENCIL1`) with `DepthBoundsTestEnable = true`,
-        // depth test itself off so only depth bounds gates the draw.
+        // WARP can ignore depth bounds with DepthEnable off even when it
+        // reports support. ALWAYS with writes off leaves bounds as the
+        // only test that can reject the draw.
         #[repr(C, align(8))]
         struct Sub21(u32, D3D12_DEPTH_STENCIL_DESC1);
         let sub = Sub21(
             21,
             D3D12_DEPTH_STENCIL_DESC1 {
-                DepthEnable: false.into(),
+                DepthEnable: true.into(),
                 DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ZERO,
                 DepthFunc: D3D12_COMPARISON_FUNC_ALWAYS,
                 DepthBoundsTestEnable: true.into(),
@@ -1281,19 +1362,18 @@ mod tests {
             &[&vs, &ps],
             &g.describe(),
         );
-        let pso = graphics_depth_bounds_pipeline(&host.device, &root, &desc, g.depth1(), &name)
+        graphics_depth_bounds_pipeline(&host.device, &root, &desc, g.depth1(), &name)
             .expect("depth-bounds PSO made");
         let loaded = super::super::library::LOADED.load(Ordering::Relaxed);
-        graphics_depth_bounds_pipeline(&host.device, &root, &desc, g.depth1(), &name)
+        let pso = graphics_depth_bounds_pipeline(&host.device, &root, &desc, g.depth1(), &name)
             .expect("depth-bounds PSO made again");
         assert!(
             super::super::library::LOADED.load(Ordering::Relaxed) > loaded,
             "the depth-bounds pipeline was compiled again instead of loaded from the library"
         );
 
-        // Execute two draws against a depth buffer cleared to 0.5:
-        // 1) bounds [0.6, 1.0] -> rejected (target stays 0)
-        // 2) bounds [0.4, 0.6] replayed onto a fresh HostList -> passes (target becomes 255)
+        // The depth bounds test reads the stored 0.5, distinct from the
+        // incoming vertex depth of 0.75.
         let make_tex = |format, flags, state, clear: D3D12_CLEAR_VALUE| {
             let heap = D3D12_HEAP_PROPERTIES {
                 Type: D3D12_HEAP_TYPE_DEFAULT,
@@ -1380,6 +1460,11 @@ mod tests {
             out.unwrap()
         };
 
+        // The directly indexed root signature requires both heaps.
+        let heaps = [
+            Some(host.fallback_view_heap().expect("CBV/SRV/UAV heap").clone()),
+            Some(host.fallback_sampler_heap().expect("sampler heap").clone()),
+        ];
         let run_draw = |min: f32, max: f32| -> u8 {
             let mut state = crate::draw::State::default();
             let first_list = host.new_list().unwrap();
@@ -1411,6 +1496,7 @@ mod tests {
                 list.list.OMSetRenderTargets(1, Some(&rtv), false, Some(&dsv));
                 list.list.RSSetViewports(&[vp]);
                 list.list.RSSetScissorRects(&[rect]);
+                list.list.SetDescriptorHeaps(&heaps);
                 list.list.SetGraphicsRootSignature(&root);
                 list.list.SetPipelineState(&pso);
                 list.list
@@ -1462,6 +1548,7 @@ mod tests {
         };
 
         assert_eq!(run_draw(0.6, 1.0), 0, "depth 0.5 outside [0.6, 1.0] must be rejected");
+        assert_eq!(run_draw(0.0, 0.4), 0, "depth 0.5 outside [0.0, 0.4] must be rejected");
         assert_eq!(run_draw(0.4, 0.6), 255, "depth 0.5 inside [0.4, 0.6] must pass");
     }
 

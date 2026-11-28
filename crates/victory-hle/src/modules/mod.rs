@@ -17,6 +17,10 @@ pub mod dsp;
 #[cfg(windows)]
 pub mod dstorage;
 #[cfg(windows)]
+pub mod endpoint;
+#[cfg(windows)]
+pub mod fidelityfx;
+#[cfg(windows)]
 pub mod files;
 pub mod gameinput;
 pub mod kernel;
@@ -62,6 +66,8 @@ pub(crate) fn all() -> Vec<HleModule> {
     #[cfg(windows)]
     all.push(dstorage::module());
     #[cfg(windows)]
+    all.push(endpoint::module());
+    #[cfg(windows)]
     all.push(files::module());
     #[cfg(windows)]
     all.push(lifecycle::module());
@@ -72,5 +78,9 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(xmem::module());
     #[cfg(windows)]
     all.push(xsystem::module());
+    #[cfg(windows)]
+    if fidelityfx::serving() {
+        all.push(fidelityfx::module());
+    }
     all
 }

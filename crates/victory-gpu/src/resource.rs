@@ -1276,12 +1276,118 @@ pub(crate) fn read_from(layout: &victory_formats::texture::Layout, first: u32) -
     if layout.bytes_from(first) < layout.size { first } else { 0 }
 }
 
+/// Optional maximum host texture side in texels for sampled placed BC 2D
+/// textures (`VICTORY_TEXTURE_MAX_DIM=<px>`, 0 or unset = unlimited). Drops
+/// top mips above this limit using the existing `held_only` / `base_level`
+/// path, saving up to 75% VRAM per 4K texture for 12–16 GB cards or extra
+/// VRAM headroom on 20 GB cards.
+#[cfg(windows)]
+fn texture_max_dim() -> Option<u64> {
+    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let value = std::env::var("VICTORY_TEXTURE_MAX_DIM").ok()?;
+        match value.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(n @ 64..=16384) => {
+                tracing::info!(max_dim = n, "limiting host size of sampled placed BC 2D textures (VICTORY_TEXTURE_MAX_DIM)");
+                Some(n)
+            }
+            _ => {
+                tracing::warn!(value, "VICTORY_TEXTURE_MAX_DIM expects 0 or a size from 64 to 16384");
+                None
+            }
+        }
+    })
+}
+
+/// First mip level of `desc` whose dimensions fit within `max_dim` (only for
+/// sampled block-compressed 2D textures with multiple mips; returns 0 if none).
+#[cfg(windows)]
+fn cap_level(desc: &ResourceDesc, max_dim: u64) -> u32 {
+    const TEXTURE_2D: u32 = 3;
+    if !fills(desc)
+        || desc.dimension != TEXTURE_2D
+        || desc.depth_or_array_size != 1
+        || desc.mip_levels <= 1
+        || desc.sample_count > 1
+        || !element(desc.format).is_some_and(|(_, block)| block == 4)
+    {
+        return 0;
+    }
+    let mut w = desc.width;
+    let mut h = u64::from(desc.height);
+    let mut drop_mips = 0u32;
+    let max_drop = u32::from(desc.mip_levels) - 1;
+    while w.max(h) > max_dim && drop_mips < max_drop {
+        let nw = (w / 2).max(1);
+        let nh = (h / 2).max(1);
+        if !nw.is_multiple_of(4) || !nh.is_multiple_of(4) {
+            break;
+        }
+        w = nw;
+        h = nh;
+        drop_mips += 1;
+    }
+    drop_mips
+}
+
+/// The share of the card's local VRAM budget in use, in percent (cached for
+/// a tenth of a second via [`crate::host::now_ms`]).
+#[cfg(windows)]
+fn video_memory_percent() -> u64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tenth = crate::host::now_ms() / 100 + 1;
+    let last = LAST.load(Relaxed);
+    if last >> 8 == tenth {
+        return last & 0xff;
+    }
+    let pct = crate::host::host()
+        .and_then(|h| h.video_memory())
+        .and_then(|[budget, used, ..]| (budget > 0).then(|| ((u128::from(used) * 100) / u128::from(budget)).min(255) as u64))
+        .unwrap_or(0);
+    LAST.store((tenth << 8) | pct, Relaxed);
+    pct
+}
+
+/// How many of a streamed placed 2D texture's largest mips to skip so no side
+/// passes `VICTORY_TEXTURE_MAX` (0: uncapped; unset: 1024, then 512 from 92 %
+/// of the VRAM budget and 256 from 97 %, after `VIctory-vitesse` 7ada43b6).
+/// Keeps 16 GB cards from filling VRAM and stalling thousands of textures.
+#[cfg(windows)]
+fn over_cap(desc: &ResourceDesc) -> u32 {
+    static SET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let set = *SET.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_MAX")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    });
+    if set == Some(0) {
+        return 0;
+    }
+    let max = set.unwrap_or_else(|| match video_memory_percent() {
+        0..92 => 1024,
+        92..97 => 512,
+        _ => 256,
+    });
+    let mut skip = 0u32;
+    while (desc.width >> skip) > max || (u64::from(desc.height) >> skip) > max {
+        if skip + 1 >= u32::from(desc.mip_levels) {
+            break;
+        }
+        skip += 1;
+    }
+    skip
+}
+
 /// The level a host copy begins at for views that start at `first`: one the
-/// host can have as a texture's level 0 ([`read_from`]; block-compressed
-/// formats in whole blocks).
+/// host can have as a texture's level 0 ([`read_from`], [`over_cap`];
+/// block-compressed formats in whole blocks), also respecting [`texture_max_dim`].
 #[cfg(windows)]
 fn base_level(desc: &ResourceDesc, first: u32) -> u32 {
     const TEXTURE_2D: u32 = 3;
+    let floor = texture_max_dim().map_or(0, |limit| cap_level(desc, limit));
+    let first = first.max(floor).max(over_cap(desc));
     if first == 0
         || !fills(desc)
         || desc.dimension != TEXTURE_2D
@@ -1312,10 +1418,10 @@ fn base_level(desc: &ResourceDesc, first: u32) -> u32 {
 /// [`placed_bytes`]. Remembered: asked for every slot that is looked at.
 #[cfg(windows)]
 pub(crate) fn placed_bytes_from(desc: &[u32; 14], first: u32) -> Option<u64> {
-    if first == 0 || !held_only() {
+    if (first == 0 && texture_max_dim().is_none()) || !held_only() {
         return placed_bytes(desc);
     }
-    type Known = std::collections::HashMap<([u32; 14], u32), Option<u64>>;
+    type Known = std::collections::HashMap<([u32; 14], u32), Option<u64>, std::hash::BuildHasherDefault<crate::host::AddressHash>>;
     thread_local! {
         static KNOWN: std::cell::RefCell<Known> = std::cell::RefCell::default();
     }
@@ -1324,6 +1430,10 @@ pub(crate) fn placed_bytes_from(desc: &[u32; 14], first: u32) -> Option<u64> {
             let whole = placed_bytes(desc)?;
             // SAFETY: 56 bytes in the description's layout.
             let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+            let first = first.max(texture_max_dim().map_or(0, |limit| cap_level(&d, limit)));
+            if first == 0 {
+                return Some(whole);
+            }
             let Some(t) = texture_layout(&d).filter(|t| t.planes.len() == 1) else {
                 return Some(whole);
             };
@@ -1424,6 +1534,34 @@ fn textures() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize
     TEXTURES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// A title texture held alive ([`hold`], [`alias_of`]).
+#[cfg(windows)]
+pub(crate) struct Held(This);
+
+#[cfg(windows)]
+impl Held {
+    /// The texture the handle keeps alive.
+    pub(crate) fn get(&self) -> This {
+        self.0
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Held {
+    fn drop(&mut self) {
+        crate::object::release_boxed::<Resource>(self.0);
+    }
+}
+
+/// Holds title texture `this` alive, for work on a thread the title knows
+/// nothing of. `None` if it is no texture, or is being released.
+#[cfg(windows)]
+pub(crate) fn hold(this: This) -> Option<Held> {
+    // A texture leaves the table before it is freed, under this lock.
+    let all = textures();
+    (all.contains(&(this as usize)) && crate::object::add_ref_alive(this)).then(|| Held(this))
+}
+
 /// The title textures the host renders to or writes (targets, depth,
 /// unordered access), by the address of their memory: what a view the
 /// title places in that memory in another format shows ([`alias_of`]). A
@@ -1453,7 +1591,7 @@ static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
 /// `VICTORY_ALIAS_COPY=0`: none is found, as before; `=1`: only textures
 /// of one level and one layer, as at first.
 #[cfg(windows)]
-pub(crate) fn alias_of(this: This) -> Option<This> {
+pub(crate) fn alias_of(this: This) -> Option<Held> {
     use std::sync::atomic::Ordering::Relaxed;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if this.is_null()
@@ -1514,7 +1652,12 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
             );
         }
     }
-    same.then_some(other)
+    // Pinned under the lock: once it is let go, the title can drop its last
+    // reference, and the caller's alias copy still needs the texture.
+    if !same || !crate::object::add_ref_alive(other) {
+        return None;
+    }
+    Some(Held(other))
 }
 
 /// Whether host copies are made on first use. On by default;
@@ -1617,15 +1760,16 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         // pick by index among them.
         let mut base = 0;
         let mut prefill = None;
-        if shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
+        if texture.is_none() && shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
             let wanted = r.host.wanted.load(Relaxed);
             let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
             let first = wanted.min(viewed);
-            if first != u32::MAX {
-                base = base_level(&r.desc, first);
-            }
-            // The store has its larger levels: made whole at once.
-            if base > 0
+            let capped = texture_max_dim().is_some();
+            base = base_level(&r.desc, if first == u32::MAX { 0 } else { first });
+            // The store has its larger levels: made whole at once (unless capped).
+            if over_cap(&r.desc) == 0
+                && !capped
+                && base > 0
                 && tiled.is_none()
                 && let Some(found) = stored_levels(r, first)
             {
@@ -2626,6 +2770,7 @@ pub(crate) fn first_shown(this: This) -> Option<u32> {
 /// A host copy made without memory of its own (`crate::tiles`), as a
 /// submission-time step of a list holds it.
 #[cfg(windows)]
+#[derive(Clone)]
 pub(crate) struct OnDemand(std::sync::Arc<HostTexture>);
 
 // SAFETY: the host texture is named only in queue calls, which any thread
@@ -4631,5 +4776,34 @@ float4 lit() : SV_Target { return 1.0; }
         let d = unsafe { more.texture.GetDesc() };
         assert_eq!((more.base, d.Width, d.MipLevels), (0, 256, 9));
         assert!(more.serial != copy.serial && more.grown.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn texture_max_dim_drops_block_aligned_top_mips() {
+        let make = |width, height, format, mip_levels, flags| ResourceDesc {
+            dimension: 3,
+            alignment: 0,
+            width,
+            height,
+            depth_or_array_size: 1,
+            mip_levels,
+            format,
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags,
+        };
+        // 4096x2048 BC7 (format 98): cap 1024 drops 2 mips -> 1024x512.
+        let bc7 = make(4096, 2048, 98, 13, 0);
+        assert_eq!(cap_level(&bc7, 1024), 2);
+        assert_eq!(cap_level(&bc7, 2048), 1);
+        assert_eq!(cap_level(&bc7, 4096), 0);
+        // Uncompressed RGBA8 (format 28) is left untouched (UI/LUTs).
+        assert_eq!(cap_level(&make(4096, 2048, 28, 13, 0), 1024), 0);
+        // Render target / UAV textures are never capped.
+        assert_eq!(cap_level(&make(4096, 2048, 98, 13, 4), 1024), 0);
+        // Stops before dropping below block alignment (4x4).
+        assert_eq!(cap_level(&make(4096, 4, 98, 13, 0), 1024), 0);
     }
 }

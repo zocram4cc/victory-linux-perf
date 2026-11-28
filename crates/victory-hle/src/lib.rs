@@ -24,6 +24,8 @@ pub mod runtime;
 pub use host::HostPolicy;
 pub use registry::{HleExport, HleModule, registry};
 pub use victory_gpu::console;
+#[cfg(windows)]
+pub use victory_gpu::fastclock;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use victory_gpu::replay;
 
@@ -101,7 +103,7 @@ mod tests {
     fn strict_policy_reports_missing() {
         let r = HleResolver::new(HostPolicy::none());
         assert_eq!(
-            r.classify("api-ms-win-core-synch-l1-1-0.dll", &name("Sleep")),
+            r.classify("api-ms-win-core-synch-l1-1-0.dll", &name("WaitForSingleObject")),
             None
         );
     }
@@ -111,7 +113,7 @@ mod tests {
     fn shared_api_sets_pass_through_to_host() {
         let r = HleResolver::default();
         assert_eq!(
-            r.classify("api-ms-win-core-synch-l1-2-0.dll", &name("Sleep")),
+            r.classify("api-ms-win-core-synch-l1-2-0.dll", &name("WaitForSingleObject")),
             Some(Provenance::Host)
         );
         // Console-only DLLs never pass through.

@@ -91,6 +91,10 @@ pub extern "system" fn XMemVirtualAlloc(
     flags: u64,
     protect: u32,
 ) -> *mut c_void {
+    // (V2, `VICTORY_SOFT_VIEWS`) The host acts on what it has mapped there.
+    if !base.is_null() {
+        soft::title_asks(base as usize, size);
+    }
     let (lowest, highest) = address_range(flags);
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
         LowestStartingAddress: lowest as *mut c_void,
@@ -177,14 +181,22 @@ pub extern "system" fn XMemVirtualAlloc(
             "XMemVirtualAlloc"
         );
     }
-    if !at.is_null() && !placeholder {
-        victory_gpu::title_memory_allocated(at as usize, size);
+    if !at.is_null() {
+        if kind & MEM_RESERVE_PLACEHOLDER != 0 {
+            victory_gpu::title_memory_placeholder(at as usize, size);
+        } else {
+            victory_gpu::title_memory_allocated(at as usize, size);
+        }
     }
     // (Grand Theft Auto VI asks for its 32-bit heap with kind 0x42000,
     // without the 64 KiB page bits: not `placeholder` above, though the host
     // makes a placeholder of it all the same.)
     if !at.is_null() && constrained && kind & MEM_COMMIT == 0 && flags & ADDRESS_32BIT != 0 {
         LOW_RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner()).push((at as usize, size));
+    }
+    // What the title asked for, for VICTORY_SKIP_WC_BACK (write-combining reservations).
+    if base.is_null() {
+        victory_gpu::title_memory_reserved(at as usize, size, asked);
     }
     note_protection(asked, kind, flags, at as usize, size);
     at
@@ -232,6 +244,8 @@ pub extern "system" fn XMemVirtualQuery(
     out: *mut BasicInformation,
 ) -> BOOL {
     let size = size_of::<MEMORY_BASIC_INFORMATION>();
+    // (V2, `VICTORY_SOFT_VIEWS`) The host answers of what it has mapped.
+    soft::title_asks(address as usize, 1);
     // SAFETY: the title passes room for the whole structure; the host
     // fails on a null one.
     unsafe {
@@ -450,6 +464,28 @@ impl Section {
 }
 
 impl Section {
+    /// (V2, `VICTORY_SOFT_VIEWS`) The section's lasting view ([`Section::window`]),
+    /// made if it is not yet, without committing anything; `None` without one.
+    fn lasting(&self) -> Option<usize> {
+        use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
+        static ON: LazyLock<bool> =
+            LazyLock::new(|| std::env::var_os("VICTORY_SECTION_WINDOW").is_none_or(|v| v != "0"));
+        if !*ON {
+            return None;
+        }
+        let base = *self.window.get_or_init(|| {
+            // SAFETY: the whole of a section we own.
+            unsafe { MapViewOfFile(self.handle, FILE_MAP_WRITE, 0, 0, self.pages * PAGE) }.Value as usize
+        });
+        (base != 0).then_some(base)
+    }
+
+    /// (V2) Whether page `index` is committed (as far as a view asked).
+    fn page_committed(&self, index: usize) -> bool {
+        on_wine()
+            || self.committed.get(index / 64).is_some_and(|w| w.load(std::sync::atomic::Ordering::Acquire) >> (index % 64) & 1 != 0)
+    }
+
     /// Commits the pages from `index` on that a view at `base` shows, unless
     /// all of them are ([`lean`]): committed for one view is for all.
     fn commit_shown(&self, index: usize, base: usize, len: usize) -> bool {
@@ -1192,6 +1228,7 @@ pub extern "system" fn XMemMapPhysicalPages(
     pages: *const usize,
 ) -> *mut c_void {
     let base = address as usize;
+    let _timed = soft::Timed::title();
     // Read before any lock is taken: a fault in title memory may wait for
     // the mapping call that holds them.
     // SAFETY: the title passes `n` page numbers, or null.
@@ -1305,6 +1342,7 @@ fn private_backing(at: usize, len: usize, first: &Slice, run: usize) -> bool {
         return false;
     }
     PRIVATE.lock().unwrap_or_else(|e| e.into_inner()).insert(at, len);
+    victory_gpu::title_memory_allocated(at, len);
     victory_gpu::title_memory_remapped(at, len);
     victory_gpu::port_private(at, len);
     static SAID: AtomicU64 = AtomicU64::new(0);
@@ -1338,6 +1376,7 @@ fn release_private(base: usize, len: usize) {
         private.remove(&at);
         // SAFETY: our own private allocation, back to a placeholder.
         unsafe { VirtualFree(at as *mut c_void, n, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) };
+        victory_gpu::title_memory_placeholder(at, n);
         victory_gpu::title_memory_remapped(at, n);
         victory_gpu::port_private_gone(at, n);
     }
@@ -1353,6 +1392,7 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     if addresses.is_null() {
         return 0;
     }
+    let _timed = soft::Timed::title();
     lift_thread();
     if side_by_side() > 1 && n > 1 {
         // Read before any lock is taken, as in `XMemMapPhysicalPages`.
@@ -1389,6 +1429,7 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 /// the title maps pages into a pool view, then has the GPU map them into its tiled
 /// heap. Page by page; false if a source page is not mapped physical memory.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
+    let _timed = soft::Timed::copies();
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let _costed = Costed::begin(None);
     let _busy = Busy::begin();
@@ -1404,8 +1445,16 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
         let Some(slice) = physical.slice_at(at) else {
             return false;
         };
+        // (V2, `VICTORY_SOFT_VIEWS=copies`) Kept in the books alone.
+        if soft::keep(&mut physical, to + k, &slice) {
+            continue;
+        }
+        let would = (soft::mode() == soft::VERIFY).then(|| slice.clone());
         if !map(&mut physical, to + k, PAGE, slice) {
             return false;
+        }
+        if let Some(slice) = would {
+            soft::would(to + k, &slice);
         }
     }
     true
@@ -1413,9 +1462,12 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
 
 /// [`map_alias`] of many ranges, in order.
 pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
+    let _timed = soft::Timed::copies();
     let _costed = Costed::begin(None);
     lift_thread();
-    if side_by_side() <= 1 {
+    // (V2, `VICTORY_SOFT_VIEWS=copies`) One page after the other: no system
+    // call is left to share out.
+    if side_by_side() <= 1 || soft::mode() == soft::COPIES {
         return ranges.iter().all(|&(to, from, len)| map_alias(to, from, len));
     }
     // By the page: the address, and the one whose page it is to show.
@@ -1597,16 +1649,19 @@ struct Op {
     had: bool,
     /// The placeholder is the page's own (or will be, after the unmapping).
     own: bool,
+    /// (V2, `VICTORY_SOFT_VIEWS`) The view taken away was in the books alone:
+    /// there is nothing to unmap.
+    soft: bool,
 }
 
 impl Op {
     fn new(at: usize, slice: Option<Slice>) -> Op {
-        Op { at, slice, had: false, own: false }
+        Op { at, slice, had: false, own: false, soft: false }
     }
 
     /// The system calls; whether the host did as asked.
     fn run(&self) -> bool {
-        if self.had {
+        if self.had && !self.soft {
             // SAFETY: a view we mapped; it becomes a placeholder again.
             let gone = counted(Call::Unmap, || unsafe {
                 UnmapViewOfFile2(
@@ -1643,6 +1698,7 @@ fn change(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
                 if let Some((size, slice)) = physical.views.remove(&op.at) {
                     shown_mut().forget(op.at, size, &slice);
                 }
+                op.soft = soft::take(op.at) == Some(false);
                 victory_gpu::title_memory_unmapping(op.at, PAGE);
                 physical.holes.remove(&op.at);
                 (op.had, op.own) = (true, lean());
@@ -1798,7 +1854,7 @@ mod pool {
             .ops
             .iter()
             .map(|(op, done)| {
-                let op = Op { at: op.at, slice: op.slice.clone(), had: op.had, own: op.own };
+                let op = Op { at: op.at, slice: op.slice.clone(), had: op.had, own: op.own, soft: op.soft };
                 (op, done.load(Ordering::Acquire))
             })
             .collect()
@@ -1966,21 +2022,27 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             continue;
         };
         shown_mut().forget(at, size, &slice);
+        // (V2, `VICTORY_SOFT_VIEWS`) A view in the books alone: nothing to unmap.
+        let soft = soft::take(at);
         if at < base || at + size > end {
             // Parts of it stay, and are mapped again below.
             victory_gpu::title_memory_splitting(at, size);
         }
         victory_gpu::title_memory_unmapping(at, size);
-        // SAFETY: a view we mapped; it becomes a placeholder again.
-        let gone = counted(Call::Unmap, || unsafe {
-            UnmapViewOfFile2(
-                GetCurrentProcess(),
-                MEMORY_MAPPED_VIEW_ADDRESS {
-                    Value: at as *mut c_void,
-                },
-                MEM_PRESERVE_PLACEHOLDER,
-            )
-        });
+        let gone = if soft == Some(false) {
+            1
+        } else {
+            // SAFETY: a view we mapped; it becomes a placeholder again.
+            counted(Call::Unmap, || unsafe {
+                UnmapViewOfFile2(
+                    GetCurrentProcess(),
+                    MEMORY_MAPPED_VIEW_ADDRESS {
+                        Value: at as *mut c_void,
+                    },
+                    MEM_PRESERVE_PLACEHOLDER,
+                )
+            })
+        };
         if gone != 0 && at >= base && at + size <= end {
             physical.holes.insert(at, size);
         }
@@ -1993,6 +2055,455 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         }
     }
 }
+
+/// (V2) `VICTORY_SOFT_VIEWS` (default off): views of the GPU's page-mapping
+/// copies (`map_alias`, `map_aliases`: the title's `CopyPageMappingsBatchX`)
+/// kept in our books alone. The title's GPU view of its streaming pool is
+/// never touched by its CPU (ghidra-ledger F3), and each such view cost a
+/// `MapViewOfFile3` and later an `UnmapViewOfFile2`, 100-290 µs each under
+/// memory pressure behind the kernel's address-space lock: 114 of 122 slow
+/// calls of a run (`docs/freeze-analysis.md`).
+///
+/// - `copies` (or `1`; the title's own CPU-view mapping calls are not kept
+///   so in this build): such a view of one page is noted in [`Physical`],
+///   [`SHOWN`] and told to the GPU side as mapped, exactly as [`map`] does,
+///   over a placeholder of its own (cut once, the first time the address is
+///   used), and the host maps nothing; taking it away calls nothing either.
+///   Only pages committed and in a section with a lasting view
+///   ([`Section::lasting`]) are kept so; others are mapped as before (counted).
+///   The GPU side reads such a view from its pages ([`read`]), guards it in
+///   its books, and has it made real ([`make_real`]) before anything that
+///   does not fault (our writes, the kernel's, the title's questions to the
+///   host about it); anything that faults (the title's CPU, a direct read of
+///   ours) has it made real in its handler, and the access is made again.
+/// - `verify`: every such view is mapped as before (no change at all) and
+///   recorded as one that would be kept; our reads of it are compared with
+///   what the books would have given (`victory_gpu` `soft_verify`), and our
+///   writes and the kernel's that would have made one real are counted.
+///
+/// Why this cannot deadlock as `VICTORY_MAP_QUIET` did (that held our
+/// protection changes, some made under the guards' lock, until a mapping
+/// call was over, while the mapping call waited for the guards' lock in its
+/// notes): nothing here waits for a mapping call. [`BOOKS`] is held only for
+/// its own map's changes, a copy out of the lasting view and the one
+/// `MapViewOfFile3` of a view made real, and nothing that holds it calls the
+/// GPU side or takes another lock; the GPU side asks for the guards' lock
+/// with `try_lock` only around [`make_real`], so a fault on a thread that
+/// holds it (or [`PHYSICAL`], or the fine mapping lock) never waits.
+/// Lock order where both are held: [`PHYSICAL`], then [`BOOKS`]; the guards,
+/// then [`BOOKS`].
+///
+/// Line every 5 s: "soft views (VICTORY_SOFT_VIEWS=...) ...".
+mod soft {
+    use std::collections::{BTreeMap, HashSet};
+    use std::ffi::c_void;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::{LazyLock, RwLock};
+
+    use windows_sys::Win32::System::Memory::{
+        MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MapViewOfFile3, PAGE_READONLY, PAGE_READWRITE,
+        VirtualFree, VirtualProtect,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    use super::{PAGE, Physical, Slice};
+
+    pub(super) const OFF: u8 = 0;
+    pub(super) const COPIES: u8 = 1;
+    pub(super) const VERIFY: u8 = 2;
+
+    #[cfg(test)]
+    thread_local! {
+        /// (Tests) The mode on this thread, beside the process's.
+        pub(super) static TEST_MODE: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// (Tests) This thread keeps views as `mode` says, the hooks set.
+    #[cfg(test)]
+    pub(super) fn test_mode(mode: u8) {
+        static HOOKS: std::sync::Once = std::sync::Once::new();
+        HOOKS.call_once(|| victory_gpu::use_soft_views(victory_gpu::SoftViews { read, make_real, verify }));
+        TEST_MODE.with(|m| m.set(Some(mode)));
+    }
+
+    pub(super) fn mode() -> u8 {
+        #[cfg(test)]
+        if let Some(mode) = TEST_MODE.with(std::cell::Cell::get) {
+            return mode;
+        }
+        static MODE: LazyLock<u8> = LazyLock::new(|| {
+            let mode = match std::env::var("VICTORY_SOFT_VIEWS").as_deref().map(str::trim) {
+                Ok("copies" | "1") => COPIES,
+                Ok("verify") => VERIFY,
+                _ => OFF,
+            };
+            if mode != OFF {
+                victory_gpu::use_soft_views(victory_gpu::SoftViews { read, make_real, verify });
+                tracing::info!(
+                    mode = if mode == COPIES { "copies" } else { "verify" },
+                    "VICTORY_SOFT_VIEWS: views of the GPU's page-mapping copies kept in the books alone until touched (verify: mapped as before, compared)"
+                );
+            }
+            mode
+        });
+        *MODE
+    }
+
+    #[derive(Default)]
+    struct Books {
+        /// Views in the books alone, of one page each: what they show.
+        soft: BTreeMap<usize, Slice>,
+        /// Views that were and were made real (mapped, ours to let go as any).
+        made: HashSet<usize>,
+        /// (verify) Views mapped as before that would be in the books.
+        would: BTreeMap<usize, Slice>,
+    }
+
+    static BOOKS: LazyLock<RwLock<Books>> = LazyLock::new(Default::default);
+
+    fn books() -> std::sync::RwLockReadGuard<'static, Books> {
+        BOOKS.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn books_mut() -> std::sync::RwLockWriteGuard<'static, Books> {
+        BOOKS.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Since the last line (see [`line`]).
+    static N: [AtomicU64; 20] = [const { AtomicU64::new(0) }; 20];
+    const KEPT: usize = 0;
+    const GONE_SOFT: usize = 1;
+    const REAL_BY: usize = 2; // ..6: by victory_gpu::SOFT_BY_*
+    const MAPS_SPARED: usize = 6;
+    const UNMAPS_SPARED: usize = 7;
+    const NOT_KEPT: usize = 8;
+    const MAKE_FAILED: usize = 9;
+    const COPY_CALLS: usize = 10;
+    const COPY_NS: usize = 11;
+    const COPY_LONGEST: usize = 12;
+    const TITLE_CALLS: usize = 13;
+    const TITLE_NS: usize = 14;
+    const TITLE_LONGEST: usize = 15;
+    const WOULD: usize = 16;
+    const SPLITS: usize = 17;
+    const GONE_REAL: usize = 18;
+    /// Views in the books now (not since the last line).
+    static NOW: AtomicU64 = AtomicU64::new(0);
+
+    fn count(what: usize, n: u64) {
+        N[what].fetch_add(n, Relaxed);
+    }
+
+    /// `[base, base + PAGE)` to show `slice`, kept in the books alone if it
+    /// can be (`copies`): noted as [`super::map`] notes a view. Whether it was;
+    /// if not, the caller maps it as before.
+    pub(super) fn keep(physical: &mut Physical, base: usize, slice: &Slice) -> bool {
+        if mode() != COPIES {
+            return false;
+        }
+        if slice.section.lasting().is_none() || !slice.section.page_committed(slice.index) {
+            count(NOT_KEPT, 1);
+            return false;
+        }
+        // A placeholder of its own, as a view made real takes it at once.
+        if !(physical.holes.remove(&base) == Some(PAGE) && super::lean()) {
+            super::split(base, PAGE);
+            count(SPLITS, 1);
+        }
+        // Known as such on the GPU side before it hears of the view.
+        victory_gpu::soft_view_noted(base, PAGE);
+        books_mut().soft.insert(base, slice.clone());
+        NOW.fetch_add(1, Relaxed);
+        super::shown_mut().note(base, PAGE, slice);
+        victory_gpu::title_memory_remapped(base, PAGE);
+        victory_gpu::title_memory_view(base, PAGE, slice.section.handle as usize, (slice.index * PAGE) as u64);
+        physical.views.insert(base, (PAGE, slice.clone()));
+        count(KEPT, 1);
+        count(MAPS_SPARED, 1);
+        true
+    }
+
+    /// (verify) `[base, base + PAGE)` was mapped as before and would have been kept.
+    pub(super) fn would(base: usize, slice: &Slice) {
+        if mode() != VERIFY || slice.section.lasting().is_none() || !slice.section.page_committed(slice.index) {
+            return;
+        }
+        books_mut().would.insert(base, slice.clone());
+        victory_gpu::soft_view_would(base, PAGE, true);
+        count(WOULD, 1);
+    }
+
+    /// The view at `at` is being taken away: `Some(false)` if it was in the
+    /// books alone (nothing to unmap: its placeholder is its own), `Some(true)`
+    /// if it was and was made real (or, verify, would have been), `None` if it
+    /// is none of ours here.
+    pub(super) fn take(at: usize) -> Option<bool> {
+        if mode() == OFF {
+            return None;
+        }
+        let mut b = books_mut();
+        if b.soft.remove(&at).is_some() {
+            drop(b);
+            NOW.fetch_sub(1, Relaxed);
+            victory_gpu::soft_view_gone(at, PAGE);
+            count(GONE_SOFT, 1);
+            count(UNMAPS_SPARED, 1);
+            return Some(false);
+        }
+        if b.made.remove(&at) {
+            drop(b);
+            victory_gpu::soft_view_gone(at, PAGE);
+            count(GONE_REAL, 1);
+            return Some(true);
+        }
+        if b.would.remove(&at).is_some() {
+            drop(b);
+            victory_gpu::soft_view_would(at, PAGE, false);
+            return Some(true);
+        }
+        None
+    }
+
+    /// [`victory_gpu::SoftViews::read`].
+    pub(super) fn read(at: usize, to: *mut u8, len: usize) -> (bool, usize) {
+        let b = books();
+        if let Some((&base, slice)) = b.soft.range(..=at).next_back()
+            && at < base + PAGE
+        {
+            let n = (base + PAGE - at).min(len);
+            if let Some(window) = slice.section.lasting() {
+                // SAFETY: committed bytes of the section's lasting view, which the
+                // slice held in the books keeps; `to` has room for `len` bytes.
+                unsafe {
+                    std::ptr::copy_nonoverlapping((window + slice.index * PAGE + (at - base)) as *const u8, to, n);
+                }
+                return (true, n);
+            }
+        }
+        let next = b.soft.range(at.saturating_add(1)..).next().map(|(&base, _)| base);
+        (false, next.map_or(len, |next| (next - at).min(len)))
+    }
+
+    /// [`victory_gpu::SoftViews::make_real`]. Never logs (it may run in the
+    /// fault handler): failures are counted for [`line`].
+    fn make_real(at: usize, len: usize, read_only: &dyn Fn(usize) -> bool, by: u8) -> bool {
+        let end = at.saturating_add(len.max(1));
+        let mut b = books_mut();
+        let hits: Vec<usize> =
+            b.soft.range(..end).rev().take_while(|(base, _)| **base + PAGE > at).map(|(&base, _)| base).collect();
+        let mut any = false;
+        for base in hits {
+            let Some(slice) = b.soft.get(&base).cloned() else { continue };
+            // Mapped read-write and then made read-only where asked: a view
+            // mapped read-only could never be opened again.
+            let read_only = read_only(base / PAGE);
+            let map = || {
+                // SAFETY: the section over the view's own placeholder (made
+                // when it was kept); acts only on a placeholder.
+                unsafe {
+                    MapViewOfFile3(
+                        slice.section.handle,
+                        GetCurrentProcess(),
+                        base as *const c_void,
+                        (slice.index * PAGE) as u64,
+                        PAGE,
+                        MEM_REPLACE_PLACEHOLDER,
+                        PAGE_READWRITE,
+                        std::ptr::null_mut(),
+                        0,
+                    )
+                }
+                .Value as usize
+                    == base
+            };
+            // (Not its own placeholder after all: cut out, once more.)
+            // SAFETY: acts only on a placeholder; fails harmlessly on one that
+            // is the page's own already.
+            if !map()
+                && (unsafe { VirtualFree(base as *mut c_void, PAGE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) } == 0 || !map())
+            {
+                count(MAKE_FAILED, 1);
+                continue;
+            }
+            if read_only {
+                let mut old = 0;
+                // SAFETY: the view just mapped; only its protection changes.
+                if unsafe { VirtualProtect(base as *const c_void, PAGE, PAGE_READONLY, &mut old) } == 0 {
+                    count(MAKE_FAILED, 1);
+                }
+            }
+            b.soft.remove(&base);
+            b.made.insert(base);
+            NOW.fetch_sub(1, Relaxed);
+            victory_gpu::soft_view_real(base, PAGE);
+            count(REAL_BY + usize::from(by.min(3)), 1);
+            any = true;
+        }
+        any
+    }
+
+    /// [`victory_gpu::SoftViews::verify`]: each view of `[at, at + len)` that
+    /// would be in the books, its page as mapped against the lasting view's.
+    pub(super) fn verify(at: usize, len: usize) -> (u64, u64) {
+        let end = at.saturating_add(len);
+        let b = books();
+        let (mut same, mut differ) = (0, 0);
+        for (&base, slice) in b.would.range(at.saturating_sub(PAGE - 1)..end) {
+            if base + PAGE <= at {
+                continue;
+            }
+            let Some(window) = slice.section.lasting() else { continue };
+            // SAFETY: a view mapped for real (its unmapping waits for the
+            // books: `take`), and the same page in the section's lasting view.
+            let (here, there) = unsafe {
+                (
+                    std::slice::from_raw_parts(base as *const u8, PAGE),
+                    std::slice::from_raw_parts((window + slice.index * PAGE) as *const u8, PAGE),
+                )
+            };
+            if here == there {
+                same += 1;
+            } else {
+                differ += 1;
+                static SAID: AtomicU64 = AtomicU64::new(0);
+                if SAID.fetch_add(1, Relaxed) < 20 {
+                    let k = here.iter().zip(there).position(|(a, b)| a != b).unwrap_or(0);
+                    tracing::warn!(
+                        view = format_args!("{base:#x}"),
+                        section = format_args!("{:#x}", slice.section.handle as usize),
+                        page = slice.index,
+                        first_byte = k,
+                        "soft views (VICTORY_SOFT_VIEWS=verify): a view's bytes differ from what the books read (or changed between the two reads)"
+                    );
+                }
+            }
+        }
+        (same, differ)
+    }
+
+    /// The title asks the host about `[at, at + len)` (a question, an
+    /// allocation at an address): views in the books there are made real first.
+    pub(super) fn title_asks(at: usize, len: usize) {
+        if mode() == COPIES {
+            victory_gpu::soft_make_real(at, len, victory_gpu::SOFT_BY_TITLE_CALL);
+        }
+    }
+
+    thread_local! {
+        static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Times a mapping call, the outermost on its thread, while it lives
+    /// (counted with the switch set, `verify` too: the two runs compare).
+    pub(super) struct Timed(Option<(std::time::Instant, usize)>);
+
+    impl Timed {
+        pub(super) fn copies() -> Timed {
+            Timed::begin(COPY_CALLS)
+        }
+
+        pub(super) fn title() -> Timed {
+            Timed::begin(TITLE_CALLS)
+        }
+
+        fn begin(kind: usize) -> Timed {
+            if mode() == OFF {
+                return Timed(None);
+            }
+            let outer = DEPTH.with(|d| {
+                d.set(d.get() + 1);
+                d.get() == 1
+            });
+            Timed(outer.then(|| (std::time::Instant::now(), kind)))
+        }
+    }
+
+    impl Drop for Timed {
+        fn drop(&mut self) {
+            if mode() == OFF {
+                return;
+            }
+            DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+            let Some((began, kind)) = self.0 else { return };
+            let ns = began.elapsed().as_nanos() as u64;
+            count(kind, 1);
+            count(kind + 1, ns);
+            N[kind + 2].fetch_max(ns, Relaxed);
+            line();
+        }
+    }
+
+    /// The line, every five seconds.
+    fn line() {
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        static START: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
+        let now = START.elapsed().as_millis() as u64;
+        let last = LAST.load(Relaxed);
+        if now < last + 5000 || LAST.compare_exchange(last, now, Relaxed, Relaxed).is_err() {
+            return;
+        }
+        let n: Vec<u64> = N.iter().map(|n| n.swap(0, Relaxed)).collect();
+        let g = victory_gpu::soft_view_counts();
+        let ms = |ns: u64| ns as f64 / 1e6;
+        tracing::info!(
+            "soft views (VICTORY_SOFT_VIEWS={}), last {:.1} s: kept soft {} (in the books now {}), let go untouched {}, let go after made real {}; \
+             made real by a title fault {}, by a fault of other code {}, by our writes {}, by title calls {}; \
+             map calls spared {}, unmap calls spared {}, placeholders cut {}, not kept (uncommitted or no lasting view) {}, made real FAILED {}; \
+             time in the mapping calls: copies {} calls {:.1} ms (longest {:.1} ms), title's own {} calls {:.1} ms (longest {:.1} ms); \
+             reads from the books {} ({} KiB); guarded in the books {} here, {} as another view; made real read-only for want of the guards' lock {}, \
+             writes let through to such {}; verify: views that would be kept {}, our reads of them {} ({} KiB), pages compared the same {}, DIFFERING {}, \
+             our writes and the kernel's that would make one real {}",
+            match mode() {
+                COPIES => "copies",
+                _ => "verify",
+            },
+            (now - last) as f64 / 1e3,
+            n[KEPT],
+            NOW.load(Relaxed),
+            n[GONE_SOFT],
+            n[GONE_REAL],
+            n[REAL_BY],
+            n[REAL_BY + 1],
+            n[REAL_BY + 2],
+            n[REAL_BY + 3],
+            n[MAPS_SPARED],
+            n[UNMAPS_SPARED],
+            n[SPLITS],
+            n[NOT_KEPT],
+            n[MAKE_FAILED],
+            n[COPY_CALLS],
+            ms(n[COPY_NS]),
+            ms(n[COPY_LONGEST]),
+            n[TITLE_CALLS],
+            ms(n[TITLE_NS]),
+            ms(n[TITLE_LONGEST]),
+            g[0],
+            g[1] >> 10,
+            g[2],
+            g[3],
+            g[4],
+            g[5],
+            n[WOULD],
+            g[6],
+            g[7] >> 10,
+            g[8],
+            g[9],
+            g[10]
+        );
+    }
+
+    #[cfg(test)]
+    pub(super) fn soft_now(at: usize) -> bool {
+        books().soft.contains_key(&at)
+    }
+
+    #[cfg(test)]
+    pub(super) fn made_now(at: usize) -> bool {
+        books().made.contains(&at)
+    }
+
+}
+
 
 /// The oldest layout we know; newer titles pass other flag values (Minecraft
 /// 0x20000001) and read the same leading fields.
@@ -2118,6 +2629,15 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The host's state of the region at `address` (`MEM_COMMIT`, ...).
+    fn host_state(address: *const c_void) -> u32 {
+        // SAFETY: plain data; zero is a valid value.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        assert_ne!(unsafe { windows_sys::Win32::System::Memory::VirtualQuery(address, &mut info, size_of_val(&info)) }, 0);
+        info.State
+    }
 
     fn query(address: *const c_void) -> BasicInformation {
         // SAFETY: plain data; zero is a valid value.
@@ -2336,6 +2856,110 @@ mod tests {
         assert!(!map_alias(b as u64, at(a, 1) as u64, PAGE as u64));
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
         assert_eq!(XMemIsToolsMemAvailable(), 0);
+    }
+
+    /// (V2, `VICTORY_SOFT_VIEWS=copies`) A page-mapping copy's view kept in
+    /// the books alone: the host has a placeholder there and maps nothing; the
+    /// books read its page's bytes; a touch makes it real (the access made
+    /// again), and so does a question of the title's; let go untouched it
+    /// leaves a placeholder of its own that a view of the title's takes.
+    #[test]
+    fn views_of_the_copies_are_kept_in_the_books_alone() {
+        soft::test_mode(soft::COPIES);
+        let pages = [0usize; 2];
+        let mut n = 2;
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_ptr().cast_mut()), 1);
+        let reserve = |pages: usize| XMemVirtualAlloc(std::ptr::null_mut(), pages * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        let (pool, gpu) = (reserve(2), reserve(3));
+        assert!(!pool.is_null() && !gpu.is_null());
+        let at = |p: *mut c_void, page: usize| p.wrapping_byte_add(page * PAGE);
+        assert_eq!(XMemMapPhysicalPages(pool, 2, pages.as_ptr()), pool);
+        // SAFETY: mapped read-write.
+        unsafe {
+            pool.cast::<u8>().add(5).write(0x55);
+            at(pool, 1).cast::<u8>().add(7).write(0x77);
+        }
+        // Two pages at the GPU view, the middle one of three.
+        assert!(map_aliases(&[(at(gpu, 1) as u64, pool as u64, PAGE as u64), (at(gpu, 2) as u64, at(pool, 1) as u64, PAGE as u64)]));
+        for k in [1, 2] {
+            assert!(soft::soft_now(at(gpu, k) as usize), "page {k} in the books");
+            assert_eq!(host_state(at(gpu, k)), MEM_RESERVE, "page {k}: nothing mapped");
+        }
+        // The books read what the pages hold, from inside one view to the next.
+        let mut out = vec![0u8; PAGE];
+        let from = at(gpu, 1) as usize + PAGE / 2;
+        assert_eq!(soft::read(from, out.as_mut_ptr(), PAGE), (true, PAGE / 2));
+        assert_eq!(soft::read(from + PAGE / 2, out[PAGE / 2..].as_mut_ptr(), PAGE / 2), (true, PAGE / 2));
+        assert_eq!(out[PAGE / 2 + 7], 0x77);
+        // Before the views: no view there, up to the first.
+        assert_eq!(soft::read(gpu as usize, out.as_mut_ptr(), 2 * PAGE), (false, PAGE));
+        // The page shown as the title would see it, in our records.
+        assert!(pages_shown(&pages[..1], 0, PAGE).contains(&(at(gpu, 1) as usize, PAGE)));
+        // A touch: made real (the GPU side's handler) and read again.
+        // SAFETY: the view in the books is made real by the read's fault.
+        assert_eq!(unsafe { at(gpu, 1).cast::<u8>().add(5).read_volatile() }, 0x55);
+        assert!(soft::made_now(at(gpu, 1) as usize) && !soft::soft_now(at(gpu, 1) as usize));
+        assert_eq!(host_state(at(gpu, 1)), MEM_COMMIT);
+        // Read-write: nothing guards it.
+        // SAFETY: mapped read-write now.
+        unsafe { at(gpu, 1).cast::<u8>().add(6).write_volatile(0x66) };
+        // SAFETY: the same page in the pool view.
+        assert_eq!(unsafe { pool.cast::<u8>().add(6).read() }, 0x66);
+        // A question of the title's makes the other real first.
+        // SAFETY: a pseudo handle of our own process.
+        assert_ne!(XMemVirtualQuery(unsafe { GetCurrentProcess() }, at(gpu, 2), &mut query(gpu)), 0);
+        assert!(soft::made_now(at(gpu, 2) as usize));
+        assert_eq!(host_state(at(gpu, 2)), MEM_COMMIT);
+        // Let go (made real: unmapped as any view).
+        assert!(map_aliases(&[(at(gpu, 1) as u64, 0, 2 * PAGE as u64)]));
+        for k in [1, 2] {
+            assert!(!soft::made_now(at(gpu, k) as usize) && !soft::soft_now(at(gpu, k) as usize));
+            assert_eq!(host_state(at(gpu, k)), MEM_RESERVE);
+        }
+        // Kept again, and let go untouched: no call, and the placeholder
+        // left is the page's own, which a view of the title's takes.
+        assert!(map_alias(gpu as u64, at(pool, 1) as u64, PAGE as u64));
+        assert!(soft::soft_now(gpu as usize));
+        assert!(map_alias(gpu as u64, 0, PAGE as u64));
+        assert!(!soft::soft_now(gpu as usize));
+        assert_eq!(XMemMapPhysicalPages(gpu, 1, pages[1..].as_ptr()), gpu);
+        // SAFETY: mapped read-write.
+        assert_eq!(unsafe { gpu.cast::<u8>().add(7).read() }, 0x77);
+        // A view of the title's over one in the books takes its place.
+        assert!(map_alias(at(gpu, 1) as u64, pool as u64, PAGE as u64));
+        assert!(soft::soft_now(at(gpu, 1) as usize));
+        assert_eq!(XMemMapPhysicalPages(at(gpu, 1), 1, pages[..1].as_ptr()), at(gpu, 1));
+        assert!(!soft::soft_now(at(gpu, 1) as usize));
+        // SAFETY: mapped read-write.
+        assert_eq!(unsafe { at(gpu, 1).cast::<u8>().add(5).read() }, 0x55);
+        assert_eq!(XMemMapPhysicalPages(gpu, 2, std::ptr::null()), gpu);
+        assert_eq!(XMemMapPhysicalPages(pool, 2, std::ptr::null()), pool);
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+        soft::test_mode(soft::OFF);
+    }
+
+    /// (V2, `VICTORY_SOFT_VIEWS=verify`) The copies' views mapped as before,
+    /// recorded as views that would be kept: the books read the same bytes.
+    #[test]
+    fn verify_maps_as_before_and_the_books_read_the_same() {
+        soft::test_mode(soft::VERIFY);
+        let pages = [0usize; 1];
+        let mut n = 1;
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_ptr().cast_mut()), 1);
+        let reserve = || XMemVirtualAlloc(std::ptr::null_mut(), PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        let (pool, gpu) = (reserve(), reserve());
+        assert_eq!(XMemMapPhysicalPages(pool, 1, pages.as_ptr()), pool);
+        // SAFETY: mapped read-write.
+        unsafe { pool.cast::<u8>().add(9).write(0x99) };
+        assert!(map_alias(gpu as u64, pool as u64, PAGE as u64));
+        assert_eq!(query(gpu).host.State, MEM_COMMIT, "mapped as before");
+        assert!(!soft::soft_now(gpu as usize));
+        assert_eq!(soft::verify(gpu as usize, PAGE), (1, 0), "page at {gpu:p}");
+        assert!(map_alias(gpu as u64, 0, PAGE as u64));
+        assert_eq!(soft::verify(gpu as usize, PAGE), (0, 0), "forgotten with the view");
+        assert_eq!(XMemMapPhysicalPages(pool, 1, std::ptr::null()), pool);
+        assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
+        soft::test_mode(soft::OFF);
     }
 
     /// A thread that reads a mapped page in place, as the GPU side reads a

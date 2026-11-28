@@ -150,7 +150,10 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
     let files = Files::new(file, Io::chosen());
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { files });
+    let file = Instance::create(
+        Object::new("dstorage file", &FILE_VTABLE),
+        File { files, id: NEXT_FILE.fetch_add(1, Ordering::Relaxed) },
+    );
     if stream_log::on() {
         stream_log::line(format_args!("F\t{:x}\t{kept}", file as usize));
     }
@@ -277,7 +280,12 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 
 struct File {
     files: Files,
+    /// Never given to another file object ([`decoded`]'s keys).
+    id: u64,
 }
+
+/// The next [`File::id`].
+static NEXT_FILE: AtomicU64 = AtomicU64::new(1);
 
 /// How files are read (`VICTORY_DSTORAGE_IO`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1372,6 +1380,153 @@ extern "system" fn close(this: QueueRef) {
     close_lane(unsafe { &*this }.state.id);
 }
 
+/// (Diagnostics) How often a decompressing request asks for what an earlier
+/// one already did (the same source, offset, sizes and options): whether
+/// a cache of decoded results would spare work. A line every 5 s.
+#[cfg(feature = "diagnostics")]
+mod repeats {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<(HashMap<(usize, u64, u32, u32, u64), u32>, std::time::Instant, [u64; 4])>> = Mutex::new(None);
+    pub(super) fn note(r: &super::Request) {
+        let key = (r.source as usize, r.offset, r.source_size, r.destination_size, r.options);
+        let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let (seen, since, n) = g.get_or_insert_with(|| (HashMap::new(), std::time::Instant::now(), [0; 4]));
+        let count = seen.entry(key).or_insert(0);
+        *count += 1;
+        // Requests, of them repeats, their destination bytes, the repeats' bytes.
+        n[0] += 1;
+        n[2] += u64::from(r.destination_size);
+        if *count > 1 {
+            n[1] += 1;
+            n[3] += u64::from(r.destination_size);
+        }
+        if since.elapsed().as_secs() >= 5 {
+            let s = since.elapsed().as_secs_f64();
+            tracing::info!(
+                "dstorage decompressing requests per second: {:.0} ({:.1} MB), of them asked before {:.0} ({:.1} MB); distinct so far {}",
+                n[0] as f64 / s,
+                n[2] as f64 / s / 1e6,
+                n[1] as f64 / s,
+                n[3] as f64 / s / 1e6,
+                seen.len()
+            );
+            *n = [0; 4];
+            *since = std::time::Instant::now();
+            if seen.len() > 2_000_000 {
+                seen.clear();
+            }
+        }
+    }
+}
+
+/// Decoded results of requests from files, kept to be copied again
+/// (`VICTORY_DSTORAGE_CACHE_MB`, 1536 unless given; 0: none). Turning the
+/// camera the title asked for about 5,900 decompressing requests a second
+/// (360 MB of output), 99.7 % of them the same as one asked before (same
+/// file, offset, sizes and options), and decoding them again (BCPack in
+/// software, zlib) kept the DirectStorage workers at 1.9 cores (28 Nov,
+/// perf and a count). Files are the title's own package and never change
+/// while it runs; requests from memory are not kept. Two generations: hits
+/// in the old one move to the new one, and when the new one holds half the
+/// budget the old one is dropped (a least-recently-used cache, roughly).
+mod decoded {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    /// File id, offset, source size, destination size, options.
+    pub(super) type Key = (u64, u64, u32, u32, u64);
+
+    struct Cache {
+        young: HashMap<Key, Arc<[u8]>>,
+        old: HashMap<Key, Arc<[u8]>>,
+        young_bytes: usize,
+    }
+
+    static CACHE: Mutex<Option<Cache>> = Mutex::new(None);
+
+    fn budget() -> usize {
+        static MB: OnceLock<usize> = OnceLock::new();
+        *MB.get_or_init(|| {
+            std::env::var("VICTORY_DSTORAGE_CACHE_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1536)
+        }) << 20
+    }
+
+    /// The request's key, if its result may be kept (from a file, decompressed,
+    /// not too large).
+    pub(super) fn key(r: &super::Request) -> Option<Key> {
+        if budget() == 0 || r.options & super::MEMORY_SOURCE != 0 || r.options & (super::ZLIB | super::BCPACK) == 0 {
+            return None;
+        }
+        if victory_gpu::ab_pick("VICTORY_DSTORAGE_CACHE") == Some(false) {
+            return None;
+        }
+        if r.destination_size as usize > budget() / 64 || r.source.is_null() {
+            return None;
+        }
+        // SAFETY: a file object we created; the title keeps it open while
+        // its requests run.
+        let id = unsafe { &*r.source.cast::<super::Instance<super::File>>() }.state.id;
+        Some((id, r.offset, r.source_size, r.destination_size, r.options))
+    }
+
+    pub(super) fn get(key: &Key) -> Option<Arc<[u8]>> {
+        let mut g = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let c = g.as_mut()?;
+        if let Some(b) = c.young.get(key) {
+            count(true);
+            return Some(b.clone());
+        }
+        let b = c.old.remove(key)?;
+        c.young_bytes += b.len();
+        c.young.insert(*key, b.clone());
+        roll(c);
+        count(true);
+        Some(b)
+    }
+
+    pub(super) fn put(key: Key, bytes: &[u8]) {
+        count(false);
+        let mut g = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let c = g.get_or_insert_with(|| Cache { young: HashMap::new(), old: HashMap::new(), young_bytes: 0 });
+        if c.young.contains_key(&key) {
+            return;
+        }
+        c.young_bytes += bytes.len();
+        c.young.insert(key, Arc::from(bytes));
+        roll(c);
+    }
+
+    /// The new generation full: the old one goes.
+    fn roll(c: &mut Cache) {
+        if c.young_bytes >= budget() / 2 {
+            c.old = std::mem::take(&mut c.young);
+            c.young_bytes = 0;
+        }
+    }
+
+    /// Hits and decodes, a line every 10 s.
+    fn count(hit: bool) {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        static N: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+        static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+        N[usize::from(hit)].fetch_add(1, Relaxed);
+        if let Ok(mut last) = LAST.try_lock() {
+            let since = *last.get_or_insert_with(std::time::Instant::now);
+            if since.elapsed().as_secs() >= 10 {
+                let s = since.elapsed().as_secs_f64();
+                *last = Some(std::time::Instant::now());
+                let (miss, hit) = (N[0].swap(0, Relaxed), N[1].swap(0, Relaxed));
+                tracing::info!(
+                    "dstorage decoded results kept (VICTORY_DSTORAGE_CACHE_MB): {:.0} copied from them a second, {:.0} decoded",
+                    hit as f64 / s,
+                    miss as f64 / s
+                );
+            }
+        }
+    }
+}
+
 /// Reads, inflates and/or unpacks, and writes one request.
 fn execute(request: &Request) -> Result<(), HRESULT> {
     let options = request.options;
@@ -1405,6 +1560,20 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         return into_destination(request, size, |out| read_into(request, out).map(|()| size))
             .map_err(|hr| fail(hr, "copying"));
     }
+    #[cfg(feature = "diagnostics")]
+    repeats::note(request);
+    // Decoded before: copied from the cache, nothing read or decoded.
+    let key = decoded::key(request);
+    if let Some(key) = key
+        && let Some(bytes) = decoded::get(&key)
+        && bytes.len() == size
+    {
+        return into_destination(request, size, |out| {
+            out.copy_from_slice(&bytes);
+            Ok(size)
+        })
+        .map_err(|hr| fail(hr, "copying from the cache"));
+    }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
     let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
     // The console's order: zlib first, then BCPack.
@@ -1416,11 +1585,19 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     } else {
         source
     };
-    into_destination(request, size, |out| match tables {
-        Some(tables) => bcpack::decode(bc, &source, out, tables)
-            .map(|()| out.len())
-            .map_err(|e| fail(INVALID_DATA, &e.to_string())),
-        None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
+    into_destination(request, size, |out| {
+        let n = match tables {
+            Some(tables) => bcpack::decode(bc, &source, out, tables)
+                .map(|()| out.len())
+                .map_err(|e| fail(INVALID_DATA, &e.to_string())),
+            None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
+        }?;
+        if let Some(key) = key
+            && n == size
+        {
+            decoded::put(key, out);
+        }
+        Ok(n)
     })?;
     tracing::trace!(
         options = format_args!("{options:#x}"),

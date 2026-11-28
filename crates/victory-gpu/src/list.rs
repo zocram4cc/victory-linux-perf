@@ -149,7 +149,7 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 /// Runs `f` with the host list and draw state of a title list, if there
 /// is a host GPU.
 #[cfg(windows)]
-fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
+pub(crate) fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
     let Some(list) = host_list(this) else { return };
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
@@ -200,8 +200,20 @@ pub(crate) struct Detached {
 
 #[cfg(windows)]
 impl Detached {
+    /// A closed list of ours, to run among a title's.
+    pub(crate) fn ours(host: crate::host::HostList) -> Self {
+        Detached { host, _uploads: Vec::new(), _state: Default::default() }
+    }
+
     pub(crate) fn host(&self) -> &crate::host::HostList {
         &self.host
+    }
+
+    /// Releases this list's dynamic descriptor slots once its GPU submission
+    /// has completed, without waiting for the full `bury_lag` (64 submissions)
+    /// allocator delay: preventing dynamic slot exhaustion at ~10k draws/frame.
+    pub(crate) fn release_tables(&mut self) {
+        self._state.tables_done();
     }
 }
 
@@ -245,7 +257,7 @@ fn pools() -> bool {
 /// A host list open for recording: one that has run, as a title's list is
 /// after its reset, or a new one.
 #[cfg(windows)]
-fn fresh_list() -> Option<crate::host::HostList> {
+pub(crate) fn fresh_list() -> Option<crate::host::HostList> {
     let idle = {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         let taken = idle.0.pop();
@@ -2132,7 +2144,9 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
 /// global barriers with layouts instead of states. Every host use of a
 /// title texture (clears, copies) moves its host copy to the state it needs
 /// first, so only their ordering matters: one barrier on every shader
-/// write (the title's buffer barriers order compute passes).
+/// write (the title's buffer barriers order compute passes). (28 Nov: the
+/// title passes no groups here, a count of 1 and a null pointer, about 1,000
+/// times a frame; there is nothing to tell a narrower barrier by.)
 extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
     #[cfg(all(windows, feature = "diagnostics"))]

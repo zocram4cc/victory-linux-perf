@@ -2,7 +2,10 @@
 //! samples the stacks of the busiest threads every `<ms>` milliseconds
 //! between two times (seconds, as `VICTORY_STACKS`), and writes them counted
 //! to `<file>` at the end (several of them, one after another, with `;`
-//! between). A thread that waits is sampled like one that
+//! between). The times are from the one start, so a window whose turn
+//! comes after its `from` (an earlier profile ran into it) covers only
+//! the rest of it and says so, and a window whose turn comes at or after
+//! its `to` writes nothing and says so. A thread that waits is sampled like one that
 //! runs: its top frame says which (`ntdll`'s system calls).
 //!
 //! The file: `thread <id> <start> <cpu ms> <samples> <name>`, then
@@ -58,6 +61,46 @@ fn cpu(thread: HANDLE) -> u64 {
     of(&t[2]) + of(&t[3])
 }
 
+/// The windows a `VICTORY_PROFILE` list asks for, and the entries that
+/// could not be read as one (an empty entry, as from a trailing `;`, is
+/// neither): the unreadable ones are named, not dropped quietly, so a
+/// missing profile is not taken for one that ran.
+fn schedule(list: &str) -> (Vec<(Duration, Duration, Duration, String)>, Vec<String>) {
+    let mut all = Vec::new();
+    let mut unread = Vec::new();
+    for entry in list.split(';') {
+        if entry.trim().is_empty() {
+            continue;
+        }
+        match asked(entry) {
+            Some(one) => all.push(one),
+            None => unread.push(entry.trim().to_string()),
+        }
+    }
+    (all, unread)
+}
+
+/// Where one window stands when its turn comes. Every window is measured
+/// against the one `start`, so a window whose turn comes after its `from`
+/// (an earlier profile ran into it) covers only what is left of it, and
+/// one whose turn comes at or after its `to` covers nothing.
+#[derive(Debug, PartialEq, Eq)]
+enum Turn {
+    OnTime,
+    Late,
+    Elapsed,
+}
+
+fn turn(from: Duration, to: Duration, now: Duration) -> Turn {
+    if now >= to {
+        Turn::Elapsed
+    } else if now > from {
+        Turn::Late
+    } else {
+        Turn::OnTime
+    }
+}
+
 /// Reads `VICTORY_PROFILE` and, if set, starts the thread that samples.
 /// `phase` is asked at each round.
 pub fn profile_on_schedule(phase: fn() -> u32) {
@@ -65,7 +108,10 @@ pub fn profile_on_schedule(phase: fn() -> u32) {
         return;
     };
     let start = Instant::now();
-    let all: Vec<_> = list.split(';').filter_map(asked).collect();
+    let (all, unread) = schedule(&list);
+    for entry in unread {
+        eprintln!("VIctory: a profile was not understood and is skipped: {entry}");
+    }
     std::thread::spawn(move || {
         for one in all {
             profile(one, start, phase);
@@ -75,6 +121,36 @@ pub fn profile_on_schedule(phase: fn() -> u32) {
 
 fn profile((from, to, every, file): (Duration, Duration, Duration, String), start: Instant, phase: fn() -> u32) {
     std::thread::sleep(from.saturating_sub(start.elapsed()));
+    match turn(from, to, start.elapsed()) {
+        Turn::Elapsed => {
+            // Nothing is written. A file already there is an earlier
+            // run's, and is left as it is — but then the message must
+            // not claim the name is empty.
+            if std::path::Path::new(&file).exists() {
+                eprintln!(
+                    "VIctory: no new profile is in {file}: its window ({:.3} to {:.3} s) had already passed when its turn came; the file there is from an earlier run and was not touched",
+                    from.as_secs_f64(),
+                    to.as_secs_f64()
+                );
+            } else {
+                eprintln!(
+                    "VIctory: no profile is in {file}: its window ({:.3} to {:.3} s) had already passed when its turn came",
+                    from.as_secs_f64(),
+                    to.as_secs_f64()
+                );
+            }
+            return;
+        }
+        Turn::Late => {
+            eprintln!(
+                "VIctory: the profile in {file} begins late (at {:.3} s of {:.3} to {:.3} s): it covers only the rest of its window",
+                start.elapsed().as_secs_f64(),
+                from.as_secs_f64(),
+                to.as_secs_f64()
+            );
+        }
+        Turn::OnTime => {}
+    }
     eprintln!("VIctory: the profile begins");
     let mut threads: HashMap<u32, Thread> = HashMap::new();
     let mut chosen: Vec<u32> = Vec::new();
@@ -191,5 +267,118 @@ mod tests {
         assert_eq!(asked("a,160,5,x"), None);
         assert_eq!(asked("-1,160,5,x"), None);
         assert_eq!(asked("1,160,0,x"), None);
+    }
+
+    #[test]
+    fn a_windows_turn_is_judged_against_the_one_start() {
+        let s = Duration::from_secs;
+        // A single window, reached before it opens and as it opens.
+        assert_eq!(turn(s(10), s(20), s(0)), Turn::OnTime);
+        assert_eq!(turn(s(10), s(20), s(10)), Turn::OnTime);
+        // Sequential, non-overlapping: the second window's turn comes at
+        // 60 s (the first window's `to`), exactly its own `from`.
+        assert_eq!(turn(s(60), s(90), s(60)), Turn::OnTime);
+        // Partially overlapping (`0,60,…;30,90,…`): the second window's
+        // turn comes at 60 s, halfway through it.
+        assert_eq!(turn(s(30), s(90), s(60)), Turn::Late);
+        assert_eq!(turn(s(30), s(90), s(89)), Turn::Late);
+        // Completely overlapping, and a deadline already elapsed: the
+        // turn comes at or after `to`.
+        assert_eq!(turn(s(10), s(50), s(60)), Turn::Elapsed);
+        assert_eq!(turn(s(30), s(90), s(90)), Turn::Elapsed);
+        assert_eq!(turn(s(30), s(90), s(120)), Turn::Elapsed);
+    }
+
+    #[test]
+    fn a_schedule_reads_its_windows_and_names_the_rest() {
+        let (all, unread) = schedule("0,60,5,a.txt;60,90,5,b.txt");
+        assert_eq!(all.len(), 2);
+        assert!(unread.is_empty());
+
+        let (all, unread) = schedule("0,60,5,a.txt;nonsense;90,60,5,b.txt;");
+        assert_eq!(all.len(), 1);
+        assert_eq!(unread, ["nonsense", "90,60,5,b.txt"]);
+
+        // Empty input and empty entries ask for nothing and hide nothing.
+        assert_eq!(schedule(""), (Vec::new(), Vec::new()));
+        assert_eq!(schedule(";;"), (Vec::new(), Vec::new()));
+        let (all, unread) = schedule("0,60,5,a.txt;");
+        assert_eq!(all.len(), 1);
+        assert!(unread.is_empty());
+    }
+
+    fn temp_file(name: &str) -> String {
+        let path = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_file(&path);
+        path.to_string_lossy().into_owned()
+    }
+
+    /// A window whose deadline passed before its turn came (an earlier
+    /// profile ran past it) must not leave a file that looks like a
+    /// profile: nothing was sampled in it.
+    #[test]
+    fn a_window_that_has_already_passed_writes_no_profile() {
+        let file = temp_file("victory-profile-elapsed.txt");
+        let start = Instant::now() - Duration::from_millis(200);
+        profile(
+            (
+                Duration::from_millis(30),
+                Duration::from_millis(90),
+                Duration::from_millis(5),
+                file.clone(),
+            ),
+            start,
+            || 0,
+        );
+        assert!(
+            !std::path::Path::new(&file).exists(),
+            "an elapsed window wrote a profile file"
+        );
+    }
+
+    /// An elapsed window also leaves an earlier run's file at the same
+    /// name exactly as it was: not truncated, not overwritten.
+    #[test]
+    fn a_window_that_has_already_passed_leaves_an_earlier_file_alone() {
+        let file = temp_file("victory-profile-stale.txt");
+        std::fs::write(&file, "rounds 99\nfrom an earlier run\n").expect("the earlier file is written");
+        let start = Instant::now() - Duration::from_millis(200);
+        profile(
+            (
+                Duration::from_millis(30),
+                Duration::from_millis(90),
+                Duration::from_millis(5),
+                file.clone(),
+            ),
+            start,
+            || 0,
+        );
+        let text = std::fs::read_to_string(&file).expect("the earlier file is still there");
+        let _ = std::fs::remove_file(&file);
+        assert_eq!(text, "rounds 99\nfrom an earlier run\n");
+    }
+
+    /// A window that begins late still samples until its (absolute)
+    /// deadline, and what it writes says it sampled: rounds above zero.
+    #[test]
+    fn a_window_that_begins_late_samples_until_its_deadline() {
+        let file = temp_file("victory-profile-late.txt");
+        let start = Instant::now() - Duration::from_millis(60);
+        profile(
+            (
+                Duration::from_millis(30),
+                Duration::from_millis(400),
+                Duration::from_millis(5),
+                file.clone(),
+            ),
+            start,
+            || 0,
+        );
+        let text = std::fs::read_to_string(&file).expect("a late window still writes its profile");
+        let _ = std::fs::remove_file(&file);
+        assert!(
+            !text.starts_with("rounds 0"),
+            "a late window sampled nothing: {text}"
+        );
     }
 }

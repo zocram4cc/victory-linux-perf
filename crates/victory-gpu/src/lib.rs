@@ -16,6 +16,8 @@
 //! `present` (swap chain).
 
 #[cfg(windows)]
+pub mod fastclock;
+#[cfg(windows)]
 mod ambient;
 #[cfg(windows)]
 mod lightprobe;
@@ -32,6 +34,17 @@ mod wine;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
+
+/// Release builds with the `mimalloc` feature: the Rust side allocates
+/// through mimalloc (per-thread caches) instead of the process heap, which
+/// it shares with the title and the drivers and which under Wine is Wine's
+/// own (after upstream VIctory, as carried by aszterrr/VIctory-NVIDIA-Azter
+/// 2653166: 24.7 -> 26.9 fps measured on an RTX 4090). Diagnostics builds
+/// count every block through `copystat`'s allocator, which then uses
+/// mimalloc too.
+#[cfg(all(feature = "mimalloc", not(all(windows, feature = "diagnostics"))))]
+#[global_allocator]
+static MIMALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod faultbook;
 #[cfg(windows)]
@@ -41,10 +54,15 @@ pub mod device;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
+#[cfg(windows)]
+pub mod external;
+pub mod framegen;
 pub mod fence;
 pub mod frame;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod book;
+#[cfg(windows)]
+mod heap_worker;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
@@ -98,6 +116,20 @@ pub mod signature;
 mod switch;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod ab;
+
+/// Whether `switch` is on in this phase of an in-run A/B (`VICTORY_AB`), if
+/// it is named there; for switches of other crates (diagnostics builds only).
+pub fn ab_pick(switch: &str) -> Option<bool> {
+    #[cfg(feature = "diagnostics")]
+    {
+        ab::pick(switch)
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    {
+        let _ = switch;
+        None
+    }
+}
 #[cfg(windows)]
 mod tdr;
 #[cfg(windows)]
@@ -110,10 +142,14 @@ mod upload;
 #[cfg(windows)]
 mod watch;
 #[cfg(windows)]
+mod wcskip; // VICTORY_SKIP_WC_BACK (on), VICTORY_SKIP_WC_MIN_KB=1024
+#[cfg(windows)]
 mod texback;
 
 #[cfg(windows)]
 pub use host::on_failure;
+#[cfg(windows)]
+pub use wcskip::title_memory_reserved;
 
 /// Whether `switch` is on now, if it is one of those `VICTORY_AB` turns on and
 /// off while the title runs (`ab`).
@@ -136,7 +172,14 @@ pub fn frames_begun() -> u64 {
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
 #[cfg(windows)]
 pub use watch::{
-    kernel_writing, title_memory_allocated, title_memory_freed, title_memory_reading, title_memory_remapped,
-    title_memory_remapping, title_memory_splitting, title_memory_unmapping, title_memory_written,
-    writing as kernel_will_write,
+    kernel_writing, title_memory_allocated, title_memory_freed, title_memory_placeholder, title_memory_reading,
+    title_memory_remapped, title_memory_remapping, title_memory_splitting, title_memory_unmapping,
+    title_memory_written, writing as kernel_will_write,
+};
+// (V2, `VICTORY_SOFT_VIEWS`, from Op-lite/victory-scarlett) Views of the page-mapping copies kept in
+// the runtime's books alone.
+#[cfg(windows)]
+pub use watch::{
+    SOFT_BY_OUR_FAULT, SOFT_BY_OUR_WRITE, SOFT_BY_TITLE_CALL, SOFT_BY_TITLE_FAULT, SoftViews, soft_make_real, soft_view_counts,
+    soft_view_gone, soft_view_noted, soft_view_real, soft_view_would, use_soft_views,
 };

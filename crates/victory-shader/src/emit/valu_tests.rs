@@ -223,6 +223,7 @@ fn run_cases_on(
 ) {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
+    let mut no_wave32 = false;
     for &(label, warp) in devices {
         let host = match Host::new(warp) {
             Ok(host) => host,
@@ -231,9 +232,16 @@ fn run_cases_on(
                 continue;
             }
         };
-        let (root, pso) = host
-            .compute_pipeline(shader)
-            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let (root, pso) = match host.compute_pipeline(shader) {
+            Ok(p) => p,
+            // A 64-lane-only host refuses a pipeline that declares WaveSize(32).
+            Err(e) if !host.runs_wave32() => {
+                eprintln!("{label}: no 32-lane waves, compute_pipeline skipped ({e})");
+                no_wave32 = true;
+                continue;
+            }
+            Err(e) => panic!("{label}: compute_pipeline failed: {e}"),
+        };
         for (i, &inputs) in cases.iter().enumerate() {
             let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
             for u in &shader.user_data {
@@ -258,6 +266,10 @@ fn run_cases_on(
             check(label, i, inputs, out[0][0]);
         }
         ran += 1;
+    }
+    if ran == 0 && no_wave32 {
+        // The pipeline needs 32-lane waves, which this host does not run.
+        return;
     }
     if ran == 0 && devices.iter().all(|&(_, warp)| !warp) {
         // A case for the hardware adapter alone, on a machine without one.
@@ -2106,8 +2118,9 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
         };
         let (root, pso) = match host.compute_pipeline(&shader) {
             Ok(p) => p,
-            // WARP does not support fixed WaveSize(32) on SM 6.6.
-            Err(e) if warp => {
+            // WARP does not support fixed WaveSize(32) on SM 6.6, nor does a
+            // 64-lane-only host.
+            Err(e) if warp || !host.runs_wave32() => {
                 eprintln!("{label}: compute_pipeline skipped ({e})");
                 continue;
             }

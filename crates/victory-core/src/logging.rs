@@ -9,7 +9,8 @@
 //! to that file (appended). Under Wine/Proton the process often gets its own
 //! console window, so redirecting stderr from the shell catches nothing.
 
-use std::sync::{Arc, Mutex};
+use std::io::Write;
+use std::sync::{Arc, Mutex, mpsc};
 
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
@@ -23,16 +24,120 @@ const CAP: LevelFilter = if cfg!(feature = "diagnostics") {
     LevelFilter::INFO
 };
 
-/// A shared file every log line is appended to.
-#[derive(Clone)]
-struct FileWriter(Arc<Mutex<std::fs::File>>);
+enum Sink {
+    Stderr,
+    File(Arc<Mutex<std::fs::File>>),
+}
 
-impl std::io::Write for FileWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).write(buf)
+impl Sink {
+    fn clone_sink(&self) -> Self {
+        match self {
+            Sink::Stderr => Sink::Stderr,
+            Sink::File(f) => Sink::File(Arc::clone(f)),
+        }
     }
+
+    fn write_all(&self, bytes: &[u8]) {
+        match self {
+            Sink::Stderr => {
+                let _ = std::io::stderr().lock().write_all(bytes);
+            }
+            Sink::File(f) => {
+                let _ = f.lock().unwrap_or_else(|e| e.into_inner()).write_all(bytes);
+            }
+        }
+    }
+}
+
+/// Asynchronous batched writer for info/debug/trace lines (`VICTORY_LOG_SYNC=1`
+/// writes synchronously as before; ported from dolb 658d5615 and extended to
+/// cover `VICTORY_LOG_FILE` too so Win32/Wine file writes never stall the
+/// submitting thread). Warnings and errors still write immediately so the last
+/// lines before a crash reach disk.
+struct AsyncLines {
+    tx: Option<mpsc::Sender<Vec<u8>>>,
+    sink: Sink,
+}
+
+impl AsyncLines {
+    fn new(name: &'static str, sink: Sink) -> Self {
+        if std::env::var_os("VICTORY_LOG_SYNC").is_some_and(|v| v == "1") {
+            return Self { tx: None, sink };
+        }
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let bg = sink.clone_sink();
+        let spawned = std::thread::Builder::new().name(name.into()).spawn(move || {
+            let mut batch = Vec::with_capacity(64 << 10);
+            while let Ok(line) = rx.recv() {
+                batch.extend_from_slice(&line);
+                while batch.len() < 256 << 10 {
+                    match rx.try_recv() {
+                        Ok(more) => batch.extend_from_slice(&more),
+                        Err(_) => break,
+                    }
+                }
+                bg.write_all(&batch);
+                batch.clear();
+            }
+        });
+        Self {
+            tx: spawned.ok().map(|_| tx),
+            sink,
+        }
+    }
+}
+
+enum LineWriter {
+    Queued(Vec<u8>, mpsc::Sender<Vec<u8>>, Sink),
+    Now(Sink),
+}
+
+impl Write for LineWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            LineWriter::Queued(line, ..) => {
+                line.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            LineWriter::Now(sink) => {
+                sink.write_all(buf);
+                Ok(buf.len())
+            }
+        }
+    }
+
     fn flush(&mut self) -> std::io::Result<()> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).flush()
+        Ok(())
+    }
+}
+
+impl Drop for LineWriter {
+    fn drop(&mut self) {
+        if let LineWriter::Queued(line, tx, sink) = self
+            && !line.is_empty()
+            && let Err(lost) = tx.send(std::mem::take(line))
+        {
+            sink.write_all(&lost.0);
+        }
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for AsyncLines {
+    type Writer = LineWriter;
+
+    fn make_writer(&'a self) -> LineWriter {
+        match &self.tx {
+            Some(tx) => LineWriter::Queued(Vec::with_capacity(256), tx.clone(), self.sink.clone_sink()),
+            None => LineWriter::Now(self.sink.clone_sink()),
+        }
+    }
+
+    fn make_writer_for(&'a self, meta: &tracing::Metadata<'_>) -> LineWriter {
+        if *meta.level() <= tracing::Level::WARN {
+            LineWriter::Now(self.sink.clone_sink())
+        } else {
+            self.make_writer()
+        }
     }
 }
 
@@ -51,11 +156,11 @@ pub fn init(default_level: &str) {
             .ok()
     });
     let file_layer = file.map(|f| {
-        let writer = FileWriter(Arc::new(Mutex::new(f)));
+        let writer = AsyncLines::new("victory-log-file", Sink::File(Arc::new(Mutex::new(f))));
         tracing_subscriber::fmt::layer()
             .with_target(true)
             .with_ansi(false)
-            .with_writer(move || writer.clone())
+            .with_writer(writer)
     });
     let _ = tracing_subscriber::registry()
         .with(CAP)
@@ -63,7 +168,7 @@ pub fn init(default_level: &str) {
         .with(
             tracing_subscriber::fmt::layer()
                 .with_target(true)
-                .with_writer(std::io::stderr),
+                .with_writer(AsyncLines::new("victory-log", Sink::Stderr)),
         )
         .with(file_layer)
         .try_init();

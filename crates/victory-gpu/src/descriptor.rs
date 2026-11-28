@@ -388,11 +388,18 @@ pub(crate) fn sync_heaps() {
     for &(start, end, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };
-        let (Some(Some(host)), Some(written), Some(step)) =
-            (heap.host.get(), &heap.written, increment(heap.desc.kind))
-        else {
+        let port = crate::port_descriptors::adopted(start);
+        let (Some(Some(host)), Some(step)) = (heap.host.get(), increment(heap.desc.kind)) else {
             continue;
         };
+        // Renderer port #2 marks slots via patched stores and our calls, so it
+        // does not require `heap.written` (under Wine, port #1 backs the 32-bit
+        // heap with private memory without MEM_WRITE_WATCH, leaving `written`
+        // as `None`). Only non-adopted heaps and port #2's optional periodic
+        // fallback need `heap.written`.
+        if !port && heap.written.is_none() {
+            continue;
+        }
         let step = u64::from(step);
         // Capped host heaps have no counterparts for the title slots reserved
         // for per-draw tables; raw writes there must not be mirrored.
@@ -419,21 +426,20 @@ pub(crate) fn sync_heaps() {
         kinds[4] += before.len() as u64 - of_tables;
         // Those of the changed pages, made together at the end.
         let mut make: Vec<u32> = Vec::new();
+        let mut taken_in_check: Vec<(u32, u32)> = Vec::new();
         // Ranges of the heap to look at, and whether a range is one the
         // fallback of renderer port #2 looks at whole.
         let mut parts: Vec<(usize, usize, bool)> = Vec::new();
-        let port = crate::port_descriptors::adopted(start);
         if port {
             // Renderer port #2: the slots the title's patched stores and our
             // calls marked, in place of the changed pages; and a few of the
             // pages the watch says were written, looked at whole.
             let phase = crate::timeline::span("the heaps' records: the marks taken (renderer port 2)");
-            for (first, n) in crate::port_descriptors::take(start).unwrap_or_default() {
-                let from = start as usize + first as usize * step as usize;
-                parts.push((from, from + n as usize * step as usize, false));
-            }
+            let runs = crate::port_descriptors::take(start).unwrap_or_default();
             phase.end();
-            if crate::port_descriptors::ask_due(frame) {
+            if let Some(written) = &heap.written
+                && crate::port_descriptors::ask_due(frame)
+            {
                 let began = std::time::Instant::now();
                 let phase = crate::timeline::span("the heaps' records: asking (renderer port 2's fallback)");
                 let taken = written.take(start as usize, end as usize);
@@ -441,10 +447,9 @@ pub(crate) fn sync_heaps() {
                 spent[0] += since(began);
                 crate::port_descriptors::asked(&taken);
             }
-            for page in crate::port_descriptors::to_check(frame) {
-                parts.push((page.max(start as usize), (page + crate::watch::PAGE).min(end as usize), true));
-            }
-        } else {
+            let pages = crate::port_descriptors::to_check(frame);
+            (parts, taken_in_check) = crate::port_descriptors::plan_parts(start, end, step, mirrored_count, &runs, &pages, crate::watch::PAGE);
+        } else if let Some(written) = &heap.written {
             let began = std::time::Instant::now();
             let phase = crate::timeline::span("the heaps' records: asking");
             let taken = written.take(start as usize, end as usize);
@@ -541,7 +546,7 @@ pub(crate) fn sync_heaps() {
                             .and_then(|b| b.try_into().ok())
                             .map_or(0, u32::from_le_bytes)
                     };
-                    if check {
+                    if check && !crate::port_descriptors::was_taken_in_check(&taken_in_check, index) {
                         // Renderer port #2's fallback: what no mark told of.
                         crate::port_descriptors::missed(index, start + u64::from(index) * step, !samplers && word(0) == VIEW_TAG, host.copied_tabled(index, frame));
                     }
@@ -1544,6 +1549,21 @@ pub(crate) fn view(handle: u64) -> Option<View> {
         return None;
     }
     view_at(i, generation)
+}
+
+/// The view recorded at `handle`, and what says which record that is
+/// (`host::HostHeap::publish`).
+#[cfg(windows)]
+pub(crate) fn view_and_key(handle: u64) -> Option<(View, u64)> {
+    if handle == 0 {
+        return None;
+    }
+    // SAFETY: as in `view`.
+    let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    if tag != VIEW_TAG {
+        return None;
+    }
+    Some((view_at(i, generation)?, u64::from(generation) << 32 | u64::from(i)))
 }
 
 /// A description of `N` words, if the title passes one.

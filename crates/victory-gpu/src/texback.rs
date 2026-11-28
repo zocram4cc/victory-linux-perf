@@ -18,7 +18,12 @@
 //! reads are copied back too (about a megabyte per such list). The copy shows
 //! what the list's last write left; a title read in between sees the frame
 //! before, as it would before the console's GPU has run.
+//!
+//! The read-back buffers are kept and used again ([`read_back_buffer`]):
+//! every list that copies back made one and let it go at its reset (~50+/s),
+//! creating thousands of committed D3D12/Vulkan allocations per run.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
@@ -124,14 +129,98 @@ impl Target {
     pub(crate) fn owner(&self) -> usize { self.ticket.owner }
 }
 
+/// A read-back buffer nothing holds.
+struct Spare(ID3D12Resource);
+
+// SAFETY: a D3D12 buffer (free-threaded), touched by nobody while it is spare.
+unsafe impl Send for Spare {}
+
+/// Spare read-back buffers by size (a power of two), and their bytes in all.
+static SPARE: Mutex<(BTreeMap<u64, Vec<Spare>>, u64)> = Mutex::new((BTreeMap::new(), 0));
+/// The most bytes kept spare unless `VICTORY_READBACK_POOL_MB` says, and
+/// the largest buffer that is pooled.
+const SPARE_MOST: (u64, u64) = (256 << 20, 16 << 20);
+/// Read-back buffers taken from the spare ones, and made, since the start.
+static SPARE_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Whether read-back buffers are kept and used again (on unless
+/// `VICTORY_READBACK_POOL=0`: made for each copy and let go, as before).
+fn pool_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_READBACK_POOL").is_none_or(|v| v != "0"))
+}
+
+/// The most bytes of read-back buffers kept spare (`VICTORY_READBACK_POOL_MB`).
+fn spare_most() -> u64 {
+    static MOST: OnceLock<u64> = OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_READBACK_POOL_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(SPARE_MOST.0, |mb| mb << 20)
+    })
+}
+
+/// The size a buffer of `total` bytes is pooled at; 0: not pooled.
+fn pool_size(total: u64, on: bool) -> u64 {
+    let size = total.max(64 << 10).next_power_of_two();
+    if on && size <= SPARE_MOST.1 { size } else { 0 }
+}
+
+/// A read-back buffer of at least `total` bytes, in COPY_DEST (where a
+/// read-back buffer always stays), and its pool size (0: not pooled).
+/// Nothing needs clearing: [`land`] reads only the footprints the list's
+/// copies wrote.
+fn read_back_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resource, u64)> {
+    let size = pool_size(total, pool_on());
+    if size != 0 {
+        let spare = {
+            let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+            let taken = all.0.get_mut(&size).and_then(Vec::pop);
+            if taken.is_some() {
+                all.1 -= size;
+            }
+            taken
+        };
+        if let Some(Spare(buffer)) = spare {
+            SPARE_STATS[0].fetch_add(1, Ordering::Relaxed);
+            return Some((buffer, size));
+        }
+    }
+    let made = if size != 0 { size } else { total };
+    let buffer = host.read_back_buffer(made)?;
+    SPARE_STATS[1].fetch_add(1, Ordering::Relaxed);
+    crate::host::name(&buffer, || format!("texback read-back buffer of {made} bytes"));
+    Some((buffer, size))
+}
+
 /// The readback resources and the allocation the pixels belong to.
 pub(crate) struct Back {
     buffer: ID3D12Resource,
+    /// The buffer's pool size ([`read_back_buffer`]); 0: its own, released
+    /// when this is dropped.
+    pooled: u64,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     mips: u32,
     layout: victory_formats::texture::Layout,
     ticket: Arc<Ticket>,
+}
+
+/// A list keeps its copies back until it is reset, which is after its last
+/// submission has run (also when a closed list is submitted more than once:
+/// every run lands from the same buffer), or until the list itself goes,
+/// unrun or run: the buffer is free for another list then.
+impl Drop for Back {
+    fn drop(&mut self) {
+        if self.pooled != 0 {
+            let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+            if all.1 + self.pooled <= spare_most() {
+                all.1 += self.pooled;
+                all.0.entry(self.pooled).or_default().push(Spare(self.buffer.clone()));
+            }
+        }
+    }
 }
 
 impl Back {
@@ -177,7 +266,7 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
             .checked_mul(u64::from(format.Depth))?;
         total = total.max(footprint.Offset.checked_add(pitched)?);
     }
-    let buffer = host.read_back_buffer(total)?;
+    let (buffer, pooled) = read_back_buffer(host, total)?;
     for (i, footprint) in footprints.iter().enumerate() {
         let to = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: a borrowed pointer the location never releases.
@@ -194,7 +283,7 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
         // SAFETY: an open list; the texture is in the copy-source state.
         unsafe { list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
-    Some(Back { buffer, footprints, rows, mips, layout: target.layout, ticket: target.ticket })
+    Some(Back { buffer, pooled, footprints, rows, mips, layout: target.layout, ticket: target.ticket })
 }
 
 /// Once the list has run, tile its texels back into the same title allocation.
@@ -244,7 +333,13 @@ pub(crate) fn land(back: &Back) {
     crate::host::copy_mapped(at as *mut u8, tiled.as_ptr(), size, true);
     let copied = COPIED.fetch_add(1, Ordering::Relaxed) + 1;
     if copied == 1 || copied.is_multiple_of(128) {
-        tracing::info!(copied, bytes = size, "texture readback landed");
+        tracing::info!(
+            copied,
+            bytes = size,
+            buffers_reused = SPARE_STATS[0].load(Ordering::Relaxed),
+            buffers_made = SPARE_STATS[1].load(Ordering::Relaxed),
+            "texture readback landed"
+        );
     }
 }
 
@@ -269,5 +364,15 @@ mod tests {
         released(93);
         assert!(!far.valid.load(Ordering::Acquire));
         assert!(track(94, 0x2000, 0x3000).valid.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn readback_buffers_pool_by_power_of_two_up_to_16_mib() {
+        assert_eq!(pool_size(1, true), 64 << 10);
+        assert_eq!(pool_size(64 << 10, true), 64 << 10);
+        assert_eq!(pool_size((256 * 256 * 4) * 4 / 3, true), 512 << 10);
+        assert_eq!(pool_size(16 << 20, true), 16 << 20);
+        assert_eq!(pool_size((16 << 20) + 1, true), 0);
+        assert_eq!(pool_size(1, false), 0);
     }
 }

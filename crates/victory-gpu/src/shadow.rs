@@ -250,6 +250,20 @@ fn card_limits() -> (u64, u64) {
 /// Bytes alive of copies' card sides, and of their "before" twins.
 static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// Bytes of title-memory-by-address (RT BVH) arenas placed in local VRAM.
+static BY_ADDRESS_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Local-VRAM buffer breakdown for the HUD: `[card_buffers_and_windows, bvh_arenas]`.
+pub(crate) fn vram_breakdown() -> [u64; 2] {
+    let bvh = BY_ADDRESS_CARD_BYTES.load(Ordering::Relaxed);
+    let win = WINDOW_CARD_BYTES.load(Ordering::Relaxed).saturating_sub(bvh);
+    let buf = CARD_BYTES[0].load(Ordering::Relaxed)
+        + CARD_BYTES[1].load(Ordering::Relaxed)
+        + win
+        + WINDOW_MAPPED_BYTES.load(Ordering::Relaxed);
+    [buf, bvh]
+}
+
 /// Whether the texture queue leaves room on the card for the card copies
 /// of title buffers that are not made yet
 /// (`VICTORY_CARD_ROOM_FOR_BUFFERS=1`; off by default).
@@ -657,7 +671,7 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
 pub(crate) fn stale_pages(most: usize, say: &mut dyn FnMut(&Shadow, usize, usize, (usize, u32, u32))) -> usize {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let mut all: Vec<Arc<Shadow>> = buffers_read().values().filter_map(|e| e.shadow.clone()).collect();
-    all.extend(LOOSE.write().unwrap_or_else(|e| e.into_inner()).values().cloned());
+    all.extend(LOOSE.read().unwrap_or_else(|e| e.into_inner()).values().cloned());
     all.retain(|s| s.place.is_none() && s.watched.load(Ordering::Relaxed) == 1);
     all.sort_by_key(|s| s.id);
     let next = NEXT.load(Ordering::Relaxed);
@@ -710,6 +724,25 @@ pub(crate) fn stale_pages(most: usize, say: &mut dyn FnMut(&Shadow, usize, usize
 /// Copies of memory (from, to, bytes: apart), on several threads if they are
 /// many.
 pub(crate) fn copy_all(copies: Vec<(usize, usize, usize)>) {
+    // (V2, `VICTORY_SOFT_VIEWS`) Title memory in views the runtime keeps in
+    // its books alone is read from its pages ([`crate::host::read_into`]);
+    // the rest as before.
+    let copies: Vec<(usize, usize, usize)> = if copies.iter().any(|&(src, _, len)| crate::watch::soft_any(src, len)) {
+        copies
+            .into_iter()
+            .filter(|&(src, dst, len)| {
+                if !crate::watch::soft_any(src, len) {
+                    return true;
+                }
+                // SAFETY: the caller's destination range.
+                let to = unsafe { std::slice::from_raw_parts_mut(dst as *mut u8, len) };
+                // (Not read whole: as before, a fault our handler takes.)
+                !crate::host::read_into(src as *const u8, to)
+            })
+            .collect()
+    } else {
+        copies
+    };
     let bytes: usize = copies.iter().map(|c| c.2).sum();
     if bytes > 4 << 20 {
         wide(copy_jobs(copies));
@@ -2897,7 +2930,7 @@ static LET_GO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 #[cfg(feature = "diagnostics")]
 pub(crate) fn windows() -> [u64; 3] {
     let asked: u64 = {
-        let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
         loose
             .values()
             .map(|s| {
@@ -2921,7 +2954,7 @@ pub(crate) fn windows() -> [u64; 3] {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn window_use() -> [u64; 8] {
     let mut out = [0u64; 8];
-    let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
     for s in loose.values() {
         let copied = s.copied.lock().unwrap_or_else(|e| e.into_inner());
         let pages = copied.iter().filter(|&&at| at != 0).count() as u64;
@@ -3029,13 +3062,14 @@ pub(crate) fn let_go_idle() {
         if map.is_empty() {
             return;
         }
+        let is_idle = |s: &Arc<Shadow>| {
+            Arc::strong_count(s) == 1
+                && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
+                && crate::host::references(&s.buffer) == 1
+        };
         let mut eligible: Vec<(u64, (u64, u64), usize, u64)> = map
             .iter()
-            .filter(|(_, s)| {
-                Arc::strong_count(s) == 1
-                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
-                    && crate::host::references(&s.buffer) == 1
-            })
+            .filter(|(_, s)| is_idle(s))
             .map(|(&key, s)| {
                 (s.used.load(Ordering::Relaxed), key, Arc::as_ptr(s) as usize, s.len)
             })
@@ -3050,7 +3084,21 @@ pub(crate) fn let_go_idle() {
                 .collect();
             window_victims(&entries, keep)
         };
-        victims.into_iter().filter_map(|i| map.remove(&eligible[i].1)).collect()
+        // Counted before they leave the table, with its lock held, and
+        // each looked at AGAIN after the count ([`TABLES_CHANGED`]): a
+        // thread that upgraded one from its own cache before the count
+        // moved holds it by now, and it stays (fork PR #1245).
+        if !victims.is_empty() {
+            tables_changed();
+        }
+        let mut gone = Vec::new();
+        for i in victims {
+            let key = eligible[i].1;
+            if map.get(&key).is_some_and(&is_idle) {
+                gone.extend(map.remove(&key));
+            }
+        }
+        gone
     };
     if !gone.is_empty() {
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
@@ -3073,7 +3121,7 @@ pub(crate) fn let_go_idle() {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn memory() -> [u64; 6] {
     let (windows, window_bytes) = {
-        let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
         // Each copy once: a window may stand under several keys.
         let mut seen = std::collections::HashSet::new();
         let bytes: u64 = loose
@@ -4348,7 +4396,11 @@ impl Shadow {
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
-        if from < to && copy_compare() && !crate::host::upcheck::on() {
+        // Never compare-read a BAR-mapped card buffer (`self.mapped`,
+        // `D3D12_HEAP_TYPE_GPU_UPLOAD`): CPU reads from WC VRAM cross PCIe a
+        // few bytes at a time (~250 ms/frame), and mapped windows have no
+        // separate card staging side to skip uploads for anyway.
+        if from < to && !self.mapped && copy_compare() && !crate::host::upcheck::on() {
             self.copy_compared(from, to);
             return to - from;
         }
@@ -4378,17 +4430,24 @@ impl Shadow {
     /// became 23-66.)
     fn copy_compared(&self, from: usize, to: usize) -> usize {
         const PIECE: usize = 4096;
+        const KEEP_SCRATCH: usize = 4 << 20;
         let start = self.start as usize;
+        let len = to - from;
         thread_local! {
             static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
         SCRATCH.with(|s| {
-            let mut title = s.borrow_mut();
-            title.clear();
-            title.resize(to - from, 0);
-            crate::host::copy_mapped(title.as_mut_ptr(), from as *const u8, to - from, false);
+            let mut scratch = s.borrow_mut();
+            // `copy_mapped` writes every byte of `dst[..len]` (zeroing unmapped
+            // pages itself), so grow only as needed instead of zero-filling
+            // ~40-66 MB/frame on every call.
+            if scratch.len() < len {
+                scratch.resize(len, 0);
+            }
+            let title = &mut scratch[..len];
+            crate::host::copy_mapped(title.as_mut_ptr(), from as *const u8, len, false);
             // SAFETY: inside the mapping (`from` and `to` are within the buffer).
-            let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), to - from) };
+            let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), len) };
             let (mut changed, mut run): (usize, Option<usize>) = (0, None);
             let mut at = 0;
             while at <= title.len() {
@@ -4407,8 +4466,12 @@ impl Shadow {
                 }
                 at = end;
             }
-            COPY_COMPARED[0].fetch_add((to - from) as u64, Ordering::Relaxed);
-            COPY_COMPARED[1].fetch_add((to - from - changed) as u64, Ordering::Relaxed);
+            if scratch.capacity() > KEEP_SCRATCH {
+                scratch.truncate(KEEP_SCRATCH);
+                scratch.shrink_to_fit();
+            }
+            COPY_COMPARED[0].fetch_add(len as u64, Ordering::Relaxed);
+            COPY_COMPARED[1].fetch_add((len - changed) as u64, Ordering::Relaxed);
             changed
         })
     }
@@ -5084,27 +5147,30 @@ struct Entry {
 static BUFFERS: std::sync::RwLock<BTreeMap<(u64, usize), Entry>> = std::sync::RwLock::new(BTreeMap::new());
 
 fn buffers() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entry>> {
-    let map = BUFFERS.write().unwrap_or_else(|e| e.into_inner());
-    // What threads remember of it ([`FOUND`]) is of before.
-    BUFFERS_CHANGED.fetch_add(1, Ordering::SeqCst);
-    map
+    BUFFERS.write().unwrap_or_else(|e| e.into_inner())
 }
 
-/// How often [`BUFFERS`] was taken to be changed.
-static BUFFERS_CHANGED: AtomicU64 = AtomicU64::new(1);
+/// How often [`BUFFERS`] or [`LOOSE`] changed in a way that can change what
+/// [`lookup`] answers: a copy that leaves a table is counted before it leaves,
+/// an entry that comes is counted after it is in, both under the table's lock
+/// (fork PR #1237 + PR #1245).
+static TABLES_CHANGED: AtomicU64 = AtomicU64::new(1);
 
-/// Answers a thread remembers.
-const FOUND_MOST: usize = 1024;
+fn tables_changed() {
+    TABLES_CHANGED.fetch_add(1, Ordering::SeqCst);
+}
 
-/// An ask (address, bytes), the count of changes it was answered at, and the
-/// answer.
-type Found = (u64, u64, u64, std::sync::Weak<Shadow>);
+/// Answers a thread remembers (buffers and windows).
+const FOUND_MOST: usize = 4096;
+
+/// An ask `(address, bytes, any)`, the count of changes it was answered at,
+/// and the answer.
+type Found = (u64, u64, bool, u64, std::sync::Weak<Shadow>);
 
 thread_local! {
-    /// The last answers of [`lookup`] out of [`BUFFERS`], by a hash of the
-    /// ask: the same buffers are asked about draw after draw, from five
-    /// threads, each time through the map's lock and a dozen of its nodes
-    /// (7 % of the recording threads' time, profile waits-1).
+    /// The last answers of [`lookup`] out of [`BUFFERS`] and [`LOOSE`], by a
+    /// hash of the ask: the same buffers and windows are asked about draw
+    /// after draw, from every recording thread.
     static FOUND: std::cell::RefCell<Vec<Found>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -5113,33 +5179,59 @@ fn quick_find() -> bool {
     crate::toggled!("VICTORY_QUICK_FIND")
 }
 
-fn found_at(address: u64, len: u64) -> usize {
-    let h = (address ^ len.rotate_left(32)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    (h >> 54) as usize % FOUND_MOST
+fn found_at(address: u64, len: u64, any: bool) -> usize {
+    let h = (address ^ len.rotate_left(32) ^ u64::from(any)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    (h >> 52) as usize % FOUND_MOST
+}
+
+#[inline]
+fn note_window(shadow: &Shadow, address: u64, end: u64, unsized_ask: bool) {
+    // (Read first: the lines are shared by all recording threads.)
+    let now = crate::host::moment();
+    if shadow.used.load(Ordering::Relaxed) != now {
+        shadow.used.store(now, Ordering::Relaxed);
+    }
+    if shadow.asked[0].load(Ordering::Relaxed) > address {
+        shadow.asked[0].fetch_min(address, Ordering::Relaxed);
+    }
+    if shadow.asked[1].load(Ordering::Relaxed) < end {
+        shadow.asked[1].fetch_max(end, Ordering::Relaxed);
+    }
+    if unsized_ask {
+        shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// What this thread remembers of an ask, if nothing changed since.
-fn found(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    let changed = BUFFERS_CHANGED.load(Ordering::SeqCst);
+fn found(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
+    let changed = TABLES_CHANGED.load(Ordering::SeqCst);
     let shadow = FOUND.with(|f| {
         let f = f.borrow();
-        let (a, n, at, shadow) = f.get(found_at(address, len))?;
-        ((*a, *n, *at) == (address, len, changed)).then(|| shadow.upgrade()).flatten()
+        let (a, n, k, at, shadow) = f.get(found_at(address, len, any))?;
+        ((*a, *n, *k, *at) == (address, len, any, changed))
+            .then(|| shadow.upgrade())
+            .flatten()
     })?;
     // Whoever takes the map to let a copy go that nobody holds finds it held
     // now, or had counted before: then it is not handed out.
     std::sync::atomic::fence(Ordering::SeqCst);
-    (BUFFERS_CHANGED.load(Ordering::SeqCst) == changed).then_some(shadow)
+    if TABLES_CHANGED.load(Ordering::SeqCst) != changed {
+        return None;
+    }
+    if shadow.window {
+        note_window(&shadow, address, address.saturating_add(len.max(1)), len <= 1);
+    }
+    Some(shadow)
 }
 
 /// Remembers an answer given while `changed` was the count.
-fn remember(address: u64, len: u64, changed: u64, shadow: &Arc<Shadow>) {
+fn remember(address: u64, len: u64, any: bool, changed: u64, shadow: &Arc<Shadow>) {
     FOUND.with(|f| {
         let mut f = f.borrow_mut();
         if f.is_empty() {
-            f.resize_with(FOUND_MOST, || (0, 0, 0, std::sync::Weak::new()));
+            f.resize_with(FOUND_MOST, || (0, 0, false, 0, std::sync::Weak::new()));
         }
-        f[found_at(address, len)] = (address, len, changed, Arc::downgrade(shadow));
+        f[found_at(address, len, any)] = (address, len, any, changed, Arc::downgrade(shadow));
     });
 }
 
@@ -5149,25 +5241,30 @@ fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), 
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    buffers().insert(
+    let mut map = buffers();
+    map.insert(
         (start, resource),
         Entry {
             end: start + len,
             shadow: None,
         },
     );
+    // After the insert, with the table's lock still held (fork PR #1245).
+    tables_changed();
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers().remove(&(start, resource));
+    let mut map = buffers();
+    tables_changed();
+    map.remove(&(start, resource));
 }
 
 /// The title buffer holding `address`, as (start, length), without making
 /// its copy (diagnostics: which buffer a dropped program's root view names).
 #[cfg(feature = "diagnostics")]
 pub(crate) fn extent(address: u64) -> Option<(u64, u64)> {
-    buffers()
+    buffers_read()
         .range(..=(address, usize::MAX))
         .rev()
         .take(64)
@@ -5189,14 +5286,21 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
             .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at)
             .map(|(key, _)| *key)
             .collect();
+        if !keys.is_empty() {
+            tables_changed();
+        }
         gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
     }
     {
         // As `lookup` finds a buffer: among the 256 that start below.
         let mut map = buffers();
-        for (_, entry) in map.range_mut(..(end, 0)).rev().take(256) {
-            if entry.end > at && entry.shadow.as_ref().is_some_and(|s| s.place.is_some()) {
-                gone.extend(entry.shadow.take());
+        let placed = |entry: &Entry| entry.end > at && entry.shadow.as_ref().is_some_and(|s| s.place.is_some());
+        if map.range(..(end, 0)).rev().take(256).any(|(_, entry)| placed(entry)) {
+            tables_changed();
+            for (_, entry) in map.range_mut(..(end, 0)).rev().take(256) {
+                if placed(entry) {
+                    gone.extend(entry.shadow.take());
+                }
             }
         }
     }
@@ -5212,7 +5316,7 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
 /// bytes, true).
 pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
     let mut spans: Vec<(u64, u64, bool)> = buffers_read().iter().map(|(key, entry)| (key.0, entry.end - key.0, false)).collect();
-    let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
     spans.extend(loose.keys().map(|&(start, len)| (start, len, true)));
     spans
 }
@@ -5257,25 +5361,32 @@ pub(crate) fn peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
 
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let quick = quick_find();
-    if quick && let Some(shadow) = found(address, len) {
+    if quick && let Some(shadow) = found(address, len, any) {
         return Some(shadow);
     }
     let end = address.checked_add(len.max(1))?;
+    let changes = if quick { TABLES_CHANGED.load(Ordering::SeqCst) } else { 0 };
     {
         let map = buffers_read();
         match map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end) {
             // The copy is made already (nearly always).
             Some((_, Entry { shadow: Some(shadow), .. })) => {
                 if quick {
-                    // (Nobody changes the map while this lock is held.)
-                    remember(address, len, BUFFERS_CHANGED.load(Ordering::SeqCst), shadow);
+                    // (Nobody changes BUFFERS while this read lock is held;
+                    // a concurrent LOOSE change would bump TABLES_CHANGED and
+                    // simply expire this entry on the next ask.)
+                    remember(address, len, any, TABLES_CHANGED.load(Ordering::SeqCst), shadow);
                 }
                 return Some(shadow.clone());
             }
             Some(_) => {}
             None => {
                 drop(map);
-                return loose(address, end, len <= 1, any);
+                let shadow = loose(address, end, len <= 1, any)?;
+                if quick && TABLES_CHANGED.load(Ordering::SeqCst) == changes {
+                    remember(address, len, any, changes, &shadow);
+                }
+                return Some(shadow);
             }
         }
     }
@@ -5288,7 +5399,11 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         .map(|(k, _)| *k);
     let Some(key) = key else {
         drop(map);
-        return loose(address, end, len <= 1, any);
+        let shadow = loose(address, end, len <= 1, any)?;
+        if quick && TABLES_CHANGED.load(Ordering::SeqCst) == changes {
+            remember(address, len, any, changes, &shadow);
+        }
+        return Some(shadow);
     };
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
@@ -5305,6 +5420,31 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // title's 32-bit graphics heap in place, big or not.
         if let Some(placed) = crate::port::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
+            return entry.shadow.clone();
+        }
+        // Folded (`VICTORY_FOLD_BUFFERS`, on unless 0): a buffer inside one
+        // window takes the window of the title's memory around it as its
+        // copy, the one asks by address outside buffers are given, instead
+        // of a second copy of the same bytes. Two copies of one range made
+        // every submission that refreshed one while a flight's shaders wrote
+        // the other wait for the card to drain (Neptune: 179.2 -> 160.1 ms
+        // a frame, settles 4.5 -> 1.0; viyourmom a540bb8, by way of
+        // meeyao/victory-8gb-linux). Not one that crosses a grid line: its
+        // window would be two cells no other ask names, a third copy.
+        // (`let_go_idle` keeps a window a buffer holds.)
+        if !big
+            && fold_buffers()
+            && folds(key.0, entry.end, window())
+            && let Some(window) = loose(key.0, entry.end, false, false)
+        {
+            if FOLDED.fetch_add(1, Ordering::Relaxed) < 8 {
+                tracing::info!(
+                    start = format_args!("{:#x}", key.0),
+                    len,
+                    "a buffer's copy is its window's (VICTORY_FOLD_BUFFERS)"
+                );
+            }
+            entry.shadow = Some(window);
             return entry.shadow.clone();
         }
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
@@ -5389,6 +5529,35 @@ fn window() -> u64 {
     })
 }
 
+/// Whether a buffer that fits in one window takes the window of the title's
+/// memory it lies in as its copy, rather than a copy of its own (on unless
+/// `VICTORY_FOLD_BUFFERS=0`, which gives every buffer its own copy, as
+/// before).
+fn fold_buffers() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // In-run A/B (diagnostics): `VICTORY_AB=<s>,VICTORY_FOLD_BUFFERS` flips it by phase.
+    #[cfg(feature = "diagnostics")]
+    if let Some(now) = crate::ab::pick("VICTORY_FOLD_BUFFERS") {
+        return now;
+    }
+    *ON.get_or_init(|| fold_setting(std::env::var_os("VICTORY_FOLD_BUFFERS").as_deref()))
+}
+
+/// [`fold_buffers`] for a value of `VICTORY_FOLD_BUFFERS`.
+fn fold_setting(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_none_or(|v| v != "0")
+}
+
+/// Whether the buffer `[start, end)` lies in one window of the `grid`
+/// ([`window_of`]), and so can take that window as its copy.
+fn folds(start: u64, end: u64, grid: u64) -> bool {
+    end > start && window_of(start, end, grid).1 == grid
+}
+
+/// Buffers that took a window as their copy since the start
+/// ([`fold_buffers`]).
+pub(crate) static FOLDED: AtomicU64 = AtomicU64::new(0);
+
 /// The window grid in bytes for a setting in KiB: a power of two from
 /// 64 KiB to 4 MiB, 4 MiB for anything else.
 fn grid(kb: Option<u64>) -> u64 {
@@ -5463,7 +5632,7 @@ fn fine() -> bool {
 /// which is copied once for each.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn window_cover() -> u64 {
-    let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
     cover(loose.keys().copied())
 }
 
@@ -5534,12 +5703,21 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     let room = host.video_memory().is_none_or(|[budget, used, ..]| used + len < budget / 100 * 97);
     let (staging, data) = host.shared_buffer(len)?;
     let on_card = if room && USED.fetch_add(len, Ordering::Relaxed) + len <= most {
-        host.uav_buffer(len)
+        host.uav_buffer(len).or_else(|| {
+            USED.fetch_sub(len, Ordering::Relaxed);
+            None
+        })
     } else {
+        if room {
+            USED.fetch_sub(len, Ordering::Relaxed);
+        }
         None
     };
     let buffer = match on_card {
-        Some(buffer) => buffer,
+        Some(buffer) => {
+            BY_ADDRESS_CARD_BYTES.fetch_add(len, Ordering::Relaxed);
+            buffer
+        }
         None => host.shared_buffer(len)?.0,
     };
     crate::host::name(&staging, || format!("title memory {start:#x}+{len:#x} by address, the CPU's side"));
@@ -5571,26 +5749,23 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     let (cell, _) = window_of(address, end, WINDOW);
     let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
     // Under the lock, with the handing out: see `let_go_idle`.
-    let note = |shadow: &Shadow| {
-        // (Read first: the lines are shared by all recording threads.)
-        let now = crate::host::moment();
-        if shadow.used.load(Ordering::Relaxed) != now {
-            shadow.used.store(now, Ordering::Relaxed);
-        }
-        if shadow.asked[0].load(Ordering::Relaxed) > address {
-            shadow.asked[0].fetch_min(address, Ordering::Relaxed);
-        }
-        if shadow.asked[1].load(Ordering::Relaxed) < end {
-            shadow.asked[1].fetch_max(end, Ordering::Relaxed);
-        }
-        if unsized_ask {
-            shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
-        }
-    };
+    let note = |shadow: &Shadow| note_window(shadow, address, end, unsized_ask);
     // The window is there already (nearly always): readers share the lock.
-    if !(unsized_ask && tails()) && !(any && fine() && !unsized_ask) {
+    // Also when windows are finer than their cell (`fine`) and the ask takes
+    // any that holds it (ported from ryuki f2420f00): the write lock is only
+    // for making a new window.
+    {
         let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
-        if let Some(shadow) = map.get(&named) {
+        let key = if unsized_ask && tails() {
+            let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+            longest_tail(there, address, end)
+        } else if any && fine() && !unsized_ask {
+            let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+            Some(holder(there, address, end).unwrap_or(named))
+        } else {
+            Some(named)
+        };
+        if let Some(shadow) = key.and_then(|key| map.get(&key)) {
             note(shadow);
             return Some(shadow.clone());
         }
@@ -5618,6 +5793,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
         note(&shadow);
         map.insert((start, len), shadow.clone());
+        tables_changed();
         return Some(shadow);
     }
     // One buffer in the card's memory, filled by the CPU through the bus.
@@ -5631,6 +5807,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let shadow = Arc::new(shadow);
         note(&shadow);
         map.insert((start, len), shadow.clone());
+        tables_changed();
         return Some(shadow);
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
@@ -5668,6 +5845,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     }
     note(&shadow);
     map.insert((start, len), shadow.clone());
+    tables_changed();
     Some(shadow)
 }
 
@@ -5756,8 +5934,8 @@ pub(crate) fn exact_line(frames: f64) {
 #[cfg(test)]
 mod window_tests {
     use super::{
-        WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, resolve_card_limits,
-        tail_of, window_of, window_victims,
+        WINDOW, cover, default_card_limits_mb, fold_setting, folds, grid, holder, longest_tail,
+        resolve_card_limits, tail_of, window_of, window_victims,
     };
 
     #[test]
@@ -5910,12 +6088,61 @@ mod window_tests {
             assert!(start % g == 0 && len % g == 0);
         }
     }
+
+    /// A buffer folds into its window only when it lies in one cell of the
+    /// grid; folding is on unless the setting is 0.
+    #[test]
+    fn buffers_fold_into_one_window_only() {
+        let base = 0x2_0040_0000;
+        assert!(folds(base, base + WINDOW, WINDOW));
+        assert!(folds(base + 0x1000, base + 0x2_0000, WINDOW));
+        assert!(!folds(base + WINDOW - 0x1000, base + WINDOW + 0x1000, WINDOW));
+        assert!(!folds(base, base + WINDOW + 0x1000, WINDOW));
+        assert!(!folds(base, base, WINDOW));
+        assert!(fold_setting(None));
+        assert!(fold_setting(Some(std::ffi::OsStr::new("1"))));
+        assert!(!fold_setting(Some(std::ffi::OsStr::new("0"))));
+    }
+
+    /// A registration that waits for the table's lock has not counted yet:
+    /// who reads the old table reads it under the old count (fork PR #1245).
+    #[test]
+    fn a_pending_registration_invalidates_readers_of_the_old_table() {
+        use super::{TABLES_CHANGED, buffers, register, unregister};
+        use std::sync::{Barrier, atomic::Ordering};
+        use std::time::{Duration, Instant};
+
+        let slot = 0u64;
+        let start = (&raw const slot) as u64;
+        let resource = start as usize;
+        let table = buffers();
+        let initial = TABLES_CHANGED.load(Ordering::Acquire);
+        let ready = Barrier::new(2);
+        let observed = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                ready.wait();
+                register(resource, start, 8);
+            });
+            ready.wait();
+            let deadline = Instant::now() + Duration::from_millis(50);
+            while TABLES_CHANGED.load(Ordering::Acquire) == initial && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            let count = TABLES_CHANGED.load(Ordering::Acquire);
+            assert!(!table.contains_key(&(start, resource)));
+            drop(table);
+            count
+        });
+        let committed = TABLES_CHANGED.load(Ordering::Acquire);
+        unregister(resource, start);
+        assert_ne!(committed, observed, "the old table still has the current count");
+    }
 }
 
 /// For device-removed reports: the copy of title memory whose host range
 /// starts closest below host GPU address `va`, and where `va` is in it.
 pub(crate) fn near(va: u64) -> String {
-    let mut all: Vec<(u64, u64, u64)> = buffers()
+    let mut all: Vec<(u64, u64, u64)> = buffers_read()
         .values()
         .filter_map(|e| e.shadow.as_deref().map(|s| (s.gpu, s.start, s.len)))
         .collect();

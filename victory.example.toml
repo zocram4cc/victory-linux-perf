@@ -7,6 +7,9 @@
 # Your own dump of the title.     env: VICTORY_GAME_DIR
 game_dir = 'D:\victory-data\game'
 
+# PC FSR 4.1.2 upscaler for -Fsr4K.   env: VICTORY_FIDELITYFX_DIR
+# fidelityfx_dir = 'D:\victory-data\fidelityfx-4.1.2'
+
 # Derived data. Default: %LOCALAPPDATA%\victory\cache.   env: VICTORY_CACHE_DIR
 # cache_dir = 'D:\victory-data\cache'
 
