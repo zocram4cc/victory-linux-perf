@@ -5456,7 +5456,10 @@ impl<'a> Lower<'a> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
-        if v.clamp || v.omod != 0 {
+        // `clamp` of the unsigned adds and subtracts is applied where they
+        // are lowered (saturation); any other integer output modifier is refused.
+        let saturated = matches!(inst.name(), "v_add_nc_u32" | "v_sub_nc_u32" | "v_subrev_nc_u32");
+        if (v.clamp && !saturated) || v.omod != 0 {
             return Err("integer output modifiers");
         }
         match v.dst {
@@ -11942,7 +11945,24 @@ impl<'a> Lower<'a> {
                     "v_subrev_nc_u32" => (Bin::Sub, b, a),
                     _ => (Bin::Mul, a, b),
                 };
-                self.s.m.bin(c, op, a, b)
+                let r = self.s.m.bin(c, op, a, b);
+                // `clamp` on these unsigned adds and subtracts saturates (the
+                // ISA): a sum that wraps is 0xFFFFFFFF, a difference below
+                // zero is 0 (P.4: `v_sub_nc_u32 … clamp`, 14 programs).
+                let clamp = matches!(&inst.fields, Fields::Valu(f) if f.clamp);
+                if clamp && matches!(op, Bin::Add | Bin::Sub) && name != "v_mul_lo_u32" {
+                    if op == Bin::Add {
+                        let wrapped = self.s.m.cmp(c, pred::IULT, r, a);
+                        let top = k(self, u32::MAX);
+                        self.s.m.select(c, wrapped, top, r)
+                    } else {
+                        let below = self.s.m.cmp(c, pred::IULT, a, b);
+                        let z = k(self, 0);
+                        self.s.m.select(c, below, z, r)
+                    }
+                } else {
+                    r
+                }
             }
             "v_xnor_b32" => {
                 let (a, b) = (s(self, 0)?, s(self, 1)?);

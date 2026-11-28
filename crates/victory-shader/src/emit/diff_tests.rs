@@ -203,6 +203,21 @@ TextureCube cubet : register(t8, space2);
 /// Compute shaders, each `cs`, dispatched as 2×2 groups of 8×8 threads
 /// over a 16×16 texture and a 256-dword buffer.
 const CS_CASES: &[(&str, &str)] = &[
+    // Unsigned differences that stop at zero and sums that stop at the top:
+    // the console compiler can use the `clamp` of `v_sub_nc_u32` /
+    // `v_add_nc_u32` (P.4: integer output modifiers).
+    (
+        "saturating unsigned add and subtract",
+        r#"CS {
+            uint n = d.y * 16 + d.x;
+            uint a = raw.Load(4 * (n & 31)) ^ (n * 2654435761u);
+            uint b = (n * 40503u) ^ asuint(k.x);
+            uint dif = a > b ? a - b : 0;
+            uint s = a + b;
+            uint sat = s < a ? 0xffffffffu : s;
+            outb.Store2(8 * n, uint2(dif, sat));
+        }"#,
+    ),
     // An atomic subtraction on a raw buffer (the console compiler's
     // `buffer_atomic_sub`), with and without the old value.
     (
