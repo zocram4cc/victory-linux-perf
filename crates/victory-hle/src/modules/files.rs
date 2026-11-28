@@ -576,7 +576,18 @@ pub extern "system" fn ReadFile(
     read: *mut u32,
     overlapped: *mut c_void,
 ) -> i32 {
-    let writing = victory_gpu::kernel_writing(buffer as usize, len as usize);
+    let Some(writing) = victory_gpu::try_kernel_writing(buffer as usize, len as usize) else {
+        // The destination could not be prepared. Avoid dereferencing an
+        // invalid title pointer when reporting a zero-byte transfer.
+        if !read.is_null() {
+            use windows_sys::Win32::System::Threading::GetCurrentProcess;
+            type NtWrite = extern "system" fn(*mut c_void, *mut c_void, *const u32, usize, *mut usize) -> i32;
+            let write = host!("ntdll.dll", "NtWriteVirtualMemory": NtWrite);
+            write(unsafe { GetCurrentProcess() }, read.cast(), &0, size_of::<u32>(), std::ptr::null_mut());
+        }
+        unsafe { windows_sys::Win32::Foundation::SetLastError(windows_sys::Win32::Foundation::ERROR_NOACCESS) };
+        return 0;
+    };
     let done = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
         file, buffer, len, read, overlapped,
     );
@@ -587,6 +598,7 @@ pub extern "system" fn ReadFile(
     // into pages the kernel has locked by now: it lands all the same, but a
     // refresh that guards its blocks before it does will not see it.
     if done == 0 && error == windows_sys::Win32::Foundation::ERROR_IO_PENDING {
+        victory_gpu::lazy_pending_io(buffer as usize, len as usize);
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::info!(len, "ReadFile: a read of the title's goes on after the call"));
     }

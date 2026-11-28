@@ -1667,7 +1667,7 @@ fn into_destination(
         // Raw reads land through the kernel, which does not fault into the
         // GPU side's guard on title buffers; open them first, and until the
         // bytes are there.
-        let writing = victory_gpu::kernel_writing(request.destination as usize, len);
+        let writing = victory_gpu::try_kernel_writing(request.destination as usize, len).ok_or(E_INVALIDARG)?;
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
@@ -1715,6 +1715,7 @@ fn into_pages(
     len: usize,
     mut fill: impl FnMut(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
+    let _lazy = victory_gpu::lazy_physical_write(|| super::xmem::shown_at(pages, offset, len)).map_err(|()| E_INVALIDARG)?;
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {

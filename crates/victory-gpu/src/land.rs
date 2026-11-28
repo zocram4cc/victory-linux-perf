@@ -610,7 +610,7 @@ unsafe fn piece_at(
     // a change is under way, what the record of the views says now does
     // ([`anytime`]), or the title's own address.
     let reading = beside.then(crate::watch::title_memory_reading_now).flatten();
-    let beside = if reading.is_some() || beside && anytime() { crate::inplace::beside(title, end) } else { None };
+    let beside = if reading.is_some() || beside && anytime() && !crate::watch::lazy_back::enabled() { crate::inplace::beside(title, end) } else { None };
     count(stat::PIECES, 1);
     count(if beside.is_some() { stat::BESIDE } else { stat::DIRECT }, 1);
     // The pages that differ, before any is written: none, and the guard

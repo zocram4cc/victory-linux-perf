@@ -519,6 +519,18 @@ pub(crate) fn shown_runs(at: usize, len: usize) -> Vec<(usize, usize)> {
     runs
 }
 
+/// Section identities intersecting an overlapped I/O destination. A kernel
+/// write continues targeting those physical pages if the title remaps its VA.
+pub(crate) fn sections_in(at: usize, len: usize) -> Vec<usize> {
+    let views = views();
+    let end = at.saturating_add(len);
+    let mut sections = Vec::new();
+    if let Some((&base, &(n, section, _))) = views.views.range(..at).next_back()
+        && base.saturating_add(n) > at { sections.push(section); }
+    sections.extend(views.views.range(at..end).map(|(_, v)| v.1));
+    sections
+}
+
 /// How the views cover `[at, at + len)`.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) enum Cover {
@@ -598,6 +610,7 @@ fn stretch_in(views: &BTreeMap<usize, (usize, usize, u64)>, at: usize, len: usiz
 /// `crate::watch::title_memory_reading`: until it lets go the title sees
 /// the same pages at `at`.
 pub(crate) fn beside(at: usize, len: usize) -> Option<usize> {
+    crate::watch::lazy_back::materialize(at, len);
     let known = {
         let v = views();
         let Cover::Run(section, offset) = cover_in(&v.views, at, len) else {
@@ -634,6 +647,7 @@ pub(crate) fn beside(at: usize, len: usize) -> Option<usize> {
 /// in no view of a section, or in very many. While the caller holds
 /// `crate::watch::title_memory_reading`.
 pub(crate) fn beside_page(page: usize) -> Option<(usize, [usize; 8])> {
+    crate::watch::lazy_back::materialize(page, K64);
     for asked in [false, true] {
         {
             let v = views();

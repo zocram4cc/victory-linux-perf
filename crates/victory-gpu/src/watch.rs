@@ -30,6 +30,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Bound, RangeBounds};
 use std::sync::{Condvar, Mutex, RwLock};
 
+pub(crate) mod lazy_back;
+
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
 /// 4 KiB pages fold into it). Finer units made the checks of the world's
 /// big buffers cost more than the copies they saved.
@@ -3193,6 +3195,7 @@ fn protect_alias(g: &Guards, block: usize, claims: Option<&mut Claims>) -> bool 
         // Another changes it now (a fault opens it): not covered.
         return false;
     }
+    lazy_back::materialize(block * BLOCK, BLOCK);
     g.aliased.insert(block);
     if g.protected.contains(block) {
         return true;
@@ -3229,6 +3232,7 @@ fn protect_alias(g: &Guards, block: usize, claims: Option<&mut Claims>) -> bool 
 
 /// [`protect`] for one range, without the other views of its pages.
 fn protect_here(g: &Guards, from: usize, to: usize) {
+    lazy_back::materialize(from * BLOCK, (to - from) * BLOCK);
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
     let set = |from: usize, to: usize| {
         let mut old = 0;
@@ -3312,6 +3316,7 @@ fn uncommitted_end(block: usize) -> usize {
 /// clean no longer, whether they are opened as well ([`open_one_view`]) or
 /// not.
 fn open(g: &Guards, start: usize, end: usize) -> usize {
+    lazy_back::materialize(start, end.saturating_sub(start));
     open_given(g, start, end, None)
 }
 
@@ -3400,6 +3405,7 @@ fn unguard(g: &Guards, blocks: &[usize]) {
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
+    lazy_back::materialize(at, len);
     // The length is the title's (`fread`'s size times count, saturated).
     let last = at.saturating_add(len).div_ceil(BLOCK);
     if !light() || PROTECTED.any(at / BLOCK, last) {
@@ -3427,9 +3433,14 @@ pub struct KernelWrite(usize, usize);
 /// write fail (the kernel does not fault into our handler): a read cut
 /// short, which the title takes for what the file holds.
 pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
+    try_kernel_writing(at, len).unwrap_or_else(|| crate::host::fail(format_args!("cannot prepare kernel write at {at:#x}")))
+}
+
+pub fn try_kernel_writing(at: usize, len: usize) -> Option<KernelWrite> {
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     {
         let mut g = guards_timed();
+        lazy_back::try_materialize(at, len).ok()?;
         open(&g, at, at.saturating_add(len));
         if len != 0 {
             // Nothing known of them stands while they are left alone.
@@ -3444,7 +3455,7 @@ pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
         }
     }
     crate::descriptor::host::remapped(at, len);
-    KernelWrite(first, if len == 0 { first } else { last })
+    Some(KernelWrite(first, if len == 0 { first } else { last }))
 }
 
 impl Drop for KernelWrite {
@@ -3843,9 +3854,43 @@ fn remapping(range: MappingRange) -> Remapping {
     }
     drop(state);
     ACTIVE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    lazy_back::drain();
     CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     CHANGING.set((true, false));
     Remapping(id)
+}
+
+/// Held while no read and no change of a mapping overlaps its range, and
+/// none begins (it stands in the queue of changes, without being one:
+/// nothing about the mapping changes, so nobody who asks whether one has is
+/// told so).
+pub(crate) struct MappingHold(u64);
+
+impl Drop for MappingHold {
+    fn drop(&mut self) {
+        let mut state = mapping_state();
+        state.writers.retain(|writer| writer.0 != self.0);
+        MAPPING_MOVED.notify_all();
+    }
+}
+
+/// [`MappingHold`] of `[at, at + len)` if it can be had at once: `None` while
+/// something reads or changes a mapping there (or waits to change).
+pub(crate) fn mapping_hold_now(at: usize, len: usize) -> Option<MappingHold> {
+    let range = mapping_range(at, len);
+    let mut state = match MAPPING.try_lock() {
+        Ok(state) => state,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return None,
+    };
+    let busy = state.readers.iter().any(|&(_, other)| mapping_overlaps(range, other))
+        || state.writers.iter().any(|&(_, other, _)| mapping_overlaps(range, other));
+    if busy {
+        return None;
+    }
+    let id = mapping_id(&mut state);
+    state.writers.push((id, range, true));
+    Some(MappingHold(id))
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
@@ -4056,6 +4101,10 @@ fn title_memory_changed(at: usize, len: usize) -> std::sync::RwLockWriteGuard<'s
 /// Registers the handler that takes writes to guarded blocks, once, ahead
 /// of the crash reporter's.
 pub(crate) fn install() {
+    ensure_handler();
+}
+
+fn ensure_handler() -> bool {
     use windows_sys::Win32::Foundation::{
         EXCEPTION_ACCESS_VIOLATION, NTSTATUS, STATUS_GUARD_PAGE_VIOLATION,
     };
@@ -4069,6 +4118,15 @@ pub(crate) fn install() {
         let r = unsafe { &*(*info).ExceptionRecord };
         const READ: usize = 0;
         const WRITE: usize = 1;
+        if r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
+            && r.NumberParameters >= 2 && matches!(r.ExceptionInformation[0], READ | WRITE)
+        {
+            match lazy_back::fault(r.ExceptionInformation[1], r.ExceptionInformation[0] == WRITE) {
+                Ok(true) => return EXCEPTION_CONTINUE_EXECUTION,
+                Err(()) => return EXCEPTION_CONTINUE_SEARCH,
+                Ok(false) => {}
+            }
+        }
         // A fault of our own copies (`crate::safecopy`): whatever it is, if
         // it is not a block we guard, the copy fails and goes on from there.
         let ours = crate::safecopy::failing_exit(r.ExceptionAddress as usize);
@@ -4151,11 +4209,9 @@ pub(crate) fn install() {
             None => EXCEPTION_CONTINUE_SEARCH,
         }
     }
-    static ONCE: std::sync::Once = std::sync::Once::new();
+    static INSTALLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // SAFETY: the handler only touches our guard state and protections.
-    ONCE.call_once(|| unsafe {
-        AddVectoredExceptionHandler(1, Some(on_write));
-    });
+    *INSTALLED.get_or_init(|| unsafe { !AddVectoredExceptionHandler(1, Some(on_write)).is_null() })
 }
 
 /// Sets the guard flag again on the page holding `at` (the address the fault
@@ -5102,6 +5158,81 @@ mod tests {
         }
         // SAFETY: the section's last reference.
         unsafe { CloseHandle(section as *mut std::ffi::c_void) };
+    }
+
+    // A separate process gives this test its own switch, submission state
+    // and mapping lock. Other GPU tests intentionally remap and drain pages.
+    #[test]
+    fn lazy_back_lands_only_on_access_and_preserves_partial_kernel_writes() {
+        const TEST: &str = "watch::tests::lazy_back_lands_only_on_access_and_preserves_partial_kernel_writes";
+        if std::env::var_os("VICTORY_TEST_LAZY_CHILD").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env("VICTORY_TEST_LAZY_CHILD", "1")
+                .env("VICTORY_LAZY_BACK", "1")
+                .env("VICTORY_WIDE_BACK", "0")
+                .status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+        let bytes = 3 * PAGE;
+        let (section, at, other) = two_views(bytes);
+        crate::inplace::title_memory_section(section, bytes as u64, true);
+        let zero = vec![0; PAGE];
+        assert!(!lazy_back::arm(at, &zero, |_| panic!("unguarded alias admitted")));
+        title_memory_remapped(other, bytes);
+        unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: other as _ }) };
+        let own = crate::inplace::beside(at, bytes).unwrap() as *const u8;
+        let mut gpu = vec![0; bytes];
+        let shadow = crate::shadow::Shadow::unbacked(at as u64, gpu.as_mut_ptr(), bytes as u64, false);
+        shadow.writing(at, bytes);
+        gpu.fill(0x52);
+        let _landing = lazy_back::completed_landing(std::iter::once((shadow.id(), at, at + bytes)));
+        assert_eq!(shadow.copy_back(at, bytes), 0);
+        // The unchanged physical alias and actual page protection distinguish
+        // deferral from a successful eager copy.
+        assert!(!writable(at));
+        unsafe {
+            assert_eq!(own.read_volatile(), 0);
+            assert_eq!((at as *const u8).read_volatile(), 0x52);
+            ((at + PAGE + 5) as *mut u8).write_volatile(0xad);
+            assert_eq!(own.add(PAGE + 5).read_volatile(), 0xad);
+            assert_eq!(own.add(PAGE + 6).read_volatile(), 0x52);
+            assert_eq!(own.add(2 * PAGE).read_volatile(), 0);
+        }
+        lazy_back::retire_sources();
+        gpu.fill(0xee);
+        let last = at + 2 * PAGE;
+        assert!(!writable(last));
+        let pin = try_kernel_writing(last + 3, 1).unwrap();
+        assert!(writable(last));
+        unsafe {
+            assert_eq!((last as *const u8).read_volatile(), 0x52);
+            ((last + 3) as *mut u8).write(0xa1);
+            assert_eq!(((last + 4) as *const u8).read(), 0x52);
+        }
+        assert!(!lazy_back::arm(last, &zero, |_| panic!("kernel-pinned page admitted")));
+        drop(pin);
+        assert!(!lazy_back::arm(last, &zero, |_| panic!("dirty title page admitted")));
+        assert!(writable(last), "a rejected arm restores the whole view");
+
+        let baseline = vec![0x52; PAGE];
+        let fails = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let injected = fails.clone();
+        assert!(lazy_back::arm(at, &baseline, move |_| {
+            if injected.load(std::sync::atomic::Ordering::Acquire) { Err(()) } else { Ok(()) }
+        }));
+        assert!(try_kernel_writing(at, 4).is_none());
+        assert!(!writable(at), "failed fetch must not publish stale title bytes");
+        // This child owns the injected failed entry. Replace the injected
+        // failure with a successful retry before releasing the section.
+        fails.store(false, std::sync::atomic::Ordering::Release);
+        drop(title_memory_remapping());
+        assert!(writable(at));
+        crate::shadow::verify_lazy_card_readback(at);
+        crate::inplace::title_memory_section_gone(section);
+        drop_views(section, &[at], bytes);
     }
 
     /// The title wrote the pages of a guarded texture through another view
