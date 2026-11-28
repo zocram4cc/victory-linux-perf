@@ -106,11 +106,11 @@ Unsigned prebuilt binaries should never be trusted blindly. You can build the ex
 git clone --branch dev https://github.com/crossducking/RAZDA4A-XEN.git
 cd RAZDA4A-XEN
 cargo xtask agility
-$env:RUSTFLAGS = "-C target-cpu=znver3"
+$env:RUSTFLAGS = "-C target-cpu=x86-64-v3"
 cargo build --release --locked -p victory
 ```
 
-Prebuilt `RAZDA4A_XEN.exe` SHA-256: `00d6d6f90466de9541eb61266715c8ce4993c6926ca3c78f7b339d518cfec3db`
+Prebuilt `RAZDA4A_XEN.exe` SHA-256: `4ab8fcf7e2614cb669ad54069011d8cb0bed74b3eac7b994854c278f2a862622`
 
 ## Branches & license
 
