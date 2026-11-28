@@ -2511,7 +2511,7 @@ impl HostHeap {
             return false;
         }
         let _made = self.made.lock(index);
-        self.made.get(index) == Some(key) && self.kept_in(index).is_some()
+        self.made.get(index) == Some(key) && self.keeps(index)
     }
 
     /// Levels on demand (`crate::tiles`): makes again the host slots of the
@@ -2613,7 +2613,7 @@ impl HostHeap {
             };
             if let Some(kept) = make(&view, self.at(slot)) {
                 self.put(slot);
-                self.keep(slot, kept);
+                self.keep(slot, kept.as_ref());
                 remade += 1;
             }
         }
@@ -2725,7 +2725,7 @@ impl HostHeap {
                 self.put(index);
                 self.clear_twin(index);
                 LATE[3].fetch_add(u64::from(kept.is_some()), Relaxed);
-                self.keep(index, kept);
+                self.keep(index, kept.as_ref());
             }
             stale
         };
@@ -2843,7 +2843,7 @@ impl HostHeap {
                 let was = shown;
                 self.quick_is(f.index, 0);
                 self.made.set(f.index, f.key);
-                self.keep(f.index, kept);
+                self.keep(f.index, kept.as_ref());
                 #[cfg(feature = "diagnostics")]
                 if f.late.is_some() && was != 0 {
                     same_bytes(was, f.key);
@@ -3208,7 +3208,7 @@ impl HostHeap {
         }
         self.put(index);
         self.twin_made(index, kept.is_some() && twinned(view));
-        self.keep_srv(index, kept.flatten(), view);
+        self.keep_srv(index, kept.flatten().as_ref(), view);
     }
 
     /// Makes slot `index` (a dynamic one) the view the record `words` names,
@@ -3256,7 +3256,7 @@ impl HostHeap {
             } else {
                 self.clear_twin(index);
             }
-            self.keep_srv(index, made.kept.clone(), &made.view);
+            self.keep_srv(index, made.kept.as_ref(), &made.view);
             Some(made.listed)
         })
     }
@@ -3320,7 +3320,7 @@ impl HostHeap {
 
     /// Only explicitly dimensioned texture SRVs have a known matching null
     /// here. CBVs, including scratch, and other views keep their slot hold.
-    fn keep_srv(&self, index: u32, resource: Option<ID3D12Resource>, view: &View) {
+    fn keep_srv(&self, index: u32, resource: Option<&ID3D12Resource>, view: &View) {
         let dimension = match view {
             View::Placed(false, desc, srv) if desc[0] != 1 => srv[1],
             View::Shader(_, Some(srv)) => srv[1],
@@ -3328,7 +3328,7 @@ impl HostHeap {
         };
         // Cached views can outlive their title object. Classify the live COM
         // resource, so a buffer with a malformed texture dimension is skipped.
-        let texture = !self.release_views.is_empty() && (2..=10).contains(&dimension) && resource.as_ref().is_some_and(|r| {
+        let texture = !self.release_views.is_empty() && (2..=10).contains(&dimension) && resource.is_some_and(|r| {
             // SAFETY: a descriptor query on the retained resource.
             unsafe { r.GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_BUFFER }
         });
@@ -3339,7 +3339,7 @@ impl HostHeap {
     }
 
     /// Slot `index` now views `resource` (or nothing of the host's).
-    fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
+    fn keep(&self, index: u32, resource: Option<&ID3D12Resource>) {
         self.note_release_view(index, 0);
         let Some(slot) = self.kept.get(index as usize) else {
             return;
@@ -3348,10 +3348,10 @@ impl HostHeap {
             use windows::core::Interface;
             let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
             // The same again: nothing to retire.
-            if slot.as_ref().map(Interface::as_raw) == resource.as_ref().map(Interface::as_raw) {
+            if slot.as_ref().map(Interface::as_raw) == resource.map(Interface::as_raw) {
                 return;
             }
-            std::mem::replace(&mut *slot, resource)
+            std::mem::replace(&mut *slot, resource.cloned())
         };
         // A running submission may still read the old resource through
         // this slot.
@@ -3361,8 +3361,13 @@ impl HostHeap {
     }
 
     /// What slot `index` views.
+    #[cfg(any(test, feature = "diagnostics"))]
     fn kept_in(&self, index: u32) -> Option<ID3D12Resource> {
         self.kept.get(index as usize)?.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn keeps(&self, index: u32) -> bool {
+        self.kept.get(index as usize).is_some_and(|kept| kept.lock().unwrap_or_else(|e| e.into_inner()).is_some())
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view of `len` bytes
@@ -3396,7 +3401,7 @@ impl HostHeap {
         self.put(index);
         // (Bound by its handle, not read by index.)
         self.clear_twin(index);
-        self.keep(index, Some(buffer.clone()));
+        self.keep(index, Some(buffer));
         self.note_release_view(index, RAW_SRV);
     }
 
@@ -3443,7 +3448,7 @@ impl HostHeap {
         };
         self.put(index);
         self.clear_twin(index);
-        self.keep(index, Some(buffer.clone()));
+        self.keep(index, Some(buffer));
         self.note_release_view(index, RAW_UAV);
     }
 
@@ -3544,7 +3549,7 @@ impl HostHeap {
         self.twin_made(index, twin.is_some());
         // After the descriptor: what it showed is let go when nothing shows
         // it any more.
-        self.keep(index, holds.then(|| buffer.clone()));
+        self.keep(index, holds.then_some(buffer));
     }
 
     /// Renderer port 5 (`crate::port_cbv`): makes slot `index` (a dynamic
@@ -3592,7 +3597,7 @@ impl HostHeap {
             host.device.CreateShaderResourceView(buffer, Some(&raw), twin);
         }
         self.twin_made(index, true);
-        self.keep(index, Some(buffer.clone()));
+        self.keep(index, Some(buffer));
         true
     }
 
@@ -3835,7 +3840,7 @@ impl HostHeap {
                     let kept = neutral_for(&view, self.at(index));
                     self.put(index);
                     self.clear_twin(index);
-                    self.keep(index, kept);
+                    self.keep(index, kept.as_ref());
                 }
                 let late = Some(crate::frame::current());
                 let flip = Flip { after, heap: std::ptr::from_ref(self) as usize, index, handle, key, late, asked: crate::host::now_ms() };
@@ -3863,7 +3868,7 @@ impl HostHeap {
                 self.put(index);
             }
             self.twin_made(index, kept.is_some() && twinned(&view));
-            self.keep(index, kept.flatten());
+            self.keep(index, kept.flatten().as_ref());
             self.quick_is(index, if later { 0 } else { key });
             drop(held);
             self.unmake_stale(index, stale);
@@ -7339,6 +7344,24 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    #[test]
+    fn a_slot_keeps_the_resource_it_is_given_until_another_or_none() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let Some(gpu) = host() else { return };
+        let (Some(a), Some(b)) = (gpu.upload_buffer(1024).map(|v| v.0), gpu.upload_buffer(1024).map(|v| v.0)) else {
+            return;
+        };
+        let index = heap.dynamic(1).unwrap();
+        heap.keep(index, Some(&a));
+        assert_eq!(heap.kept_in(index).as_ref(), Some(&a));
+        heap.keep(index, Some(&b));
+        assert_eq!(heap.kept_in(index).as_ref(), Some(&b), "a changed resource replaces the one kept");
+        heap.keep(index, None);
+        assert!(heap.kept_in(index).is_none());
     }
 
     #[test]
