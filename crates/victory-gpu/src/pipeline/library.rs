@@ -751,6 +751,8 @@ pub(crate) fn save(now: bool) {
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
+            slow_this_run = SLOW_NOW.load(Ordering::Relaxed),
+            new_static_samplers = super::sampler_order::NEW.load(Ordering::Relaxed),
             "host pipeline library saved"
         ),
         Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
@@ -811,6 +813,9 @@ const SLOW_FILE: &str = "slow-pipelines.txt";
 /// A pipeline that takes this long is one ([`slow`]).
 pub(crate) const SLOW_MS: u64 = 1000;
 static SLOW: Mutex<Option<std::collections::HashMap<String, u64>>> = Mutex::new(None);
+/// Title pipelines that took [`SLOW_MS`] or longer to make in this run (with
+/// the driver's cache answering, a handful: `sampler_order`).
+pub(crate) static SLOW_NOW: AtomicU64 = AtomicU64::new(0);
 
 fn slow_ones() -> std::sync::MutexGuard<'static, Option<std::collections::HashMap<String, u64>>> {
     let mut slow = SLOW.lock().unwrap_or_else(|e| e.into_inner());
@@ -838,6 +843,7 @@ pub(crate) fn note_time(key: &str, ms: u64) {
     if ms < SLOW_MS {
         return;
     }
+    SLOW_NOW.fetch_add(1, Ordering::Relaxed);
     let mut slow = slow_ones();
     let known = slow.get_or_insert_default().entry(key.to_owned()).or_insert(0);
     if ms > *known {

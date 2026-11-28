@@ -599,6 +599,9 @@ impl HostPipeline {
             }
             bound.push(stage);
         }
+        // Its static samplers have their places in the driver's table first
+        // (`sampler_order`): the same in every run.
+        super::sampler_order::before(&host.device, &samplers);
         let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
             Ok(root) => root,
             Err(e) => {

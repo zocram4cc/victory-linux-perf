@@ -641,6 +641,7 @@ fn drained() {
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
+            slow_this_run = super::library::SLOW_NOW.load(Ordering::Relaxed),
             "host pipelines all made"
         );
     }

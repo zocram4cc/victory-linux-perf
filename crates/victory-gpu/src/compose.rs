@@ -85,6 +85,26 @@ impl Composer {
         // SAFETY: the blobs' own bytes, alive through the calls.
         unsafe {
             let device = &host.device;
+            // The static sampler of `RS` as the compiler fills it in, given its
+            // place in the driver's table like the title's (`sampler_order`).
+            crate::pipeline::sampler_order::before(
+                device,
+                &[D3D12_STATIC_SAMPLER_DESC {
+                    Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+                    AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                    AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                    AddressW: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+                    MipLODBias: 0.0,
+                    MaxAnisotropy: 16,
+                    ComparisonFunc: D3D12_COMPARISON_FUNC_LESS_EQUAL,
+                    BorderColor: D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE,
+                    MinLOD: 0.0,
+                    MaxLOD: f32::MAX,
+                    ShaderRegister: 0,
+                    RegisterSpace: 0,
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+                }],
+            );
             // Not the blob: under Wine the host refuses the signature inside
             // it (E_FAIL), while a description read from the source's `RS`
             // and serialized here works, as the title's own signatures do.
