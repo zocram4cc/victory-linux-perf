@@ -206,6 +206,16 @@ impl DynamicBits {
         self.find_in(0, second_end, n)
     }
 
+    /// Whether slot `index` is marked taken. `None` when `index` is past the mask.
+    #[cfg(feature = "diagnostics")]
+    fn occupied(&self, index: usize) -> Option<bool> {
+        if index >= self.len {
+            return None;
+        }
+        let word = *self.words.get(index >> 6)?;
+        Some(word & (1u64 << (index & 63)) != 0)
+    }
+
     fn set_range(&mut self, first: usize, n: usize) {
         let mut i = first;
         let end = first + n;
@@ -1676,7 +1686,12 @@ pub(crate) fn slot_story(slot: u32) -> String {
         let mut text = if index < host.count {
             format!("title slot {index}, made from {}", host.describe_slot(index).unwrap_or_default())
         } else {
-            let taken = host.next.lock().unwrap_or_else(|e| e.into_inner()).1.get((index - host.count) as usize).copied();
+            let taken = host
+                .next
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .1
+                .occupied((index - host.count) as usize);
             format!("dynamic slot {} (taken {taken:?})", index - host.count)
         };
         if twin {

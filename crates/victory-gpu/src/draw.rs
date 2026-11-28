@@ -2521,12 +2521,16 @@ impl State {
             }
             Some(s)
         };
+        // Copied out so the closure does not borrow `self` across `alloc_dynamic`
+        // (the diagnostics build otherwise rejects that pair of borrows).
+        #[cfg(feature = "diagnostics")]
+        let pipeline_id = self.pipeline;
         let ready = |a: u64, s: &std::sync::Arc<crate::shadow::Shadow>| {
             let len = s.left(a).min(limit);
             s.refresh(list, a, len);
             if writes {
                 #[cfg(feature = "diagnostics")]
-                crate::host::wide_write(a, len, self.pipeline);
+                crate::host::wide_write(a, len, pipeline_id);
                 s.gpu_writes(list, a, len);
                 crate::port_cbv::mark_gpu_written(s.id());
                 GPU_WRITE_GEN.set(GPU_WRITE_GEN.get().wrapping_add(1));
