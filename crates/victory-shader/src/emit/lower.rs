@@ -3243,7 +3243,18 @@ impl<'a> Lower<'a> {
     /// their biases and the memory directory would not fit with 16 dwords
     /// nothing reads in front.)
     fn user_first(&self) -> u32 {
-        if crate::spill::is_spilled(self.x.native) {
+        // A spilled table's dwords start at user-data index 16; with no
+        // root parameter in a register below that, the host's user data
+        // starts there too. A program that also has root parameters in
+        // registers (root constants in s2, say: found by the differential
+        // tests, a root signature of eight parameters) numbers from 0, or
+        // those come out negative (index 2 - 16: a constant buffer of
+        // 4 GiB the validator refused). The host fills each dword by its
+        // index either way.
+        let native = self.x.native;
+        if crate::spill::is_spilled(native)
+            && !native.layout.iter().any(|p| p.sgprs > 0 && u32::from(p.user_data) < 16)
+        {
             16
         } else {
             0

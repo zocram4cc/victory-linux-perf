@@ -163,7 +163,7 @@ const CASES: &[(&str, &str)] = &[
 
 const CS_RS: &str = "RootConstants(num32BitConstants=4, b0), \
                      DescriptorTable(SRV(t0, numDescriptors=4)), DescriptorTable(Sampler(s0)), \
-                     DescriptorTable(UAV(u0, numDescriptors=4)), CBV(b1), SRV(t4), \
+                     DescriptorTable(UAV(u0, numDescriptors=5)), CBV(b1), SRV(t4), \
                      DescriptorTable(SRV(t0, space=2, numDescriptors=9)), \
 \
                      StaticSampler(s3, filter=FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT, \
@@ -207,6 +207,21 @@ const CS_CASES: &[(&str, &str)] = &[
     // channel alone, which the console compiler makes an image store of
     // mask 0x8 and the translation a read of the texel, the channel
     // replaced, all four written.
+    (
+        "half alpha-only store",
+        // A half-precision texture (the title's mask-0x8 stores are `d16`):
+        // a texel read, its alpha set, written back; others written whole.
+        r#"RWTexture2D<half4> outh : register(u4);
+        CS {
+            half4 c = outh[d.xy];
+            if (((d.x ^ d.y) & 1) != 0) {
+                c.w = (half)1.0;
+                outh[d.xy] = c;
+            } else {
+                outh[d.xy] = half4(d.x * 0.25, d.y * 0.5, k.x, 0.5);
+            }
+        }"#,
+    ),
     (
         "alpha-only store, read and written back",
         // The texel read, its alpha changed, written back: the colour is
@@ -735,8 +750,8 @@ fn user_data(s: &HostShader, k: &[u32; 4]) -> Vec<u32> {
             (RootType::Table, 1) => 32,
             (RootType::Table, 2) => 16,
             (RootType::Table, 3) => 5 * 32,
-            // The typed views of `raw` (compute) from 9.
-            (RootType::Table, 6) => 9 * 32,
+            // The typed views of `raw` (compute) from 10.
+            (RootType::Table, 6) => 10 * 32,
             other => panic!("unexpected user data {other:?}"),
         };
     }
@@ -1179,6 +1194,8 @@ fn translated_compute_matches_pc() {
         View::TextureUav(16, 16),
         View::UintTextureUav(16, 16),
         View::HalfUav(256),
+        // u4: an RGBA16F texture (half-precision stores, `d16`).
+        View::HalfTextureUav(16, 16),
     ];
     let typed_view = |format, bytes| View::Buffer {
         data: &raw_data,
@@ -1330,7 +1347,7 @@ fn translated_compute_matches_pc() {
                             data: root_srv.clone(),
                         },
                     ),
-                    (6, table(false, 9)),
+                    (6, table(false, 10)),
                 ]),
             )
             .unwrap();

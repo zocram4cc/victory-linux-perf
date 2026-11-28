@@ -32,7 +32,12 @@ fn main() {
         }
     }
     match victory_shader::emit::translate(&bytes) {
-        Ok(s) => println!("translates: {} bytes of DXIL, {} user-data dwords", s.dxil.len(), s.user_data.len()),
+        Ok(s) => {
+            println!("translates: {} bytes of DXIL, {} user-data dwords", s.dxil.len(), s.user_data.len());
+            for u in &s.user_data {
+                println!("  user data {u:?}");
+            }
+        }
         Err(e) => println!("does not translate: {e}"),
     }
 }
