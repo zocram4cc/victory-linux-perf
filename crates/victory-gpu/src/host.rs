@@ -1570,6 +1570,27 @@ mod tests {
         let title = unsafe { std::slice::from_raw_parts((at + 0x100) as *const u8, 0x200) };
         assert!(title.iter().all(|&v| v == 0x5a), "what the card wrote is in title memory: nothing is copied back");
     }
+
+    fn address_hash<T: std::hash::Hash>(key: &T) -> u64 {
+        let mut hash = super::AddressHash::default();
+        key.hash(&mut hash);
+        std::hash::Hasher::finish(&hash)
+    }
+
+    #[test]
+    fn address_hash_reads_every_word_of_a_key() {
+        assert_ne!(address_hash(&[1u32, 2, 3]), address_hash(&[1u32, 2, 4]));
+        assert_ne!(address_hash(&[1u64, 2, 3, 4]), address_hash(&[1u64, 2, 3, 5]));
+        let (a, mut b) = ([7u8; 13], [7u8; 13]);
+        b[12] = 8;
+        assert_ne!(address_hash(&a), address_hash(&b));
+        let mut map: std::collections::HashMap<[u64; 4], u8, std::hash::BuildHasherDefault<super::AddressHash>> =
+            Default::default();
+        map.insert([1, 2, 3, 4], 1);
+        map.insert([1, 2, 3, 5], 2);
+        assert_eq!(map.get(&[1u64, 2, 3, 4]), Some(&1));
+        assert_eq!(map.get(&[1u64, 2, 3, 5]), Some(&2));
+    }
 }
 
 /// The batches of clamped records in one scratch buffer
@@ -8328,7 +8349,15 @@ impl std::hash::Hasher for AddressHash {
     fn finish(&self) -> u64 {
         self.0
     }
-    fn write(&mut self, bytes: &[u8]) {
+    fn write(&mut self, mut bytes: &[u8]) {
+        while let Some((word, rest)) = bytes.split_first_chunk::<8>() {
+            self.write_u64(u64::from_le_bytes(*word));
+            bytes = rest;
+        }
+        if let Some((word, rest)) = bytes.split_first_chunk::<4>() {
+            self.write_u32(u32::from_le_bytes(*word));
+            bytes = rest;
+        }
         for &b in bytes {
             self.write_usize(usize::from(b));
         }
