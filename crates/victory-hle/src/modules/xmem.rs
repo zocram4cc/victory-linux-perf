@@ -3196,6 +3196,33 @@ mod tests {
         assert_eq!(wine_map::zero_copy_freeing(at as usize, 0), None, "gone with the release");
     }
 
+    /// Zero copy's tracking (also `VICTORY_ZERO_COPY_TRACK=1`): the runtime's
+    /// scanner finds exactly the 4 KiB pages written since it last asked.
+    #[test]
+    fn zero_copy_memory_tells_the_pages_written() {
+        let Some((min, _)) = zero_copy_sizes().filter(|_| wine_map::on() && victory_gpu::zero_copy_tracking()) else {
+            eprintln!("not tried: without VICTORY_ZERO_COPY and VICTORY_ZERO_COPY_TRACK=1 under Wine with pages shown by mmap");
+            return;
+        };
+        let len = min.next_multiple_of(64 << 10);
+        let at = XMemVirtualAlloc(std::ptr::null_mut(), len, MEM_RESERVE | MEM_COMMIT, GRAPHICS, PAGE_READWRITE) as usize;
+        assert_ne!(at, 0);
+        let mut found = Vec::new();
+        assert!(wine_map::written(at, at + len, &mut found), "tracked");
+        found.clear();
+        // SAFETY: committed read-write.
+        unsafe {
+            ((at + 5 * 4096 + 8) as *mut u32).write(1);
+            ((at + len - 4) as *mut u32).write(2);
+        }
+        assert!(wine_map::written(at, at + len, &mut found));
+        assert_eq!(found, [at + 5 * 4096, at + len - 4096], "the pages written, each once");
+        found.clear();
+        assert!(wine_map::written(at, at + len, &mut found));
+        assert_eq!(found, [], "taken by the asking before");
+        assert_ne!(title_virtual_free(at as *mut c_void, 0, MEM_RELEASE), 0);
+    }
+
     /// Under Wine with renderer port 1 (the tests run with
     /// `VICTORY_WINE_MAP=1 VICTORY_PORT_CONSTANTS=1 VICTORY_PORT_HOME=1`;
     /// nothing is tried otherwise): the 32-bit heap's pages are memory of

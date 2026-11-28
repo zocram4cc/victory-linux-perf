@@ -919,7 +919,46 @@ static ZERO_COPY_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 static ZERO_COPY_HEAPS: std::sync::Mutex<Vec<(usize, ID3D12Heap)>> = std::sync::Mutex::new(Vec::new());
 /// Regions made and their bytes, buffers and windows placed, bytes placed,
 /// placements refused, askings answered "not watched".
-static ZERO_COPY_STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+static ZERO_COPY_STATS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+
+/// `VICTORY_ZERO_COPY_TRACK=1` (off by default; read here): zero-copy memory
+/// is not placed but keeps its copies (big ones in the card's memory, read
+/// there), and the pages written in it come from the runtime's own scanner
+/// of a userfaultfd ([`set_zero_copy_scanner`], `victory-hle`'s `wine_map`)
+/// instead of Wine's write watch: no Wine memory lock, one call per asking.
+pub fn zero_copy_tracking() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("VICTORY_ZERO_COPY_TRACK").is_some_and(|v| v == "1"));
+    *ON
+}
+
+/// Gives the 4 KiB pages of `[start, end)` written since it was last asked
+/// (and resets them); `false`: not all of one tracked reservation.
+pub type WrittenScanner = fn(usize, usize, &mut Vec<usize>) -> bool;
+static SCANNER: std::sync::OnceLock<WrittenScanner> = std::sync::OnceLock::new();
+
+/// The runtime's scanner of zero-copy memory ([`zero_copy_tracking`]).
+pub fn set_zero_copy_scanner(scanner: WrittenScanner) {
+    let _ = SCANNER.set(scanner);
+}
+
+/// With [`zero_copy_tracking`]: `None` if `[at, end)` is no zero-copy memory
+/// (the host's write watch is asked as before); else the addresses of the
+/// 4 KiB pages written since the last asking, or `None` inside if the scanner
+/// cannot tell (copies made whole, as for memory not watched).
+pub(crate) fn zero_copy_written(at: usize, end: usize) -> Option<Option<Vec<usize>>> {
+    if !ZERO_COPY_ANY.load(Ordering::Relaxed) || !zero_copy_tracking() {
+        return None;
+    }
+    if !ZERO_COPY.read().unwrap_or_else(|e| e.into_inner()).iter().any(|r| r.0 < end && at < r.1) {
+        return None;
+    }
+    let mut out = Vec::new();
+    let told = SCANNER.get().is_some_and(|scan| scan(at, end, &mut out));
+    ZERO_COPY_STATS[if told { 7 } else { 6 }].fetch_add(1, Ordering::Relaxed);
+    ZERO_COPY_STATS[8].fetch_add(out.len() as u64, Ordering::Relaxed);
+    Some(told.then_some(out))
+}
 
 /// Whether any zero-copy memory was made ([`ZERO_COPY`]).
 pub(crate) fn zero_copy_on() -> bool {
@@ -951,7 +990,7 @@ pub fn title_memory_zero_copy(at: usize, len: usize, handle: Option<usize>) {
 /// Whether any of `[at, end)` is zero-copy memory ([`ZERO_COPY`]); counted
 /// as an asking answered "not watched" if so.
 pub(crate) fn zero_copy_touches(at: usize, end: usize) -> bool {
-    if !ZERO_COPY_ANY.load(Ordering::Relaxed) {
+    if !ZERO_COPY_ANY.load(Ordering::Relaxed) || zero_copy_tracking() {
         return false;
     }
     let touches = ZERO_COPY.read().unwrap_or_else(|e| e.into_inner()).iter().any(|r| r.0 < end && at < r.1);
@@ -964,7 +1003,7 @@ pub(crate) fn zero_copy_touches(at: usize, end: usize) -> bool {
 /// Title memory `[start, start + len)` in place if it lies in zero-copy
 /// memory ([`ZERO_COPY`]): a buffer placed in the heap opened by its handle.
 pub(crate) fn place_zero_copy(start: u64, len: u64, window: bool) -> Option<Placed> {
-    if !ZERO_COPY_ANY.load(Ordering::Relaxed) {
+    if !ZERO_COPY_ANY.load(Ordering::Relaxed) || zero_copy_tracking() {
         return None;
     }
     let (start, len) = (start as usize, len as usize);
@@ -1016,14 +1055,17 @@ fn zero_copy_say() {
     let s: Vec<u64> = ZERO_COPY_STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
     tracing::info!(
         "zero copy (VICTORY_ZERO_COPY), since the start: {} regions of title memory made memfds ({} MB); placed in them {} title buffers and {} windows ({} MB, \
-         no copy, no asking, no copy-back); {} refused (copies); {} askings about such memory answered \"not watched\"",
+         no copy, no asking, no copy-back); {} refused (copies); {} askings about such memory answered \"not watched\"; \
+         tracked (VICTORY_ZERO_COPY_TRACK): {} askings answered by the runtime's scanner, {} pages of 4 KiB found written",
         s[0],
         s[1] >> 20,
         s[2],
         s[3],
         s[4] >> 20,
         s[5],
-        s[6]
+        s[6],
+        s[7],
+        s[8]
     );
 }
 

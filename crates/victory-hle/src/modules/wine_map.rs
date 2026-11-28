@@ -61,6 +61,8 @@ type Fcntl = unsafe extern "sysv64" fn(i32, i32, i32) -> i32;
 type Open = unsafe extern "sysv64" fn(*const u8, i32) -> i32;
 type Ioctl = unsafe extern "sysv64" fn(i32, u64, *mut UdmabufCreate) -> i32;
 type FdToHandle = unsafe extern "C" fn(i32, u32, u32, *mut HANDLE) -> i32;
+type Syscall = unsafe extern "sysv64" fn(i64, i64) -> i64;
+type IoctlAny = unsafe extern "sysv64" fn(i32, u64, *mut c_void) -> i32;
 
 const PROT_READ: i32 = 1;
 const PROT_WRITE: i32 = 2;
@@ -109,6 +111,10 @@ struct Bo {
     open: Open,
     ioctl: Ioctl,
     fd_to_handle: FdToHandle,
+    /// The C library's `syscall` and `ioctl` of any argument
+    /// ([`zero_copy`]'s tracking), if found.
+    syscall: Option<Syscall>,
+    ioctl_any: IoctlAny,
 }
 
 /// What is needed, if all of it is there and a page shown this way reads and
@@ -408,6 +414,7 @@ fn find() -> Result<Direct, &'static str> {
             }?;
             let values = symbols(&file, &["memfd_create", "ftruncate", "fcntl", "open", "ioctl"])?;
             let calls = values.into_iter().map(&at).collect::<Option<Vec<usize>>>()?;
+            let syscall = symbols(&file, &["syscall"]).and_then(|values| at(values[0]));
             // SAFETY: as below: the C library's functions in its executable mappings, called
             // as the host's calling convention has them, and ntdll's export, of this signature.
             Some(unsafe {
@@ -418,6 +425,8 @@ fn find() -> Result<Direct, &'static str> {
                     open: std::mem::transmute::<usize, Open>(calls[3]),
                     ioctl: std::mem::transmute::<usize, Ioctl>(calls[4]),
                     fd_to_handle: std::mem::transmute::<unsafe extern "system" fn() -> isize, FdToHandle>(fd_to_handle),
+                    syscall: syscall.map(|at| std::mem::transmute::<usize, Syscall>(at)),
+                    ioctl_any: std::mem::transmute::<usize, IoctlAny>(calls[4]),
                 }
             })
         })
@@ -738,6 +747,9 @@ pub(crate) fn zero_copy(base: usize, len: usize) -> bool {
         tracing::info!(at = format_args!("{base:#x}"), len, n, "zero copy: title memory is a memfd the card reads in place (VICTORY_ZERO_COPY)");
     }
     victory_gpu::title_memory_zero_copy(base, len, Some(handle));
+    if victory_gpu::zero_copy_tracking() && !track(bo, base, len) {
+        tracing::warn!(at = format_args!("{base:#x}"), len, "zero copy: its writes are not tracked (VICTORY_ZERO_COPY_TRACK=1): copies there are made whole");
+    }
     true
 }
 
@@ -756,10 +768,119 @@ pub(crate) fn zero_copy_freeing(at: usize, len: usize) -> Option<usize> {
         tracing::warn!(at = format_args!("{at:#x}"), len, base = format_args!("{base:#x}"), bytes, "zero copy: part of a memfd reservation freed");
     }
     victory_gpu::title_memory_zero_copy(base, bytes, None);
+    TRACKED.lock().unwrap_or_else(|e| e.into_inner()).retain(|t| t.0 != base);
     if let Some(direct) = DIRECT.as_ref() {
         direct.let_go(memfd, handle);
     }
     Some(bytes)
+}
+
+/// The userfaultfd and the `/proc/self/pagemap` of the host process that
+/// [`track`] arms and [`written`] asks; `None` if either could not be made.
+static TRACKER: std::sync::OnceLock<Option<(i32, i32)>> = std::sync::OnceLock::new();
+/// The reservations [`track`] armed: start, bytes.
+static TRACKED: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+const SYS_USERFAULTFD: i64 = 323;
+const O_NONBLOCK: i64 = 0o4000;
+const UFFD_USER_MODE_ONLY: i64 = 1;
+const UFFDIO_API: u64 = 0xc018_aa3f;
+const UFFDIO_REGISTER: u64 = 0xc020_aa00;
+const UFFDIO_WRITEPROTECT: u64 = 0xc018_aa06;
+const PAGEMAP_SCAN: u64 = 0xc060_6610;
+const UFFD_API: u64 = 0xaa;
+const UFFD_FEATURES: u64 = 0x8000 | 0x2000 | 0x1000;
+const UFFDIO_REGISTER_MODE_WP: u64 = 2;
+const UFFDIO_WRITEPROTECT_MODE_WP: u64 = 1;
+const PM_SCAN_WP_MATCHING: u64 = 1;
+const PM_SCAN_CHECK_WPASYNC: u64 = 2;
+const PAGE_IS_WRITTEN: u64 = 2;
+
+/// Zero copy's tracking (`VICTORY_ZERO_COPY_TRACK=1`): `[base, base + len)`,
+/// a memfd [`zero_copy`] showed, is write-protected asynchronously through a
+/// userfaultfd of ours (the mapping is new: Wine's write watch went with the
+/// one it replaced), so that [`written`] finds the pages written since it
+/// last asked with one `PAGEMAP_SCAN`, without Wine's memory lock (a 1.3 GB
+/// pool: 0.2-0.4 ms natively, against ~150 us per GetWriteWatch asking).
+fn track(bo: &Bo, base: usize, len: usize) -> bool {
+    let Some(&(uffd, _)) = TRACKER
+        .get_or_init(|| {
+            let syscall = bo.syscall?;
+            // SAFETY: the C library's calls with their arguments; the structures outlive them.
+            unsafe {
+                let uffd = syscall(SYS_USERFAULTFD, i64::from(O_CLOEXEC) | O_NONBLOCK | UFFD_USER_MODE_ONLY) as i32;
+                let mut api = [UFFD_API, UFFD_FEATURES, 0];
+                if uffd < 0 || (bo.ioctl_any)(uffd, UFFDIO_API, api.as_mut_ptr().cast()) != 0 {
+                    return None;
+                }
+                let pagemap = (bo.open)(c"/proc/self/pagemap".as_ptr().cast(), O_CLOEXEC);
+                (pagemap >= 0).then_some((uffd, pagemap))
+            }
+        })
+        .as_ref()
+    else {
+        return false;
+    };
+    let mut register = [base as u64, len as u64, UFFDIO_REGISTER_MODE_WP, 0];
+    let mut protect = [base as u64, len as u64, UFFDIO_WRITEPROTECT_MODE_WP];
+    // SAFETY: as above; the range is the memfd's mapping.
+    let armed = unsafe {
+        (bo.ioctl_any)(uffd, UFFDIO_REGISTER, register.as_mut_ptr().cast()) == 0
+            && (bo.ioctl_any)(uffd, UFFDIO_WRITEPROTECT, protect.as_mut_ptr().cast()) == 0
+    };
+    if armed {
+        TRACKED.lock().unwrap_or_else(|e| e.into_inner()).push((base, len));
+        victory_gpu::set_zero_copy_scanner(written);
+    }
+    armed
+}
+
+/// The 4 KiB pages of `[start, end)` written since the last asking (which
+/// this is), into `out`; `false` if the range is not all of one tracked
+/// reservation ([`track`]).
+pub(crate) fn written(start: usize, end: usize, out: &mut Vec<usize>) -> bool {
+    let Some(Some((_, pagemap))) = TRACKER.get() else {
+        return false;
+    };
+    if !TRACKED.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|t| t.0 <= start && end <= t.0 + t.1) {
+        return false;
+    }
+    let Some(bo) = DIRECT.as_ref().and_then(|d| d.bo.as_ref()) else {
+        return false;
+    };
+    let mut regions = [[0u64; 3]; 256];
+    let mut at = start as u64;
+    while at < end as u64 {
+        // `struct pm_scan_arg`: size, flags, start, end, walk_end, vec, vec_len,
+        // max_pages, category_inverted, category_mask, category_anyof_mask, return_mask.
+        let mut scan = [
+            96,
+            PM_SCAN_WP_MATCHING | PM_SCAN_CHECK_WPASYNC,
+            at,
+            end as u64,
+            0,
+            regions.as_mut_ptr() as u64,
+            regions.len() as u64,
+            0,
+            0,
+            PAGE_IS_WRITTEN,
+            0,
+            PAGE_IS_WRITTEN,
+        ];
+        // SAFETY: the C library's `ioctl`; `regions` has room for `vec_len` entries.
+        let n = unsafe { (bo.ioctl_any)(*pagemap, PAGEMAP_SCAN, scan.as_mut_ptr().cast()) };
+        if n < 0 {
+            return false;
+        }
+        for r in &regions[..n as usize] {
+            out.extend((r[0]..r[1]).step_by(4096).map(|p| p as usize));
+        }
+        if scan[4] <= at {
+            break;
+        }
+        at = scan[4];
+    }
+    true
 }
 
 impl Bo {

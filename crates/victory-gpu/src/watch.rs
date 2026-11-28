@@ -774,6 +774,18 @@ fn spread_each<T: Send>(n: usize, each: impl Fn(usize) -> T + Sync) -> Vec<T> {
 fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    // Zero copy's tracking: the runtime's own scanner, not Wine's.
+    if let Some(scanned) = crate::inplace::zero_copy_written(first * PAGE, last * PAGE) {
+        let mut pages: Vec<(usize, u16)> = Vec::new();
+        for at in scanned? {
+            let (page, part) = (at / PAGE, 1u16 << (at % PAGE / KERNEL_PAGE));
+            match pages.last_mut() {
+                Some((last, parts)) if *last == page => *parts |= part,
+                _ => pages.push((page, part)),
+            }
+        }
+        return Some(pages);
+    }
     FOUND.with(|found| {
         let mut found = found.borrow_mut();
         let mut count = (last - first) * PAGE / KERNEL_PAGE;
