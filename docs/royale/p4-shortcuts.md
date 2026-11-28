@@ -162,3 +162,24 @@ The user has legitimate access to the console SDK, kept locally. Rule: reference
 3. Point `VICTORY_CONSOLE_DXC` at a small wrapper that runs the console compiler under Wine.
 
 That gives real side-by-side runs of console-compiled-and-translated against PC-compiled shaders: the strongest check we can have short of a console.
+
+## An outside soundness review of the proofs (28 Nov, ~03:30)
+
+A friend of the user, working from the helper prompt, sent a patch (`p4-proof-soundness.patch`). I reviewed it in full and applied it as one commit. It found real holes in the proofs of steps 22-34, each shown by a hand-assembled program in new unit tests:
+
+| hole | what was unsound | fix |
+|---|---|---|
+| loops | `edge_unread`, `edge_reaches` and `lane_phi` met lane conditions across a loop's back edge, where the atoms belong to an earlier iteration | back edges are never pruned |
+| wide branches | a branch the whole wave takes together carries no per-lane condition | `wide` blocks are not pruned |
+| `0 + carry` | `plus_scc` took any `s_add_u32 x, 0, src_scc` as a 0 high half; SCC from an unrelated compare makes it 1 | only SCC from an add on the same base, at most once per path (`scc_from_base_add`) |
+| XOR folding | `xor_terms` could take the SCC write as a result dword; 64-bit inline float constants were folded as integers | width-checked; float constants not followed |
+| descriptor-only uses | a register that is also `soffset`, store data, or a BVH memory base was taken as a pure descriptor use; only the first read in an instruction was looked at | `is_pure_descriptor_use`, every read |
+| view identity | comparisons mixing dword 0 and 1, non-view-heap loads, guarded or SDWA `v_mov_b32`, mixed joins | per-dword `rel`, view-heap loads only, those moves refused; dword 1 gets the identity too |
+| wave64 masks | the "no lanes" rule looked only at the low dword of a 64-bit mask | the high dword must be a dead descriptor dword too |
+
+**Measured:**
+- 211 unit tests pass, the patch's 2 new ones included;
+- the harness goes 1,274 → **1,259**: 15 programs had translated only through these holes, none in the families used in game;
+- the compute differential tests stay **24/24 equal**.
+
+This is the right trade: the user wants correct data over coverage.

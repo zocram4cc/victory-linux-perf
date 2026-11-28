@@ -148,3 +148,4 @@ Seen: the intro flickers before the loading screen (the author lists it as known
 - **Step 36 (28 Nov):** the view-heap scan took SOPP/SOPC opcode bits for destinations (an s_cbranch of opcode 10 'overwrote' s10): fixed; 1,274. Still 479 buffer-d1 loads traced to the sampler heap in the census (VICTORY_WHY_STALE): to look at.
 - **Step 37 (28 Nov ~02:15):** diff tests run on Linux (scripts/diff-tests.sh): compute 21/21 equal; mesh 'grid through shared memory' differs (real bug); graphics stops at a case a compiler rejects. docs/royale/diff-tests.md.
 - **Step 38 (~03:00):** diff tests: alpha/half cases equal (console never emits the mask-0x8 d16 store for them); bug found and fixed: spilled programs with register params got negative user-data indices. Compute 24/24. Open: the spilled+register path's values.
+- **Step 39 (~03:30):** friend's soundness patch reviewed and applied (7 holes closed, tests); 1,259; diff tests 24/24.
