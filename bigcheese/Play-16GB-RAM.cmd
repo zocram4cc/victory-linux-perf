@@ -215,6 +215,9 @@ rem It starts off: F7 turns it on and off while playing. Off, nothing waits for
 rem it (18-22 real fps against 9.4 with it on, 16 GB PC, RX 9060 XT). Set
 rem VICTORY_FRAMEGEN_PAUSED=0 before this file to start with it on.
 if not defined VICTORY_FRAMEGEN_PAUSED set "VICTORY_FRAMEGEN_PAUSED=1"
+rem On, its presents are sent ahead like any other, so nothing waits for the
+rem card (13.7-14.3 real fps against 9.4 waiting; VICTORY_FRAMEGEN_AHEAD=0: wait).
+if not defined VICTORY_FRAMEGEN_AHEAD set "VICTORY_FRAMEGEN_AHEAD=1"
 
 
 rem victory-amd's list of the pipelines the game needs first (faster first
