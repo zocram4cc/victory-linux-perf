@@ -75,7 +75,14 @@ const MOST: u64 = 512 << 20;
 pub(crate) fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // Read once, here: the switch of renderer port #1.
-    *ON.get_or_init(|| std::env::var("VICTORY_PORT_CONSTANTS").is_ok_and(|v| v.trim() == "1") || all())
+    // `VICTORY_PORT_CONSTANTS=0` turns it off even with `VICTORY_PORT_ALL=1`
+    // (the launchers set both: the port stayed on, 860-1,065 MB of regions in
+    // runs n4b..t1128-2117, with the black textures it brings).
+    *ON.get_or_init(|| match std::env::var("VICTORY_PORT_CONSTANTS").as_deref().map(str::trim) {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => all(),
+    })
 }
 
 /// `VICTORY_PORT_ALL=1`: renderer port #1 for all of the title's memory
