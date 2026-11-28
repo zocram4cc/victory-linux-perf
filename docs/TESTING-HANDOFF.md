@@ -4,6 +4,8 @@ One procedure for a tester agent on **Windows 10**, MSVC, an AMD RDNA GPU. Power
 
 Do not push to `main` until the last stage says pass. Pull request #6 stays the branch `integration/upstream-port-2`.
 
+Wave 13 order (what to try next: framerate, then textures and water, then the GUI launcher, plus branding, cleanup, and checkpoint reports) is `docs/WAVE13-MASTER-PLAN.md`. This file stays the build, the baseline, and the merge. Do not copy that plan into here. If the two disagree about the next experiment, the master plan wins. If they disagree about how to build or how to land on `main`, this file wins. After each major checkpoint, also write `docs/reports/checkpoint-NN.md` using the template in the master plan. The one-line file below is only the resume pointer.
+
 Write progress to `logs\handoff-checkpoint.txt` in the clone (that folder is gitignored). One line: stage name, commit SHA, pass or fail.
 
 ## 0. Prerequisites
@@ -207,4 +209,4 @@ stage C pass 8ef7ca1
 stage D1 pass ef4616d
 ```
 
-On a new session: clone or `git fetch`, read that file, check out the SHA on the last pass line, rebuild if the last stage was B or C, and start at the next stage. Do not rerun a stage marked pass unless the binary was lost. If the last line is a fail with a revert, stay on that revert and continue to the next stage only for bugs that do not depend on the reverted commit.
+On a new session: clone or `git fetch`, read that file and the newest `docs/reports/checkpoint-*.md`, check out the SHA on the last pass line, rebuild if the last stage was B or C, and start at the next stage. Do not rerun a stage marked pass unless the binary was lost. If the last line is a fail with a revert, stay on that revert and continue to the next stage only for bugs that do not depend on the reverted commit. Wave 13 resume commands are in `docs/WAVE13-MASTER-PLAN.md`.
