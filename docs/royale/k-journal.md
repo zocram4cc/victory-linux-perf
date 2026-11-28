@@ -159,3 +159,4 @@ Seen: the intro flickers before the loading screen (the author lists it as known
 - **Step 48:** DPP compares (1,450; diff 30/30). Big-family blockers left are lane-mask/wave-section ones: handoff in docs/royale/p4-handoff-lane-masks.md.
 - **Step 49 (28 Nov ~09:30, unattended):** code-table buffer loads (verified by a diff case): 1,530 (+80). Family 0x302dbfc0 (125) whole → 13 families, 228 programs; 4 automatic runs: first black (cold cache, 125 new pipelines), then 3 right at ~25 fps. Checkpoint 2026-11-28-translator-1530.
 - **Step 50 (~10:30):** buffer_atomic_sub (diff case), constant BVH descriptors, saddr global accesses: 1,544, diff 32/32.
+- **Step 51:** integer clamp on unsigned add/sub (diff case): 1,552, diff 33/33.
