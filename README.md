@@ -163,6 +163,9 @@ The dump comes from one game run with `VICTORY_NATIVE_PSO_DUMP=Z:\…\pso-dump` 
   The wall is gone from the top; **1,304 → 1,324**, none lost.
 - 30, **cube images sized from their descriptor** (kind 5, DEPTH 0 cubes less one as RADV computes it, type 11), as the image lowering already takes cubes. Then the dead-dword rule extended to sampler and constant-buffer dwords: **1,324 → 1,340**.
 - 31, **the dead-dword rule tightened from an assumption to a proof** (default): **1,265** proven; the assumption (1,340) behind `VICTORY_DEAD_DESCRIPTOR_JOINS=assume`, its 75 extra programs to be checked with real values. Details: [p4-shortcuts.md](docs/royale/p4-shortcuts.md).
+- 42-43, `s_sext_i32_i16`, `s_absdiff_i32`, `s_bitreplicate_b64_b32`, uninitialized VCC and trap temporaries read as 0, `v_readfirstlane` destination in the heap scan: 1,332.
+- 44, **the friend's lane-mask patch** (reviewed, merged with conflicts resolved): exact mask pairs, more mask ops, 4 new diff cases; 1,432, diff tests 28/28.
+- 45, **heaps from the title's own root signatures** (real data): the layer logs and passes each program's root signature flags; the rule (heaps in the last user SGPRs) is checked against the code both ways over all 2,680 programs; the code scan is now only a fallback. 1,434. Details: [p4-shortcuts.md](docs/royale/p4-shortcuts.md), "Heaps from the title's root signatures".
 - 40, **three missing instructions** that gated the big families: `v_ldexp_f32` (2^n built from exponent bits as three normal factors), `s_flbit_i32_b64`, `s_bfm_b64`. 1,259 → 1,302.
 - 41, **three more bugs in the view-heap scan** (`native::view_heap_sgpr`), found by tracing which instruction "overwrote" s6/s7 (`VICTORY_WHY_HEAP=1`):
   1. scalar loads marked **16 SGPRs** as written instead of the dwords they load, so an `s_buffer_load_dword` into s2 hid s6/s7;

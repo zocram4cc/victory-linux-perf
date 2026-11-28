@@ -183,3 +183,36 @@ A friend of the user, working from the helper prompt, sent a patch (`p4-proof-so
 - the compute differential tests stay **24/24 equal**.
 
 This is the right trade: the user wants correct data over coverage.
+
+## Heaps from the title's root signatures (28 Nov, ~06:00): real data, not deduction
+
+Until now the translator *deduced* where a program's descriptor heaps sit:
+- first with a fixed rule (view heap in s[n-2], samplers in s[n-1]);
+- then from the code (`native::view_heap_sgpr`), which had to be fixed five times.
+
+Now it **reads them from the title's own root signature**.
+
+**Collecting the data.** `VICTORY_NATIVE_ROOT_LOG=1` makes the layer log, for each 0x218 description, the flags and parameter count of the root signature that description names (its word 0). That root signature is the title's serialized blob: a DXBC container whose `RTS0` part has the flags at byte 20 (`root::rts0`, `root::blob_flags`). One automatic run with P.4 on and an empty program list (no program made native, play unchanged) logged all 2,680 programs. They are in `bench/p4-root-flags.txt`:
+
+| flags | programs | heaps indexed directly |
+|---|---|---|
+| `0xc00` | 1,164 | views and samplers |
+| `0x0` | 1,026 | none |
+| `0x400` | 483 | views |
+| `0x800` | 7 | samplers |
+
+(The two flag bits are the standard ones for directly indexing the view and sampler heaps; the SDK's reference for console root signature flags, read locally, names the same two.)
+
+**Checked both ways:**
+1. **Against the code scan:** wherever it had found the view heap (1,416 programs), it agrees with the flags without one exception: `0xc00` → s[n-2] (1,093), `0x400` → s[n-1] (323). It had missed the heap in 231 programs (`0x400` 160, `0xc00` 71).
+2. **Against the code's heap loads** (a census of loads from a user SGPR by index stride): in `0xc00` programs, view descriptors (index × 32) come from s[n-2] and samplers (index × 16) from s[n-1]; in `0x400` programs, views come from s[n-1].
+
+**The rule:** the heaps take the last user SGPRs. Both indexed: views in s[n-2], samplers in s[n-1]. One alone: it in s[n-1].
+
+**How it is used:**
+- The layer adds the flags to the program it rebuilds, as an FSPX piece of ours (`native::FSPX_ROOT_FLAGS = 0x7F`). The harness adds them from `bench/p4-root-flags.txt` (`K_ROOT_FLAGS=0` leaves them out).
+- `fspx_program` places the heaps by the flags and clamps root constants below them. A listed table where the flags put a heap is refused, not guessed.
+- The code scan stays only as the fallback when no flags come.
+- No more phantom sampler heap in programs that index none.
+
+**Result:** 1,432 → 1,434, none lost. The main gain is that every program's heaps now come from the title's data.
