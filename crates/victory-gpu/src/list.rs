@@ -386,6 +386,25 @@ pub(crate) fn cut_list(this: This) -> bool {
     !list.earlier.is_empty() || !list.gate.is_empty()
 }
 
+/// (`VICTORY_REFRESH_PREFETCH=1`) Recording `this` is translated to its end: the refreshes of its
+/// host lists are brought up to date ahead of its submission ([`crate::host::HostList::prefetch`]).
+/// Done before the recording is, since the queue takes its lists only then.
+#[cfg(windows)]
+pub(crate) fn prefetch(this: This) {
+    if this.is_null() || !crate::shadow::prefetch_on() {
+        return;
+    }
+    // SAFETY: the title's list, which the thread that translated it has closed: nothing records
+    // into it now, and the queue takes it only once the recording is done.
+    let list = unsafe { &*this.cast::<List>() };
+    for part in &list.earlier {
+        part.host.prefetch();
+    }
+    if let Some(host) = &list.host {
+        host.prefetch();
+    }
+}
+
 /// What a queue is given for submitted lists that were cut at their waits:
 /// the waits it stands at, the host lists it runs once they are met, and
 /// the order those run in.

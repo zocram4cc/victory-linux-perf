@@ -53,6 +53,12 @@ pub(crate) struct Shadow {
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
+    /// Held while the copy is brought up to date ([`Shadow::update`]) or a
+    /// range of it is declared ([`Shadow::writing`]), with [`prefetch_on`]: a
+    /// prefetch and a submission never copy the same bytes at once, and no
+    /// range is declared while a copy of it is being made. Taken before
+    /// `pending`.
+    refreshing: Mutex<()>,
     /// With [`relay`]: how many submissions not yet copied back declared
     /// each range of `pending` ([`Flights`]). Locked inside `pending`'s
     /// lock.
@@ -1587,6 +1593,31 @@ pub(crate) fn wide_back() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // On by default; `VICTORY_WIDE_BACK=0` turns it off.
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_BACK").is_none_or(|v| v != "0"))
+}
+
+/// Whether the host copies of a list are brought up to date ahead of its
+/// submission, by the thread that translated it ([`Shadow::prefetch`];
+/// `VICTORY_REFRESH_PREFETCH=1`, off by default). On, [`Shadow::update`] and
+/// [`Shadow::writing`] hold their copy's `refreshing` lock.
+pub(crate) fn prefetch_on() -> bool {
+    #[cfg(test)]
+    if PREFETCH_IN_TEST.get() {
+        return true;
+    }
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::switch::on("VICTORY_REFRESH_PREFETCH"));
+    *ON
+}
+
+thread_local! {
+    /// On a thread that prefetches: its copies are made on it alone, not on
+    /// the threads kept for [`wide`], which may be waiting for the copy it holds.
+    static PREFETCHING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: [`prefetch_on`] for this thread.
+    pub(crate) static PREFETCH_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 type Job = Box<dyn FnOnce() + Send>;
@@ -3458,6 +3489,7 @@ impl Shadow {
             ranged: Mutex::default(),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
+            refreshing: Mutex::default(),
             flights: Mutex::default(),
             before: Mutex::default(),
             merging: RwLock::default(),
@@ -3522,6 +3554,7 @@ impl Shadow {
         if self.place.is_some() {
             return;
         }
+        let _refreshing = self.refreshing_held();
         let range = (address, address + len);
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         // With the copy-back on its own thread: counted for this submission
@@ -4230,6 +4263,7 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        let _refreshing = self.refreshing_held();
         // In place: the card reads title memory itself.
         if self.place.is_some() {
             return 0;
@@ -4265,6 +4299,34 @@ impl Shadow {
             return bytes;
         }
         self.update_free(from, to)
+    }
+
+    /// With [`prefetch_on`]: the copy's `refreshing` lock, held by the caller
+    /// while it brings a range up to date or declares one.
+    fn refreshing_held(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+        prefetch_on().then(|| self.refreshing.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// (`VICTORY_REFRESH_PREFETCH=1`) [`Shadow::update`] of `[address, address + len)`
+    /// on the thread that translated the list whose refresh it is, as the list's
+    /// recording ends and before its submission ([`crate::list::prefetch`]). What
+    /// the title wrote by then is copied, stamped with the asking that found it, so
+    /// the submission's refresh copies only what the title writes after that. A
+    /// range a flight may still land into is left alone (`pending`). Unwatched
+    /// memory is copied whole at every refresh anyway: it is not prefetched.
+    pub(crate) fn prefetch(&self, address: usize, len: usize) -> usize {
+        if !prefetch_on() || self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+            return 0;
+        }
+        let was = PREFETCHING.replace(true);
+        let copied = self.update(address, len);
+        PREFETCHING.set(was);
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::host::PREFETCH[0].fetch_add(1, Ordering::Relaxed);
+            crate::host::PREFETCH[1].fetch_add(copied as u64, Ordering::Relaxed);
+        }
+        copied
     }
 
     /// Whether [`Shadow::update`] of `[address, address + len)` would copy
@@ -4471,7 +4533,7 @@ impl Shadow {
         const LONG: usize = 1 << 20;
         const PART: usize = 256 << 10;
         let bytes: usize = runs.iter().map(|r| r.1 - r.0).sum();
-        if bytes < LONG || !crate::watch::light() {
+        if bytes < LONG || !crate::watch::light() || PREFETCHING.get() {
             return runs
                 .into_iter()
                 .map(|(from, to, known)| self.take(from, to, known))

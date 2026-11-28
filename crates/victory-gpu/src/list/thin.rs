@@ -253,6 +253,11 @@ impl Recording {
             };
             let began = std::time::Instant::now();
             let (calls, closed) = translate(back, &chunk, || self.abandoned.load(Acquire));
+            if closed {
+                // Before the recording is done: the queue takes its lists then, and their refreshes are
+                // brought up to date here, ahead of their submission (`VICTORY_REFRESH_PREFETCH=1`).
+                super::prefetch(back);
+            }
             STATS[0].fetch_add(calls, Relaxed);
             STATS[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
             let mut inner = held(&self.inner);

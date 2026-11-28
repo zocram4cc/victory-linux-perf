@@ -7791,6 +7791,51 @@ impl HostList {
         }
     }
 
+    /// (`VICTORY_REFRESH_PREFETCH=1`) What this list's refreshes bring up to
+    /// date is brought up to date now, on the thread that translated the list
+    /// ([`crate::shadow::Shadow::prefetch`]), so that its submission copies
+    /// only what the title writes after this. The ranges are those the lists
+    /// read, joined as [`add_range`] joins them.
+    pub(crate) fn prefetch(&self) {
+        let mut copies: ByCopy<usize> = ByCopy::default();
+        let mut grouped: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
+        for step in &self.deferred().copies {
+            let Step::Refresh(shadow, at, len) = step else {
+                continue;
+            };
+            let i = *copies.entry(std::sync::Arc::as_ptr(shadow) as usize).or_insert_with(|| {
+                grouped.push((shadow.clone(), Vec::new()));
+                grouped.len() - 1
+            });
+            if *len > 0 {
+                add_range(&mut grouped[i].1, *at, *at + *len);
+            }
+        }
+        // Asked once for the ranges, in runs, as the submission's refreshes are ([`Batch::refresh_spans`]):
+        // the copies below answer from that asking.
+        let ahead = grouped.len() > 1;
+        if ahead {
+            let asked: Vec<(usize, usize)> = grouped.iter().filter(|c| c.0.asked_ahead()).flat_map(|c| c.1.iter().copied()).collect();
+            crate::watch::ask_ahead(&asked);
+        }
+        // A MiB at a time, cut at multiples of one in title memory: a declaration of the copy
+        // waits for the piece under way, not for a whole range.
+        const PIECE: usize = 1 << 20;
+        for (shadow, ranges) in &grouped {
+            for &(from, to) in ranges {
+                let mut at = from;
+                while at < to {
+                    let next = ((at / PIECE + 1) * PIECE).min(to);
+                    shadow.prefetch(at, next - at);
+                    at = next;
+                }
+            }
+        }
+        if ahead {
+            crate::watch::ask_ahead_done();
+        }
+    }
+
     /// Shaders of the list write `[address, address + len)` of a buffer's
     /// host copy: copied back into title memory once the list has run.
     /// Declared once until the list next writes title memory (but with
@@ -8401,6 +8446,13 @@ static READS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::At
 #[cfg(feature = "diagnostics")]
 static FLUSHES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Since the last frame-rate line, with `VICTORY_REFRESH_PREFETCH=1`: spans
+/// brought up to date ahead of their submission by the lists' threads, and the
+/// bytes they copied (0, 1); the submissions' own refreshes, and the bytes they
+/// copied (2, 3) ([`Batch::update`], [`crate::shadow::Shadow::prefetch`]).
+#[cfg(feature = "diagnostics")]
+pub(crate) static PREFETCH: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
 /// Counts into [`SPLIT`].
 #[cfg(feature = "diagnostics")]
 struct Split(std::cell::Cell<std::time::Instant>);
@@ -8465,14 +8517,20 @@ fn split_line(frames: f64) {
     );
     {
         let r: Vec<f64> = REFRESH_SPLIT.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        let p: Vec<f64> = PREFETCH.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         tracing::info!(
             "refreshes on several threads per frame: {:.1} ms wall, threads' {:.1} ms asking whether a span is known to copy nothing and {:.1} ms \
-             updating the others; {:.0} spans in {:.0} host copies (counted once a flush)",
+             updating the others; {:.0} spans in {:.0} host copies (counted once a flush); ahead of their submissions, by the lists' threads \
+             (VICTORY_REFRESH_PREFETCH): {:.0} spans {:.2} MB; at the submissions: {:.0} spans {:.2} MB",
             r[4] / 1e6,
             r[0] / 1e6,
             r[1] / 1e6,
             r[2],
             r[3],
+            p[0],
+            p[1] / 1e6,
+            p[2],
+            p[3] / 1e6,
         );
     }
     tracing::info!(
@@ -9231,6 +9289,11 @@ impl Batch {
         let started = std::time::Instant::now();
         let _one = crate::timeline::span("a copy's refresh");
         let copied = shadow.update(from, to - from);
+        #[cfg(feature = "diagnostics")]
+        {
+            PREFETCH[2].fetch_add(1, Ordering::Relaxed);
+            PREFETCH[3].fetch_add(copied as u64, Ordering::Relaxed);
+        }
         let us = started.elapsed().as_micros() as u64;
         #[cfg(feature = "diagnostics")]
         crate::copystat::range(from, to - from, us, 0);
@@ -12009,6 +12072,145 @@ mod refresh_tests {
                 // go up.
                 unsafe { std::ptr::copy_nonoverlapping((self.data + a) as *const u8, card.2[a..b].as_mut_ptr(), b - a) };
             }
+        }
+    }
+
+    /// [`crate::shadow::prefetch_on`] for this thread, for as long as it lives.
+    struct PrefetchOn;
+
+    impl PrefetchOn {
+        fn new() -> PrefetchOn {
+            crate::shadow::PREFETCH_IN_TEST.set(true);
+            PrefetchOn
+        }
+    }
+
+    impl Drop for PrefetchOn {
+        fn drop(&mut self) {
+            crate::shadow::PREFETCH_IN_TEST.set(false);
+        }
+    }
+
+    /// A title write after a prefetch is refreshed by the submission that
+    /// follows it, and what the prefetch copied is not copied again.
+    #[test]
+    fn a_title_write_after_a_prefetch_is_refreshed_at_the_submission() {
+        let _prefetching = PrefetchOn::new();
+        const LEN: usize = 4 * PAGE;
+        let region = title(LEN, false);
+        // SAFETY: the test's own memory.
+        unsafe { std::ptr::write_bytes(region as *mut u8, 1, LEN) };
+        let data = memory(LEN);
+        let copy = Shadow::unbacked(region as u64, data, LEN as u64, false);
+        // Brought up to date as the list's recording ends: all of it, never taken before.
+        assert_eq!(copy.prefetch(region, LEN), LEN);
+        // The title writes after that, in the second block.
+        // SAFETY: as above.
+        unsafe { ((region + PAGE + 777) as *mut u8).write_volatile(2) };
+        // The submission: its asking, its refresh, the asking's end.
+        crate::watch::ask_once(&[(region, region + LEN)], &[]);
+        let copied = copy.update(region, LEN);
+        crate::watch::ask_once_end();
+        assert_eq!(copied, 4096, "only the page the title wrote since the prefetch");
+        // SAFETY: the copy's own memory.
+        assert_eq!(unsafe { data.add(PAGE + 777).read() }, 2, "the title's write is in the copy");
+    }
+
+    /// A range a flight may still land into is not prefetched, though the title
+    /// wrote into it: its shaders' bytes stay as they are, and the landing puts
+    /// them into title memory where the title did not write, as it does without
+    /// a prefetch.
+    #[test]
+    fn a_range_a_flight_writes_is_not_prefetched_and_its_landing_wins() {
+        let _prefetching = PrefetchOn::new();
+        const LEN: usize = 4 * PAGE;
+        let region = title(LEN, false);
+        // SAFETY: the test's own memory.
+        unsafe { std::ptr::write_bytes(region as *mut u8, 1, LEN) };
+        let data = memory(LEN);
+        let copy = Shadow::unbacked(region as u64, data, LEN as u64, false);
+        copy.update(region, LEN);
+        // The flight's submission declares its shaders' writes to the second
+        // block, and takes the copy's bytes there as they are.
+        copy.writing(region + PAGE, PAGE);
+        crate::shadow::take_snapshots();
+        // SAFETY: the copy's own memory, which the flight's shaders write.
+        unsafe { std::ptr::write_bytes(data.add(PAGE), 0xAA, PAGE) };
+        // The title writes into that block, and into the third one, which no flight writes.
+        // SAFETY: the test's own memory.
+        unsafe { ((region + PAGE + 100) as *mut u8).write_volatile(0x55) };
+        unsafe { ((region + 2 * PAGE + 5) as *mut u8).write_volatile(3) };
+        copy.prefetch(region, LEN);
+        // SAFETY: the copy's own memory.
+        assert_eq!(unsafe { data.add(2 * PAGE + 5).read() }, 3, "a range nothing writes is brought up to date");
+        assert_eq!(unsafe { data.add(PAGE + 100).read() }, 0xAA, "a range a flight writes is left as its shaders wrote it");
+        assert_eq!(unsafe { data.add(PAGE + 4000).read() }, 0xAA, "nor is the rest of its page, which the title did not write");
+        // The flight lands: where the title did not write, its bytes go into title memory; where it did, the title's stay.
+        copy.copy_back(region + PAGE, PAGE);
+        copy.copy_back_done(&[(region + PAGE, region + 2 * PAGE)]);
+        // SAFETY: the test's own memory.
+        assert_eq!(unsafe { ((region + PAGE + 4000) as *const u8).read() }, 0xAA, "the landing puts the flight's bytes into title memory");
+        assert_eq!(unsafe { ((region + PAGE + 100) as *const u8).read() }, 0x55, "the title's own write during the flight stays");
+    }
+
+    /// A range is not declared while a prefetch copies it: the declaration sees
+    /// the bytes the prefetch copies, and the prefetch does not change them after.
+    #[test]
+    fn a_range_is_not_declared_while_a_prefetch_copies_it() {
+        let _prefetching = PrefetchOn::new();
+        const LEN: usize = 64 << 20;
+        let region = title(LEN, false);
+        // SAFETY: the test's own memory.
+        unsafe { std::ptr::write_bytes(region as *mut u8, 1, LEN) };
+        let data = memory(LEN);
+        let copy = Shadow::unbacked(region as u64, data, LEN as u64, false);
+        let prefetching = copy.clone();
+        let thread = std::thread::spawn(move || {
+            let _prefetching = PrefetchOn::new();
+            prefetching.prefetch(region, LEN);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        // The last block, which the prefetch copies last.
+        copy.writing(region + LEN - PAGE, PAGE);
+        // SAFETY: the copy's own memory.
+        let declared = unsafe { std::slice::from_raw_parts(data.add(LEN - PAGE), PAGE) }.to_vec();
+        thread.join().unwrap();
+        // SAFETY: as above.
+        let after = unsafe { std::slice::from_raw_parts(data.add(LEN - PAGE), PAGE) };
+        assert!(declared.iter().all(|&b| b == 1), "the declaration sees the prefetch's copy");
+        assert!(declared == after, "the prefetch copied the declared range after the declaration");
+    }
+
+    /// A list's prefetch brings up to date the copies its refreshes read, in
+    /// pieces: what the title wrote into them before it is in them after it.
+    #[test]
+    fn a_list_prefetches_the_copies_its_refreshes_read() {
+        let _prefetching = PrefetchOn::new();
+        const LEN: usize = 48 * PAGE;
+        let list = super::host().expect("the host GPU").new_list().expect("a list");
+        let mut copies = Vec::new();
+        for _ in 0..2 {
+            let region = title(LEN, false);
+            // SAFETY: the test's own memory.
+            unsafe { std::ptr::write_bytes(region as *mut u8, 1, LEN) };
+            let data = memory(LEN);
+            let copy = Shadow::unbacked(region as u64, data, LEN as u64, false);
+            list.defer_refresh(&copy, region, LEN);
+            copies.push((region, data));
+        }
+        // The title writes into each copy's memory, in its first megabyte and in its last, and then the list's prefetch runs.
+        for &(region, _) in &copies {
+            // SAFETY: the test's own memory.
+            unsafe {
+                ((region + 3 * PAGE + 9) as *mut u8).write_volatile(4);
+                ((region + 40 * PAGE + 9) as *mut u8).write_volatile(5);
+            }
+        }
+        list.prefetch();
+        for &(_, data) in &copies {
+            // SAFETY: the copy's own memory.
+            assert_eq!(unsafe { data.add(3 * PAGE + 9).read() }, 4, "the list's prefetch brings its first megabyte up to date");
+            assert_eq!(unsafe { data.add(40 * PAGE + 9).read() }, 5, "and its last one");
         }
     }
 
