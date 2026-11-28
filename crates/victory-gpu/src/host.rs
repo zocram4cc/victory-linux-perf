@@ -4354,6 +4354,7 @@ fn late_line(frames: f64) {
 pub(crate) mod aside;
 pub(crate) mod awake;
 pub(crate) mod framecsv;
+mod framegen;
 mod card_steps;
 mod compare;
 #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
@@ -10205,6 +10206,10 @@ struct Presenter {
     meter: Meter,
     /// Composes a second presented plane over the first ([`crate::compose`]).
     composer: Option<crate::compose::Composer>,
+    /// Presenting through frame generation's swap chain ([`crate::ffx`]).
+    framegen: bool,
+    /// The interface plane's copy for frame generation ([`framegen`]), made once per size.
+    ui: Option<ID3D12Resource>,
     #[cfg(feature = "diagnostics")]
     panel: panel::Panel,
 }
@@ -10905,6 +10910,10 @@ impl Host {
                         p.composer = None;
                     }
                     (p.width, p.height, p.format) = (width, height, format);
+                    if p.framegen {
+                        crate::ffx::framegen_display(width, height, format.0);
+                        p.ui = None;
+                    }
                     tracing::info!(
                         width,
                         height,
@@ -10944,7 +10953,7 @@ impl Host {
             let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
             #[cfg(not(feature = "diagnostics"))]
             let read_now = false;
-            let slot = if late_free_present() && !read_now {
+            let slot = if late_free_present() && !read_now && !p.framegen {
                 let finished = FINISHED.load(Ordering::Acquire);
                 p.ahead.iter().position(|(_, flown)| *flown <= finished).or_else(|| {
                     let list = self.new_list().ok()?;
@@ -10962,7 +10971,20 @@ impl Host {
             copy.reset();
             copy.keep(texture);
             let list = &copy.list;
-            let composed = if let Some((over, over_state, base_fmt, over_fmt)) = planes {
+            let fg_ui = match planes {
+                Some((over, over_state, _, _)) if p.framegen => {
+                    let over_desc = over.GetDesc();
+                    let back = (format, width, height);
+                    let fits = framegen::copyable((desc.Format, width, height), back)
+                        && framegen::copyable((over_desc.Format, over_desc.Width as u32, over_desc.Height), back);
+                    fits.then(|| framegen::ui_texture(&self.device, &mut p.ui, (width, height, format)))
+                        .flatten()
+                        .map(|ui| (over, over_state, ui))
+                }
+                _ => None,
+            };
+            let interpolate = !p.framegen || planes.is_none() || fg_ui.is_some();
+            let composed = if let Some((over, over_state, base_fmt, over_fmt)) = planes.filter(|_| fg_ui.is_none()) {
                 copy.keep(over);
                 if let Some(composer) = p.composer.as_mut() {
                     let mut pre = Vec::with_capacity(3);
@@ -11020,6 +11042,11 @@ impl Host {
             } else {
                 false
             };
+            if let Some((over, over_state, ui)) = fg_ui.as_ref() {
+                copy.keep(*over);
+                copy.keep(ui);
+                framegen::record_ui(list, *over, *over_state, ui);
+            }
             if !composed {
                 let mut pre = Vec::with_capacity(2);
                 if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
@@ -11112,8 +11139,14 @@ impl Host {
             }
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
+            if p.framegen {
+                crate::ffx::framegen_before_present(fg_ui.as_ref().map(|(_, _, ui)| ui), true, interpolate);
+            }
             let mut showing = crate::timeline::span("the host's Present");
             let status = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            if p.framegen {
+                crate::ffx::framegen_after_present(p.swap_chain.GetLastPresentCount().ok());
+            }
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
             if status == windows::Win32::Foundation::S_OK {
@@ -11156,9 +11189,19 @@ impl Host {
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
                 ..Default::default()
             };
-            let swap_chain = factory
-                .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
-                .cast::<IDXGISwapChain3>()?;
+            let swap = crate::ffx::framegen_on()
+                .then(|| crate::ffx::framegen_swap_chain(hwnd, &desc, &factory, &self.queue))
+                .flatten();
+            let fg = swap.is_some();
+            let swap_chain = match swap {
+                Some(swap_chain) => {
+                    crate::ffx::framegen_display(width, height, format.0);
+                    swap_chain
+                }
+                None => factory
+                    .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
+                    .cast::<IDXGISwapChain3>()?,
+            };
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
@@ -11173,6 +11216,8 @@ impl Host {
                 hwnd,
                 meter: Meter::new(),
                 composer: None,
+                framegen: fg,
+                ui: None,
                 #[cfg(feature = "diagnostics")]
                 panel: panel::Panel::new(),
             })

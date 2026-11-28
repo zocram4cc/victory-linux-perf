@@ -1063,12 +1063,13 @@ unsafe extern "C" fn generate(params: *mut Header, context: *mut c_void) -> Retu
 }
 
 /// Before a present through the frame generation swap chain: `ui` (the
-/// window's size and format, in the common state; `None`: the interface is
+/// interface plane's texture, in the common state; `None`: the interface is
 /// in the image) is registered for composition, and frame generation is on
-/// for the frame if an upscale prepared it.
+/// for the frame if `interpolate` and an upscale prepared it.
 pub(crate) fn framegen_before_present(
     ui: Option<&windows::Win32::Graphics::Direct3D12::ID3D12Resource>,
     premultiplied: bool,
+    interpolate: bool,
 ) {
     let Some(api) = api() else { return };
     let fg = FRAMEGEN.lock().unwrap_or_else(|e| e.into_inner());
@@ -1092,7 +1093,7 @@ pub(crate) fn framegen_before_present(
         return;
     }
     let frame = FRAME.load(Ordering::Acquire);
-    configure(api, &fg, frame, PREPARED.load(Ordering::Acquire) == frame + 1);
+    configure(api, &fg, frame, interpolate && PREPARED.load(Ordering::Acquire) == frame + 1);
 }
 
 /// After a present through the frame generation swap chain, given the swap
