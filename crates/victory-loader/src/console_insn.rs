@@ -119,7 +119,7 @@ pub(crate) fn near(at: usize) -> Option<usize> {
     let at = at & !0xffff;
     (0x10_0000..0x7000_0000).step_by(0x10_0000).flat_map(|d| [at.checked_sub(d), at.checked_add(d)]).flatten().find_map(|place| {
         // SAFETY: reserves free memory at that address or fails.
-        let got = unsafe { VirtualAlloc(place as *const _, STUBS_LEN, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) } as usize;
+        let got = victory_core::mapping::changing(|| unsafe { VirtualAlloc(place as *const _, STUBS_LEN, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) }) as usize;
         (got != 0).then_some(got)
     })
 }

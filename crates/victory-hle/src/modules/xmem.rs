@@ -159,7 +159,7 @@ pub extern "system" fn XMemVirtualAlloc(
     }
     // SAFETY: the title's own arguments, cleaned of console bits; the
     // parameter points at `requirements`, which outlives the call.
-    let at = unsafe {
+    let at = victory_core::mapping::changing(|| unsafe {
         VirtualAlloc2(
             GetCurrentProcess(),
             base,
@@ -173,7 +173,7 @@ pub extern "system" fn XMemVirtualAlloc(
             },
             constrained.into(),
         )
-    };
+    });
     if at.is_null() {
         let error = std::io::Error::last_os_error();
         if kind & MEM_COMMIT != 0 {
@@ -403,7 +403,7 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     // (the title uses its GPU heap). Sub-allocate from a
     // reservation below 2^40 if one does.
     // SAFETY: the layout has a non-zero size.
-    let block = unsafe { alloc(layout) };
+    let block = victory_core::mapping::changing(|| unsafe { alloc(layout) });
     if block.is_null() {
         tracing::warn!(size, "XMemAllocDefault: the host heap is out of memory");
         return block.cast();
@@ -429,15 +429,15 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     unsafe {
         let watched = WATCHED.lock().unwrap_or_else(|e| e.into_inner()).remove(&(address as usize));
         if attributes & ALLOC_32BIT != 0 || watched {
-            VirtualFree(address, 0, MEM_RELEASE);
+            victory_core::mapping::changing(|| VirtualFree(address, 0, MEM_RELEASE));
             return;
         }
         let user = address.cast::<u8>();
         let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
-        dealloc(
+        victory_core::mapping::changing(|| dealloc(
             user.sub(align),
             Layout::from_size_align_unchecked(size, align),
-        );
+        ));
     }
 }
 
@@ -509,7 +509,7 @@ impl Section {
         }
         let base = *self.window.get_or_init(|| {
             // SAFETY: the whole of a section we own.
-            unsafe { MapViewOfFile(self.handle, FILE_MAP_WRITE, 0, 0, self.pages * PAGE) }.Value as usize
+            victory_core::mapping::changing(|| unsafe { MapViewOfFile(self.handle, FILE_MAP_WRITE, 0, 0, self.pages * PAGE) }).Value as usize
         });
         if base == 0 {
             return None;
@@ -700,7 +700,7 @@ fn show_home(base: usize, len: usize, slice: &Slice, first: usize) -> bool {
     }
     // SAFETY: a range of a plain reservation of the title's that shows nothing
     // (the caller unmapped it): committed, it is fresh memory of the process's.
-    if unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
+    if victory_core::mapping::changing(|| unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }).is_null() {
         commit_refused(len, "physical pages at home", std::io::Error::last_os_error());
         return false;
     }
@@ -718,7 +718,7 @@ fn show_home(base: usize, len: usize, slice: &Slice, first: usize) -> bool {
         let Some(from) = section.kept(page, run) else {
             tracing::warn!(address = format_args!("{base:#x}"), len, "physical pages are not shown as memory of their own: what they held cannot be read");
             // SAFETY: the range committed above.
-            unsafe { VirtualFree(base as *mut c_void, len, MEM_DECOMMIT) };
+            victory_core::mapping::changing(|| unsafe { VirtualFree(base as *mut c_void, len, MEM_DECOMMIT) });
             return false;
         };
         // SAFETY: `run` pages of the section's view, and as many of the range
@@ -831,11 +831,11 @@ impl Drop for Section {
             && base != 0
         {
             // SAFETY: our view; whoever writes through it holds the section.
-            unsafe {
+            victory_core::mapping::changing(|| unsafe {
                 UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
                     Value: base as *mut c_void,
                 })
-            };
+            });
         }
         victory_gpu::title_memory_section_gone(self.handle as usize);
         if let Some(fd) = self.fd {
@@ -1103,7 +1103,7 @@ impl View {
         use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
         let (offset, len) = ((slice.index * PAGE) as u64, n * PAGE);
         // SAFETY: slices of a section we own; the view is ours until dropped.
-        let at = unsafe {
+        let at = victory_core::mapping::changing(|| unsafe {
             MapViewOfFile(
                 slice.section.handle,
                 FILE_MAP_WRITE,
@@ -1111,7 +1111,7 @@ impl View {
                 offset as u32,
                 len,
             )
-        };
+        });
         if at.Value.is_null() {
             tracing::warn!(error = %std::io::Error::last_os_error(), n, "physical pages not mapped for a write");
             return None;
@@ -1136,7 +1136,7 @@ impl Drop for View {
     fn drop(&mut self) {
         use windows_sys::Win32::System::Memory::UnmapViewOfFile;
         // SAFETY: our view.
-        unsafe { UnmapViewOfFile(self.at) };
+        victory_core::mapping::changing(|| unsafe { UnmapViewOfFile(self.at) });
     }
 }
 
@@ -2415,9 +2415,9 @@ fn join_run(physical: &mut Physical, run: &[(usize, usize)]) -> bool {
         shown_mut().forget(at, size, &slice);
         victory_gpu::title_memory_unmapping(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
-        let gone = counted(Call::Unmap, size, || unsafe {
+        let gone = counted(Call::Unmap, size, || victory_core::mapping::changing(|| unsafe {
             UnmapViewOfFile2(GetCurrentProcess(), MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut c_void }, MEM_PRESERVE_PLACEHOLDER)
-        });
+        }));
         if gone == 0 {
             // Still mapped as it was: keep it so.
             shown_mut().note(at, size, &slice);
@@ -2430,7 +2430,7 @@ fn join_run(physical: &mut Physical, run: &[(usize, usize)]) -> bool {
     const MEM_COALESCE_PLACEHOLDERS: u32 = 1;
     // SAFETY: placeholders of ours, the views over them just unmapped.
     let joined = whole
-        && counted(Call::Split, len, || unsafe { VirtualFree(base as *mut c_void, len, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) }) != 0;
+        && counted(Call::Split, len, || victory_core::mapping::changing(|| unsafe { VirtualFree(base as *mut c_void, len, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) })) != 0;
     if joined && show(base, len, &first, true) {
         shown_mut().note(base, len, &first);
         victory_gpu::title_memory_view(base, len, first.section.handle as usize, (first.index * PAGE) as u64);
@@ -2458,13 +2458,13 @@ fn split(base: usize, len: usize) {
         return; // no placeholder there, and nothing to cut
     }
     // SAFETY: acts only on a placeholder.
-    counted(Call::Split, len, || unsafe {
+    counted(Call::Split, len, || victory_core::mapping::changing(|| unsafe {
         VirtualFree(
             base as *mut c_void,
             len,
             MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
         )
-    });
+    }));
 }
 
 /// The system calls of [`map`]; `own`: the placeholder at `base` is `len`
@@ -2495,7 +2495,7 @@ fn show(base: usize, len: usize, slice: &Slice, own: bool) -> bool {
     }
     let map_view = || {
         // SAFETY: maps the section over a placeholder; acts only on one.
-        counted(Call::Map, len, || unsafe {
+        counted(Call::Map, len, || victory_core::mapping::changing(|| unsafe {
             MapViewOfFile3(
                 slice.section.handle,
                 GetCurrentProcess(),
@@ -2507,7 +2507,7 @@ fn show(base: usize, len: usize, slice: &Slice, own: bool) -> bool {
                 std::ptr::null_mut(),
                 0,
             )
-        })
+        }))
     };
     let mut view = if own { map_view() } else { MEMORY_MAPPED_VIEW_ADDRESS { Value: std::ptr::null_mut() } };
     if view.Value as usize != base {
@@ -2552,11 +2552,11 @@ fn show(base: usize, len: usize, slice: &Slice, own: bool) -> bool {
 fn join_unasked(base: usize, len: usize) -> bool {
     const MEM_COALESCE_PLACEHOLDERS: u32 = 0x1;
     // SAFETY: these flags only split and join placeholders.
-    unsafe {
+    victory_core::mapping::changing(|| unsafe {
         counted(Call::Split, PAGE, || VirtualFree(base as *mut c_void, PAGE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER));
         counted(Call::Split, PAGE, || VirtualFree((base + len - PAGE) as *mut c_void, PAGE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER));
         counted(Call::Split, len, || VirtualFree(base as *mut c_void, len, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS)) != 0
-    }
+    })
 }
 
 /// Takes the view (or what [`wine_map`] put in its stead) at
@@ -2568,9 +2568,9 @@ fn hide(base: usize, len: usize) -> bool {
         return wine_map::hide(base, len);
     }
     // SAFETY: a view we mapped; it becomes a placeholder again.
-    unsafe {
+    victory_core::mapping::changing(|| unsafe {
         UnmapViewOfFile2(GetCurrentProcess(), MEMORY_MAPPED_VIEW_ADDRESS { Value: base as *mut c_void }, MEM_PRESERVE_PLACEHOLDER) != 0
-    }
+    })
 }
 
 /// Commits the section pages a view shows (once per page, whichever view).
@@ -2579,7 +2579,7 @@ fn commit(base: usize, len: usize) -> bool {
         return true; // sections are committed whole there
     }
     // SAFETY: `[base, base + len)` is a view of a reserved section.
-    if !unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
+    if !victory_core::mapping::changing(|| unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }).is_null() {
         return true;
     }
     commit_refused(len, "physical pages", std::io::Error::last_os_error());
@@ -2842,7 +2842,7 @@ fn free_in_space(at: usize, size: usize, kind: u32) -> Option<bool> {
         if asked == 0 || info.State == MEM_COMMIT || info.RegionSize < size {
             victory_gpu::title_memory_freed(at, size);
             // SAFETY: a range of a reservation of the title's with no view in it.
-            unsafe { VirtualFree(at as *mut c_void, size, MEM_DECOMMIT) };
+            victory_core::mapping::changing(|| unsafe { VirtualFree(at as *mut c_void, size, MEM_DECOMMIT) });
         }
         return Some(true);
     }
@@ -2858,7 +2858,7 @@ fn free_in_space(at: usize, size: usize, kind: u32) -> Option<bool> {
         wine_map::spaces().released(at);
         // SAFETY: a piece of a reservation of the title's, which it gives up
         // (under Wine part of a reservation can be released).
-        return Some(unsafe { VirtualFree(at as *mut c_void, len, MEM_RELEASE) } != 0);
+        return Some(victory_core::mapping::changing(|| unsafe { VirtualFree(at as *mut c_void, len, MEM_RELEASE) }) != 0);
     }
     None
 }
@@ -2875,29 +2875,41 @@ extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u
         victory_gpu::title_memory_freed(address as usize, size);
     }
     // SAFETY: the title's own arguments.
-    unsafe { VirtualFree(address, size, kind) }
+    victory_core::mapping::changing(|| unsafe { VirtualFree(address, size, kind) })
+}
+
+/// The title's own `VirtualAlloc`: the host would pass that call through
+/// unseen, so the change is recorded here (see [`module`]).
+extern "system" fn title_virtual_alloc(address: *const c_void, size: usize, kind: u32, protect: u32) -> *mut c_void {
+    victory_core::mapping::changing(|| unsafe { VirtualAlloc(address, size, kind, protect) })
 }
 
 pub(crate) fn module() -> HleModule {
+    let mut exports = vec![
+        crate::HleExport { name: "VirtualFree", address: title_virtual_free as *const () as usize },
+        hle_export!(XMemAlloc),
+        hle_export!(XMemFree),
+        hle_export!(XMemAllocDefault),
+        hle_export!(XMemFreeDefault),
+        hle_export!(XMemIsToolsMemAvailable),
+        hle_export!(XMemAllocatePhysicalPages),
+        hle_export!(XMemFreePhysicalPages),
+        hle_export!(XMemMapPhysicalPages),
+        hle_export!(XMemMapPhysicalPagesScatter),
+        hle_export!(XMemVirtualAlloc),
+        hle_export!(XMemVirtualQuery),
+        hle_export!(XMemGetWorkingSetStatistics),
+        hle_export!(XMemTransferMemory),
+    ];
+    // The title's VirtualAlloc comes here only where the cache keeps answers
+    // (`VICTORY_MAPPED_CACHE=1`); else the host serves it as before.
+    if victory_core::mapping::cached() {
+        exports.push(crate::HleExport { name: "VirtualAlloc", address: title_virtual_alloc as *const () as usize });
+    }
     HleModule {
         name: "xmem",
         dlls: &["xmem.dll", "kernel32.dll", "kernelbase.dll", "api-ms-win-core-memory-*"],
-        exports: vec![
-            crate::HleExport { name: "VirtualFree", address: title_virtual_free as *const () as usize },
-            hle_export!(XMemAlloc),
-            hle_export!(XMemFree),
-            hle_export!(XMemAllocDefault),
-            hle_export!(XMemFreeDefault),
-            hle_export!(XMemIsToolsMemAvailable),
-            hle_export!(XMemAllocatePhysicalPages),
-            hle_export!(XMemFreePhysicalPages),
-            hle_export!(XMemMapPhysicalPages),
-            hle_export!(XMemMapPhysicalPagesScatter),
-            hle_export!(XMemVirtualAlloc),
-            hle_export!(XMemVirtualQuery),
-            hle_export!(XMemGetWorkingSetStatistics),
-            hle_export!(XMemTransferMemory),
-        ],
+        exports,
     }
 }
 
@@ -2912,6 +2924,17 @@ mod tests {
         let process = unsafe { GetCurrentProcess() };
         assert_eq!(XMemVirtualQuery(process, address, &mut info), 1);
         info
+    }
+
+    #[test]
+    fn the_titles_own_allocation_and_free_move_the_map_generation() {
+        let before = victory_core::mapping::generation();
+        let at = title_virtual_alloc(std::ptr::null(), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        assert!(!at.is_null());
+        let allocated = victory_core::mapping::generation();
+        assert!(allocated > before, "the title's VirtualAlloc did not move the map generation");
+        assert_ne!(title_virtual_free(at, 0, MEM_RELEASE), 0);
+        assert!(victory_core::mapping::generation() > allocated, "the title's VirtualFree did not move the map generation");
     }
 
     #[test]

@@ -2143,8 +2143,20 @@ pub(crate) fn staged(resource: This, ask: bool) -> Option<(u64, bool)> {
 }
 
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
-/// unmapped until their pages arrive).
+/// unmapped until their pages arrive). With `VICTORY_MAPPED_CACHE=1` the answer
+/// is kept while the title's memory map stands (see [`mapped_bytes`]); it is
+/// for memory the map records, so the addresses a shader supplied go to
+/// [`asked_committed`] instead.
 pub(crate) fn committed(at: *const u8, len: usize) -> bool {
+    if by_query() || len == 0 || !victory_core::mapping::cached() {
+        return asked_committed(at, len);
+    }
+    COMMITTED.get_or_ask(at as usize, len, victory_core::mapping::answering(), || u64::from(asked_committed(at, len))) == 1
+}
+
+/// [`committed`] as the host says it now, kept nowhere: for addresses a shader
+/// or packed data supplied, which may be memory the title's map does not record.
+pub(crate) fn asked_committed(at: *const u8, len: usize) -> bool {
     if by_query() {
         return committed_by_query(at, len);
     }
@@ -2233,6 +2245,73 @@ fn committed_by_query(at: *const u8, len: usize) -> bool {
     true
 }
 
+/// The answers of [`mapped_bytes`] kept under one generation of the title's
+/// memory map (`victory_core::mapping`), by address and length. Direct-mapped
+/// in shards of answers, so the list threads asking at once do not queue on
+/// one lock; a collision replaces the answer kept there. Bounded: 4,096 answers.
+struct Answers([Mutex<[Option<Kept>; SLOTS]>; SHARDS]);
+
+const SHARDS: usize = 64;
+const SLOTS: usize = 64;
+
+#[derive(Clone, Copy)]
+struct Kept {
+    at: usize,
+    len: usize,
+    generation: u64,
+    there: u64,
+}
+
+/// The answers [`mapped_bytes`] keeps (`VICTORY_MAPPED_CACHE=1`).
+static ANSWERS: Answers = Answers::new();
+
+/// The answers [`committed`] keeps (`VICTORY_MAPPED_CACHE=1`).
+static COMMITTED: Answers = Answers::new();
+
+impl Answers {
+    const fn new() -> Answers {
+        const SHARD: Mutex<[Option<Kept>; SLOTS]> = Mutex::new([None; SLOTS]);
+        Answers([SHARD; SHARDS])
+    }
+
+    /// `there` for `[at, at + len)` as of `generation`: kept under it, or
+    /// asked and kept. `None` (a change of the map is in flight): asked, and
+    /// not kept.
+    fn get_or_ask(&self, at: usize, len: usize, generation: Option<u64>, ask: impl FnOnce() -> u64) -> u64 {
+        let Some(generation) = generation else {
+            tally(false);
+            return ask();
+        };
+        let h = (at as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (len as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+        let (shard, slot) = ((h >> 58) as usize, (h >> 52) as usize & (SLOTS - 1));
+        let kept = {
+            let guard = self.0[shard].lock().unwrap_or_else(|e| e.into_inner());
+            guard[slot].filter(|k| k.at == at && k.len == len && k.generation == generation)
+        };
+        if let Some(kept) = kept {
+            tally(true);
+            return kept.there;
+        }
+        tally(false);
+        let there = ask();
+        self.0[shard].lock().unwrap_or_else(|e| e.into_inner())[slot] = Some(Kept { at, len, generation, there });
+        there
+    }
+}
+
+/// Diagnostics: the answers [`mapped_bytes`] and [`committed`] kept (first) and
+/// asked (second) since the card accounting line last said so.
+#[cfg(feature = "diagnostics")]
+pub(crate) static ANSWERED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+#[cfg(feature = "diagnostics")]
+fn tally(kept: bool) {
+    ANSWERED[usize::from(!kept)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(not(feature = "diagnostics"))]
+fn tally(_kept: bool) {}
+
 /// How many bytes of `[at, at + len)` are committed memory: all of a
 /// texture that is there, some of one streaming in (its smaller mips lie
 /// at the start of its memory, and their pages are mapped first), none of
@@ -2240,12 +2319,10 @@ fn committed_by_query(at: *const u8, len: usize) -> bool {
 /// answer is none without a look at the pages between (two queries for the
 /// slots whose texture is away, which are asked again and again).
 pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
     if len == 0 {
         return 0;
     }
     let start = at as usize;
-    let end = start.saturating_add(len);
     // Streamed textures lie in views of physical pages, of which the runtime
     // knows which are there: one look, where the host was asked for every
     // 64 KiB of the texture (and once more for each that is not there).
@@ -2256,6 +2333,22 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     {
         return there;
     }
+    // `VICTORY_MAPPED_CACHE=1`: the host's answer is kept while the title's
+    // memory map stands still (`victory_core::mapping`).
+    if !victory_core::mapping::cached() {
+        return asked_mapped_bytes(at, len);
+    }
+    ANSWERS.get_or_ask(start, len, victory_core::mapping::answering(), || asked_mapped_bytes(at, len))
+}
+
+/// [`mapped_bytes`] as the host says it.
+fn asked_mapped_bytes(at: *const u8, len: usize) -> u64 {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    if len == 0 {
+        return 0;
+    }
+    let start = at as usize;
+    let end = start.saturating_add(len);
     if !committed(at, 1) && !committed((end - 1) as *const u8, 1) {
         return 0;
     }
@@ -2781,6 +2874,66 @@ mod allocation_costs {
             }
             crate::inplace::views_gone(noted, blocks * BLOCK);
         }
+    }
+
+    /// An answer is kept under the generation it was asked under, and asked
+    /// again once the generation moves on.
+    #[test]
+    fn an_answer_is_kept_while_the_generation_stands() {
+        let answers = super::Answers::new();
+        let mut asked = 0;
+        let first = answers.get_or_ask(0x10_0000, 4 << 20, Some(7), || {
+            asked += 1;
+            3 << 20
+        });
+        let again = answers.get_or_ask(0x10_0000, 4 << 20, Some(7), || {
+            asked += 1;
+            0
+        });
+        assert_eq!((first, again, asked), (3 << 20, 3 << 20, 1));
+        assert_eq!(answers.get_or_ask(0x10_0000, 4 << 20, Some(8), || 0), 0, "a new generation asks again");
+    }
+
+    /// A decommit recorded in the title's memory map is seen by the next
+    /// answer.
+    #[test]
+    fn a_recorded_decommit_is_seen_by_the_next_answer() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        const BLOCK: usize = 64 << 10;
+        // SAFETY: a reservation of our own, two blocks committed; released below.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), 2 * BLOCK, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_ne!(at, 0);
+        let ask = move || super::asked_mapped_bytes(at as *const u8, 2 * BLOCK);
+        let full = super::ANSWERS.get_or_ask(at, 2 * BLOCK, victory_core::mapping::answering(), ask);
+        assert_eq!(full, 2 * BLOCK as u64);
+        // SAFETY: a block of our reservation.
+        victory_core::mapping::changing(|| unsafe { VirtualFree(at as *mut _, BLOCK, MEM_DECOMMIT) });
+        let seen = super::ANSWERS.get_or_ask(at, 2 * BLOCK, victory_core::mapping::answering(), ask);
+        assert_eq!(seen, BLOCK as u64, "the recorded decommit is seen: the next answer is asked again");
+        // SAFETY: our reservation.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// The same for [`committed`]: a decommit recorded in the title's map is
+    /// seen by the next answer.
+    #[test]
+    fn a_recorded_decommit_is_seen_by_the_next_committed_answer() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        const BLOCK: usize = 64 << 10;
+        // SAFETY: a reservation of our own, one block committed; released below.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), BLOCK, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_ne!(at, 0);
+        let ask = move || u64::from(super::asked_committed(at as *const u8, BLOCK));
+        assert_eq!(super::COMMITTED.get_or_ask(at, BLOCK, victory_core::mapping::answering(), ask), 1);
+        // SAFETY: the block of our reservation.
+        victory_core::mapping::changing(|| unsafe { VirtualFree(at as *mut _, BLOCK, MEM_DECOMMIT) });
+        assert_eq!(
+            super::COMMITTED.get_or_ask(at, BLOCK, victory_core::mapping::answering(), ask),
+            0,
+            "the recorded decommit is seen: the next answer is asked again"
+        );
+        // SAFETY: our reservation.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
     }
 
     /// The digest tells every length and every changed byte apart, zeros

@@ -73,7 +73,7 @@ pub(crate) fn reserve(len: usize) -> Option<usize> {
     parameter.Anonymous2.Pointer = (&raw mut requirements).cast();
     // SAFETY: a fresh allocation; the parameter points at `requirements`,
     // which outlives the call.
-    let at = unsafe {
+    let at = victory_core::mapping::changing(|| unsafe {
         VirtualAlloc2(
             std::ptr::null_mut(),
             std::ptr::null(),
@@ -83,7 +83,7 @@ pub(crate) fn reserve(len: usize) -> Option<usize> {
             &mut parameter,
             1,
         )
-    } as usize;
+    }) as usize;
     (at != 0).then_some(at)
 }
 

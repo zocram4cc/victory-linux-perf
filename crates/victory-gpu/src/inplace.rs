@@ -295,7 +295,7 @@ pub(crate) fn place(device: &ID3D12Device, heap: &ID3D12Heap, offset: u64, size:
 pub(crate) fn section_views_seen(device: &ID3D12Device) -> bool {
     static SEEN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *SEEN.get_or_init(|| {
-        let (seen, how) = try_section_view(device);
+        let (seen, how) = victory_core::mapping::changing(|| try_section_view(device));
         tracing::info!(
             seen,
             how,
@@ -430,7 +430,7 @@ pub fn title_memory_section_gone(section: usize) {
         // SAFETY: a view of ours. Who writes through it found the section
         // in a view the title saw and holds off its unmapping
         // (`crate::watch::title_memory_reading`), which came before this.
-        unsafe { mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: base as *mut c_void }) };
+        victory_core::mapping::changing(|| unsafe { mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: base as *mut c_void }) });
     }
 }
 
@@ -701,7 +701,7 @@ pub(crate) fn beside(at: usize, len: usize) -> Option<usize> {
             let &(_, bytes, _) = v.sections.iter().find(|s| s.0 == section)?;
             // SAFETY: the whole of a section the runtime made; a view the
             // title sees is of it, so its handle is open.
-            let base = unsafe { mem::MapViewOfFile(section as _, mem::FILE_MAP_WRITE, 0, 0, bytes as usize) }.Value as usize;
+            let base = victory_core::mapping::changing(|| unsafe { mem::MapViewOfFile(section as _, mem::FILE_MAP_WRITE, 0, 0, bytes as usize) }).Value as usize;
             if base == 0 {
                 tracing::warn!(error = %std::io::Error::last_os_error(), "no view of the title's pages beside its own");
             }

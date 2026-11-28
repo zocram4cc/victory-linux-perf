@@ -4029,10 +4029,19 @@ const SETTING: usize = 3;
 /// `VirtualProtect` of `n` blocks from `block` on, counted in [`PROTECTS`].
 fn change(kind: usize, block: usize, n: usize, protect: u32, old: &mut u32) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE};
     // SAFETY: title view memory (or what the caller found in its place); only
-    // its protection changes.
-    let done =
-        unsafe { windows_sys::Win32::System::Memory::VirtualProtect((block * BLOCK) as *const _, n * BLOCK, protect, old) } != 0;
+    // its protection changes. Read-only and read-write are both readable, so a
+    // change between them leaves the map as it is (`victory_core::mapping`).
+    let done = if matches!(protect, PAGE_READONLY | PAGE_READWRITE) {
+        unsafe { windows_sys::Win32::System::Memory::VirtualProtect((block * BLOCK) as *const _, n * BLOCK, protect, &mut *old) != 0 }
+    } else {
+        victory_core::mapping::changing(|| unsafe { windows_sys::Win32::System::Memory::VirtualProtect((block * BLOCK) as *const _, n * BLOCK, protect, &mut *old) != 0 })
+    };
+    if done && !matches!(*old, PAGE_READONLY | PAGE_READWRITE) {
+        // What was there was not read-only or read-write: the map changed.
+        victory_core::mapping::changed();
+    }
     PROTECTS[kind].fetch_add(1, Relaxed);
     PROTECTS[kind + 1].fetch_add(n as u64, Relaxed);
     PROTECTS[kind + 2].fetch_add(u64::from(!done), Relaxed);
@@ -5477,6 +5486,7 @@ fn rearm_guard(at: Option<usize>) -> bool {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, VirtualProtect, VirtualQuery,
     };
+    victory_core::mapping::changed();
     let done = at.is_some_and(|at| {
         let page = at / KERNEL_PAGE * KERNEL_PAGE;
         // SAFETY: plain data filled in by the query.
@@ -5487,7 +5497,7 @@ fn rearm_guard(at: Option<usize>) -> bool {
         unsafe {
             VirtualQuery(page as *const _, &mut info, size_of_val(&info)) != 0
                 && info.State == MEM_COMMIT
-                && VirtualProtect(page as *const _, KERNEL_PAGE, info.Protect | PAGE_GUARD, &mut old) != 0
+                && victory_core::mapping::changing(|| VirtualProtect(page as *const _, KERNEL_PAGE, info.Protect | PAGE_GUARD, &mut old)) != 0
         }
     });
     if !done {
