@@ -564,6 +564,48 @@ pub(crate) fn references(object: &impl Interface) -> u32 {
     }
 }
 
+/// Whether the periodic [`sweep`] runs on a thread of its own at low
+/// priority, without settling the flights in the air first
+/// (`VICTORY_SWEEP_ASYNC=1`; off by default; in-run A/B-able). On the
+/// submitting thread it was a settle of everything in the air and the sweep
+/// every 1.5 s: 9-11 ms stalls of that thread (timeline sc-tl1). What the
+/// sweep lets go of is only what nothing holds (no list, flying or not, no
+/// slot), as the list threads already record beside it.
+/// After RAZDA4A XEN (crossducking/RAZDA4A-XEN d16ca9a7d).
+fn sweep_async() -> bool {
+    static BIT: std::sync::LazyLock<Option<u32>> = std::sync::LazyLock::new(|| crate::ab::bit("VICTORY_SWEEP_ASYNC"));
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("VICTORY_SWEEP_ASYNC").is_some_and(|v| v == "1"));
+    BIT.map_or(*ON, crate::ab::on)
+}
+
+/// Has the `victory-sweep` thread run [`sweep`] once, without waiting for it.
+fn sweep_beside() {
+    static DUE: (Mutex<bool>, std::sync::Condvar) = (Mutex::new(false), std::sync::Condvar::new());
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let worker = || {
+            use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL};
+            // SAFETY: this thread's own priority.
+            unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) };
+            loop {
+                let mut due = DUE.0.lock().unwrap_or_else(|e| e.into_inner());
+                while !*due {
+                    due = DUE.1.wait(due).unwrap_or_else(|e| e.into_inner());
+                }
+                *due = false;
+                drop(due);
+                let _sweeping = crate::timeline::span("the sweep, beside");
+                sweep();
+            }
+        };
+        if let Err(e) = std::thread::Builder::new().name("victory-sweep".into()).spawn(worker) {
+            tracing::warn!(error = %e, "no thread for the sweep: nothing is let go");
+        }
+    });
+    *DUE.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    DUE.1.notify_one();
+}
+
 /// Once a second, before a submission starts: lets go of what nothing
 /// names any more (copies of windows of title memory, staging buffers,
 /// host copies of textures the title fills).
@@ -6368,7 +6410,15 @@ impl Host {
         // sweep waits for a submission that finds none in the air: there is
         // one at every present).
         static SWEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        if !behind {
+        if sweep_async() && !upcheck::on() {
+            // On a thread of its own, without a moment made with nothing in
+            // the air: what it lets go of is what no list holds.
+            let now = now_ms();
+            if now > SWEPT.load(Ordering::Relaxed) + 1500 {
+                SWEPT.store(now, Ordering::Relaxed);
+                sweep_beside();
+            }
+        } else if !behind {
             if upcheck::on() {
                 upcheck::at_rest(self);
             }
