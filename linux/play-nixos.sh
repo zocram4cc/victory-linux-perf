@@ -25,4 +25,5 @@ PROFILE=release KEYS=0 exec "$(dirname "$0")/nixos-run.sh" "play-$(date +%H%M%S)
     VICTORY_ASK_SPREAD=1 \
     VICTORY_JOIN_BARRIERS=1 \
     VICTORY_THIN_THREADS=6 \
-    VICTORY_GUARD_HOT=500
+    VICTORY_GUARD_HOT=500 \
+    VICTORY_WAIT_RESIDENT=0

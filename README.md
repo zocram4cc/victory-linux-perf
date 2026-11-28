@@ -22,7 +22,7 @@ Performance-focused Linux/Proton fork of `victory-proton`, targeting native **30
 - **HLE & build**:
   - `VICTORY_SLEEP0_YIELD=1` in `crates/victory-hle/src/modules/kernel.rs` to throttle tight `Sleep(0)` spin loops (eliminated a 68% CPU spin thread).
   - Thin LTO (`lto = "thin"`) and `x86-64-v3` (AVX2/BMI2/FMA) codegen.
-  - Runtime tuning: `VICTORY_GUARD_HOT=500`, `VICTORY_JOIN_BARRIERS=1`, `VICTORY_THIN_THREADS=6`.
+  - Runtime tuning: `VICTORY_GUARD_HOT=500`, `VICTORY_JOIN_BARRIERS=1`, `VICTORY_THIN_THREADS=6`, `VICTORY_WAIT_RESIDENT=0` (disables a Windows WDDM residency fence wait that caused multi-second stalls and texture upload backlogs on Linux/RADV during cutscenes).
 
 ## Measured Progress (Starting Zone Idle, Native, Zero Frame Gen, `VICTORY_UPSCALER=6`)
 
