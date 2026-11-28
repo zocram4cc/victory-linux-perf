@@ -147,7 +147,12 @@ impl Made {
     }
 }
 
+static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 pub(crate) struct HostHeap {
+    id: u64,
+    /// Physical-page writes deferred until this heap's next bake.
+    bake_page_written: Mutex<Vec<(u64, u64)>>,
     pub(crate) buffer_sweep: Mutex<crate::draw::BufferSweep>,
     pub(crate) buffer_frame: std::sync::atomic::AtomicU64,
     pub(crate) heap: ID3D12DescriptorHeap,
@@ -829,15 +834,19 @@ impl Spans {
     }
 }
 
-/// Title memory written behind the guards' back whose bytes are there
-/// (DirectStorage's reads into physical pages, at the addresses the title
-/// has them mapped; `crate::watch::title_memory_written`), since a texture
-/// pass last took the ranges ([`page_written`]). Kept apart from
-/// [`REMAPPED`] so that what such writes do is counted by itself.
-static PAGE_WRITTEN: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+#[derive(Default)]
+struct HeapTextureChanges {
+    written: Vec<(u64, u64)>,
+    remapped: Vec<(u64, u64)>,
+}
 
-/// Since the start: such ranges kept for a pass; ranges dropped because no
-/// pass took them; slots of placed textures that held bytes of them when a
+/// A command list can bind a different view heap for its next draw. Each
+/// heap subscribes on its first placed texture and drains its own notes.
+static HEAP_CHANGES: Mutex<std::collections::BTreeMap<u64, HeapTextureChanges>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// Since the start: such ranges kept for a pass; ranges compacted when the
+/// queue filled; slots of placed textures that held bytes of them when a
 /// pass took them; of those, the slots whose texture had been uploaded
 /// before the write (out of the queue, or in it after an upload): they are
 /// the ones that kept the bytes from before, and the ones made due when
@@ -850,6 +859,48 @@ pub(crate) static PAGE_WRITES: [std::sync::atomic::AtomicU64; 4] =
 /// two frames on takes those of the next frame with it.
 const PAGE_WRITE_AFTER: u64 = 2;
 
+const MAX_PENDING_TEXTURE_CHANGES: usize = 1 << 15;
+const MAX_BAKE_TEXTURE_CHANGES: usize = 1 << 14;
+
+/// DirectStorage can finish many batches between two one-shot bakes.
+fn retain_bake_writes(kept: &mut Vec<(u64, u64)>, ranges: &[(u64, u64)]) {
+    kept.extend_from_slice(ranges);
+    if kept.len() > MAX_BAKE_TEXTURE_CHANGES {
+        compact_texture_changes(kept, MAX_BAKE_TEXTURE_CHANGES);
+    }
+}
+
+fn remember_texture_change(ranges: &mut Vec<(u64, u64)>, start: u64, end: u64) -> usize {
+    if let Some(last) = ranges.last_mut()
+        && last.1 == start
+    {
+        last.1 = end;
+        return 0;
+    }
+    let mut compacted = 0;
+    if ranges.len() >= MAX_PENDING_TEXTURE_CHANGES {
+        compacted = ranges.len();
+        compact_texture_changes(ranges, MAX_PENDING_TEXTURE_CHANGES / 2);
+    }
+    ranges.push((start, end));
+    compacted
+}
+
+/// Keep every changed byte covered. At capacity a pair can span an unchanged
+/// gap, whose textures will also be checked at the next pass.
+fn compact_texture_changes(ranges: &mut Vec<(u64, u64)>, limit: usize) {
+    join(ranges);
+    while ranges.len() > limit {
+        let pairs = ranges.len().div_ceil(2);
+        for pair in 0..pairs {
+            let first = 2 * pair;
+            let last = (first + 1).min(ranges.len() - 1);
+            ranges[pair] = (ranges[first].0, ranges[last].1);
+        }
+        ranges.truncate(pairs);
+    }
+}
+
 /// The bytes of a write the guards do not see are in title memory `[at,
 /// at + len)`: the placed textures there changed with no descriptor
 /// written and nothing mapped. Kept for the next texture pass
@@ -857,30 +908,17 @@ const PAGE_WRITE_AFTER: u64 = 2;
 /// ranges; locks one mutex and calls nothing.
 pub(crate) fn page_written(at: usize, len: usize) {
     use std::sync::atomic::Ordering::Relaxed;
-    /// Ranges kept until a pass takes them.
-    const MOST: usize = 1 << 15;
     let (start, end) = (at as u64, at.saturating_add(len) as u64);
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
     }
-    let mut ranges = PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut heaps = HEAP_CHANGES.lock().unwrap_or_else(|e| e.into_inner());
     PAGE_WRITES[0].fetch_add(1, Relaxed);
-    if let Some(last) = ranges.last_mut()
-        && last.1 == start
-    {
-        last.1 = end;
-        return;
+    let compacted: usize = heaps.values_mut().map(|heap| remember_texture_change(&mut heap.written, start, end)).sum();
+    if compacted != 0 {
+        PAGE_WRITES[1].fetch_add(compacted as u64, Relaxed);
     }
-    if ranges.len() >= MOST {
-        PAGE_WRITES[1].fetch_add(ranges.len() as u64, Relaxed);
-        ranges.clear();
-    }
-    ranges.push((start, end));
 }
-
-/// Title memory the runtime mapped, unmapped or is about to write since a
-/// texture pass last took the ranges ([`remapped`]).
-static REMAPPED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 
 /// The lowest start and the highest end of any span of [`Spans`] so far
 /// (the start is `u64::MAX` until there is one): what the runtime does to
@@ -892,7 +930,7 @@ static SPANNED: [std::sync::atomic::AtomicU64; 2] = [
 
 /// Since the start: slots whose view a newer view of other memory there
 /// made stale; ranges of memory noted as mapped, unmapped or written;
-/// ranges dropped because no pass took them; slots made due by such
+/// ranges compacted when the queue filled; slots made due by such
 /// ranges; and made slots whose memory was found unmapped (made null).
 pub(crate) static STALE: [std::sync::atomic::AtomicU64; 5] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 5];
@@ -919,28 +957,16 @@ fn stale_rule() -> Rule {
 /// locks held: this locks one mutex of its own and calls nothing.
 pub(crate) fn remapped(at: usize, len: usize) {
     use std::sync::atomic::Ordering::Relaxed;
-    /// Ranges kept until a pass takes them.
-    const MOST: usize = 1 << 15;
     let (start, end) = (at as u64, at.saturating_add(len) as u64);
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
     }
-    let mut ranges = REMAPPED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut heaps = HEAP_CHANGES.lock().unwrap_or_else(|e| e.into_inner());
     STALE[1].fetch_add(1, Relaxed);
-    // Pages are mapped one after the other.
-    if let Some(last) = ranges.last_mut()
-        && last.1 == start
-    {
-        last.1 = end;
-        return;
+    let compacted: usize = heaps.values_mut().map(|heap| remember_texture_change(&mut heap.remapped, start, end)).sum();
+    if compacted != 0 {
+        STALE[2].fetch_add(compacted as u64, Relaxed);
     }
-    if ranges.len() >= MOST {
-        // No pass runs (no shader that picks textures by index is bound):
-        // the slots there are looked at when they are due, as before.
-        STALE[2].fetch_add(ranges.len() as u64, Relaxed);
-        ranges.clear();
-    }
-    ranges.push((start, end));
 }
 
 /// Ranges of memory, those that touch made one (DexNom/VIctory 921d8d3b:
@@ -1077,8 +1103,8 @@ impl Queued {
 }
 
 /// Slots due of a [`TextureQueue`], of those looked at before and of the
-/// others: the frame each was written in, the slot and its write's number.
-type Due = [Vec<(u64, u32, u64)>; 2];
+/// others: the slot and its write's number.
+type Due = [Vec<(u32, u64)>; 2];
 
 impl TextureQueue {
     fn insert(&mut self, index: u32, waiting: Waiting) {
@@ -1147,30 +1173,45 @@ impl TextureQueue {
     fn all_due(&self, frame: u64) -> Due {
         let mut due = Due::default();
         for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
-            due[usize::from(w.looks == 0 && w.mapped == 0)].push((w.written, index, w.write));
+            due[usize::from(w.looks == 0 && w.mapped == 0)].push((index, w.write));
         }
         due
     }
 
-    /// What [`TextureQueue::due`] says of `due` (with nothing held: some
-    /// ten thousand slots are sorted).
+    /// Select a batch in service order after releasing the queue lock.
     fn in_order([mut again, mut fresh]: Due, max: usize) -> Vec<(u32, u64)> {
         // By the number of the write, counted over the run.
-        let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
+        let newest_first = |a: &(u32, u64), b: &(u32, u64)| b.1.cmp(&a.1);
+        if again.len() > max {
+            again.select_nth_unstable_by(max, newest_first);
+            again.truncate(max);
+        }
         again.sort_unstable_by(newest_first);
+        let take = fresh.len().min(max - again.len());
+        if take == 0 {
+            return again;
+        }
+        // When a normal pass cannot serve the whole backlog, keep only the
+        // newest and oldest writes it will actually return.
+        if take < fresh.len() {
+            let newest = take.div_ceil(2);
+            let oldest = fresh.len() - take / 2;
+            fresh.select_nth_unstable_by(newest, newest_first);
+            if oldest < fresh.len() {
+                fresh[newest..].select_nth_unstable_by(oldest - newest, newest_first);
+            }
+            fresh.drain(newest..oldest);
+        }
         fresh.sort_unstable_by(newest_first);
-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
-        let (mut new, mut old) = (0, fresh.len());
-        while new < old && order.len() < max {
-            order.push((fresh[new].1, fresh[new].2));
-            new += 1;
-            if new < old && order.len() < max {
-                old -= 1;
-                order.push((fresh[old].1, fresh[old].2));
+        again.reserve(take);
+        let mut fresh = fresh.into_iter();
+        while let Some(newest) = fresh.next() {
+            again.push(newest);
+            if let Some(oldest) = fresh.next_back() {
+                again.push(oldest);
             }
         }
-        order.truncate(max);
-        order
+        again
     }
 
     /// The entry of `index` if it is still the write the pass was handed.
@@ -1779,6 +1820,14 @@ pub(crate) fn reclaim_dynamic() -> bool {
 const RAW_SRV: u8 = 1;
 const RAW_UAV: u8 = u8::MAX;
 
+impl Drop for HostHeap {
+    fn drop(&mut self) {
+        if !self.sampler {
+            HEAP_CHANGES.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.id);
+        }
+    }
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -1884,6 +1933,8 @@ impl HostHeap {
             .flatten();
         let queued = std::sync::Arc::new(Queued::new(if sampler { 0 } else { count }));
         let h = HostHeap {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            bake_page_written: Mutex::default(),
             buffer_sweep: Mutex::default(),
             buffer_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
             heap,
@@ -2151,8 +2202,10 @@ impl HostHeap {
     /// whether memory was noted since a pass last took the notes.
     pub(crate) fn texture_news(&self) -> (u64, bool) {
         let writes = self.textures.lock().unwrap_or_else(|e| e.into_inner()).writes;
-        let noted = |ranges: &Mutex<Vec<(u64, u64)>>| !ranges.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
-        (writes, noted(&REMAPPED) || noted(&PAGE_WRITTEN))
+        let noted = HEAP_CHANGES.lock().unwrap_or_else(|e| e.into_inner()).get(&self.id)
+            .is_some_and(|heap| !heap.written.is_empty() || !heap.remapped.is_empty())
+            || !self.bake_page_written.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
+        (writes, noted)
     }
 
     /// Every title slot of the queue that is due at `frame`, and whether
@@ -2249,7 +2302,8 @@ impl HostHeap {
     pub(crate) fn texture_slots_remapped(&self, frame: u64) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
         self.texture_slots_page_written(frame);
-        let mut ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut ranges = HEAP_CHANGES.lock().unwrap_or_else(|e| e.into_inner())
+            .get_mut(&self.id).map(|heap| std::mem::take(&mut heap.remapped)).unwrap_or_default();
         if ranges.is_empty() {
             return 0;
         }
@@ -2306,11 +2360,43 @@ impl HostHeap {
     /// are left to their draws. Counted either way; returns how many slots
     /// it made due.
     fn texture_slots_page_written(&self, frame: u64) -> usize {
-        let ranges = std::mem::take(&mut *PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()));
+        let due = crate::watch::page_writes() & 2 != 0;
+        // A concurrent bake must see these writes in the incoming queue
+        // or the bake queue, even while the regular pass is moving them.
+        let retained = (!due).then(|| self.bake_page_written.lock().unwrap_or_else(|e| e.into_inner()));
+        let ranges = HEAP_CHANGES.lock().unwrap_or_else(|e| e.into_inner())
+            .get_mut(&self.id).map(|heap| std::mem::take(&mut heap.written)).unwrap_or_default();
         if ranges.is_empty() {
             return 0;
         }
-        self.slots_written_under(&ranges, frame, crate::watch::page_writes() & 2 != 0)[2]
+        if let Some(mut kept) = retained {
+            retain_bake_writes(&mut kept, &ranges);
+        }
+        self.slots_written_under(&ranges, frame, due)[2]
+    }
+
+    /// Wakes uploaded placed-texture slots touched by recent physical-page
+    /// writes (DirectStorage completions) immediately (`due = frame`) right
+    /// before a one-shot ped/decoration bake draw.
+    pub(crate) fn texture_slots_bake_written(&self, frame: u64) -> usize {
+        let mut ranges = std::mem::take(&mut *self.bake_page_written.lock().unwrap_or_else(|e| e.into_inner()));
+        if ranges.is_empty() {
+            return 0;
+        }
+        join(&mut ranges);
+        let mut slots: Vec<u32> = {
+            let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+            ranges.iter().flat_map(|&(start, end)| placed.slots_holding(start, end)).collect()
+        };
+        slots.sort_unstable();
+        slots.dedup();
+        slots.retain(|&slot| !self.tabled_lately(slot, frame));
+        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        slots.retain(|slot| textures.slots.get(slot).is_none_or(|w| w.mapped > 0 || w.checked.2 != 0));
+        for &slot in &slots {
+            textures.changed(slot, frame, frame);
+        }
+        slots.len()
     }
 
     /// [`HostHeap::texture_slots_page_written`] for `ranges` (start, end):
@@ -2934,6 +3020,9 @@ impl HostHeap {
             });
             match span {
                 Some((start, end, first, held)) => {
+                    if placed.by_start.is_empty() {
+                        HEAP_CHANGES.lock().unwrap_or_else(|e| e.into_inner()).entry(self.id).or_default();
+                    }
                     SPANNED[0].fetch_min(start, Relaxed);
                     SPANNED[1].fetch_max(end, Relaxed);
                     placed.rule = stale_rule();

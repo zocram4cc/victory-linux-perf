@@ -47,9 +47,17 @@ pub(crate) struct Pending {
     used: AtomicBool,
     /// A pass over the screen ([`GraphicsState::screen_pass`]).
     screen: bool,
+    /// The title dispatches this head blend-shape map only once.
+    head_map: bool,
+    wait_for_head_map: bool,
     /// Microseconds draws have waited for it, over all frames
     /// ([`each_budget`]).
     waited_us: AtomicU64,
+}
+
+fn head_map_wait() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAD_MAP_WAIT").is_none_or(|value| value != "0"))
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -74,8 +82,15 @@ impl Pending {
             tracing::info!(hash, "VICTORY_SKIP_PIPELINES: host pipeline not made");
             let _ = made.set(None);
         }
+        // Losing this producer leaves eyes and teeth without the surrounding
+        // skin. See avatarmanz/VIctory-7900XTX #166 and TaynanGT/Vice-Tay #372.
+        let head_map = graphics.is_none()
+            && matches!(&shaders[..], [shader] if shader.stage == "compute" && shader.hash == "61e54e90adccaf6a");
+        let wait_for_head_map = head_map && head_map_wait();
         Pending {
-            screen: graphics.as_ref().is_some_and(|g| g.screen_pass()),
+            screen: graphics.as_ref().is_some_and(|g| g.screen_pass()) || wait_for_head_map,
+            head_map,
+            wait_for_head_map,
             shaders,
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
@@ -92,13 +107,17 @@ impl Pending {
     }
 
     fn make(&self) {
-        self.made.get_or_init(|| {
+        self.make_with(|| {
             let _building = crate::timeline::span("pipeline: build a host pipeline");
             let began = Instant::now();
             let made = refused_on_panic(&self.shaders, || HostPipeline::new(&self.shaders, self.graphics.as_deref()));
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
             made
         });
+    }
+
+    fn make_with(&self, build: impl FnOnce() -> Option<HostPipeline>) {
+        self.made.get_or_init(build);
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -148,6 +167,55 @@ pub(crate) fn hashes(p: &Pending) -> String {
 
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
+
+fn wait_for_made<T>(made: &OnceLock<T>, started: Instant, allowance: Duration) -> Option<&T> {
+    if let Some(result) = made.get() {
+        return Some(result);
+    }
+    if started.elapsed() >= allowance {
+        return made.get();
+    }
+    let (lock, done) = &DONE;
+    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while made.get().is_none() {
+        let left = allowance.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            break;
+        }
+        held = done.wait_timeout(held, left).unwrap_or_else(|e| e.into_inner()).0;
+    }
+    made.get()
+}
+
+/// Waiting for the prequeued head map is normally a matter of milliseconds.
+/// After a timeout, later dispatches only poll. A successful wait leaves
+/// the budget available if the title creates another pipeline for the shader.
+struct HeadMapWait {
+    allowance: Duration,
+    timed_out: AtomicBool,
+}
+
+impl HeadMapWait {
+    const fn new(allowance: Duration) -> Self {
+        Self { allowance, timed_out: AtomicBool::new(false) }
+    }
+
+    fn wait<'a>(&self, pipeline: &'a Pending) -> Option<&'a Option<HostPipeline>> {
+        if self.timed_out.load(Ordering::Acquire) {
+            return pipeline.made.get();
+        }
+        let made = wait_for_made(&pipeline.made, Instant::now(), self.allowance);
+        if made.is_none() && !self.timed_out.swap(true, Ordering::AcqRel) {
+            tracing::warn!(
+                key = pipeline.key,
+                frame = crate::frame::current(),
+                budget_ms = self.allowance.as_millis() as u64,
+                "head blend-shape map pipeline still pending at its dispatch deadline"
+            );
+        }
+        made
+    }
+}
 
 /// Waiting allowed per title frame, over all threads.
 fn wait_budget() -> Duration {
@@ -214,19 +282,43 @@ pub(crate) fn waiting() -> u64 {
     WAITING.load(Ordering::Relaxed)
 }
 
-/// The host pipeline if it is made (or is made within the frame's budget);
-/// queues it on first use.
-pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
+/// Queue the host pipeline on first use and wait within the frame budget.
+/// The one-shot head map has its own budget below the title's watchdog.
+pub(crate) fn ready(p: &Arc<Pending>, dispatch: bool) -> Option<&HostPipeline> {
+    static HEAD_MAP_WAIT: HeadMapWait = HeadMapWait::new(Duration::from_secs(2));
     // A still-pending pipeline was requested by the title too. Prewarm it
     // on the next launch, even if this run never got to use it.
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
         super::library::note_used(&p.key);
     }
-    if p.made.get().is_none() {
+    let mut made = p.made.get();
+    let already_ready = made.is_some();
+    static HEAD_MAP_REPORTED: AtomicBool = AtomicBool::new(false);
+    let first_head = dispatch && p.head_map && !HEAD_MAP_REPORTED.load(Ordering::Relaxed)
+        && !HEAD_MAP_REPORTED.swap(true, Ordering::Relaxed);
+    let began = first_head.then(|| (crate::frame::current(), Instant::now()));
+    if !already_ready {
         start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        made = if dispatch && p.wait_for_head_map {
+            HEAD_MAP_WAIT.wait(p)
+        } else {
+            wait(p, crate::frame::current());
+            p.made.get()
+        };
     }
-    p.made.get()?.as_ref()
+    let host_pipeline = made.and_then(Option::as_ref);
+    if let Some((frame, began)) = began {
+        tracing::info!(
+            frame,
+            key = p.key,
+            already_ready,
+            host_pipeline = host_pipeline.is_some(),
+            wait_enabled = p.wait_for_head_map,
+            wait_ms = began.elapsed().as_secs_f64() * 1e3,
+            "head blend-shape map pipeline at dispatch"
+        );
+    }
+    host_pipeline
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
@@ -237,9 +329,10 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
 }
 
 /// At the title's creation of a pipeline: starts it at once if an earlier
-/// run drew with it (during loading, so the world's first frames find it).
+/// run drew with it (during loading, so the world's first frames find it),
+/// or if it is the one-shot head blend-shape map.
 pub(crate) fn early(p: &Arc<Pending>) {
-    if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
+    if !p.shaders.is_empty() && (p.wait_for_head_map || super::library::wanted_early(&p.key)) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, EARLY);
     }
@@ -294,16 +387,7 @@ fn wait(p: &Pending, frame: u64) {
     }
     let waiting = crate::timeline::span("pipeline: first use waits for a host pipeline");
     let started = Instant::now();
-    let (lock, done) = &DONE;
-    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
-    while p.made.get().is_none() {
-        let rest = left.saturating_sub(started.elapsed());
-        if rest.is_zero() {
-            break;
-        }
-        held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
-    }
-    drop(held);
+    let _ = wait_for_made(&p.made, started, left);
     let waited = started.elapsed().min(left);
     p.waited_us.fetch_add(waited.as_micros() as u64, Ordering::Relaxed);
     waiting.end();
@@ -346,15 +430,8 @@ const MAKING: u8 = 3;
 /// the first minute and a half of the world ran at 0.5 to 1.6 s a frame,
 /// dropping up to 2,900 draws a frame (run shaders-1).
 /// `VICTORY_PIPELINE_SLOW=0`: in the order the title creates them, as before.
-fn slow_limit() -> usize {
-    static LIMIT: OnceLock<usize> = OnceLock::new();
-    *LIMIT.get_or_init(|| {
-        if std::env::var_os("VICTORY_PIPELINE_SLOW").is_some_and(|v| v == "0") {
-            usize::MAX
-        } else {
-            (worker_count(None, std::thread::available_parallelism().map_or(2, |n| n.get())) / 4).max(1)
-        }
-    })
+fn slow_limit(workers: usize) -> usize {
+    (workers / 4).max(1)
 }
 
 struct Queue {
@@ -383,7 +460,11 @@ impl Queue {
     /// Queues an unrequested pipeline or promotes one queued at creation.
     /// Returns whether it is new to the queue, or `None` if nothing changed.
     fn push(&mut self, p: &Arc<Pending>, priority: u8) -> Option<bool> {
-        self.push_as(p, priority, slow_limit() != usize::MAX && super::library::slow(&p.key))
+        static LIMIT_SLOW: OnceLock<bool> = OnceLock::new();
+        let slow = priority == EARLY
+            && *LIMIT_SLOW.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_SLOW").is_none_or(|v| v != "0"))
+            && super::library::slow(&p.key);
+        self.push_as(p, priority, slow)
     }
 
     fn push_as(&mut self, p: &Arc<Pending>, priority: u8, slow: bool) -> Option<bool> {
@@ -392,7 +473,9 @@ impl Queue {
             return None;
         }
         p.queue_state.store(priority, Ordering::Relaxed);
-        if priority == REQUESTED && p.screen && screens_first() {
+        if priority == REQUESTED && p.wait_for_head_map {
+            self.screen.push_front(p.clone());
+        } else if priority == REQUESTED && p.screen && screens_first() {
             self.screen.push_back(p.clone());
         } else if priority == REQUESTED {
             self.requested.push_back(p.clone());
@@ -437,7 +520,11 @@ fn start(p: &Arc<Pending>, priority: u8) {
     }
     if !workers() {
         if p.queue_state.swap(MAKING, Ordering::Relaxed) == NOT_QUEUED {
-            p.make();
+            if p.wait_for_head_map {
+                p.make_with(|| None);
+            } else {
+                p.make();
+            }
         }
         return;
     }
@@ -464,10 +551,10 @@ const SCREEN_WORKERS: usize = 2;
 /// is used is what a compile reaches.
 pub(crate) const PIPELINE_STACK: usize = 64 << 20;
 
-fn next(screens_only: bool) -> Arc<Pending> {
+fn next(screens_only: bool, slow_limit: usize) -> Arc<Pending> {
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     loop {
-        if let Some(p) = queue.pop(screens_only, slow_limit()) {
+        if let Some(p) = queue.pop(screens_only, slow_limit) {
             return p;
         }
         queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
@@ -496,6 +583,7 @@ fn workers() -> bool {
             std::thread::available_parallelism().map_or(2, |n| n.get()),
         );
         tracing::info!(workers, "pipeline workers");
+        let slow_limit = slow_limit(workers);
         let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
         for i in 0..workers + screens {
             let screens_only = i >= workers;
@@ -517,7 +605,7 @@ fn workers() -> bool {
                         let _ = SetThreadPriority(GetCurrentThread(), priority);
                     }
                     loop {
-                        let p = next(screens_only);
+                        let p = next(screens_only, slow_limit);
                         p.make();
                         if p.was_slow.load(Ordering::Relaxed) {
                             let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
@@ -577,7 +665,7 @@ mod tests {
     #[test]
     fn first_use_is_made_by_a_worker() {
         let p = Arc::new(Pending::new(Vec::new(), None));
-        assert!(ready(&p).is_none());
+        assert!(ready(&p, false).is_none());
         assert_ne!(p.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
         let started = Instant::now();
         while p.made.get().is_none() && started.elapsed() < Duration::from_secs(10) {
@@ -639,7 +727,7 @@ mod tests {
         let p = Arc::new(p);
 
         assert!(!super::super::library::wanted_early(&p.key));
-        assert!(ready(&p).is_none());
+        assert!(ready(&p, false).is_none());
         assert!(p.made.get().is_none());
         assert!(super::super::library::wanted_early(&p.key));
     }
