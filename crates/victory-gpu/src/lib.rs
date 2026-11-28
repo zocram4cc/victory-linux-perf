@@ -164,7 +164,7 @@ pub use watch::{
 pub use watch::title_view_space;
 #[cfg(windows)]
 pub use inplace::{
-    opens_heap_by_handle, set_zero_copy_scanner, title_memory_home, title_memory_quiesce, title_memory_home_handle, title_memory_zero_copy, zero_copy_tracking,
+    opens_heap_by_handle, set_view_scanner, set_zero_copy_scanner, title_memory_home, title_memory_quiesce, title_memory_home_handle, title_memory_zero_copy, zero_copy_tracking,
 };
 #[cfg(windows)]
 #[doc(hidden)]

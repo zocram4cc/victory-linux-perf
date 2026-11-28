@@ -2548,6 +2548,9 @@ fn show(base: usize, len: usize, slice: &Slice, own: bool) -> bool {
             return false;
         };
         let shown = counted(Call::Map, len, || wine_map::show(base, len, fd, (slice.index * PAGE) as u64));
+        if shown {
+            view_shown(base, len, slice);
+        }
         if !shown {
             tracing::warn!(address = format_args!("{base:#x}"), len, "mapping physical pages with the host's mmap failed");
         }
@@ -2627,12 +2630,143 @@ fn join_unasked(base: usize, len: usize) -> bool {
 fn hide(base: usize, len: usize) -> bool {
     if wine_map::holds(base) {
         leave_home(base, len);
+        view_hidden(base, len);
         return wine_map::hide(base, len);
     }
     // SAFETY: a view we mapped; it becomes a placeholder again.
     victory_core::mapping::changing(|| unsafe {
         UnmapViewOfFile2(GetCurrentProcess(), MEMORY_MAPPED_VIEW_ADDRESS { Value: base as *mut c_void }, MEM_PRESERVE_PLACEHOLDER) != 0
     })
+}
+
+/// `VICTORY_TRACK_VIEWS=1` (off unless set; under Wine with
+/// `VICTORY_WINE_MAP=1 VICTORY_HOME_BO=1`): the pages the title writes in the
+/// views of its physical pages are found by a userfaultfd of ours
+/// (`wine_map::arm_view`, armed as each view is shown) and one `PAGEMAP_SCAN`
+/// an asking ([`view_written`]), not by guards (read-only blocks, a fault and
+/// two changes of protection a write). A page shown at several addresses is
+/// written at all of them once any is.
+fn track_views() -> bool {
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("VICTORY_TRACK_VIEWS").is_some_and(|v| v == "1" || v == "2"));
+    *ON
+}
+
+/// `VICTORY_TRACK_VIEWS=2`: no look at a page's other addresses (diagnostics
+/// only: a write through another view of a page is missed).
+fn views_alone() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_TRACK_VIEWS").is_some_and(|v| v == "2"));
+    *ON
+}
+
+/// What [`track_views`] knows: for each 64 KiB block armed, the page it
+/// shows (section, index); the blocks that show each page; for each page the
+/// asking that last found it written, and for each block the asking it was
+/// last told up to (none: written, as when it was shown anew).
+#[derive(Default)]
+struct ViewTrack {
+    page_of: HashMap<usize, (usize, usize)>,
+    blocks_of: HashMap<(usize, usize), Vec<usize>>,
+    written_at: HashMap<(usize, usize), u64>,
+    told: HashMap<usize, u64>,
+    asking: u64,
+}
+
+static VIEW_TRACK: LazyLock<Mutex<ViewTrack>> = LazyLock::new(Default::default);
+
+impl ViewTrack {
+    fn forget(&mut self, block: usize) {
+        if let Some(page) = self.page_of.remove(&block)
+            && let Some(blocks) = self.blocks_of.get_mut(&page)
+        {
+            blocks.retain(|&b| b != block);
+            if blocks.is_empty() {
+                self.blocks_of.remove(&page);
+            }
+        }
+        self.told.remove(&block);
+    }
+}
+
+/// A view of `slice` was shown at `[base, base + len)` ([`track_views`]).
+fn view_shown(base: usize, len: usize, slice: &Slice) {
+    if !track_views() {
+        return;
+    }
+    let armed = wine_map::arm_view(base, len);
+    let section = Arc::as_ptr(&slice.section) as usize;
+    let mut t = VIEW_TRACK.lock().unwrap_or_else(|e| e.into_inner());
+    for k in 0..len / PAGE {
+        let block = base + k * PAGE;
+        t.forget(block);
+        if armed {
+            let page = (section, slice.index + k);
+            t.page_of.insert(block, page);
+            t.blocks_of.entry(page).or_default().push(block);
+        }
+    }
+    if armed {
+        victory_gpu::set_view_scanner(view_written);
+    }
+}
+
+/// The view at `[base, base + len)` goes ([`track_views`]).
+fn view_hidden(base: usize, len: usize) {
+    if !track_views() {
+        return;
+    }
+    let mut t = VIEW_TRACK.lock().unwrap_or_else(|e| e.into_inner());
+    for k in 0..len.div_ceil(PAGE) {
+        t.forget(base + k * PAGE);
+    }
+}
+
+/// The 4 KiB pages of views in `[start, end)` written since this range was
+/// last asked about ([`track_views`]), into `out`: of a block whose page was
+/// written at any of its addresses, or shown anew, all of it. `false` if a
+/// block of the range is not an armed view (the guards are asked, as before).
+fn view_written(start: usize, end: usize, out: &mut Vec<usize>) -> bool {
+    let (first, last) = (start / PAGE * PAGE, end.div_ceil(PAGE) * PAGE);
+    let mut t = VIEW_TRACK.lock().unwrap_or_else(|e| e.into_inner());
+    if !(first..last).step_by(PAGE).all(|block| t.page_of.contains_key(&block)) {
+        return false;
+    }
+    let mut found = Vec::new();
+    if !wine_map::scan(first, last, &mut found) {
+        return false;
+    }
+    t.asking += 1;
+    let now = t.asking;
+    for at in &found {
+        let page = t.page_of[&(at / PAGE * PAGE)];
+        t.written_at.insert(page, now);
+    }
+    // The same pages at other addresses: written there, written here.
+    let mut others: Vec<((usize, usize), usize)> = Vec::new();
+    for block in (first..last).step_by(PAGE) {
+        let page = t.page_of[&block];
+        // (Not a page shown in more than 64 places, what the title shows where
+        // it has nothing: each address for itself, as the guards have it.)
+        if let Some(blocks) = t.blocks_of.get(&page).filter(|blocks| blocks.len() <= 64 && !views_alone()) {
+            others.extend(blocks.iter().filter(|&&b| b < first || b >= last).map(|&b| (page, b)));
+        }
+    }
+    let mut there = Vec::new();
+    for (page, block) in others {
+        there.clear();
+        if wine_map::scan(block, block + PAGE, &mut there) && !there.is_empty() {
+            t.written_at.insert(page, now);
+        }
+    }
+    for block in (first..last).step_by(PAGE) {
+        let page = t.page_of[&block];
+        let written = t.written_at.get(&page).copied().unwrap_or(0);
+        if t.told.get(&block).is_none_or(|&told| written > told) {
+            out.extend((block..block + PAGE).step_by(4096));
+        }
+        t.told.insert(block, written);
+    }
+    true
 }
 
 /// Commits the section pages a view shows (once per page, whichever view).
@@ -3221,6 +3355,47 @@ mod tests {
         assert!(wine_map::written(at, at + len, &mut found));
         assert_eq!(found, [], "taken by the asking before");
         assert_ne!(title_virtual_free(at as *mut c_void, 0, MEM_RELEASE), 0);
+    }
+
+    /// Views tracked by our userfaultfd (`VICTORY_WINE_MAP=1 VICTORY_HOME_BO=1
+    /// VICTORY_TRACK_VIEWS=1` under Wine; nothing is tried otherwise): a view
+    /// shown anew is written whole once; a write through another view of the
+    /// same page is a write at both, told once at each; a page nobody wrote
+    /// is not.
+    #[test]
+    fn views_tell_writes_through_any_of_their_addresses() {
+        if !(track_views() && wine_map::on()) {
+            eprintln!("not tried: without VICTORY_TRACK_VIEWS=1 under Wine with pages shown by mmap");
+            return;
+        }
+        let pages = allocate(2);
+        let reserve = |n: usize| {
+            let at = XMemVirtualAlloc(std::ptr::null_mut(), n * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+            assert!(!at.is_null());
+            at
+        };
+        let (a, b) = (reserve(2), reserve(1));
+        assert_eq!(XMemMapPhysicalPages(a, 2, pages.as_ptr()), a);
+        assert_eq!(XMemMapPhysicalPages(b, 1, pages[1..].as_ptr()), b);
+        let (a, b) = (a as usize, b as usize);
+        let asked = |at: usize, len: usize| {
+            let mut out = Vec::new();
+            assert!(view_written(at, at + len, &mut out), "tracked");
+            out.into_iter().map(|p| (p - at) / PAGE).collect::<std::collections::BTreeSet<_>>().into_iter().collect::<Vec<_>>()
+        };
+        assert_eq!(asked(a, 2 * PAGE), [0, 1], "shown anew: written");
+        assert_eq!(asked(b, PAGE), [0], "shown anew: written");
+        assert_eq!(asked(a, 2 * PAGE), [] as [usize; 0], "nothing since");
+        // SAFETY: mapped read-write: the second page of `a`, through `b`.
+        unsafe { (b as *mut u32).add(3).write(9) };
+        assert_eq!(unsafe { ((a + PAGE) as *const u32).add(3).read() }, 9);
+        assert_eq!(asked(a, 2 * PAGE), [1], "written through the other view");
+        assert_eq!(asked(b, PAGE), [0], "and at the view written");
+        assert_eq!(asked(a, 2 * PAGE), [] as [usize; 0]);
+        assert_eq!(asked(b, PAGE), [] as [usize; 0]);
+        assert_eq!(XMemMapPhysicalPages(a as *mut c_void, 2, std::ptr::null()), a as *mut c_void);
+        assert_eq!(XMemMapPhysicalPages(b as *mut c_void, 1, std::ptr::null()), b as *mut c_void);
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
     }
 
     /// Under Wine with renderer port 1 (the tests run with

@@ -807,6 +807,17 @@ const PAGE_IS_WRITTEN: u64 = 2;
 /// last asked with one `PAGEMAP_SCAN`, without Wine's memory lock (a 1.3 GB
 /// pool: 0.2-0.4 ms natively, against ~150 us per GetWriteWatch asking).
 fn track(bo: &Bo, base: usize, len: usize) -> bool {
+    let armed = arm(bo, base, len);
+    if armed {
+        TRACKED.lock().unwrap_or_else(|e| e.into_inner()).push((base, len));
+        victory_gpu::set_zero_copy_scanner(written);
+    }
+    armed
+}
+
+/// Write-protects `[base, base + len)`, a mapping of ours, asynchronously
+/// through our userfaultfd ([`TRACKER`], made at the first call).
+fn arm(bo: &Bo, base: usize, len: usize) -> bool {
     let Some(&(uffd, _)) = TRACKER
         .get_or_init(|| {
             let syscall = bo.syscall?;
@@ -827,28 +838,35 @@ fn track(bo: &Bo, base: usize, len: usize) -> bool {
     };
     let mut register = [base as u64, len as u64, UFFDIO_REGISTER_MODE_WP, 0];
     let mut protect = [base as u64, len as u64, UFFDIO_WRITEPROTECT_MODE_WP];
-    // SAFETY: as above; the range is the memfd's mapping.
-    let armed = unsafe {
+    // SAFETY: as above; the range is a mapping of ours.
+    unsafe {
         (bo.ioctl_any)(uffd, UFFDIO_REGISTER, register.as_mut_ptr().cast()) == 0
             && (bo.ioctl_any)(uffd, UFFDIO_WRITEPROTECT, protect.as_mut_ptr().cast()) == 0
-    };
-    if armed {
-        TRACKED.lock().unwrap_or_else(|e| e.into_inner()).push((base, len));
-        victory_gpu::set_zero_copy_scanner(written);
     }
-    armed
+}
+
+/// [`arm`] for a view of physical pages `xmem` just showed (`VICTORY_TRACK_VIEWS=1`).
+pub(crate) fn arm_view(base: usize, len: usize) -> bool {
+    DIRECT.as_ref().and_then(|d| d.bo.as_ref()).is_some_and(|bo| arm(bo, base, len))
 }
 
 /// The 4 KiB pages of `[start, end)` written since the last asking (which
 /// this is), into `out`; `false` if the range is not all of one tracked
 /// reservation ([`track`]).
 pub(crate) fn written(start: usize, end: usize, out: &mut Vec<usize>) -> bool {
-    let Some(Some((_, pagemap))) = TRACKER.get() else {
-        return false;
-    };
     if !TRACKED.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|t| t.0 <= start && end <= t.0 + t.1) {
         return false;
     }
+    scan(start, end, out)
+}
+
+/// One `PAGEMAP_SCAN` of `[start, end)` (every page of it [`arm`]ed): the 4 KiB
+/// pages written since the last, into `out`, and write-protected again.
+/// `false` if the kernel refuses (a page not armed).
+pub(crate) fn scan(start: usize, end: usize, out: &mut Vec<usize>) -> bool {
+    let Some(Some((_, pagemap))) = TRACKER.get() else {
+        return false;
+    };
     let Some(bo) = DIRECT.as_ref().and_then(|d| d.bo.as_ref()) else {
         return false;
     };

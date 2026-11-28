@@ -1919,7 +1919,24 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         port6_count(P6_NOT_ASKED, 1);
     }
     let refused = protected || viewed || known_refused;
-    let pages = match if refused { None } else { kernel_written(first, last) } {
+    // Views the runtime's userfaultfd tracks (`VICTORY_TRACK_VIEWS=1`): its
+    // answer, no guard.
+    let scanned = if guarded { crate::inplace::views_written(first * PAGE, last * PAGE) } else { None }.map(|found| {
+        let mut pages: Vec<(usize, u16)> = Vec::new();
+        for at in found {
+            let (page, part) = (at / PAGE, 1u16 << (at % PAGE / KERNEL_PAGE));
+            match pages.last_mut() {
+                Some((last, parts)) if *last == page => *parts |= part,
+                _ => pages.push((page, part)),
+            }
+        }
+        pages
+    });
+    if scanned.is_some() && !VIEWS.all(first, last) {
+        // Known for a view: askings ahead leave it out (the kernel refuses it).
+        (first..last).for_each(|block| VIEWS.set(block));
+    }
+    let pages = match if scanned.is_some() { scanned } else if refused { None } else { kernel_written(first, last) } {
         Some(pages) => pages,
         None => {
             guards_asked = true;

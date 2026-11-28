@@ -942,6 +942,27 @@ pub fn set_zero_copy_scanner(scanner: WrittenScanner) {
     let _ = SCANNER.set(scanner);
 }
 
+static VIEW_SCANNER: std::sync::OnceLock<WrittenScanner> = std::sync::OnceLock::new();
+/// Askings about views answered by [`VIEW_SCANNER`], and those it could not answer.
+static VIEW_SCANS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// The runtime's scanner of the views of its physical pages
+/// (`VICTORY_TRACK_VIEWS=1`, `victory-hle`'s `xmem`).
+pub fn set_view_scanner(scanner: WrittenScanner) {
+    let _ = VIEW_SCANNER.set(scanner);
+}
+
+/// The 4 KiB pages of views in `[at, end)` written since the range was last
+/// asked about, from the runtime's scanner; `None` if it cannot tell (no
+/// scanner, or not all of it views it tracks): the guards are asked.
+pub(crate) fn views_written(at: usize, end: usize) -> Option<Vec<usize>> {
+    let scan = VIEW_SCANNER.get()?;
+    let mut out = Vec::new();
+    let told = scan(at, end, &mut out);
+    VIEW_SCANS[usize::from(!told)].fetch_add(1, Ordering::Relaxed);
+    told.then_some(out)
+}
+
 /// With [`zero_copy_tracking`]: `None` if `[at, end)` is no zero-copy memory
 /// (the host's write watch is asked as before); else the addresses of the
 /// 4 KiB pages written since the last asking, or `None` inside if the scanner
@@ -1066,6 +1087,21 @@ pub(crate) fn place_zero_copy(start: u64, len: u64, window: bool) -> Option<Plac
             None
         }
     }
+}
+
+/// The views' tracking line (`VICTORY_TRACK_VIEWS=1`), every ten seconds.
+fn views_say() {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = crate::host::now_ms();
+    let last = LAST.load(Ordering::Relaxed);
+    if now < last + 10_000 || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return;
+    }
+    tracing::info!(
+        answered = VIEW_SCANS[0].load(Ordering::Relaxed),
+        left_to_the_guards = VIEW_SCANS[1].load(Ordering::Relaxed),
+        "views tracked by the runtime's userfaultfd (VICTORY_TRACK_VIEWS), since the start: askings"
+    );
 }
 
 /// The zero-copy line, every ten seconds.
@@ -1747,6 +1783,9 @@ pub(crate) fn tick() {
     }
     if ZERO_COPY_ANY.load(Ordering::Relaxed) {
         zero_copy_say();
+    }
+    if VIEW_SCANNER.get().is_some() {
+        views_say();
     }
     if probe_level() == 0 {
         return;
