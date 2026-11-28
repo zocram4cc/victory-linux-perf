@@ -113,7 +113,31 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     if skip_activate && named(shaders, b"CS_ScreenProbes_ActivateRays") {
         return Some("ray activation shader without BVH, left out");
     }
+    if keep_screen_hits() && named(shaders, b"CS_RaytraceVBuffer") {
+        return Some("ray trace of the reflections without BVH, left out (VICTORY_KEEP_SCREEN_HITS)");
+    }
     None
+}
+
+/// `VICTORY_KEEP_SCREEN_HITS=1`, with the ray-tracing structure builder off:
+/// the title's ray trace of its reflections (`CS_RaytraceVBuffer_*`) is left
+/// out. With nothing built it finds nothing, and in a corridor frame it
+/// turned 15% of the floor's reflection rays that the screen-space march had
+/// resolved into misses (38.8% of them missed after it, 23.4% before); misses
+/// take the sky's light (magenta at that hour) and cannot be reprojected, so
+/// the temporal resolve keeps them only for the frame (on the floor half the
+/// pixels were this frame's alone). Off unless set; a run decides.
+fn keep_screen_hits() -> bool {
+    static SET: OnceLock<bool> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
+        keep_screen_hits_of(builder, std::env::var("VICTORY_KEEP_SCREEN_HITS").ok().as_deref())
+    })
+}
+
+/// [`keep_screen_hits`] of the builder's state and the switch. Pure, for testing.
+fn keep_screen_hits_of(builder: bool, set: Option<&str>) -> bool {
+    !builder && set.is_some_and(|v| v.trim() == "1")
 }
 
 /// Confirmed first-scene producers. Prepare these at creation even on a cold
@@ -1635,6 +1659,17 @@ fn account_line() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `VICTORY_KEEP_SCREEN_HITS=1` leaves the reflections' ray trace out only
+    /// while nothing is built to trace against.
+    #[test]
+    fn screen_hits_are_kept_only_when_asked_and_without_the_builder() {
+        assert!(!keep_screen_hits_of(false, None));
+        assert!(!keep_screen_hits_of(false, Some("0")));
+        assert!(keep_screen_hits_of(false, Some("1")));
+        assert!(keep_screen_hits_of(false, Some(" 1 ")));
+        assert!(!keep_screen_hits_of(true, Some("1")));
+    }
 
     #[test]
     fn worker_count_follows_the_processors_and_the_switch() {
