@@ -3632,56 +3632,48 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     // that fills at world entry. They are not part of what a texture is.
     // `VICTORY_PLACED_FILLER=1`: kept in the key, as before.
     static KEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let raw = *desc;
-    if let Some(r) = placed_seen(address, &raw) {
+    let mut key = *desc;
+    if !*KEPT.get_or_init(|| std::env::var_os("VICTORY_PLACED_FILLER").is_some_and(|v| v == "1")) {
+        key = without_filler(desc);
+    }
+    // Diagnostics counts distinct filler variants under the global lock.
+    let cache_key = if cfg!(feature = "diagnostics") { desc } else { &key };
+    if let Some(r) = placed_seen(address, cache_key) {
         return Some(r);
     }
-    let kept = *KEPT.get_or_init(|| std::env::var_os("VICTORY_PLACED_FILLER").is_some_and(|v| v == "1"));
-    let found = texture_at_locked(address, raw, kept)?;
-    keep_placed_seen(address, &raw, found);
+    let found = texture_at_locked(address, &key, desc)?;
+    keep_placed_seen(address, cache_key, found);
     Some(found)
 }
 
 /// Placed textures each thread found lately, by address and description
-/// as asked: draws read the same placed views over and over, and each
-/// lookup in [`PLACED_TEXTURES`] took its lock. A placed texture stays in
-/// that table for the run (nothing takes one out), so what a thread found
-/// holds.
+/// used for lookup (the filler left out): draws read the same placed views
+/// over and over, and each lookup in [`PLACED_TEXTURES`] took its lock. A
+/// placed texture stays in that table for the run (nothing takes one out),
+/// so what a thread found holds.
 #[cfg(windows)]
-const PLACED_SEEN: usize = 256;
+const PLACED_SEEN: usize = 1 << 14;
 
 #[cfg(windows)]
-type PlacedSeen = (u64, [u32; 14], usize);
+type PlacedSeen = std::collections::HashMap<(u64, [u32; 14]), usize, std::hash::BuildHasherDefault<crate::host::AddressHash>>;
 
 #[cfg(windows)]
 thread_local! {
-    static SEEN: std::cell::RefCell<Vec<PlacedSeen>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
-#[cfg(windows)]
-fn placed_slot(address: u64, desc: &[u32; 14]) -> usize {
-    let mut h = address.wrapping_mul(0x9e37_79b9_7f4a_7c15);
-    for &w in desc {
-        h = (h ^ u64::from(w)).wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    (h >> 40) as usize % PLACED_SEEN
+    static SEEN: std::cell::RefCell<PlacedSeen> = std::cell::RefCell::new(PlacedSeen::default());
 }
 
 #[cfg(windows)]
 fn placed_seen(address: u64, desc: &[u32; 14]) -> Option<This> {
-    SEEN.with_borrow(|seen| {
-        let &(a, d, r) = seen.get(placed_slot(address, desc))?;
-        (a == address && d == *desc && r != 0).then_some(r as This)
-    })
+    SEEN.with_borrow(|seen| seen.get(&(address, *desc)).map(|&r| r as This))
 }
 
 #[cfg(windows)]
 fn keep_placed_seen(address: u64, desc: &[u32; 14], found: This) {
     SEEN.with_borrow_mut(|seen| {
-        if seen.is_empty() {
-            seen.resize(PLACED_SEEN, (0, [0; 14], 0));
+        if seen.len() >= PLACED_SEEN {
+            seen.clear();
         }
-        seen[placed_slot(address, desc)] = (address, *desc, found as usize);
+        seen.insert((address, *desc), found as usize);
     });
 }
 
@@ -3691,35 +3683,31 @@ pub(crate) fn hold_placed() -> std::sync::MutexGuard<'static, std::collections::
     PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// [`texture_at`] under the table's lock; `kept`: the filler words stay
-/// in the key (`VICTORY_PLACED_FILLER=1`).
+/// [`texture_at`] on a local miss, under the table's lock. `desc` is the
+/// key (the filler words left out unless `VICTORY_PLACED_FILLER=1`), `_raw`
+/// the description as asked (a diagnostics build counts its filler variants).
 #[cfg(windows)]
-fn texture_at_locked(address: u64, raw: [u32; 14], kept: bool) -> Option<This> {
-    let mut key = raw;
-    if !kept {
-        key = without_filler(&raw);
-    }
+fn texture_at_locked(address: u64, desc: &[u32; 14], _raw: &[u32; 14]) -> Option<This> {
     // How many resources the filler alone would have added (a count for
     // the log: `placed_filler_twins`).
     // Only a diagnostics build reads the count, so only it keeps the variants,
     // and not past a cap: every filler variant the title ever passed was a
     // set entry (about 100 bytes each, 1M of them in a synthetic load test).
     #[cfg(feature = "diagnostics")]
-    if raw != key {
+    if _raw != desc {
         let mut seen = PLACED_RAW.lock().unwrap_or_else(|e| e.into_inner());
         if seen.len() >= PLACED_RAW_CAP {
             seen.clear();
         }
-        if seen.insert((address, raw)) {
+        if seen.insert((address, *_raw)) {
             let others = seen.range((address, [0; 14])..=(address, [u32::MAX; 14])).filter(|(_, r)| {
-                without_filler(r) == key
+                without_filler(r) == *desc
             });
             if others.count() > 1 {
                 PLACED_TWINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }
-    let desc = &key;
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(&r) = map.get(&(address, *desc)) {
         return Some(r as This);
@@ -3964,6 +3952,27 @@ pub(crate) fn test_buffer(width: u64) -> This {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[cfg(windows)]
+    #[test]
+    fn placed_cache_retains_distinct_keys_until_its_bound() {
+        let desc = [3; 14];
+        let other = [4; 14];
+        // These addresses collided in the old direct-mapped cache.
+        let a = 0x1000;
+        let b = a + (1 << 48);
+        keep_placed_seen(a, &desc, 1 as This);
+        keep_placed_seen(b, &desc, 2 as This);
+        keep_placed_seen(a, &other, 3 as This);
+        assert_eq!(placed_seen(a, &desc), Some(1 as This));
+        assert_eq!(placed_seen(b, &desc), Some(2 as This));
+        assert_eq!(placed_seen(a, &other), Some(3 as This));
+        assert_eq!(placed_seen(b, &other), None);
+        for i in 0..(1 << 14) {
+            keep_placed_seen(0x10000 + i, &desc, 4 as This);
+        }
+        assert_eq!(placed_seen(a, &desc), None);
+    }
 
     #[test]
     fn the_room_for_targets_follows_what_they_take_once_known() {
