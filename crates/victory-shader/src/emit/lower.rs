@@ -13101,6 +13101,15 @@ impl<'a> Lower<'a> {
                 .collect();
             let front = gt(self, theirs[3], near);
             let valid = and(self, valid, front);
+            // A vertex at x = y = 0 exactly is one put aside (seen at
+            // (0, 0, -1, 1) beside sound ones), not a neighbour.
+            let zero = f(self, 0.0);
+            let x0 = self.s.m.cmp(c, pred::OEQ, theirs[0], zero);
+            let y0 = self.s.m.cmp(c, pred::OEQ, theirs[1], zero);
+            let parked = and(self, x0, y0);
+            let t = self.s.m.bool(true);
+            let real = self.s.m.bin(c, Bin::Xor, parked, t);
+            let valid = and(self, valid, real);
             let mut d = None;
             for k in [0usize, 1, 3] {
                 let v = [x, y, z, w][k];
@@ -13124,6 +13133,12 @@ impl<'a> Lower<'a> {
         let in_front = gt(self, w, near);
         let counted = and(self, any, in_front);
         let zero = f(self, 0.0);
+        let x0 = self.s.m.cmp(c, pred::OEQ, x, zero);
+        let y0 = self.s.m.cmp(c, pred::OEQ, y, zero);
+        let parked = and(self, x0, y0);
+        let t = self.s.m.bool(true);
+        let real = self.s.m.bin(c, Bin::Xor, parked, t);
+        let counted = and(self, counted, real);
         let jump = self.s.m.select(c, counted, jump, zero);
         let noted = f(self, SHEET_JUMP_NOTED);
         let flagged = gt(self, jump, noted);

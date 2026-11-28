@@ -31,6 +31,8 @@ pub(super) struct Watch {
     /// The next region, and what each was given to.
     next: AtomicU32,
     labels: Mutex<Vec<String>>,
+    /// By pipeline: whether its mesh program is pre-skinned.
+    watched: Mutex<HashMap<u32, bool>>,
 }
 
 /// The last region is bound when a root signature is set, for draws that
@@ -89,6 +91,7 @@ impl Watch {
             current: Cell::new(None),
             next: AtomicU32::new(0),
             labels: Mutex::new(vec![String::new(); SHEET_REGIONS as usize]),
+            watched: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -128,6 +131,26 @@ impl Watch {
                 }
             }
         }
+    }
+
+    /// Whether pipeline `pso` draws with a pre-skinned mesh program: by the
+    /// hash in its name (`mesh <hash>`) and that container in `containers`
+    /// beside the capture (`--retranslate` collects them).
+    pub(super) fn watched(&self, pso: u32, frame: &crate::replay::wire::Frame, folder: &std::path::Path) -> bool {
+        let Ok(mut known) = self.watched.lock() else {
+            return false;
+        };
+        *known.entry(pso).or_insert_with(|| {
+            let Some(p) = frame.pipelines.iter().find(|p| p.id == pso) else {
+                return false;
+            };
+            let Some(at) = p.name.find("mesh ") else {
+                return false;
+            };
+            let hash: String = p.name[at + 5..].chars().take_while(char::is_ascii_hexdigit).collect();
+            let containers = folder.with_file_name("containers");
+            std::fs::read(containers.join(format!("{hash}.cdxil"))).is_ok_and(|c| crate::sheets::pre_skinned(&c))
+        })
     }
 
     /// Before a draw: a region of its own, named by `label`.
