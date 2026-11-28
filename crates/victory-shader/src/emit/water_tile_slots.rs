@@ -84,7 +84,7 @@ pub(super) fn rewrite(native: &mut NativeProgram) -> bool {
             new.extend_from_slice(&before[piece.clone()]);
         }
         let body = &mut native.code[append.body];
-        debug_assert!(new.len() <= body.len() && body.len() % 4 == 0);
+        debug_assert!(new.len() <= body.len() && body.len().is_multiple_of(4));
         body[..new.len()].copy_from_slice(&new);
         for word in body[new.len()..].chunks_exact_mut(4) {
             word.copy_from_slice(&nop);

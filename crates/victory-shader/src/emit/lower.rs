@@ -115,6 +115,7 @@ fn prune_signature(elements: &mut Vec<SigElement>, keep: &KeptOutputs) {
     });
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     lower_pruned(parts, None)
 }
@@ -143,6 +144,7 @@ fn counted_in_threads(parts: &Parts) -> bool {
 /// [`lower`]; `counted`: the lanes past a dispatch's count of threads leave
 /// at once (`shader.rs` `USER_DISPATCH_THREADS_X`; after DexNom/VIctory
 /// bc3cd4b0, which does so for two of the programs by their digests).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn lower_counted(parts: &Parts, counted: bool) -> Result<Lowered, ShaderError> {
     lower_counted_pruned(parts, counted, None)
 }
