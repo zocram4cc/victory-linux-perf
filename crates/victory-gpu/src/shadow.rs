@@ -838,18 +838,20 @@ pub(crate) fn copy_all(copies: Vec<(usize, usize, usize)>) {
     }
 }
 
+/// The copies in `carded` whose range overlaps `[dst, dst + len)`, in id order.
+fn overlapping<T>(carded: &BTreeMap<u64, (usize, usize, T)>, dst: usize, len: usize) -> impl Iterator<Item = &T> {
+    let dst_end = dst + len;
+    carded.values().filter(move |(start, end, _)| *start < dst_end && *end > dst).map(|(_, _, copy)| copy)
+}
+
 /// A title buffer copy was done on the CPU into `[dst, dst + len)`: all of it
 /// goes up to the copies in the card's memory that hold it, whether their
 /// CPU side held the same before or not. Left out is what shaders in the air
 /// may be writing (such a copy waits for them, or is done on the card).
 pub(crate) fn send_copied(dst: usize, len: usize) {
     let dst_end = dst + len;
-    let hits: Vec<Arc<Shadow>> = CARDED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .values()
-        .filter(|(start, end, _)| *start < dst_end && *end > dst)
-        .filter_map(|(_, _, weak)| weak.upgrade())
+    let hits: Vec<Arc<Shadow>> = overlapping(&CARDED.lock().unwrap_or_else(|e| e.into_inner()), dst, len)
+        .filter_map(|weak| weak.upgrade())
         .collect();
     for shadow in hits {
         let (start, end) = (shadow.start as usize, (shadow.start + shadow.len) as usize);
@@ -868,6 +870,21 @@ pub(crate) fn send_copied(dst: usize, len: usize) {
 /// The copies in the card's memory (diagnostics: `crate::host::upcheck`).
 pub(crate) fn carded_copies() -> Vec<Arc<Shadow>> {
     CARDED.lock().unwrap_or_else(|e| e.into_inner()).values().filter_map(|(_, _, weak)| weak.upgrade()).collect()
+}
+
+#[cfg(test)]
+mod carded_tests {
+    use super::*;
+
+    #[test]
+    fn send_copied_only_takes_the_copies_that_overlap() {
+        let carded: BTreeMap<u64, (usize, usize, u32)> = [(1, (0, 100, 1)), (2, (100, 200, 2)), (3, (150, 160, 3)), (4, (300, 400, 4))].into_iter().collect();
+        let hits = |dst: usize, len: usize| -> Vec<u32> { overlapping(&carded, dst, len).copied().collect() };
+        assert_eq!(hits(50, 10), vec![1], "a range inside copy 1");
+        assert_eq!(hits(90, 20), vec![1, 2], "a range across the end of copy 1");
+        assert_eq!(hits(0, 1000), vec![1, 2, 3, 4], "a range over every copy");
+        assert_eq!(hits(200, 100), Vec::<u32>::new(), "a range between copies 2 and 4");
+    }
 }
 
 /// Ranges in order, those that overlap or touch as one.
