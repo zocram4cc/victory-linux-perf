@@ -2902,13 +2902,25 @@ impl<'a> Lower<'a> {
                     None if n <= 105 && self.x.io.initialized_sgprs.is_some_and(|k| n >= k) => {
                         Val::I32(self.s.m.i32(0))
                     }
+                    // VCC (106-107) and the trap temporaries (108-123, which
+                    // `ir::unspill` also hands out for parked scalars): the
+                    // hardware initializes neither for a wave, so the same
+                    // holds (P.4: 6 programs of family 0x2996b5a0 read VCC so).
+                    None if (106..=123).contains(&n) && self.x.io.initialized_sgprs.is_some() => {
+                        Val::I32(self.s.m.i32(0))
+                    }
                     // A scalar parked in a VGPR lane (`ir::unspill`), read where the
                     // paths only seem to allow it before any save: the lane of a VGPR
                     // nobody wrote, and VGPRs nobody set read as zero.
                     None if n >= crate::ir::PARKED => Val::I32(self.s.m.i32(0)),
                     // No wave overlaps this one (see `ordered_section`).
                     None if self.pops_collision(v) => Val::I32(self.s.m.i32(0)),
-                    None => Val::Missing("a hardware SGPR input"),
+                    None => {
+                        if std::env::var_os("VICTORY_WHY_INPUT").is_some() {
+                            eprintln!("WHY-INPUT s{n} read before written; initialized {:?}", self.x.io.initialized_sgprs);
+                        }
+                        Val::Missing("a hardware SGPR input")
+                    }
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
                 Reg::V(_) => match io_inputs.get(&v) {
