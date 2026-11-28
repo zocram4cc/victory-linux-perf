@@ -68,3 +68,22 @@ Two cases added to `CS_CASES`, both **equal**:
 - **a `unorm` texture format** whose view the compiler knows.
 
 Until a case makes the console compiler emit it, shortcut #1 stays **not verified by console code** (it is still the only way to translate those stores at all).
+
+## Half precision, and a translator bug the tests found (28 Nov, ~03:00)
+
+**The harness gained an RGBA16F texture UAV** (`View::HalfTextureUav`, register `u4`, the fifth entry of the compute UAV table; the typed views of `raw` moved from heap index 9 to 10). There is a new case, "half alpha-only store": a `half4` texel read, its alpha set to 1.0 and written back, the others written whole. It is **equal**.
+
+The console code again shows no partial store: `image_load … dmask:0x7`, then `image_store … dmask:0xf`, not even `d16`. **The title's mask-0x8 `d16` stores are still unexplained**, and shortcut #1 stays unverified by console code.
+
+**A real translator bug, found on the way.** A first try added the half texture as an eighth root parameter. With eight, the console compiler moves root parameters into a "spilled" user-data table in memory (index 16 on), while the root constants stay in registers (s2).
+
+The translator numbered user data from 16 for every spilled program (`Lower::user_first`). That held for the only spilled programs seen before (the ray-tracing structure builder, nothing in registers), but here the root constants came out at index 2 - 16, wrapped to 4294967284. The DXIL then declared a constant buffer of 4 GiB, and the validator refused it.
+
+Fixed: a spilled program that also has root parameters in registers numbers its user data from 0 (the host fills each dword by its index anyway).
+
+**Still open on that path** (case not kept): with the fix, the spilled variant validated but its half-texture writes came out 0 while the PC's did not. Spilled programs with parameters in registers too need their own test. To do: a case with eight root parameters, checked word by word.
+
+**State:**
+- compute diff tests **24 of 24 equal**;
+- harness 1,274 of 2,680 (none lost);
+- 209 unit tests pass.
