@@ -69,6 +69,25 @@ const ADDRESS_32BIT: u64 = 4;
 /// The host's write watching (not in windows-sys' memory module).
 const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
+/// `VICTORY_ZERO_COPY=<MiB>[-<MiB>]` (unset or 0: off; under Wine, with
+/// `VICTORY_WINE_MAP=1 VICTORY_HOME_BO=1` and their patched vkd3d-proton and
+/// win32u): committed title memory of that many MiB or more (and no more
+/// than the second number), in 64 KiB pages, is a memfd the card reads and
+/// writes in place (`wine_map::zero_copy`): no copy of its title buffers and
+/// windows. The bound is a knob: what the card reads a lot is slower across
+/// the bus than from a copy in its own memory (run zc-on1: the title's two
+/// pools of 1.2 and 1.3 GB in place made the card the frame's chain).
+fn zero_copy_sizes() -> Option<(usize, usize)> {
+    static SIZES: LazyLock<Option<(usize, usize)>> = LazyLock::new(|| {
+        let v = std::env::var("VICTORY_ZERO_COPY").ok()?;
+        let (min, max) = v.trim().split_once('-').unwrap_or((v.trim(), ""));
+        let min = min.parse::<usize>().ok().filter(|&m| m > 0)?;
+        let max = max.parse::<usize>().unwrap_or(usize::MAX >> 20);
+        Some((min << 20, max << 20))
+    });
+    *SIZES
+}
+
 /// The addresses XMem `flags` allow, first and last: the low 4 GiB for
 /// 32-bit memory; else from 4 GiB (kept for 32-bit requests, which the
 /// title's big pools would otherwise crowd out) up to 46 down to 40 bits
@@ -157,6 +176,32 @@ pub extern "system" fn XMemVirtualAlloc(
             );
         }
     }
+    // Zero copy (`VICTORY_ZERO_COPY=<MiB>`): committed title memory of that
+    // size or more is reserved here and made a memfd the card reads in place
+    // (`wine_map::zero_copy`); committed as before if that fails.
+    let zero_copy = base.is_null()
+        && kind & MEM_COMMIT != 0
+        && !placeholder
+        && flags & ADDRESS_32BIT == 0
+        && protect == PAGE_READWRITE
+        && size % (64 << 10) == 0
+        && zero_copy_sizes().is_some_and(|(min, max)| size >= min && size <= max)
+        && wine_map::on();
+    if zero_copy {
+        kind &= !MEM_COMMIT;
+    } else if zero_copy_sizes().is_some() && size >= 16 << 20 {
+        static SAID: AtomicU64 = AtomicU64::new(0);
+        if SAID.fetch_add(1, Ordering::Relaxed) < 32 {
+            tracing::info!(
+                size,
+                kind = format_args!("{kind:#x}"),
+                flags = format_args!("{flags:#x}"),
+                protect = format_args!("{protect:#x}"),
+                base = format_args!("{base:p}"),
+                "zero copy: XMemVirtualAlloc of 16 MiB or more not made a memfd"
+            );
+        }
+    }
     // SAFETY: the title's own arguments, cleaned of console bits; the
     // parameter points at `requirements`, which outlives the call.
     let at = victory_core::mapping::changing(|| unsafe {
@@ -174,6 +219,17 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     });
+    let at = if zero_copy && !at.is_null() && !wine_map::zero_copy(at as usize, size) {
+        // SAFETY: the reservation just made, committed as the title asked.
+        let committed = victory_core::mapping::changing(|| unsafe { VirtualAlloc(at, size, MEM_COMMIT, protect) });
+        if committed.is_null() {
+            // SAFETY: ours, from above.
+            victory_core::mapping::changing(|| unsafe { VirtualFree(at, 0, MEM_RELEASE) });
+        }
+        committed
+    } else {
+        at
+    };
     if at.is_null() {
         let error = std::io::Error::last_os_error();
         if kind & MEM_COMMIT != 0 {
@@ -306,9 +362,14 @@ static WATCHED: Mutex<std::collections::BTreeSet<usize>> = Mutex::new(std::colle
 fn graphics_block(size: usize, attributes: u64) -> Option<*mut c_void> {
     static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_GRAPHICS_WATCH").is_none_or(|v| v != "0"));
     let align = 1usize << (attributes >> ALIGNMENT_SHIFT & 0x1f).max(4);
-    if !*ON || attributes >> 16 & 0xff != D3D_ALLOCATOR || size < WATCHED_FROM || align > WATCHED_FROM {
+    // Zero copy: a block of the switch's sizes is a reservation of its own
+    // in 64 KiB pages, made a memfd in `XMemVirtualAlloc`, whatever
+    // `VICTORY_GRAPHICS_WATCH` says.
+    let zero_copy = zero_copy_sizes().is_some_and(|(min, max)| size >= min && size <= max);
+    if !(*ON || zero_copy) || attributes >> 16 & 0xff != D3D_ALLOCATOR || size < WATCHED_FROM || align > WATCHED_FROM {
         return None;
     }
+    let size = if zero_copy { size.next_multiple_of(64 << 10) } else { size };
     let at = XMemVirtualAlloc(std::ptr::null_mut(), size, MEM_RESERVE | MEM_COMMIT, GRAPHICS, PAGE_READWRITE);
     if at.is_null() {
         return None;
@@ -429,6 +490,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     unsafe {
         let watched = WATCHED.lock().unwrap_or_else(|e| e.into_inner()).remove(&(address as usize));
         if attributes & ALLOC_32BIT != 0 || watched {
+            wine_map::zero_copy_freeing(address as usize, 0);
             victory_core::mapping::changing(|| VirtualFree(address, 0, MEM_RELEASE));
             return;
         }
@@ -2872,6 +2934,7 @@ extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u
     }
     // Splitting and joining placeholders changes nothing they show.
     if kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) == 0 {
+        wine_map::zero_copy_freeing(address as usize, size);
         victory_gpu::title_memory_freed(address as usize, size);
     }
     // SAFETY: the title's own arguments.
@@ -2881,7 +2944,14 @@ extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u
 /// The title's own `VirtualAlloc`: the host would pass that call through
 /// unseen, so the change is recorded here (see [`module`]).
 extern "system" fn title_virtual_alloc(address: *const c_void, size: usize, kind: u32, protect: u32) -> *mut c_void {
-    victory_core::mapping::changing(|| unsafe { VirtualAlloc(address, size, kind, protect) })
+    let at = victory_core::mapping::changing(|| unsafe { VirtualAlloc(address, size, kind, protect) });
+    if zero_copy_sizes().is_some() && size >= 16 << 20 && kind & MEM_COMMIT != 0 {
+        static SAID: AtomicU64 = AtomicU64::new(0);
+        if SAID.fetch_add(1, Ordering::Relaxed) < 32 {
+            tracing::info!(size, kind = format_args!("{kind:#x}"), protect = format_args!("{protect:#x}"), at = format_args!("{at:p}"), "zero copy: the title's VirtualAlloc of 16 MiB or more (not made a memfd)");
+        }
+    }
+    at
 }
 
 pub(crate) fn module() -> HleModule {
@@ -3101,6 +3171,29 @@ mod tests {
         unsafe { at(3).cast::<u32>().write(7) };
         assert_eq!(XMemMapPhysicalPages(base, 4, std::ptr::null()), base);
         assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
+    }
+
+    /// Zero copy (the test runs with `VICTORY_WINE_MAP=1 VICTORY_HOME_BO=1
+    /// VICTORY_ZERO_COPY=1` under Wine; nothing is tried otherwise): committed
+    /// title memory of the switch's size is a memfd, read and written as any,
+    /// until the title releases it.
+    #[test]
+    fn zero_copy_memory_is_a_memfd_until_released() {
+        let Some((min, _)) = zero_copy_sizes().filter(|_| wine_map::on()) else {
+            eprintln!("not tried: not under Wine with pages shown by mmap, or without VICTORY_ZERO_COPY");
+            return;
+        };
+        let len = min.next_multiple_of(64 << 10);
+        let at = XMemVirtualAlloc(std::ptr::null_mut(), len, MEM_RESERVE | MEM_COMMIT, GRAPHICS, PAGE_READWRITE);
+        assert!(!at.is_null());
+        // SAFETY: committed read-write.
+        unsafe {
+            at.cast::<u32>().byte_add(len - 4).write(7);
+            assert_eq!(at.cast::<u32>().byte_add(len - 4).read(), 7);
+        }
+        assert_eq!(wine_map::memfd_at(at as usize), Some(true), "a memfd holds it");
+        assert_ne!(title_virtual_free(at, 0, MEM_RELEASE), 0);
+        assert_eq!(wine_map::zero_copy_freeing(at as usize, 0), None, "gone with the release");
     }
 
     /// Under Wine with renderer port 1 (the tests run with

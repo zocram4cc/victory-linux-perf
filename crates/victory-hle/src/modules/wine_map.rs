@@ -699,6 +699,69 @@ pub(crate) fn shared(first: usize) -> Option<i32> {
     SHARED.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|s| s.0 == first).map(|s| s.2)
 }
 
+/// The reservations [`zero_copy`] made a memfd: start, bytes, the memfd and
+/// the handle the card's heap there is opened by.
+static ZERO_COPY: Mutex<Vec<(usize, usize, i32, usize)>> = Mutex::new(Vec::new());
+
+/// Zero copy (`VICTORY_ZERO_COPY`, `xmem`): `[base, base + len)`, a fresh
+/// reservation of the title's that shows nothing, made a sealed memfd shown
+/// there and committed, as [`own`] does at home with `VICTORY_HOME_BO=1`
+/// (which this needs); `victory_gpu` places the title's buffers and windows
+/// in it by a handle to a dma-buf of its pages. Not asked first whether the
+/// device opens such a heap (the title asks for memory before there is a
+/// device): where it does not, `victory_gpu` copies whole what lies there.
+/// `false`: nothing changed, the caller commits as before.
+pub(crate) fn zero_copy(base: usize, len: usize) -> bool {
+    let Some(direct) = DIRECT.as_ref() else {
+        return false;
+    };
+    let Some(bo) = direct.bo.as_ref() else {
+        return false;
+    };
+    let (memfd, handle) = match bo.memfd(direct.close, len) {
+        Ok(made) => made,
+        Err(why) => {
+            tracing::warn!(why = %why, at = format_args!("{base:#x}"), len, "zero copy: no memfd, title memory as before (VICTORY_ZERO_COPY)");
+            return false;
+        }
+    };
+    if !victory_core::mapping::changing(|| direct.show(base, len, memfd, 0)) {
+        direct.let_go(memfd, handle);
+        return false;
+    }
+    let n = {
+        let mut made = ZERO_COPY.lock().unwrap_or_else(|e| e.into_inner());
+        made.push((base, len, memfd, handle));
+        made.len()
+    };
+    if n <= 32 || n.is_power_of_two() {
+        tracing::info!(at = format_args!("{base:#x}"), len, n, "zero copy: title memory is a memfd the card reads in place (VICTORY_ZERO_COPY)");
+    }
+    victory_gpu::title_memory_zero_copy(base, len, Some(handle));
+    true
+}
+
+/// Before the title frees `[at, at + len)` (`len` 0: the allocation at
+/// `at`): a reservation [`zero_copy`] made there goes, what is in place in
+/// it first. The bytes of the one released, if any.
+pub(crate) fn zero_copy_freeing(at: usize, len: usize) -> Option<usize> {
+    let mut made = ZERO_COPY.lock().unwrap_or_else(|e| e.into_inner());
+    let end = if len == 0 { at + 1 } else { at.saturating_add(len) };
+    let i = made.iter().position(|z| z.0 < end && at < z.0 + z.1)?;
+    let (base, bytes, memfd, handle) = made.swap_remove(i);
+    if (at, len) != (base, 0) && (at, len) != (base, bytes) {
+        // shortcut: part of it freed; the whole goes from the card's side,
+        // and copies of the rest would miss writes (the host watches none
+        // there). Not seen in the title: this line says if it happens.
+        tracing::warn!(at = format_args!("{at:#x}"), len, base = format_args!("{base:#x}"), bytes, "zero copy: part of a memfd reservation freed");
+    }
+    victory_gpu::title_memory_zero_copy(base, bytes, None);
+    if let Some(direct) = DIRECT.as_ref() {
+        direct.let_go(memfd, handle);
+    }
+    Some(bytes)
+}
+
 impl Bo {
     /// A sealed memfd of `len` bytes, and a handle to a dma-buf of its pages
     /// that the host's device opens a heap by: [`own`]'s memory with the

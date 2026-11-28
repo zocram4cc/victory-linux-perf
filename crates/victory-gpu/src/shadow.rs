@@ -5640,6 +5640,7 @@ fn one_owner() -> std::sync::MutexGuard<'static, ()> {
 /// anywhere, with renderer port 1 below 4 GiB).
 fn at_stake(at: u64, end: u64) -> bool {
     crate::inplace::level() > 0
+        || crate::inplace::zero_copy_on()
         || at < 1 << 32 && crate::port::on()
         || PLACED_SPAN[0].load(Ordering::Relaxed) < end && at < PLACED_SPAN[1].load(Ordering::Relaxed)
 }
@@ -5811,7 +5812,9 @@ fn lookup_with(address: u64, len: u64, any: bool, quick: bool, buckets: bool) ->
         let placed = if over {
             None
         } else {
-            crate::port::place_for(key.0, len, false).or_else(|| if big { None } else { crate::inplace::place_for(key.0, len, false) })
+            crate::port::place_for(key.0, len, false)
+                .or_else(|| crate::inplace::place_zero_copy(key.0, len, false))
+                .or_else(|| if big { None } else { crate::inplace::place_for(key.0, len, false) })
         };
         if let Some(placed) = placed {
             let shadow = Arc::new(Shadow::placed(placed, key.0, len, false));
@@ -6619,7 +6622,13 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     // window is the title's own memory, with nothing to copy. One owner per
     // byte ([`ONE_OWNER`]): not over a copy of the same bytes, ...
     let over = one.is_some() && copied_over(&buffers_read(), &map, start, start + len);
-    let placed = if over { None } else { crate::port::place_for(start, len, true).or_else(|| crate::inplace::place_for(start, len, true)) };
+    let placed = if over {
+        None
+    } else {
+        crate::port::place_for(start, len, true)
+            .or_else(|| crate::inplace::place_zero_copy(start, len, true))
+            .or_else(|| crate::inplace::place_for(start, len, true))
+    };
     if let Some(placed) = placed {
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
         note(&shadow);

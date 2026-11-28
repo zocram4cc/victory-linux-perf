@@ -1848,6 +1848,10 @@ fn ahead_answer(first: usize, last: usize) -> Option<(u64, Vec<(usize, u64)>)> {
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    // Zero copy: the host watches no write there (`crate::inplace::ZERO_COPY`).
+    if crate::inplace::zero_copy_touches(start, end) {
+        return None;
+    }
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     // Asked ahead with the submission's other ranges: the journal has it.
     // (The standing number changes only with the journal held alone, so its
@@ -2036,6 +2040,9 @@ pub(crate) fn textures_join() -> bool {
 /// asked: the submission's asking covers the range, or its blocks are known
 /// by their bits. `false` if something would have to be asked.
 pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64], ranged: u64) -> bool {
+    if crate::inplace::zero_copy_touches(start, end) {
+        return false;
+    }
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     // The bits first, then the journal, as in `writes`.
     let known = published(start, end);

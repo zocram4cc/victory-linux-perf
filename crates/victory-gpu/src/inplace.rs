@@ -903,6 +903,130 @@ pub fn opens_heap_by_handle(handle: usize) -> Result<(), String> {
     open(&host.device, From::Shared(handle)).map(drop).map_err(|e| e.to_string())
 }
 
+/// Zero copy (`VICTORY_ZERO_COPY`, `victory-hle`'s `xmem`): title graphics
+/// memory the runtime made a memfd at the title's address when the title
+/// asked for it, with a handle to a dma-buf of its pages: start, end, handle.
+/// Every title buffer and window in it is placed in a heap opened by the
+/// handle ([`place_zero_copy`]): the card reads and writes the title's bytes,
+/// nothing is asked, refreshed, compared or copied back for them. The host's
+/// write watch sees no write to such memory (a mapping made anew over a
+/// watched reservation answers "nothing written"), so a copy there could not
+/// be kept up to date: [`zero_copy_touches`] makes every asking about it
+/// answer "not watched" (whole copies, counted).
+static ZERO_COPY: std::sync::RwLock<Vec<(usize, usize, usize)>> = std::sync::RwLock::new(Vec::new());
+static ZERO_COPY_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The heaps opened by each handle of [`ZERO_COPY`].
+static ZERO_COPY_HEAPS: std::sync::Mutex<Vec<(usize, ID3D12Heap)>> = std::sync::Mutex::new(Vec::new());
+/// Regions made and their bytes, buffers and windows placed, bytes placed,
+/// placements refused, askings answered "not watched".
+static ZERO_COPY_STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+/// Whether any zero-copy memory was made ([`ZERO_COPY`]).
+pub(crate) fn zero_copy_on() -> bool {
+    ZERO_COPY_ANY.load(Ordering::Relaxed)
+}
+
+/// The runtime made `[at, at + len)` the memory behind `handle` (zero copy),
+/// or (`None`) it goes: what is in place there is let go first.
+pub fn title_memory_zero_copy(at: usize, len: usize, handle: Option<usize>) {
+    let end = at.saturating_add(len);
+    let gone: Vec<usize> = {
+        let mut regions = ZERO_COPY.write().unwrap_or_else(|e| e.into_inner());
+        let gone = regions.iter().filter(|r| r.0 < end && at < r.1).map(|r| r.2).collect();
+        regions.retain(|r| r.1 <= at || end <= r.0);
+        if let Some(handle) = handle {
+            regions.push((at, end, handle));
+            ZERO_COPY_STATS[0].fetch_add(1, Ordering::Relaxed);
+            ZERO_COPY_STATS[1].fetch_add(len as u64, Ordering::Relaxed);
+            ZERO_COPY_ANY.store(true, Ordering::Relaxed);
+        }
+        gone
+    };
+    if !gone.is_empty() {
+        title_memory_freeing(at, len);
+        ZERO_COPY_HEAPS.lock().unwrap_or_else(|e| e.into_inner()).retain(|h| !gone.contains(&h.0));
+    }
+}
+
+/// Whether any of `[at, end)` is zero-copy memory ([`ZERO_COPY`]); counted
+/// as an asking answered "not watched" if so.
+pub(crate) fn zero_copy_touches(at: usize, end: usize) -> bool {
+    if !ZERO_COPY_ANY.load(Ordering::Relaxed) {
+        return false;
+    }
+    let touches = ZERO_COPY.read().unwrap_or_else(|e| e.into_inner()).iter().any(|r| r.0 < end && at < r.1);
+    if touches {
+        ZERO_COPY_STATS[6].fetch_add(1, Ordering::Relaxed);
+    }
+    touches
+}
+
+/// Title memory `[start, start + len)` in place if it lies in zero-copy
+/// memory ([`ZERO_COPY`]): a buffer placed in the heap opened by its handle.
+pub(crate) fn place_zero_copy(start: u64, len: u64, window: bool) -> Option<Placed> {
+    if !ZERO_COPY_ANY.load(Ordering::Relaxed) {
+        return None;
+    }
+    let (start, len) = (start as usize, len as usize);
+    let at = start & !(K64 - 1);
+    let end = start + len.max(1);
+    let (first, last, handle) = ZERO_COPY.read().unwrap_or_else(|e| e.into_inner()).iter().copied().find(|r| r.0 <= at && end <= r.1)?;
+    let bytes = (end.next_multiple_of(K64).min(last) - at) as u64;
+    let host = crate::host::host()?;
+    let placed = (|| {
+        let mut heaps = ZERO_COPY_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let heap = match heaps.iter().find(|h| h.0 == handle) {
+            Some(h) => h.1.clone(),
+            None => {
+                let heap = open(&host.device, From::Shared(handle))?;
+                heaps.push((handle, heap.clone()));
+                heap
+            }
+        };
+        drop(heaps);
+        let buffer = place(&host.device, &heap, (at - first) as u64, bytes)?;
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at) as u64;
+        windows::core::Result::Ok(Placed { buffer, heap, gpu, bias: (start - at) as u64 })
+    })();
+    match placed {
+        Ok(placed) => {
+            counted(window, len as u64);
+            ZERO_COPY_STATS[if window { 3 } else { 2 }].fetch_add(1, Ordering::Relaxed);
+            ZERO_COPY_STATS[4].fetch_add(len as u64, Ordering::Relaxed);
+            Some(placed)
+        }
+        Err(e) => {
+            if ZERO_COPY_STATS[5].fetch_add(1, Ordering::Relaxed) < 8 {
+                tracing::warn!(start = format_args!("{start:#x}"), len, window, %e, "zero copy: not placed, a copy (asked whole every time)");
+            }
+            None
+        }
+    }
+}
+
+/// The zero-copy line, every ten seconds.
+fn zero_copy_say() {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = crate::host::now_ms();
+    let last = LAST.load(Ordering::Relaxed);
+    if now < last + 10_000 || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return;
+    }
+    let s: Vec<u64> = ZERO_COPY_STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
+    tracing::info!(
+        "zero copy (VICTORY_ZERO_COPY), since the start: {} regions of title memory made memfds ({} MB); placed in them {} title buffers and {} windows ({} MB, \
+         no copy, no asking, no copy-back); {} refused (copies); {} askings about such memory answered \"not watched\"",
+        s[0],
+        s[1] >> 20,
+        s[2],
+        s[3],
+        s[4] >> 20,
+        s[5],
+        s[6]
+    );
+}
+
 /// Whether the card reads the memory's bytes through `heap`, opened on
 /// `[memory, memory + bytes)` from its byte `offset` on: the first 4 KiB of
 /// its first 32 MiB that are not all zeros are fetched through a buffer placed
@@ -1544,6 +1668,9 @@ fn real_part(spans: &[(u64, u64, bool)]) -> Vec<String> {
 pub(crate) fn tick() {
     if level() > 0 {
         say();
+    }
+    if ZERO_COPY_ANY.load(Ordering::Relaxed) {
+        zero_copy_say();
     }
     if probe_level() == 0 {
         return;
