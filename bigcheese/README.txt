@@ -15,7 +15,13 @@ How to play
 -----------
 1. Extract the whole zip anywhere (its own folder, or inside your game folder).
    Keep the fsr folder and early-pipelines.txt next to Play-16GB-RAM.cmd.
-2. Double-click Play-16GB-RAM.cmd (16 GB of RAM) or Play.cmd (32 GB or more).
+2. Double-click BigCheese-Launcher.cmd: a window asks for your game folder,
+   then for ray tracing, 16 GB of RAM, an 8 GB graphics card and Series X or
+   S (X: the full detail; it played well on a 16 GB PC with the 16 GB box
+   ticked), and has a button for the saves folder. Play starts one of the
+   .cmd files below with those choices; it remembers them in launcher\settings.txt.
+   Or, without the window:
+   Double-click Play-16GB-RAM.cmd (16 GB of RAM) or Play.cmd (32 GB or more).
    The first time, it asks for your game folder (a "choose folder" window) and
    remembers it. If you extracted the zip inside your game folder, it finds the
    game by itself. You can also write the folder into the file: open
