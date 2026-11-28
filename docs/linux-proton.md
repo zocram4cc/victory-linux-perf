@@ -19,10 +19,12 @@ Tested on: AMD RX 6800 XT (RDNA2), Mesa RADV, CachyOS, our Proton build (see
 | Input: live keys from a file (`VICTORY_KEYS_FILE`, diagnostics builds) | lines appended to a file while the game runs are pressed (`<key>[+<key>...][:<ms>]`), on top of `VICTORY_KEYS` and a connected controller: for hands-free and scripted test runs |
 | Linux: our Proton build as a submodule, `proton-ge`; this file | see below |
 | GPU: the ray-tracing builder is its 52 programs, not any program that spills its user data | with ray tracing off, every compute program whose user data spills was dropped as a builder stage; now the builder is the 52 programs of `XboxBvhBuilder.dll` (by hash, build 1.0.2.1), and other spilled programs run (logged once each) |
-| Linux: Proton fork at 8fed4516 | its Wine imports section memory as dma-bufs (udmabuf): `VICTORY_PORT_CONSTANTS` needs it (see below); it keeps the views VIctory maps the title's GPU pages through away from the wineserver (`WINE_VICTORY_LOCAL_VIEWS=1`, set by `scripts/play-linux.sh`): loading 60 → 49 s on an RX 6800 XT |
+| Linux: Proton fork at 1860c50e | its Wine imports section memory as dma-bufs (udmabuf): `VICTORY_PORT_CONSTANTS` needs it (see below); it keeps the views VIctory maps the title's GPU pages through away from the wineserver (`WINE_VICTORY_LOCAL_VIEWS=1`, set by `scripts/play-linux.sh`): loading 60 → 49 s on an RX 6800 XT; it gives VIctory's guards a synchronous userfaultfd (next row) |
 | FidelityFX: under Wine FSR 4.1.2 only when its code loads | Proton's builtin `amdxc64` makes AMD's SDK offer FSR 4.1.2 although its code (`amdxcffx64.dll`) is missing; the context made on it upscaled wrongly (doubled, smeared outlines). Without the DLL the newest FSR 3.1 is used |
 | GPU: raw twins of buffer views off 16 bytes begin at the view's own dword (lloyd's change from avatarmanz's fork, #437; views beginning inside a dword stay as before; `VICTORY_TWIN_EXACT=0` turns it off) | under D3D12's 16-byte rule such twins were null views and shaders read zeros (about 370 a frame in the jail): trees and palms dropped out for single frames (the intro's title shot) and the print on the back of Lucia's jumpsuit was missing. Known issue: in about half of the runs the diner waitress's face shows coloured speckles; the cause is not found yet |
 | GPU: under Wine the first use of a compute pass waits for its pipeline by a budget of its own, and those pipelines are made first (borntofrag's change from avatarmanz's fork, #440; `VICTORY_COMPUTE_WAIT_MS`, half a second; 0: as before) | a pass the title runs once when a character is made (it fills the table the face is deformed by) was dropped while its pipeline was still being made: on a first run with cold caches Lucia and Jason showed only eyes and teeth to the end of the run. The intro with cold caches: eyes and teeth without the change, normal faces with it |
+| GPU: under Wine, aliased light textures are copied texture to texture, not through a buffer (`VICTORY_ALIAS_DIRECT=0` restores the buffer path) | the title writes light as R9G9B9E5 packed into R32_UINT textures and samples it through R9G9B9E5 views at the same memory; the copy between the two host textures went through a buffer with three barriers. vkd3d-proton copies any two formats of one texel size: the 78 alias copies a frame in the jail took 2.5 ms of the card's time, now 0.6 ms; frame time within the noise |
+| GPU: under our Proton the guards arm view memory through a synchronous userfaultfd (`VICTORY_SYNC_GUARDS=0` turns it off) | the guards made title memory read-only and took the access violations: under Wine a signal, an exception and protection changes under Wine's memory lock each (100-150 µs a change, ~120 µs a fault). Through our Wine's private class of `NtSetInformationVirtualMemory` a write to an armed block waits in the kernel for a handler thread that opens it and tells VIctory. RX 6800 XT, jail save, 3+3 interleaved: protection changes 27.5 → 2.3 ms a frame; walk-around mean 37.8 → 36.6 ms, p95 58.3 → 49.0 ms, frames over 50 ms 13.8 → 3.9 %; diner p95 97.5 → 89.0 ms. Another Wine refuses the class and nothing changes |
 
 What earlier Wine fixes of the fork's `linux` branch became here:
 
@@ -142,7 +144,12 @@ that every protection change and page fault waits for. A page map in the game
 went from 64-107 to 9-28 µs; loading the jail save from 60 to 49 s, and the
 title streams a quarter more texture data in the same time (about 0.5 GB more
 GPU-mapped memory). Its ntdll also copies with fast strings (`memcpy` moved a
-byte at a time; Wine's heap moves growing blocks with it).
+byte at a time; Wine's heap moves growing blocks with it). VIctory's guards
+arm the title's memory through a synchronous userfaultfd of its Wine (a
+private class of `NtSetInformationVirtualMemory`): a write to an armed block
+waits in the kernel for a handler thread that lifts the protection and hands
+the block to VIctory, with no signal, exception or protection change under
+Wine's memory lock (see the table above).
 More fixes for VIctory under Wine go there as they come. It is not supported
 by GloriousEggroll: report problems with it here, not to GE-Proton.
 
@@ -154,9 +161,9 @@ git submodule update --init --recursive proton-ge   # about 8 GB of sources
 cd proton-ge
 ./patches/protonprep-valve-staging.sh &> patchlog.txt   # grep -i fail patchlog.txt
 cd .. && mkdir proton-build && cd proton-build
-../proton-ge/configure.sh --build-name=GE-Proton11-14-victory5
+../proton-ge/configure.sh --build-name=GE-Proton11-14-victory6
 make ENABLE_CCACHE=1 redist   # ccache (in ~/.ccache) speeds up later full builds
-tar -xf GE-Proton11-14-victory5.tar.gz -C ~/.steam/steam/compatibilitytools.d/
+tar -xf GE-Proton11-14-victory6.tar.gz -C ~/.steam/steam/compatibilitytools.d/
 ```
 
 After pulling a newer `proton-ge`, `make ENABLE_CCACHE=1 redist` again in the
@@ -175,7 +182,7 @@ build, the game at nice 10; `--safe` for Belobug's defaults, `--fsr` for the
 PC upscaler). By hand:
 
 ```sh
-PROTON=~/.steam/steam/compatibilitytools.d/GE-Proton11-14-victory5/proton
+PROTON=~/.steam/steam/compatibilitytools.d/GE-Proton11-14-victory6/proton
 export STEAM_COMPAT_DATA_PATH=~/victory-prefix STEAM_COMPAT_CLIENT_INSTALL_PATH=~/.steam/steam
 export WINEDLLOVERRIDES="d3d12=n;d3d12core=n;dxgi=n;d3d11=n;d3d10core=n;d3d9=n"
 export VICTORY_GAME_DIR='Z:\path\to\GTA6.Xbox.v1.0.2.1'

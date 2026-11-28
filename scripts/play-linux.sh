@@ -4,7 +4,7 @@
 #   scripts/play-linux.sh <game folder> [--safe] [--fsr quality|balanced|performance <fidelityfx folder>]
 #   --safe   Belobug's defaults: none of play.ps1's settings or the renderer patches (the lighting below stays)
 #   --fsr    AMD's PC upscaler from <fidelityfx folder> (FSR 3.1, or FSR 4 on RDNA3/4 with PROTON_FSR4_UPGRADE=1)
-# Environment: PROTON (default ~/.steam/steam/compatibilitytools.d/GE-Proton11-14-victory5/proton), STEAM_COMPAT_DATA_PATH
+# Environment: PROTON (default ~/.steam/steam/compatibilitytools.d/GE-Proton11-14-victory6/proton), STEAM_COMPAT_DATA_PATH
 # (default ~/victory-prefix), VICTORY_EXE (default target/x86_64-pc-windows-msvc/diag/victory.exe in this checkout).
 #
 # The game runs at nice 10 and cannot raise a thread above it (prlimit): at normal or raised priority its ~150 busy
@@ -21,7 +21,7 @@ while [ $# -gt 0 ]; do
   shift
 done
 HERE=$(cd "$(dirname "$0")/.." && pwd)
-PROTON=${PROTON:-$HOME/.steam/steam/compatibilitytools.d/GE-Proton11-14-victory5/proton}
+PROTON=${PROTON:-$HOME/.steam/steam/compatibilitytools.d/GE-Proton11-14-victory6/proton}
 EXE=${VICTORY_EXE:-$HERE/target/x86_64-pc-windows-msvc/diag/victory.exe}
 win() { printf 'Z:%s' "$(realpath "$1")" | sed 's,/,\\,g'; }
 [ -x "$PROTON" ] || { echo "no Proton at $PROTON (set PROTON)" >&2; exit 1; }
