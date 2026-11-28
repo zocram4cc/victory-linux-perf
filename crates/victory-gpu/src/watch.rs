@@ -1700,6 +1700,23 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 /// taken whole, or 0) does not hold, as [`writes`] would answer with nothing
 /// asked: the submission's asking covers the range, or its blocks are known
 /// by their bits. `false` if something would have to be asked.
+/// Lock-free fast path for [`Shadow::nothing_new`] when every page in the
+/// shadow has been copied at or after `min_copied` (`min_copied > 0`).
+pub(crate) fn nothing_new_min(start: usize, end: usize, min_copied: u64) -> bool {
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    if last - first > 64 || !published(start, end) {
+        return false;
+    }
+    for p in first..last {
+        if PAGE_MAX[p & PAGE_MAX_MASK].load(std::sync::atomic::Ordering::Acquire) > min_copied {
+            return false;
+        }
+    }
+    #[cfg(feature = "diagnostics")]
+    crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
+    true
+}
+
 pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64], ranged: u64) -> bool {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {

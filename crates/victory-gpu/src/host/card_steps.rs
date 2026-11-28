@@ -789,20 +789,26 @@ mod late {
     /// The submission has landed: the fills of it the CPU did when it was
     /// sent (digest at submission, place, length) compared with title memory now.
     pub(super) fn landed_cpu(cpu: &[(u128, usize, usize)]) {
-        let mut now = Vec::new();
-        for &(was, src, len) in cpu {
-            now.clear();
-            now.resize(len, 0);
-            if !crate::host::read_into(src as *const u8, &mut now) {
-                continue;
-            }
-            COUNTS[4].fetch_add(1, Ordering::Relaxed);
-            if crate::texture::digest(&now).0 == was {
-                continue;
-            }
-            COUNTS[5].fetch_add(1, Ordering::Relaxed);
-            learn(src, src + len, "on the CPU");
+        thread_local! {
+            static NOW: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
+        NOW.with_borrow_mut(|now| {
+            for &(was, src, len) in cpu {
+                if written(src, src + len) {
+                    continue;
+                }
+                now.resize(len, 0);
+                if !crate::host::read_into(src as *const u8, &mut now[..len]) {
+                    continue;
+                }
+                COUNTS[4].fetch_add(1, Ordering::Relaxed);
+                if crate::texture::digest(&now[..len]).0 == was {
+                    continue;
+                }
+                COUNTS[5].fetch_add(1, Ordering::Relaxed);
+                learn(src, src + len, "on the CPU");
+            }
+        });
     }
 
     /// Tests: nothing learned (the pages are one set for the process).
@@ -1764,23 +1770,28 @@ impl Host {
             chosen.iter().map(|&(i, _)| steps[i]).collect();
         // The fills left to the CPU: snapshot their digest from cached title
         // memory now so `landed_cpu` never reads back from WC upload memory.
+        // Skip fills whose pages are already learned (`late::written`).
         let mut cpu = Vec::new();
         if late::on() {
-            let mut scratch = Vec::new();
-            for list in runs {
-                let at = std::ptr::from_ref::<HostList>(list) as usize;
-                for (i, step) in list.deferred().copies.iter().enumerate() {
-                    if let &Step::Fill(_dst, src, len, _) = step
-                        && !steps.contains(&(at, i))
-                    {
-                        scratch.clear();
-                        scratch.resize(len, 0);
-                        if crate::host::read_into(src as *const u8, &mut scratch) {
-                            cpu.push((crate::texture::digest(&scratch).0, src, len));
+            thread_local! {
+                static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+            }
+            SCRATCH.with_borrow_mut(|scratch| {
+                for list in runs {
+                    let at = std::ptr::from_ref::<HostList>(list) as usize;
+                    for (i, step) in list.deferred().copies.iter().enumerate() {
+                        if let &Step::Fill(_dst, src, len, _) = step
+                            && !steps.contains(&(at, i))
+                            && !late::written(src, src + len)
+                        {
+                            scratch.resize(len, 0);
+                            if crate::host::read_into(src as *const u8, &mut scratch[..len]) {
+                                cpu.push((crate::texture::digest(&scratch[..len]).0, src, len));
+                            }
                         }
                     }
                 }
-            }
+            });
         }
         Ok((
             Some(Taken {

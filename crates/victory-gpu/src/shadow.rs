@@ -43,6 +43,10 @@ pub(crate) struct Shadow {
     /// Per page of title memory from `start`'s on: the write-watch asking
     /// after which it was last copied (0: never).
     copied: Mutex<Vec<u64>>,
+    /// Lock-free minimum of `copied` (for shadows <= 64 pages; 0 if any page
+    /// is still uncopied or shadow is larger). Allows `nothing_new` to bypass
+    /// `copied`'s Mutex and `journal()`'s RwLock.
+    min_copied: AtomicU64,
     /// Two ranges of title memory taken whole, the last one and the longest,
     /// and the asking after which each was ([`Shadow::copy_stale`]). A page
     /// a range holds in part cannot say so in `copied`. Locked inside
@@ -3371,6 +3375,7 @@ impl Shadow {
             start,
             len,
             copied: Mutex::new(vec![0; pages as usize]),
+            min_copied: AtomicU64::new(0),
             ranged: Mutex::default(),
             has_ranged: AtomicBool::new(false),
             watched: AtomicU8::new(0),
@@ -4031,6 +4036,9 @@ impl Shadow {
                         *at = now;
                     }
                 }
+                if copied.len() <= 64 {
+                    self.min_copied.store(copied.iter().copied().min().unwrap_or(0), Ordering::Release);
+                }
             }
             under_ns(4, t);
             if over.into_inner() {
@@ -4196,6 +4204,16 @@ impl Shadow {
             && self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
         {
             return false;
+        }
+        let min_copied = self.min_copied.load(Ordering::Acquire);
+        if min_copied != 0 && crate::watch::nothing_new_min(from, to, min_copied) {
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add};
+                add(C::Checked, (to - from) as u64);
+                add(C::Unchanged, (to - from) as u64);
+            }
+            return true;
         }
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let same = crate::watch::nothing_new(from, to, start / PAGE, &copied, self.ranged(from, to));
@@ -4365,6 +4383,9 @@ impl Shadow {
         }
         let runs = by_parts(runs, &again_at, &crate::watch::parts_written(&again_at));
         let bytes = self.take_all(runs);
+        if copied.len() <= 64 {
+            self.min_copied.store(copied.iter().copied().min().unwrap_or(0), Ordering::Release);
+        }
         if crate::watch::light() {
             // All of the range is in the copy as of this asking.
             let mut ranged = self.ranged.lock().unwrap_or_else(|e| e.into_inner());
@@ -5033,6 +5054,9 @@ impl Shadow {
         let held = *at != 0 && *at >= before && crate::watch::block_published(block);
         if held {
             *at = (*at).max(now);
+            if copied.len() <= 64 {
+                self.min_copied.store(copied.iter().copied().min().unwrap_or(0), Ordering::Release);
+            }
         }
         held
     }
