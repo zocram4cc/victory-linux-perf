@@ -4732,7 +4732,6 @@ pub(crate) fn table_reuse_line(frames: f64) {
         "tables met again per frame: {:.0} left as they were ({:.0} of them over moves of other textures, VICTORY_TABLE_TEXTURES), {:.0} gone through (group has UAVs or selected entries), {:.0} (epoch moved), {:.0} (another reader); {:.0} made afresh; entries {:.0} met again, {:.0} made afresh",
         n[0], n[7], n[1], n[2], n[3], n[4], n[5], n[6]
     );
-    crate::host::epoch_moves_line(frames);
 }
 
 /// Whether a table a list reads again, with nothing changed in the list

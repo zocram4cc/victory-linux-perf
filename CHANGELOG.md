@@ -17,6 +17,16 @@ from the same save in the same house (`victory-abtest`; standing, or turning the
 time). In-run A/B: phases of 20 s alternating inside one run (`VICTORY_AB`), compared with the
 scene's draw count taken out.
 
+### Placed textures found by hash; the filler count only in diagnostics builds
+`texture_at` runs for every view of a placed texture a draw's tables name. Its map was an ordered
+map with 120-byte keys compared along the tree, under the lock every recording thread takes; it
+is a hash map now (only looked up, filled and counted). And on every call whose description had
+other filler words than the key (the title leaves stack bytes there) it inserted into a growing
+ordered set under a second lock and scanned a range of it, for a count in the log; that count is
+kept in diagnostics builds only now. 2+2 alternating standing runs (diagnostics builds, so with
+the count in both): -0.2 +- 0.2 ms, list calls 5.68 against 5.73 us; release builds save the
+count's work besides (not measured on its own).
+
 ### mimalloc as the Rust allocator (cargo feature `mimalloc`, on by default)
 The layer's Rust allocations went through the process heap it shares with the title and the
 drivers, under Wine Wine's own. With mimalloc (per-thread caches; after upstream VIctory, as
@@ -113,6 +123,12 @@ Off until that part is done.
   of page by page (`change` in `xmem.rs`), with the soft views on, turning: +1.3 ms. Not kept.
 - The title's own `QueryPerformanceCounter` (its import from `api-ms-win-core-profile-l1-1-0`)
   from the same TSC clock: -0.1 ms, no crash; not kept (the title's timing stays the host's).
+- A descriptor slot's kept resource taken by reference (no reference count change for the same
+  one again) and two slot maps on the address hasher: +0.6 +- 0.3 ms, worse (callers that passed
+  theirs by value now cloned and dropped it). Reverted.
+- Built with `-C target-cpu=x86-64-v3` (AVX2, BMI, FMA everywhere; as Azter's fork does): standing
+  2+2 runs -0.3 +- 0.2 ms, partly fewer draws in its runs. Not adopted: it would require AVX2 of
+  every player's CPU for about nothing.
 - `VKD3D_CONFIG=descriptor_heap` (vkd3d-proton on RADV's `VK_EXT_descriptor_heap`), standing, 2+2
   runs: -0.7 +- 1.2 ms, no clear gain (not set).
 - Our own writes ([`writing`]) opening their guarded blocks with the guards' lock shared, block

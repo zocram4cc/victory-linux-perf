@@ -6704,11 +6704,6 @@ impl HostList {
     /// refreshed.
     #[track_caller]
     pub(crate) fn changed_something(&self) {
-        #[cfg(feature = "diagnostics")]
-        {
-            let line = std::panic::Location::caller().line();
-            *EPOCH_MOVES.lock().unwrap_or_else(|e| e.into_inner()).entry(line).or_default() += 1;
-        }
         self.moved(0);
     }
 
@@ -6716,11 +6711,6 @@ impl HostList {
     /// texture whose list state is `key`, and nothing else.
     #[track_caller]
     fn changed_texture(&self, key: usize) {
-        #[cfg(feature = "diagnostics")]
-        {
-            let line = std::panic::Location::caller().line();
-            *EPOCH_MOVES.lock().unwrap_or_else(|e| e.into_inner()).entry(line).or_default() += 1;
-        }
         self.moved(key);
     }
 
@@ -11786,23 +11776,3 @@ pub(crate) fn collected_textures() -> Vec<usize> {
 #[cfg(feature = "diagnostics")]
 pub(crate) static WHY_NOT: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
-/// (Diagnostics) Moves of host lists' epochs ([`HostList::changed_something`])
-/// by the line that moved them.
-#[cfg(feature = "diagnostics")]
-static EPOCH_MOVES: std::sync::Mutex<std::collections::BTreeMap<u32, u64>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
-
-/// (Diagnostics) The frame line of [`EPOCH_MOVES`].
-#[cfg(feature = "diagnostics")]
-pub(crate) fn epoch_moves_line(frames: f64) {
-    let by = std::mem::take(&mut *EPOCH_MOVES.lock().unwrap_or_else(|e| e.into_inner()));
-    let mut by: Vec<_> = by.into_iter().collect();
-    by.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
-    let text: Vec<String> = by.iter().map(|(line, n)| format!("host.rs:{line} {:.0}", *n as f64 / frames)).collect();
-    tracing::info!("host lists' epochs moved per frame, by line: {}", text.join(", "));
-    let w: Vec<f64> = WHY_NOT.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames).collect();
-    let looks = (w[0] + w[1] + w[2] + w[3]).max(1.0);
-    tracing::info!(
-        "move log looked at per frame: {:.0} passed, failed on a lone move for everything {:.0}, on one among others {:.0}, on a texture of its own {:.0}; {:.1} moves and {:.1} textures a look",
-        w[0], w[1], w[2], w[3], w[4] / looks, w[5] / looks
-    );
-}

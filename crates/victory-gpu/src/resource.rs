@@ -3135,13 +3135,18 @@ pub(crate) extern "system" fn create_at_address(
 /// The resource is kept for the run (views and lists name its address);
 /// its host texture is let go when nothing names it any more
 /// ([`let_go_idle`]) and made again on the next use.
+/// (A hash map: only looked up and filled, about once for every view of a
+/// placed texture a draw's tables name; it was an ordered map with 120-byte
+/// keys compared along the tree, under the one lock all recording threads
+/// take.)
 #[cfg(windows)]
-static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
-    std::sync::Mutex::new(std::collections::BTreeMap::new());
+static PLACED_TEXTURES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<(u64, [u32; 14]), usize, std::hash::BuildHasherDefault<crate::host::AddressHash>>>,
+> = std::sync::LazyLock::new(Default::default);
 
 /// The placed textures asked for with filler words set, as asked
 /// (address and description): for [`PLACED_TWINS`].
-#[cfg(windows)]
+#[cfg(all(windows, feature = "diagnostics"))]
 static PLACED_RAW: std::sync::Mutex<std::collections::BTreeSet<(u64, [u32; 14])>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 
@@ -3234,6 +3239,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     // that fills at world entry. They are not part of what a texture is.
     // `VICTORY_PLACED_FILLER=1`: kept in the key, as before.
     static KEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    #[cfg(feature = "diagnostics")]
     let raw = *desc;
     let mut key = *desc;
     if !*KEPT.get_or_init(|| std::env::var_os("VICTORY_PLACED_FILLER").is_some_and(|v| v == "1")) {
@@ -3243,7 +3249,9 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     let desc = &key;
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     // How many resources the filler alone would have added (a count for
-    // the log: `placed_filler_twins`).
+    // the log: `placed_filler_twins`; diagnostics builds only: it inserted
+    // into a growing ordered set under a second lock on every such call).
+    #[cfg(feature = "diagnostics")]
     if raw != key {
         let mut seen = PLACED_RAW.lock().unwrap_or_else(|e| e.into_inner());
         if seen.insert((address, raw)) {
