@@ -17,7 +17,7 @@
 
 use std::ffi::c_void;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::core::{Interface, PCSTR, PCWSTR};
@@ -700,6 +700,9 @@ const FRAMEGEN_DLL: &str = "amd_fidelityfx_framegeneration_dx12.dll";
 const CREATE_FRAMEGEN: u64 = 0x0002_0001;
 const CONFIGURE_FRAMEGEN: u64 = 0x0002_0002;
 const DISPATCH_FRAMEGEN_PREPARE_V2: u64 = 0x0002_000c;
+const CREATE_FRAMEGEN_VERSION: u64 = 0x0002_000e;
+/// `FFX_FRAMEGENERATION_VERSION` of SDK 2.4 (4.0.2).
+const FRAMEGEN_VERSION: u32 = (4 << 22) | 2;
 const CREATE_SWAP_CHAIN_FOR_HWND: u64 = 0x0003_0006;
 const CONFIGURE_SWAP_CHAIN_UI: u64 = 0x0003_0002;
 const DISPATCH_SWAP_CHAIN_WAIT_FOR_PRESENTS: u64 = 0x0003_0007;
@@ -822,6 +825,10 @@ static FAILED: AtomicBool = AtomicBool::new(false);
 static FRAME: AtomicU64 = AtomicU64::new(0);
 /// The last frame prepared, plus one.
 static PREPARED: AtomicU64 = AtomicU64::new(0);
+/// The swap chain's presents since it was made, generated frames included.
+static PRESENTED: AtomicU32 = AtomicU32::new(0);
+/// The frames the SDK generated, counted by its callback.
+static GENERATED: AtomicU64 = AtomicU64::new(0);
 
 /// Whether `VICTORY_FRAMEGEN=1` asks for frame generation and AMD's
 /// upscaler (`VICTORY_FFX_DIR`, not simple mode) is there to feed it.
@@ -904,6 +911,7 @@ pub(crate) fn framegen_swap_chain(
     // SAFETY: the swap chain the SDK made, with a reference for us.
     let swap_chain = unsafe { windows::Win32::Graphics::Dxgi::IDXGISwapChain4::from_raw(out) };
     SWAP_CHAIN.store(out, Ordering::Release);
+    PRESENTED.store(0, Ordering::Release);
     tracing::info!("ffx: presenting through AMD's frame generation swap chain");
     swap_chain.cast().ok()
 }
@@ -993,10 +1001,17 @@ fn create_framegen(api: &Api, fg: &Framegen) -> bool {
         header: header(BACKEND_DX12),
         device,
     };
+    let mut version = Version {
+        header: Header {
+            kind: CREATE_FRAMEGEN_VERSION,
+            next: (&raw mut dx12).cast(),
+        },
+        version: FRAMEGEN_VERSION,
+    };
     let mut create = CreateFramegen {
         header: Header {
             kind: CREATE_FRAMEGEN,
-            next: (&raw mut dx12).cast(),
+            next: (&raw mut version).cast(),
         },
         flags: framegen_flags(fg.upscale_flags),
         display: fg.display,
@@ -1041,6 +1056,7 @@ fn configure(api: &Api, fg: &Framegen, frame: u64, enabled: bool) {
 
 /// The SDK's call back to generate a frame: its dispatch on our context.
 unsafe extern "C" fn generate(params: *mut Header, context: *mut c_void) -> ReturnCode {
+    GENERATED.fetch_add(1, Ordering::Relaxed);
     let Some(api) = api() else { return ERROR };
     // SAFETY: the SDK's description, for the context it was configured with.
     unsafe { (api.dispatch)(context.cast(), params) }
@@ -1079,16 +1095,21 @@ pub(crate) fn framegen_before_present(
     configure(api, &fg, frame, PREPARED.load(Ordering::Acquire) == frame + 1);
 }
 
-/// After a present through the frame generation swap chain, given the
-/// swap chain's count of presents (real and generated): once a second, the
-/// real frame rate and the presented one.
+/// After a present through the frame generation swap chain, given the swap
+/// chain's count of presents (real and generated): the count is kept for the
+/// frame counters ([`shown_total`]); once a second, the real, generated and
+/// presented frame rates are logged.
 pub(crate) fn framegen_after_present(presented: Option<u32>) {
     let real = FRAME.fetch_add(1, Ordering::AcqRel) + 1;
-    static SINCE: std::sync::Mutex<Option<(std::time::Instant, u64, u32)>> = std::sync::Mutex::new(None);
+    if let Some(presented) = presented {
+        PRESENTED.store(presented, Ordering::Release);
+    }
+    static SINCE: std::sync::Mutex<Option<(std::time::Instant, u64, u32, u64)>> = std::sync::Mutex::new(None);
     let mut since = SINCE.lock().unwrap_or_else(|e| e.into_inner());
-    let presented = presented.unwrap_or(0);
-    let Some((at, real_then, presented_then)) = *since else {
-        *since = Some((std::time::Instant::now(), real, presented));
+    let presented = PRESENTED.load(Ordering::Acquire);
+    let generated = GENERATED.load(Ordering::Relaxed);
+    let Some((at, real_then, presented_then, generated_then)) = *since else {
+        *since = Some((std::time::Instant::now(), real, presented, generated));
         return;
     };
     let seconds = at.elapsed().as_secs_f64();
@@ -1096,10 +1117,11 @@ pub(crate) fn framegen_after_present(presented: Option<u32>) {
         return;
     }
     let real_fps = (real - real_then) as f64 / seconds;
+    let generated_fps = (generated - generated_then) as f64 / seconds;
     let presented_fps = f64::from(presented.wrapping_sub(presented_then)) / seconds;
     let on = !CONTEXT.load(Ordering::Acquire).is_null() && !FAILED.load(Ordering::Relaxed);
-    tracing::info!(on, "ffx: frame generation: {real_fps:.1} real fps, {presented_fps:.1} fps presented");
-    *since = Some((std::time::Instant::now(), real, presented));
+    tracing::info!(on, "ffx: frame generation: {real_fps:.1} real fps, {generated_fps:.1} generated fps, {presented_fps:.1} fps presented");
+    *since = Some((std::time::Instant::now(), real, presented, generated));
 }
 
 fn missing_texture(slot: usize, title: This) {
