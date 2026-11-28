@@ -3814,8 +3814,8 @@ impl<'a> Lower<'a> {
         else {
             unreachable!()
         };
-        if *lds || !matches!(saddr, None | Some(Operand::Scalar { code: NULL, .. })) {
-            return Err("a global address with a scalar base");
+        if *lds {
+            return Err("a global access to LDS");
         }
         let Some(Operand::Vector { reg: areg, .. }) = *addr else {
             return Err("a global address not in VGPRs");
@@ -3824,7 +3824,27 @@ impl<'a> Lower<'a> {
             let v = inst.read(Reg::V(areg + k)).ok_or("a global address")?;
             l.i32_of(v)
         };
-        let (lo, hi) = (word(self, 0)?, word(self, 1)?);
+        let (lo, hi) = match *saddr {
+            // GFX10 `saddr`: the 64-bit SGPR pair plus the VGPR's 32 bits,
+            // unsigned (the ISA's address = SGPR[pair] + zext(VGPR) + offset).
+            Some(Operand::Scalar { code, .. }) if code != NULL => {
+                let s = |l: &mut Self, k: u8| -> Result<V, Why> {
+                    let v = inst.read(Reg::S(code + k)).ok_or("a global scalar base")?;
+                    l.i32_of(v)
+                };
+                let (blo, bhi) = (s(self, 0)?, s(self, 1)?);
+                let voff = word(self, 0)?;
+                let c = self.cur;
+                let sum = self.s.m.bin(c, Bin::Add, blo, voff);
+                let carry = self.s.m.cmp(c, pred::IULT, sum, blo);
+                let i32t = self.s.t.i32;
+                let carry = self.s.m.cast(c, Cast::ZExt, carry, i32t);
+                let high = self.s.m.bin(c, Bin::Add, bhi, carry);
+                (sum, high)
+            }
+            None | Some(Operand::Scalar { .. }) => (word(self, 0)?, word(self, 1)?),
+            Some(_) => return Err("a global address with a scalar base"),
+        };
         let (lo, hi) = self.address_plus(lo, hi, i32::from(*offset));
         let guard = self.memory_guard(b, i)?;
         let (i32t, res, void) = (self.s.t.i32, self.s.t.res_ret, self.s.t.void);
