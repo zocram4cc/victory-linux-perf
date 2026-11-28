@@ -1,4 +1,5 @@
 @echo off
+chcp 65001 >nul
 setlocal
 REM ============================================================================
 REM  PRESET 3: Native No-FG (Zero Input Latency)
@@ -19,6 +20,7 @@ if not exist "%GAME_EXE%" (
 )
 if not exist "%ROOT%\cache" mkdir "%ROOT%\cache"
 if not exist "%ROOT%\data" mkdir "%ROOT%\data"
+if not exist "%ROOT%\logs" mkdir "%ROOT%\logs"
 for /f "delims==" %%V in ('set VICTORY_ 2^>nul') do set "%%V="
 
 set "VICTORY_GAME_DIR=%GAME_DIR%"
@@ -26,6 +28,7 @@ set "VICTORY_CACHE_DIR=%ROOT%\cache"
 set "VICTORY_DATA_DIR=%ROOT%\data"
 set "VICTORY_FIDELITYFX_DIR=%ROOT%\fidelityfx"
 set "VICTORY_LOG=info"
+set "VICTORY_LOG_FILE=%ROOT%\logs\last_run.log"
 set "VICTORY_FSR_PC=1"
 set "VICTORY_AMBIENT=0.75"
 set "VICTORY_AMBIENT_AIR=1.5"
@@ -86,7 +89,7 @@ set "VICTORY_WINDOW_IDLE_MS=2500"
 set "VICTORY_SCRATCH_SPARE_MB=16"
 set "VICTORY_READ_KEEP_MB=16"
 set "VICTORY_WAIT_RESIDENT=textures"
-set "VICTORY_CARD_BUFFERS_MIN_KB=64"
+REM Leave VICTORY_CARD_BUFFERS_MIN_KB unset ("auto") so Auto-VRAM scales safely on 8/12/16+ GB GPUs
 set "VICTORY_KEEP_FREED=0"
 set "VICTORY_LIST_IDLE_MOST=1024"
 set "VICTORY_LIST_IDLE_TRIM_S=60"

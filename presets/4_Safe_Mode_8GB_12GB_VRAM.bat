@@ -1,9 +1,10 @@
 @echo off
+chcp 65001 >nul
 setlocal
 REM ============================================================================
-REM  PRESET 4: Safe Mode / 8-12 GB VRAM (Maximum Stability)
-REM  Strictest VRAM & Commit budgets, NVMe physical pages, full descriptor
-REM  page scans, VSync ON — use if you have 8-12 GB VRAM or flicker issues.
+REM  PRESET 4: Safe Mode / 8-12 GB VRAM (Live-Budget Fit — PR #1 by nathanbzrr)
+REM  Verified on RX 7600 8 GB: 3.67 -> 12.7 native FPS (24.86 displayed FG),
+REM  p99 1047 -> 242 ms, 0 OOM. Normal CPU priority, NVMe physical pages.
 REM ============================================================================
 for %%I in ("%~dp0..") do set "ROOT=%%~fI"
 if not exist "%ROOT%\config.bat" (
@@ -19,6 +20,7 @@ if not exist "%GAME_EXE%" (
 )
 if not exist "%ROOT%\cache" mkdir "%ROOT%\cache"
 if not exist "%ROOT%\data" mkdir "%ROOT%\data"
+if not exist "%ROOT%\logs" mkdir "%ROOT%\logs"
 for /f "delims==" %%V in ('set VICTORY_ 2^>nul') do set "%%V="
 
 set "VICTORY_GAME_DIR=%GAME_DIR%"
@@ -26,6 +28,7 @@ set "VICTORY_CACHE_DIR=%ROOT%\cache"
 set "VICTORY_DATA_DIR=%ROOT%\data"
 set "VICTORY_FIDELITYFX_DIR=%ROOT%\fidelityfx"
 set "VICTORY_LOG=info"
+set "VICTORY_LOG_FILE=%ROOT%\logs\last_run.log"
 set "VICTORY_FSR_PC=1"
 set "VICTORY_AMBIENT=0.75"
 set "VICTORY_AMBIENT_AIR=1.5"
@@ -84,6 +87,7 @@ set "VICTORY_RESIDENCY=1"
 set "VICTORY_SEGMENT_TIGHT=85"
 set "VICTORY_SWEEP_ASYNC=1"
 set "VICTORY_TEXTURE_KEEP_PERCENT=40"
+set "VICTORY_TEXTURE_ROOM_PERCENT=65"
 set "VICTORY_TEXTURE_STAGE_MB=64"
 set "VICTORY_STAGING_MAX_MB=96"
 set "VICTORY_STAGING_IDLE_MS=1000"
@@ -93,9 +97,9 @@ set "VICTORY_SEND_SPARE_MB=24"
 set "VICTORY_SCRATCH_SPARE_MB=16"
 set "VICTORY_READ_KEEP_MB=16"
 set "VICTORY_WAIT_RESIDENT=textures"
-set "VICTORY_CARD_BUFFERS_MIN_KB=256"
-set "VICTORY_CARD_BUFFERS_MB=1280"
-set "VICTORY_CARD_ROOM_FOR_TARGETS_MB=1536"
+set "VICTORY_CARD_BUFFERS_MIN_KB=128"
+set "VICTORY_CARD_BUFFERS_MB=768"
+set "VICTORY_CARD_ROOM_FOR_TARGETS_MB=2048"
 set "VICTORY_KEEP_FREED=0"
 set "VICTORY_LIST_IDLE_MOST=128"
 set "VICTORY_LIST_IDLE_TRIM_S=30"
@@ -112,8 +116,8 @@ set "VICTORY_PANEL=1"
 set "VICTORY_PANEL_POS=top-right"
 
 echo ============================================================================
-echo  RAZDA4A XEN — Preset: Safe Mode (8-12 GB VRAM / Max Compatibility)
-echo  Strict VRAM/Commit Caps ^| NVMe Physical Pages ^| Full Descriptor Scans
+echo  RAZDA4A XEN — Preset: Safe Mode (8-12 GB VRAM / Live-Budget Fit)
+echo  65%% Texture Room ^| 2048 MB Targets ^| 768 MB Card Buffers ^| NVMe Physical
 echo ============================================================================
 pushd "%ROOT%"
 start "" /WAIT /B "%ROOT%\RAZDA4A_XEN.exe" run --console series-s "%GAME_EXE%" --execute

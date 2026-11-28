@@ -1,0 +1,9 @@
+# RAZDA4A XEN — Wave 11 Binary & Runtime DLL SHA-256 Checksums
+# Verify in PowerShell: Get-FileHash .\RAZDA4A_XEN.exe -Algorithm SHA256
+# Or on Linux/macOS:    sha256sum -c SHA256SUMS.txt
+
+4ab8fcf7e2614cb669ad54069011d8cb0bed74b3eac7b994854c278f2a862622  RAZDA4A_XEN.exe
+70a6d47d335b4a15180544c01a35b84474522a369dc582d85fe057313a3aeaa0  D3D12/D3D12Core.dll
+e6843252f58b0341a0d80f6a20bc0d840643ee95bc48c22cac08745344577bb6  fidelityfx/amd_fidelityfx_framegeneration_dx12.dll
+e2191d3c0828be45eb8affd4e3ec0378f2293adc345b772a7170edcf3b021ecb  fidelityfx/amd_fidelityfx_loader_dx12.dll
+aad4fccccb29084a655f9a4f9f613bd22c8c03fb4a0f8840148cc6543b4ccace  fidelityfx/amd_fidelityfx_upscaler_dx12.dll

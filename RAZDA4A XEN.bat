@@ -1,10 +1,11 @@
 ﻿@echo off
+chcp 65001 >nul
 setlocal
 
 REM ============================================================================
-REM  RAZDA4A XEN — Budget & 16 GB RAM Edition (Wave 5 + Hotfix)
-REM  Pure --release Zen 3 build | Win10 Agility SDK | FSR 4.1.2 ML + HUDLess FG
-REM  Run with --no-gui to skip the Launch Options dialog.
+REM  RAZDA4A XEN — Budget & 16 GB RAM Edition
+REM  Portable x86-64-v3 release build | Win10 Agility SDK | FSR 4.1.2 ML + HUDLess FG
+REM  Run with --no-gui to skip the Launch Options dialog (VILauncher / CLI friendly).
 REM ============================================================================
 
 set "ROOT=%~dp0"
@@ -41,6 +42,7 @@ if not exist "%GAME_EXE%" (
 
 if not exist "%ROOT%\cache" mkdir "%ROOT%\cache"
 if not exist "%ROOT%\data" mkdir "%ROOT%\data"
+if not exist "%ROOT%\logs" mkdir "%ROOT%\logs"
 
 REM Clear any inherited VICTORY_* variables
 for /f "delims==" %%V in ('set VICTORY_ 2^>nul') do set "%%V="
@@ -50,6 +52,7 @@ set "VICTORY_CACHE_DIR=%ROOT%\cache"
 set "VICTORY_DATA_DIR=%ROOT%\data"
 set "VICTORY_FIDELITYFX_DIR=%ROOT%\fidelityfx"
 set "VICTORY_LOG=info"
+set "VICTORY_LOG_FILE=%ROOT%\logs\last_run.log"
 
 REM === GRAPHICS QUALITY: Native AMD FSR 4.1.2 ML + Reflections + Air ===
 set "VICTORY_FSR_PC=1"
@@ -144,6 +147,7 @@ if /I "%XEN_PROFILE%"=="cbv_exp" (
     set "VICTORY_PORT_CBV_SHADOW=2"
 )
 if /I "%XEN_PROFILE%"=="safe" (
+    REM Verified 8 GB VRAM live-budget fit (PR #1 by nathanbzrr: RX 7600 8 GB 3.67 -> 12.7 native / 24.86 FG FPS)
     set "VICTORY_ALLOW_TEARING=0"
     set "VICTORY_VSYNC=1"
     set "VICTORY_HELPER_PRIORITY=0"
@@ -153,15 +157,16 @@ if /I "%XEN_PROFILE%"=="safe" (
     set "VICTORY_PIPELINE_WORKERS=2"
     set "VICTORY_SEGMENT_TIGHT=85"
     set "VICTORY_TEXTURE_KEEP_PERCENT=40"
+    set "VICTORY_TEXTURE_ROOM_PERCENT=65"
     set "VICTORY_TEXTURE_STAGE_MB=64"
     set "VICTORY_STAGING_MAX_MB=96"
     set "VICTORY_STAGING_IDLE_MS=1000"
     set "VICTORY_WINDOW_BUDGET_MB=96"
     set "VICTORY_WINDOW_IDLE_MS=2000"
     set "VICTORY_SEND_SPARE_MB=24"
-    set "VICTORY_CARD_BUFFERS_MIN_KB=256"
-    set "VICTORY_CARD_BUFFERS_MB=1280"
-    set "VICTORY_CARD_ROOM_FOR_TARGETS_MB=1536"
+    set "VICTORY_CARD_BUFFERS_MIN_KB=128"
+    set "VICTORY_CARD_BUFFERS_MB=768"
+    set "VICTORY_CARD_ROOM_FOR_TARGETS_MB=2048"
     set "VICTORY_LIST_IDLE_MOST=128"
     set "VICTORY_LIST_IDLE_TRIM_S=30"
     set "VICTORY_LATE_WAIT_LISTS=128"
@@ -181,9 +186,10 @@ set "FG_LABEL=ON (HUDLess 2x FPS)"
 if "%XEN_FRAMEGEN%"=="0" set "FG_LABEL=OFF (Native Zero-Latency)"
 
 echo ============================================================================
-echo  RAZDA4A XEN — Budget & 16 GB RAM Edition
+echo  RAZDA4A XEN — Budget ^& 16 GB RAM Edition
 echo  Profile: %XEN_PROFILE% ^| Frame Generation: %FG_LABEL%
 echo  Controls: F2 or ~ = toggle mouse-look ^| F3 = toggle FPS HUD
+echo  Tip: Run collect_logs.bat to export a sanitized bug report if needed.
 echo ============================================================================
 pushd "%ROOT%"
 start "" /WAIT /B "%ROOT%\RAZDA4A_XEN.exe" run --console series-s "%GAME_EXE%" --execute

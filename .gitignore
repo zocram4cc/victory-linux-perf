@@ -1,6 +1,6 @@
 cache/
 data/
+logs/
 saves-backup/
 *.log
-
 launcher_prefs.bat

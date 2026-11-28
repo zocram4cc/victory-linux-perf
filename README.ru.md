@@ -1,86 +1,112 @@
-[English](README.md) | Русский | [简体中文](README.zh.md) | [Español](README.es.md) | [Português (BR)](README.pt-BR.md)
+﻿[English](README.md) | Русский | [简体中文](README.zh.md) | [Español](README.es.md) | [Português (BR)](README.pt-BR.md)
 
 # RAZDA4A XEN
 
-Слой совместимости Direct3D 12 под Windows для систем с **16 ГБ RAM**, **6-ядерным CPU**, **видеокартами 8–16 ГБ VRAM** и **Windows 10**.
+Direct3D 12 Windows-рантайм для **видеокарт AMD RDNA2 / RDNA3 / RDNA4**, нацеленный на **16 ГБ ОЗУ**, **6-ядерные CPU**, **8–16 ГБ VRAM** и **Windows 10 / 11** (а также Linux через Proton / VKD3D-Proton).
 
-Репозиторий не содержит файлов игры, ассетов или исполняемых файлов. Используется собственный дамп *«Великого Автоугонщика» от Звёздной Компании*.
+Файлы игры, ассеты и исполняемые файлы игры в репозиторий не входят — используйте собственную копию *Великого симулятора автоугона от Звёздной студии*.
 
-## Отличия от оригинального VIctory
+## Подтверждённые замеры (Нативный FPS отдельно от Frame Generation)
 
-Оригинальный VIctory разрабатывается и профилируется под стенды с 64 ГБ RAM, 24 ГБ видеокартами и Windows 11 (WDDM 3.0+ с `D3D12_HEAP_TYPE_GPU_UPLOAD`). На ПК с 16 ГБ RAM и Windows 10 это приводит к вылетам `0x8007000E` (`E_OUTOFMEMORY`), падению FPS вдвое из-за VSync, двоению HUD в Frame Generation и упору в однопоточный CPU.
+Во всех таблицах ниже **нативный FPS (без Frame Gen)** всегда указан отдельно от **отображаемого FPS (FSR 3.1.6 Frame Gen 2x)** с указанием точной сцены и конфигурации.
 
-Замеры на **Ryzen 5 5600 (6C/12T), Radeon RX 9060 XT 16 ГБ, 16 ГБ DDR4, Windows 10 (19045)** — 1080p профиль Series S, RT выкл., 180-секундные прогоны, 0 ошибок:
+### 16 ГБ VRAM / 16 ГБ RAM (Открытый мир, 1080p Series S, RT выкл.)
 
-| Параметр | База (конфиг upstream) | RAZDA4A XEN |
+Замерено на **Ryzen 5 5600 (6C/12T), Radeon RX 9060 XT 16 ГБ, 16 ГБ DDR4, Windows 10 (19045)** — 180-секундные прогоны в открытом мире + 22-минутный прогон Wave 11 (18 393 кадра), 0 ошибок, 0 OOM:
+
+| Метрика | База (апстрим-конфиг) | RAZDA4A XEN (Wave 7 / Wave 11) |
 |---|---|---|
-| Private Commit (установившийся) | 21.8 – 30+ ГБ (вылеты `0x8007000E`) | **19.3 ГБ** (6.2 ГБ RAM WS, 5.5 ГБ свободно) |
-| Dedicated VRAM | 9.92 ГБ (`5.06 ГБ` пул текстур) | **12.11 ГБ** (`5.12 ГБ` пул текстур; до `13.18 ГБ` / `6.40 ГБ` пул; авто 8–24 ГБ DXGI) |
-| Shared GPU (`NON_LOCAL`) | 6.68 ГБ (5.58 ГБ Series S) | **2.18 ГБ** (`-61%` к базе Series S; `2.01 ГБ` при keep 91%) |
+| **Нативный FPS (FG выкл., открытый мир)** | 14.08 средн. (71.03 мс, p99 152.1 мс / 1% low 6.6 FPS) | **18.19 p50** (54.97 мс), **16.17** средн., 15.2–23.4 стабильно, p99.9 **478.6 мс** |
+| **Отображаемый FPS (FSR 3.1.6 FG 2x)** | 25–27 FPS (падения до 15–20 из-за VSync) | **29.2 – 31.0 FPS** стабильно (HUDLess RGBA8-кольцо, без просадок VSync) |
+| Private Commit (устоявшийся) | 21.8 – 30+ ГБ (`0x8007000E` OOM) | **19.3 ГБ** (6.2 ГБ RAM WS, 5.5 ГБ свободного Commit) |
+| Выделенная VRAM | 9.92 ГБ (`5.06 ГБ` пул текстур) | **12.11 ГБ** (авто 8–24 ГБ DXGI; `0` отказов по VRAM за 22 мин в Wave 11) |
+| Shared GPU (`NON_LOCAL`) | 6.68 ГБ (5.58 ГБ Series S) | **2.18 ГБ** (`-61%` к базе Series S) |
 | Трафик copy-back | 27.0 МБ / кадр | **0.5 МБ / кадр** |
-| CPU `preparing` | 45.8 мс | **32.2 – 35.4 мс** |
-| Реальный кадр (мин / медиана) | 68.6 / 73.1 мс | **64.3 / 66.2 – 69.6 мс** |
-| Нативный FPS и фреймтайм (без FG, открытый мир) | 14.08 FPS (ср. 71.03 мс, p99 152.1 мс / 1% low 6.6 FPS) | **15.2 – 23.4 FPS** (p50 **60.4 мс** / 16.6 FPS, `list_al` **0.03 мс**, `alloc` **4.8 мс**, `0` фризов 5–10 с, `0` OOM / `0` emergency reclaim) |
-| Проход `heap buffers` (макс. в игре / спайки >50 мс) | 821.1 мс (8 спайков >50 мс) | **33.8 мс (0 спайков >50 мс; в стационаре 8.6–10.0 мс)** |
-| Ожидания `settle` и `port_descriptors::take()` (без FG) | 0.2–2.6 мс settle / 0.75–1.07 мс `take()` | **0.0 мс settle / 0.31–0.47 мс `take()`** |
-| Отображаемый FPS (FSR 3.1.6 FG) | 25–27 FPS (провалы VSync до 15–20) | **29.2 – 31.0 FPS** (без провалов VSync) |
-| HUD и субтитры в Frame Gen | Шлейфы и двоение | Без артефактов (`HUDLessColor`, 3-слотовый RGBA8) |
-| Windows 10 D3D12 | Ручная установка Agility SDK | Встроенный `D3D12Core.dll` (Agility SDK 620) |
+| CPU `preparing` / `heap buffers` | 45.8 мс / 821.1 мс макс. | **32.2 – 35.4 мс** / **33.8 мс макс.** (0 пиков >50 мс) |
+| Raw buffer views (`LIST_VIEWS`, Wave 11) | 372.1–575.8 null/кадр (пропадали деревья/объекты) | **0.0 null/кадр** (28 212/кадр, 932.5 невыровн. -> 0 null; деревья/листва/заборы починены) |
+| Windows 10 D3D12 | Ручная настройка Agility SDK | Встроенный `D3D12Core.dll` (Agility SDK 620) |
+
+### Проверка 8 ГБ VRAM — Safe Mode (PR #1 от `nathanbzrr`)
+
+Замерено на **Ryzen 5 5500X3D, Radeon RX 7600 8 ГБ, 32 ГБ DDR4, Windows 11 (26340)** — 1080p Series S, Safe Mode (`65%` лимит текстур / `2048 МБ` рендер-таргеты / `768 МБ` буферы карты), FSR FG 2x, 180 с:
+
+| Метрика | До подгонки 8 ГБ | После подгонки под живой бюджет |
+|---|---:|---:|
+| **Нативный FPS (без FG)** | 3.67 | **12.7** (средн. 79.01 мс, p50 68.90 мс, p99 **242.26 мс** против 1047.30 мс) |
+| **Отображаемый FPS (FSR FG 2x)** | 7.32 | **24.86** (1803 сгенерировано / 1803 отрендерено) |
+| Пик VRAM / живой бюджет | 6548 МБ | **6169 МБ** / 5934–5981 МБ (`0` ошибок, `0` OOM, `0` device removal) |
 
 ## Технические изменения
 
-- **Память и устранение OOM (`0x8007000E`):** глобальный ограниченный пул прелюдий `(64, 16)`; немедленное переиспользование приземлившихся списков и командных аллокаторов (`recycle_landed`) с отложенным освобождением ресурсов (`bury_lag`); проактивный `emergency_reclaim()` при свободном Commit <2.5 ГБ или Shared GPU (`NON_LOCAL`) >=88% с агрессивной LRU-выгрузкой неактивных текстур/staging/пулов и динамическим троттлингом потоков записи `thin` (1–2 воркера под давлением); защита `HostList::close()`, `make_list()` и `record_prelude()` при `E_OUTOFMEMORY` (reclaim, retry и безопасный сброс/вывод аллокатора без краша); `MEM_RESET` для освобождённых несмапленных физических страниц; upstream-фиксы `#2143` (таблица констант после инструкций), `#2234` (освобождение таблицы памяти при удалении view heap), `#2462` (проверка `typed_store` для UAV), `#2844` (RAII-слоты `CpuViews`) и `#3540` (16-байтное выравнивание raw buffer views); опциональные автоудаляемые файлы физических страниц на NVMe (`FILE_FLAG_DELETE_ON_CLOSE` в `%LOCALAPPDATA%\victory\physical`, >11 ГБ свободного Commit при загрузке). Подтверждено на 180-секундном нативном прогоне без FG на стандартном файле подкачки (`VICTORY_FILE_PHYSICAL=0`): 0 ошибок, 0 OOM, `min_free_commit 3.47 ГБ`, стабильно `5.10–5.57 ГБ` свободного Commit.
-- **Вывод кадра и Frame Generation:** 3-слотовый RGBA8 захват `HUDLessColor` до наложения UI/субтитров/HUD; тройная буферизация с `DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING` и `DXGI_PRESENT_ALLOW_TEARING`; нативный апскейл AMD FSR 4.1.2 ML (автофоллбэк на FSR 3.1 на старых GPU).
-- **CPU-сабмит и copy-back:** write-combined записи шейдеров остаются в VRAM (`27 -> 0.5 МБ/кадр`); 128-байтный AVX2 `vptest` fast-skip и векторизованный `merge_piece`; lock-free work-stealing пул `land`; 64-байтные cache-aligned шарды write-watch; однопроходный объединённый скан `ask_once`/`stale_under_flights`; lock-free `mirror` дескрипторов; `OnceLock` сигнатуры команд; стековые `Few<Barrier, 16>`; 64-шардовый `PLACED_TEXTURES`; разблокировка очереди при `unfold` и lock-free `wake()`; зануление `upload::ARENAS` вне мьютекса; повышенный приоритет helper-потоков на 6 ядрах; предпланирование списков на thin-воркерах; хэш до detile; переиспользование upload-буферов.
-- **Динамический DXGI авто-VRAM и снижение Shared GPU:** автоматическое масштабирование профилей 8 / 12 / 16 / 24+ ГБ по `DedicatedVideoMemory` и живому `DXGI_QUERY_VIDEO_MEMORY_INFO` (`VICTORY_VRAM_MODE=auto|8gb|12gb|16gb|24gb|legacy`, поддержка `"auto"` и ручных env-переопределений, детекция UMA и ступенчатая защита по Commit). На 16 ГБ GPU политика учитывает объём RAM: на системах `<=20 ГБ` RAM держит `84%` keep / `90%` room (`12.11 ГБ` VRAM, `2.18 ГБ` Shared GPU, без свопа working set в Windows, `+55%` к 1% low FPS), на `>=32 ГБ` RAM — `91%` keep / `95%` room (`~13.2–14.2 ГБ` VRAM). Прямые VRAM-окна без дублирующего staging (`CardCpu::Direct`), компактные CPU-тени (`CardCpu::Cpu`), O(dirty) очередь `DIRTY_CARDED`, пошаговая эвикция VRAM-окон с гистерезисом (не более 8/с), общий scratch для depth-stencil двойников (upstream `#2162`), исправление защёлки `host_pressure` на 16 ГБ RAM (`send_allocs` `117/15с -> 0/15с`), автодетекция NVMe (`VICTORY_FILE_PHYSICAL=auto`) и точный учёт памяти игры в `XMemGetWorkingSetStatistics`.
-- **Фреймпейсинг и устранение спайков (нативный режим без FG):** асинхронный инкрементальный `sweep()` (`victory-sweep`, `VICTORY_SWEEP_ASYNC=1`), убирающий синхронную остановку конвейера `settle(WHY_SYNC)` каждые 1.5 с; фоновый сборщик `bury()` с троттлингом (`victory-bury`, `VICTORY_BURY_ASYNC=1`); ожидание `WHY_FENCE`/`WHY_VALUE` по `Line.seq` без блокировки `host.submitted`; пропуск лишнего `sync_heaps` на `execute_own` при презенте (`0.0` немаркированных раундов); 64-битный скан `AtomicU64` в `port_descriptors::take()` (ускорение в 2–3×); точный сон `frame::wait` без лишних `Sleep(0)`; покадровая телеметрия `present pacing` (`avg / p50 / p95 / p99 / 1% low / max / >50 мс / >100 мс`, `VICTORY_FRAME_TIMES_FILE`) и плоский `heap buffers` (`VICTORY_TEXTURE_STAGE_MS=4`, `VICTORY_TEXTURE_CATCHUP=0`, `0` спайков >50 мс).
-- **Фаза 2 — оптимизация CPU-сабмита и дескрипторов (`feat/phase2-30fps`):** межсабмитный `MappedCache` с диапазонной инвалидацией для `VirtualQuery` в `card_steps` (`12.56 мс / 36 вызовов -> 0.00 мс / 0 вызовов`, `own_cs` `15.1 -> 2.5 мс`); lock-free послотовая таблица поколений `ENTRY_GENS` + 8192-слотовый TLS-кэш `descriptor::VIEWS` и `words_for` (`100.0%` попаданий); быстрый inline-CBV путь, 128-слотовый слэб-аллокатор динамических дескрипторов и батч-освобождение `release_dynamic_batch` в `draw_bind::tables` + потоковый `RETIRE_TLS`; переиспользование списков без утечек (`BACKS_MOST=512`, `IDLE_BYTES=512 MiB`, `list::boxed()` → `fresh_list()`, `list_al` `-99.7%`, `alloc` `-83%`, `lists` churn `+0`); покопийный инкрементальный `BufferSweep` и пропуск неизменившихся слотов в `heap_buffer_pass` (`HBP_SPANS` `10.94 -> 0.51 мс`); расширенные пулы `PRELUDES_MOST` `(512, 128)`, `SPARE_BATCH` `(128/256)`, `send::SPARE` `(256/128 MiB)` и `VICTORY_LIST_IDLE_MOST=1024`; приоритетная очередь compute PSO + 4 compute/screen воркера с лимитом поздних ожиданий (`VICTORY_COMPUTE_LATE_WAIT_MS=400`, ноль 5–10 с зависаний в геймплее, `p99.9` `-80%`, `1% low` в `3.2×` лучше); исправление порогов `residency` на 16 ГБ RAM (`unmap_null` `-97%`, `VICTORY_KEEP_SHOWN=2`, `VICTORY_TEXTURE_AWAY_MS=10000`); постраничная (64 KiB) битовая карта `gpu_written_pages` для `PORT_CBV`; HUD в правом верхнем углу (`VICTORY_PANEL_POS=top-right`); встроенный профилировщик `VICTORY_PHASE2_PROFILE=1`.
-- **Исправления и управление:** бюджет ожидания compute-пайплайнов (`5000 мс`) — исправлены отсутствующие лица персонажей; пропуск проблемного шейдера RDNA4 (`240cb516c1af0bc3`); фильтр битых фиолетовых ambient-проб; безопасный async-флип дескрипторов; повтор сбойного detile текстур; ПК-управление (`F2`/`~` обзор мышью, `F3` оверлей FPS); встроенная галочка выбора Frame Generation (вкл/выкл) в лаунчере.
+- **Wave 11 (деревья/листва и портативный бинарь):** исправлено `372–575` принудительных `NULL` raw-буферных view за кадр в `LIST_VIEWS` (перестали пропадать деревья, листва, заборы, столбы и знаки); поддержка `SW_64KB_D`; донастройка 16 ГБ VRAM residency (`0` отказов `card has no room` и `host memory pressure` за 22 минуты); переносимый бинарь **`x86-64-v3`** (полный AVX2/BMI2/FMA на AMD Zen 2–5 и Intel Haswell–Arrow Lake без AMD-специфичных расширений `znver3`).
+- **Wave 6–7 (текстуры, дескрипторы и стабильность):** HashMap + 8192-слотовый TLS-кэш дескрипторов (`100%` попаданий), best-fit пул, ограниченная `let_go_idle`, перемежающаяся очередь текстур (очередь в катсценах `3936 -> 0` кадров), гистерезис для 16 ГБ RAM, обычный приоритет CPU (не вешает фоновые приложения) и запись лога в файл `VICTORY_LOG_FILE`.
+- **Память и OOM (`0x8007000E`):** ограниченные пулы прелюдий, мгновенная переработка `recycle_landed`, упреждающая `emergency_reclaim()` (<2.5 ГБ свободного Commit или >=88% Shared GPU), восстановление при `E_OUTOFMEMORY`, `MEM_RESET`, динамический DXGI Auto-VRAM (`8/12/16/24 ГБ`), опциональный NVMe-файл физических страниц (`VICTORY_FILE_PHYSICAL=auto`).
+- **Отрисовка и управление:** 3-слотовый RGBA8-захват `HUDLessColor` для FSR 3.1.6 FG, swapchain с tearing, нативный апскейл AMD FSR 4.1.2 ML (откат на FSR 3.1), бюджет ожидания compute `5000 мс` (исправление лиц), защита от краш-шейдера RDNA4 (`240cb516c1af0bc3`), управление ПК (`F2`/`~` — обзор мышью, `F3` — HUD FPS в правом верхнем углу).
 
-## Текущие известные ограничения (в работе на `dev`)
+## Известные ограничения (в работе на `dev`)
 
-- Нативные 30 FPS (`<= 33.3 мс`) продолжаем дожимать на `dev`: `victory-submit` уже снижен до `34.4 мс/кадр`, следующая цель — потоки записи списков (`victory-list-0..3`) и копии CBV.
-- Переход из пролога в открытый мир на сильно урезанных файлах подкачки смягчён проактивным `emergency_reclaim()` и автодетекцией NVMe (`VICTORY_FILE_PHYSICAL=auto`) на `dev`.
+- В плотных городских районах нативный FPS может падать до `5–10` с длинными статтерами на таблице дескрипторов в долгих сессиях (активно решается в **Wave 12** на `dev`).
+- Трассировка лучей (RT) отключена на время стабилизации базового рендера, VRAM и достижения нативных 30 FPS.
+- Первый запуск компилирует PSO-шейдеры (1–3 минуты возможных фризов); со второго запуска и после `warm_shaders.bat` работает заметно плавнее.
 
-## Подтверждённые результаты железа и комьюнити (Wave 4 / Wave 5)
+## Совместимость железа и FAQ
 
-| Железо / ОС | Стенд / Тестер | Статус и результаты |
-|---|---|---|
-| **AMD Ryzen 7 7800X3D + Radeon RX 9060 XT (RDNA 4)** — Windows | Основной стенд разработки | Стабильно. Wave 4: **~14–24 нативных FPS** (`14.0 FPS` ср. в открытом мире, `15–19 FPS` в типовых сценах) + 2× с **AMD FSR 3.1.6 FG (`HUDLessColor`)**, VRAM `~11.9 ГБ`. После последнего апдейта: **35 FPS без FG / 60+ FPS с FG**. |
-| **AMD Ryzen 5 5600 + 16 ГБ RAM** — Windows | Стенд проверки 16 ГБ ОЗУ | Стабильно в открытом мире без 5–10 с фризов после фиксов Wave 4/5 (`15.2 ср. / 16.6 мед. / 23.4 пик` нативных FPS в Wave 5). |
-| **AMD Ryzen 7 7700X + Radeon RX 7800 XT (16 ГБ) + 64 ГБ RAM** — Windows | `@LynxarAD` | Работает: **31–37 FPS с FSR FG** (`15.7×2`–`18.6×2`, натив `~16–19 FPS`), VRAM `~12.3 GiB`, GPU `46%` / CPU `75%`. Второй запуск заметно плавнее первого после прогрева кэша PSO; в катсценах и новых зонах возможны просадки до `~7 FPS`. |
-| **AMD Radeon RX 6600 (8 ГБ) + 16 ГБ RAM** — Windows | `@TriguerosZoe99` | Работает в **14–20 нативных FPS** (без FG) с **`Preset 1 (Low-Commit NVMe)`** или **`Preset 4 (Safe Mode 8–12GB VRAM)`** + файл подкачки на NVMe. Лаунчер теперь автоматически предвыбирает Safe Mode на картах `<= 8 ГБ VRAM`. |
-| **Intel Core i7-8700 + NVIDIA RTX 2070 (8 ГБ) + 16 ГБ DDR4** — Linux | `@supimcinnamon` | Запускается в **~10 нативных FPS** только на модифицированном форке поверх `RAZDA4A-XEN` с пропатченным `wineserver`. |
-| **AMD Ryzen 5 5500 + NVIDIA RTX 5060 (8 ГБ) + 16 ГБ RAM** — Windows | `@Golden_L2` | Не работает (`0 FPS` в 3D, чёрный экран, нехватка ОЗУ). Ветка поддерживает только AMD RDNA; для RTX используйте комьюнити-форки (например, `trustno1-coder/VIctory-NVIDIA`). |
-
-## Быстрый старт
-
-1. Скачай ветку `main` (**Code -> Download ZIP** или `git clone --branch main https://github.com/crossducking/RAZDA4A-XEN.git`) и распакуй (например `D:\RAZDA4A-XEN\`). Все нужные DLL (`D3D12\D3D12Core.dll`, `fidelityfx\*.dll`) уже внутри.
-2. Укажи в **`config.bat`** свою папку и **`ваш_запускной_файл.exe`**:
-   ```bat
-   set "GAME_DIR=D:\Path\To\Your\GameFolder"
-   set "GAME_EXE=%GAME_DIR%\ваш_запускной_файл.exe"
-   ```
-3. Запусти **`RAZDA4A XEN.bat`** или выбери пресет из `presets\`:
-
-| Файл | Профиль |
+| Вопрос | Ответ |
 |---|---|
-| `RAZDA4A XEN.bat` | Основной лаунчер с **кнопкой `Browse...` для выбора `.exe`**, **галочкой Frame Generation (вкл/выкл)** (сохраняется в `launcher_prefs.bat`), авто-Safe-Mode для 8 ГБ видеокарт и проверкой железа/Commit |
-| `launch_linux_proton.sh` | Прямой запуск на Linux (Proton / Wine / VKD3D) без PowerShell/WinForms GUI |
-| `presets\1_Low_Commit_NVMe_16GB.bat` | Маленький файл подкачки / открыт браузер: физические страницы на NVMe, ~8.0 ГБ VRAM, >11 ГБ свободного Commit при загрузке |
-| `presets\2_Max_FPS_Experimental_CBV.bat` | Сбалансированный + чтение констант на месте (экспериментальный) |
-| `presets\3_Native_No_FG_Zero_Latency.bat` | Нативный рендер без Frame Gen, минимальная задержка ввода |
-| `presets\4_Safe_Mode_8GB_12GB_VRAM.bat` | Видеокарты 8–12 ГБ VRAM / безопасный режим: жёсткие лимиты, VSync вкл., полное сканирование дескрипторов |
+| **Какие AMD GPU поддерживаются?** | **AMD RDNA2 / RDNA3 / RDNA4** (RX 6000 / 7000 / 9000 — требуются DX12 Ultimate и Mesh Shaders). |
+| **Работает ли на NVIDIA / Intel Arc?** | **Нет.** Этот форк только для AMD RDNA; на RTX будет чёрный экран/вылет. Для NVIDIA используйте форки сообщества, например [`trustno1-coder/VIctory-NVIDIA`](https://github.com/trustno1-coder/VIctory-NVIDIA). |
+| **Intel CPU + AMD GPU подойдёт?** | **Да.** Сборки начиная с Wave 11 используют универсальный `-C target-cpu=x86-64-v3`. |
+| **8 ГБ / 6 ГБ / <=4 ГБ VRAM?** | **8 ГБ:** работает через **Safe Mode** (проверено: 12.7 native / 24.86 FG на RX 7600, также проверено на RX 6600). **6 ГБ:** экспериментально и тяжело (Safe Mode + FG выкл.). **<=4 ГБ, RDNA1 (RX 5500/5700), GTX 10/16:** не поддерживаются (нет аппаратных Mesh Shaders или слишком мало VRAM). |
+| **16 ГБ ОЗУ / HDD?** | **16 ГБ ОЗУ:** поддерживается на **NVMe/SATA SSD** с файлом подкачки 24–32 ГБ (`pagefile_16gb_ram.ps1`) или пресетом `Low-Commit NVMe`. **HDD:** не поддерживается (подгрузка / DirectStorage). |
+| **Нужен ли утёкший GDK?** | **Нет.** Полностью автономный open-source рантайм (`GPL-3.0-or-later`). |
+| **Куда отправлять баги и логи?** | Запустите **`collect_logs.bat`** (или кнопку **Export Logs** в лаунчере) — создастся очищенный от личных путей `logs\bug_report_*.txt`, приложите его в [GitHub Issues](https://github.com/crossducking/RAZDA4A-XEN/issues). |
 
-- **`F2` / `~`** — переключить обзор мышкой (`Esc` освобождает курсор)
-- **`F3`** — оверлей FPS
-- **`warm_shaders.bat`** — запустить один раз после закрытия первой сессии для предкомпиляции шейдеров
-- **`backup_saves.bat`** — бэкап/восстановление `data\`
-- **`pagefile_16gb_ram.ps1`** — опциональный скрипт администратора (файл подкачки 16–32 ГБ на SSD)
+## Быстрый старт (Windows)
 
-## Сборка из исходников и проверка бинарника
+1. Скачайте ветку `main` (**Code -> Download ZIP** или `git clone --branch main https://github.com/crossducking/RAZDA4A-XEN.git`) и распакуйте (например, в `D:\RAZDA4A-XEN\`). Все DLL (`D3D12\D3D12Core.dll`, `fidelityfx\*.dll`) уже внутри.
+2. Запустите **`RAZDA4A XEN.bat`**, через **Browse...** выберите **`ваш_запускной_файл.exe`** (сохранится в `config.bat` в UTF-8, включая русские пути), выберите профиль и галочку Frame Generation и нажмите **Launch**.
+   - Для сторонних лаунчеров (`VILauncher` и т.д.): используйте **`RAZDA4A XEN.bat --no-gui`** после настройки `config.bat`.
 
-Если не хочешь запускать неподписанный `.exe`, собери бинарник сам из исходников в ветке `dev`:
+| Файл | Назначение |
+|---|---|
+| `RAZDA4A XEN.bat` | Основной лаунчер (выбор `.exe`, FG вкл/выкл, авто-Safe-Mode для 8 ГБ, кнопки Warm Shaders и Export Logs) |
+| `presets\1_Low_Commit_NVMe_16GB.bat` | Для 16 ГБ RAM и малого pagefile: NVMe-файл физических страниц (`VICTORY_FILE_PHYSICAL=1`) |
+| `presets\2_Max_FPS_Experimental_CBV.bat` | Balanced + экспериментальные in-place CBV (`VICTORY_PORT_CBV=1`) |
+| `presets\3_Native_No_FG_Zero_Latency.bat` | Чистый нативный рендер без Frame Gen, минимальная задержка |
+| `presets\4_Safe_Mode_8GB_12GB_VRAM.bat` | Safe Mode для 8–12 ГБ VRAM (`65%` / `2048 МБ` таргеты / `768 МБ` буферы, VSync вкл.) |
+| `warm_shaders.bat` | Предкомпиляция встреченных PSO после первой сессии |
+| `collect_logs.bat` | Сбор очищенного багрепорта (железо + `logs\last_run.log`) |
+| `pagefile_16gb_ram.ps1` / `backup_saves.bat` | Помощник файла подкачки 16–32 ГБ / бэкап `data\` |
+
+Управление: **`F2` / `~`** — обзор мышью (`Esc` — отпустить курсор), **`F3`** — HUD FPS в правом верхнем углу.
+
+## Быстрый старт (Linux — Proton / Wine / VKD3D-Proton)
+
+1. Установите **Proton Experimental / GE-Proton** (через `umu-run`, Steam или Lutris) и **Mesa RADV** на AMD RDNA2+ GPU.
+2. Запустите `launch_linux_proton.sh` (скрипт автоматически выставляет `WINEDLLOVERRIDES="d3d12,d3d12core=n"`, чтобы встроенный Windows 10 `D3D12Core.dll` не перекрывал `vkd3d-proton` и не вызывал 1 FPS / пустой 3D-экран):
+   ```bash
+   chmod +x launch_linux_proton.sh
+   GAME_DIR="/path/to/unpacked" \
+   GAME_EXE="/path/to/unpacked/your_executable.exe" \
+   RUNNER="umu-run" \
+   XEN_PROFILE="safe" \
+   XEN_FRAMEGEN="0" \
+   ./launch_linux_proton.sh
+   ```
+   Лог пишется в `logs/last_run.log`. На картах 12–16+ ГБ VRAM можно использовать `XEN_PROFILE=balanced`.
+
+## Безопасность, ложные срабатывания антивируса и сборка из исходников
+
+Браузеры (Brave/Edge) и Windows Defender ML могут помечать неподписанные ZIP-архивы с `.exe` + `.bat` + `.ps1` как **`Trojan:Script/Wacatac.H!ml`**. Не доверяйте неподписанным бинарям на слово — сверьте хеш или соберите бинарь сами из открытой ветки `dev`:
+
+```powershell
+# Проверка хеша по SHA256SUMS.txt
+Get-FileHash .\RAZDA4A_XEN.exe -Algorithm SHA256
+```
+
+- Wave 11 `RAZDA4A_XEN.exe` (`x86-64-v3`) SHA-256: `4ab8fcf7e2614cb669ad54069011d8cb0bed74b3eac7b994854c278f2a862622` (хеши всех DLL см. в [`SHA256SUMS.txt`](SHA256SUMS.txt)).
+
+Сборка из исходников (ветка `dev`, Rust MSVC):
 
 ```powershell
 git clone --branch dev https://github.com/crossducking/RAZDA4A-XEN.git
@@ -90,11 +116,9 @@ $env:RUSTFLAGS = "-C target-cpu=x86-64-v3"
 cargo build --release --locked -p victory
 ```
 
-SHA-256 готового `RAZDA4A_XEN.exe`: `4ab8fcf7e2614cb669ad54069011d8cb0bed74b3eac7b994854c278f2a862622`
-
 ## Ветки и лицензия
 
-- `main`: готовый бинарник, системные DLL, пресеты, документация.
-- `dev`: полный исходный код Rust, юнит-тесты, CI, `AGENTS.md`.
+- `main`: готовый бинарь, DLL, пресеты, лаунчер, контрольные суммы, документация.
+- `dev`: полный исходный код на Rust, юнит-тесты, `xtask policy`, CI, `AGENTS.md`.
 
-Основано на VIctory, лицензия **GPL-3.0-or-later** ([LICENSE](LICENSE)). Полный исходный код доступен в ветке [`dev`](https://github.com/crossducking/RAZDA4A-XEN/tree/dev).
+Производный проект от VIctory под лицензией **GPL-3.0-or-later** ([LICENSE](LICENSE)). Полный исходный код доступен в [`dev`](https://github.com/crossducking/RAZDA4A-XEN/tree/dev).

@@ -1,74 +1,106 @@
-[English](README.md) | [Русский](README.ru.md) | [简体中文](README.zh.md) | Español | [Português (BR)](README.pt-BR.md)
+﻿[English](README.md) | [Русский](README.ru.md) | [简体中文](README.zh.md) | Español | [Português (BR)](README.pt-BR.md)
 
 # RAZDA4A XEN
 
-Capa de ejecución Direct3D 12 para Windows enfocada en **16 GB de RAM**, **CPUs de 6 núcleos**, **GPUs de 8–16 GB VRAM** y **Windows 10**.
+Capa de ejecución Direct3D 12 para Windows orientada a **GPUs AMD RDNA2 / RDNA3 / RDNA4**, **16 GB de RAM**, **CPUs de 6 núcleos**, **8–16 GB de VRAM** y **Windows 10 / 11** (y Linux mediante Proton / VKD3D-Proton).
 
-No incluye archivos de juego, recursos ni ejecutables. Debes aportar tu propia copia de *El Gran Simulador de Préstamo de Autos del Estudio Estelar*.
+No se incluyen archivos, assets ni ejecutables del juego. Debes aportar tu propia copia de *El Gran Simulador de Préstamo de Coches del Estudio Estrellado*.
 
-## Diferencias frente al VIctory original
+## Rendimiento Medido (FPS Nativos vs. Frame Generation)
 
-El proyecto VIctory original se perfila principalmente en 64 GB de RAM, GPUs de 24 GB y Windows 11 (WDDM 3.0+ con `D3D12_HEAP_TYPE_GPU_UPLOAD`). En equipos con 16 GB de RAM y Windows 10 provoca cierres `0x8007000E` (`E_OUTOFMEMORY`), caídas a la mitad por VSync, ghosting de HUD en Frame Generation y cuello de botella en el hilo de envío CPU.
+Todas las métricas separan **FPS nativos (Frame Gen OFF)** de **FPS mostrados (FSR 3.1.6 Frame Gen 2x)** indicando escena y hardware exactos.
 
-Medido en **Ryzen 5 5600 (6C/12T), Radeon RX 9060 XT 16 GB, 16 GB DDR4, Windows 10 (19045)** — 1080p perfil Series S, sin RT, ejecuciones continuas de 180 s, 0 errores:
+### Base 16 GB VRAM / 16 GB RAM (Mundo Abierto, 1080p Series S, RT OFF)
 
-| Métrica | Base (configuración upstream) | RAZDA4A XEN |
+Medido en **Ryzen 5 5600 (6C/12T), Radeon RX 9060 XT 16 GB, 16 GB DDR4, Windows 10 (19045)** — pruebas de 180 s en mundo abierto + prueba de estabilidad Wave 11 de 22 minutos (18.393 cuadros), 0 errores, 0 OOM:
+
+| Métrica | Base (config upstream) | RAZDA4A XEN (Wave 7 / Wave 11) |
 |---|---|---|
-| Private Commit (estable) | 21.8 – 30+ GB (`0x8007000E` OOM) | **19.3 GB** (6.2 GB RAM WS, 5.5 GB libres) |
-| VRAM dedicada | 9.92 GB (`5.06 GB` pool de texturas) | **12.11 GB** (`5.12 GB` pool de texturas; hasta `13.18 GB` / `6.40 GB` pool; auto 8–24 GB DXGI) |
-| GPU compartida (`NON_LOCAL`) | 6.68 GB (5.58 GB Series S) | **2.18 GB** (`-61%` frente a base Series S; `2.01 GB` al 91% keep) |
-| Tráfico copy-back | 27.0 MB / cuadro | **0.5 MB / cuadro** |
-| CPU `preparing` | 45.8 ms | **32.2 – 35.4 ms** |
-| Cuadro real (mín / med) | 68.6 / 73.1 ms | **64.3 / 66.2 – 69.6 ms** |
-| FPS nativos y estabilidad (sin FG, mundo abierto estable) | 14.08 FPS (media 71.03 ms, p99 152.1 ms / 1% low 6.6 FPS) | **15.2 – 23.4 FPS** (p50 **60.4 ms** / 16.6 FPS, `list_al` **0.03 ms**, `alloc` **4.8 ms**, `0` bloqueos de 5–10 s, `0` OOM / `0` emergency reclaim) |
-| Pase `heap buffers` (máx. / picos >50 ms) | 821.1 ms (8 picos >50 ms) | **33.8 ms (0 picos >50 ms; estable 8.6–10.0 ms)** |
-| Esperas `settle` y `take()` (estable sin FG) | 0.2–2.6 ms settle / 0.75–1.07 ms `take()` | **0.0 ms settle / 0.31–0.47 ms `take()`** |
-| FPS mostrados (FSR 3.1.6 FG) | 25–27 FPS (caídas VSync a 15–20) | **29.2 – 31.0 FPS** (sin caídas VSync) |
-| HUD y subtítulos en FG | Ghosting y deformación | Limpio (`HUDLessColor` RGBA8 de 3 ranuras) |
-| Windows 10 D3D12 | Instalación manual de Agility SDK | `D3D12Core.dll` incluido (Agility SDK 620) |
+| **FPS nativos (FG OFF, Mundo Abierto)** | 14,08 media (71,03 ms, p99 152,1 ms / 1% low 6,6 FPS) | **18,19 p50** (54,97 ms), **16,17** media, 15,2–23,4 estable, p99.9 **478,6 ms** |
+| **FPS mostrados (FSR 3.1.6 FG 2x)** | 25–27 FPS (caídas a 15–20 por VSync) | **29,2 – 31,0 FPS** estables (anillo RGBA8 `HUDLessColor`, sin caídas VSync) |
+| Private Commit (estable) | 21,8 – 30+ GB (`0x8007000E` OOM) | **19,3 GB** (6,2 GB RAM WS, 5,5 GB commit libre) |
+| VRAM dedicada | 9,92 GB (`5,06 GB` pool de texturas) | **12,11 GB** (auto 8–24 GB DXGI; `0` rechazos VRAM en 22 min en Wave 11) |
+| GPU compartida (`NON_LOCAL`) | 6,68 GB (5,58 GB Series S) | **2,18 GB** (`-61%` vs Series S) |
+| Tráfico copy-back | 27,0 MB / cuadro | **0,5 MB / cuadro** |
+| CPU `preparing` / `heap buffers` | 45,8 ms / 821,1 ms máx. | **32,2 – 35,4 ms** / **33,8 ms máx.** (0 picos >50 ms) |
+| Vistas raw (`LIST_VIEWS`, Wave 11) | 372,1–575,8 null/cuadro (árboles/objetos desaparecían) | **0,0 null/cuadro** (28.212/cuadro; árboles, follaje, vallas y postes corregidos) |
+| Windows 10 D3D12 | Configuración manual Agility SDK | `D3D12Core.dll` incluido (Agility SDK 620) |
 
-## Cambios técnicos
+### Verificación 8 GB VRAM — Safe Mode (PR #1 de `nathanbzrr`)
 
-- **Memoria y OOM (`0x8007000E`):** pool global acotado de preludios `(64, 16)`; reciclaje inmediato de listas y asignadores (`recycle_landed`) con retiro diferido (`bury_lag`); `emergency_reclaim()` proactivo con <2.5 GiB de commit libre o >=88% de Shared GPU (`NON_LOCAL`), con expulsión LRU agresiva de texturas/staging/pools y límite dinámico de concurrencia en `thin` (1–2 hilos bajo presión); recuperación, reintento y reinicio/retiro seguro del asignador ante `E_OUTOFMEMORY` en `HostList::close()`, `make_list()` y `record_prelude()`; `MEM_RESET` en páginas físicas liberadas sin mapeo; correcciones upstream `#2143`, `#2234`, `#2462`, `#2844` (`CpuViews` RAII) y `#3540` (alineación de 16 bytes en vistas raw); páginas físicas opcionales en NVMe (`FILE_FLAG_DELETE_ON_CLOSE` en `%LOCALAPPDATA%\victory\physical`, >11 GB libres al cargar). Verificado en ejecución nativa de 180 s sin FG con archivo de paginación estándar (`VICTORY_FILE_PHYSICAL=0`): 0 errores, 0 OOM, `min_free_commit 3.47 GB`, `5.10–5.57 GB` libres en estado estable.
-- **Presentación y Frame Generation:** captura `HUDLessColor` RGBA8 de 3 ranuras antes de componer UI/subtítulos/HUD; swapchain triple-buffer con `DXGI_PRESENT_ALLOW_TEARING`; AMD FSR 4.1.2 ML nativo (respaldo FSR 3.1 en GPUs anteriores).
-- **Envío CPU y copy-back:** escrituras write-combined retenidas en VRAM (`27 -> 0.5 MB/cuadro`); salto rápido AVX2 `vptest` de 128 B y `merge_piece` vectorizado; pool lock-free work-stealing en `land`; shards write-watch alineados a 64 B; escaneo fusionado `ask_once`/`stale_under_flights`; `mirror` lock-free; `OnceLock` en firmas de comando; `Few<Barrier, 16>` en pila; `PLACED_TEXTURES` en 64 shards; `unfold` sin bloqueo y `wake()` lock-free; puesta a cero de `upload::ARENAS` fuera del mutex; prioridad elevada para hilos auxiliares en 6 núcleos; listas preplanificadas; hash antes de detile; reutilización de búferes de subida.
-- **Auto-VRAM dinámico DXGI y reducción de Shared GPU:** escalado automático 8 / 12 / 16 / 24+ GB mediante `DedicatedVideoMemory` y `DXGI_QUERY_VIDEO_MEMORY_INFO` en vivo (`VICTORY_VRAM_MODE=auto|8gb|12gb|16gb|24gb|legacy`, soporte `"auto"` y sobrescrituras manuales, detección UMA y descenso escalonado por Commit). En GPUs de 16 GB adapta el presupuesto según la RAM: `<=20 GB` RAM usa `84%` keep / `90%` room (`12.11 GB` VRAM, `2.18 GB` Shared GPU, sin paginación de working set, `+55%` en 1% low FPS) y `>=32 GB` RAM usa `91%` keep / `95%` room (`~13.2–14.2 GB` VRAM). Ventanas VRAM directas sin staging (`CardCpu::Direct`), copias CPU compactas (`CardCpu::Cpu`), cola `DIRTY_CARDED` O(dirty), expulsión incremental de ventanas con histéresis (máx. 8/s), scratch compartido para depth-stencil (upstream `#2162`), corrección del umbral `host_pressure` en 16 GB RAM (`send_allocs` `117/15s -> 0/15s`), autodetección NVMe (`VICTORY_FILE_PHYSICAL=auto`) y estadísticas de memoria propias del título en `XMemGetWorkingSetStatistics`.
-- **Frame pacing y eliminación de picos (nativo sin FG):** `sweep()` asíncrono incremental (`victory-sweep`, `VICTORY_SWEEP_ASYNC=1`) eliminando el drenaje síncrono `settle(WHY_SYNC)` cada 1.5 s; recolección en segundo plano `bury()` con limitación (`victory-bury`, `VICTORY_BURY_ASYNC=1`); esperas `WHY_FENCE`/`WHY_VALUE` por `Line.seq` sin bloquear `host.submitted`; omisión de `sync_heaps` redundante en `execute_own` (`0.0` rondas sin marca); escaneo de 64 bits `AtomicU64` en `port_descriptors::take()` (`2–3×` más rápido); `frame::wait` de precisión sin `Sleep(0)`; telemetría por cuadro `present pacing` (`avg / p50 / p95 / p99 / 1% low / max / >50 ms / >100 ms`, `VICTORY_FRAME_TIMES_FILE`) y `heap buffers` plano (`VICTORY_TEXTURE_STAGE_MS=4`, `VICTORY_TEXTURE_CATCHUP=0`, `0` picos >50 ms).
-- **Fase 2 — optimización de envío CPU y descriptores (`feat/phase2-30fps`):** caché `VirtualQuery` `MappedCache` con invalidación por rango (`12.56 ms -> 0.00 ms`, `own_cs` `15.1 -> 2.5 ms`); tabla atómica `ENTRY_GENS` + caché TLS de 8192 entradas (`100.0%` de aciertos); ruta rápida inline-CBV, asignador slab dinámico de 128 ranuras + `release_dynamic_batch` en `draw_bind::tables` y lotes `RETIRE_TLS`; reciclaje de listas sin pérdidas (`BACKS_MOST=512`, `IDLE_BYTES=512 MiB`, `list::boxed()` → `fresh_list()`, `list_al` `-99.7%`, `alloc` `-83%`, `lists` churn `+0`); `BufferSweep` incremental (`HBP_SPANS` `10.94 -> 0.51 ms`); pools ampliados `PRELUDES_MOST` `(512, 128)`, `SPARE_BATCH` `(128/256)`, `VICTORY_LIST_IDLE_MOST=1024`; cola prioritaria compute PSO + 4 workers compute/screen con límite de espera tardía (`VICTORY_COMPUTE_LATE_WAIT_MS=400`, cero bloqueos de 5–10 s, `p99.9` `-80%`, `1% low` `3.2×`); corrección de umbrales `residency` en 16 GB RAM (`unmap_null` `-97%`, `VICTORY_KEEP_SHOWN=2`); mapa `gpu_written_pages` de 64 KiB; HUD arriba a la derecha (`VICTORY_PANEL_POS=top-right`) y casilla para activar/desactivar Frame Generation en el lanzador.
-- **Correcciones y controles:** presupuesto de espera compute (`5000 ms`) corrigiendo rostros faltantes; omisión de shader con fallo en RDNA4 (`240cb516c1af0bc3`); filtro de sondas violetas; flips asíncronos seguros; reintento de detile; teclado y ratón PC (`F2`/`~` cámara, `F3` panel FPS arriba a la derecha).
+Probado en **Ryzen 5 5500X3D, Radeon RX 7600 8 GB, 32 GB DDR4, Windows 11 (26340)** — 1080p Series S, Safe Mode (`65%` texturas / `2048 MB` targets / `768 MB` búferes), FSR FG 2x, 180 s:
 
-## Límites conocidos (en desarrollo en `dev`)
+| Métrica | Antes del ajuste 8 GB | Después del ajuste a presupuesto vivo |
+|---|---:|---:|
+| **FPS nativos (sin FG)** | 3,67 | **12,7** (media 79,01 ms, p50 68,90 ms, p99 **242,26 ms** vs 1047,30 ms) |
+| **FPS mostrados (FSR FG 2x)** | 7,32 | **24,86** (1803 generados / 1803 renderizados) |
+| VRAM pico / presupuesto vivo | 6548 MB | **6169 MB** / 5934–5981 MB (`0` errores, `0` OOM, `0` device removal) |
 
-- Los 30 FPS nativos (`<= 33.3 ms`) siguen optimizándose en `dev`: `victory-submit` ya bajó a `34.4 ms/cuadro`; el siguiente foco es la grabación paralela (`victory-list-0..3`) y copias CBV.
-- Los picos de Commit en la transición prólogo -> mundo abierto en archivos de paginación muy ajustados se mitigan en `dev` con `emergency_reclaim()` y autodetección NVMe (`VICTORY_FILE_PHYSICAL=auto`).
+## Cambios Técnicos
 
-## Inicio rápido
+- **Wave 11 (follaje/objetos y binario portable):** corrige `372–575` vistas raw `NULL` por cuadro en `LIST_VIEWS` (elimina la desaparición de árboles, follaje, vallas, postes y señales); soporte `SW_64KB_D`; ajuste de residencia 16 GB (`0` rechazos VRAM en 22 min); binario portable **`x86-64-v3`** (AVX2/BMI2/FMA en AMD Zen 2–5 e Intel Haswell–Arrow Lake).
+- **Wave 6–7 (texturas, descriptores y estabilidad):** caché TLS de 8192 ranuras (`100%` aciertos), cola de texturas intercalada (retraso en cinemáticas `3936 -> 0`), prioridad normal de CPU y registro en archivo `VICTORY_LOG_FILE`.
+- **Memoria y OOM (`0x8007000E`):** `recycle_landed`, `emergency_reclaim()` proactivo, recuperación `E_OUTOFMEMORY`, Auto-VRAM DXGI (`8/12/16/24 GB`) y páginas físicas NVMe (`VICTORY_FILE_PHYSICAL=auto`).
+- **Presentación y controles:** `HUDLessColor` RGBA8 para FSR 3.1.6 FG, tearing swapchain, FSR 4.1.2 ML nativo, espera compute `5000 ms` (rostros), escudo RDNA4 (`240cb516c1af0bc3`), ratón/teclado PC (`F2`/`~` cámara, `F3` HUD FPS).
 
-1. Descarga `main` (**Code -> Download ZIP** o `git clone --branch main https://github.com/crossducking/RAZDA4A-XEN.git`) y descomprime (ej. `D:\RAZDA4A-XEN\`). Las DLL necesarias ya están incluidas.
-2. Edita **`config.bat`** apuntando a tu carpeta y **`tu_archivo_ejecutable.exe`**:
-   ```bat
-   set "GAME_DIR=D:\Ruta\A\Tu\Carpeta"
-   set "GAME_EXE=%GAME_DIR%\tu_archivo_ejecutable.exe"
-   ```
-3. Ejecuta **`RAZDA4A XEN.bat`** o elige un preset en `presets\`:
+## Límites Conocidos (Trabajo Activo en `dev`)
 
-| Archivo | Perfil |
+- Las zonas urbanas densas aún pueden bajar a `5–10` FPS nativos y generar pausas largas en sesiones extensas (**Wave 12** en curso en `dev`).
+- Ray Tracing permanece desactivado mientras se estabilizan el render base y los 30 FPS nativos.
+- El primer inicio compila shaders PSO (1–3 min con tirones); ejecuta `warm_shaders.bat` tras cerrar para que el segundo inicio sea mucho más fluido.
+
+## Compatibilidad de Hardware y FAQ
+
+| Pregunta | Respuesta |
 |---|---|
-| `RAZDA4A XEN.bat` | Equilibrado (predeterminado): 29–31 FG FPS, ~8.2 GB VRAM, 6.2 GB RAM, HUDLess FG + Tearing |
-| `presets\1_Low_Commit_NVMe_16GB.bat` | Paginación ajustada / navegador abierto: páginas físicas en NVMe, ~8.0 GB VRAM, >11 GB libres al cargar |
-| `presets\2_Max_FPS_Experimental_CBV.bat` | Equilibrado + búferes de constantes en sitio (experimental) |
-| `presets\3_Native_No_FG_Zero_Latency.bat` | Renderizado nativo sin Frame Gen, latencia mínima |
-| `presets\4_Safe_Mode_8GB_12GB_VRAM.bat` | 8–12 GB VRAM / modo seguro: límites estrictos, VSync activado, escaneo completo de descriptores |
+| **¿GPUs AMD soportadas?** | **AMD RDNA2 / RDNA3 / RDNA4** (RX 6000 / 7000 / 9000; requiere DX12 Ultimate + Mesh Shaders). |
+| **¿NVIDIA / Intel Arc?** | **No soportado en este fork.** En RTX hay pantalla negra/crashes; usa forks NVIDIA de la comunidad como [`trustno1-coder/VIctory-NVIDIA`](https://github.com/trustno1-coder/VIctory-NVIDIA). |
+| **¿CPU Intel + GPU AMD?** | **Sí.** Desde Wave 11 el binario usa `-C target-cpu=x86-64-v3`. |
+| **¿8 GB / 6 GB / <=4 GB VRAM?** | **8 GB:** funciona con **Safe Mode** (12,7 nativos / 24,86 FG en RX 7600; probado en RX 6600). **6 GB:** experimental/lento (Safe Mode + FG OFF). **<=4 GB, RDNA1 (RX 5500/5700), GTX 10/16:** no soportado (sin Mesh Shaders o poca VRAM). |
+| **¿16 GB RAM / HDD?** | **16 GB RAM:** soportado en **SSD NVMe/SATA** con pagefile de 24–32 GB (`pagefile_16gb_ram.ps1`) o preset `Low-Commit NVMe`. **HDD:** no soportado. |
+| **¿Necesito el GDK filtrado?** | **No.** Runtime open-source independiente (`GPL-3.0-or-later`). |
+| **¿Dónde enviar bugs y logs?** | Ejecuta **`collect_logs.bat`** (o **Export Logs** en el lanzador) para generar `logs\bug_report_*.txt` sin rutas privadas y adjúntalo en [GitHub Issues](https://github.com/crossducking/RAZDA4A-XEN/issues). |
 
-- **`F2` / `~`** — alternar ratón (`Esc` libera cursor)
-- **`F3`** — panel FPS
-- **`warm_shaders.bat`** — ejecutar una vez tras cerrar la primera sesión para precompilar shaders
-- **`backup_saves.bat`** — respaldar/restaurar `data\`
-- **`pagefile_16gb_ram.ps1`** — script opcional de administrador (paginación SSD 16–32 GB)
+## Inicio Rápido (Windows)
 
-## Compilar desde código fuente y verificación
+1. Descarga `main` (**Code -> Download ZIP** o `git clone --branch main https://github.com/crossducking/RAZDA4A-XEN.git`) y descomprime. Incluye `D3D12\D3D12Core.dll` y `fidelityfx\*.dll`.
+2. Ejecuta **`RAZDA4A XEN.bat`**, pulsa **Browse...** para elegir **`your_executable.exe`** (guardado en UTF-8 en `config.bat`), selecciona perfil y Frame Generation y pulsa **Launch**.
+   - Lanzadores externos (`VILauncher`, etc.): usa **`RAZDA4A XEN.bat --no-gui`**.
 
-Si prefieres no usar binarios sin firmar, compila directamente desde la rama `dev`:
+| Archivo | Uso |
+|---|---|
+| `RAZDA4A XEN.bat` | Lanzador principal (selector `.exe`, FG ON/OFF, auto-Safe-Mode 8 GB, Warm Shaders y Export Logs) |
+| `presets\1_Low_Commit_NVMe_16GB.bat` | 16 GB RAM / pagefile pequeño: páginas físicas en NVMe |
+| `presets\2_Max_FPS_Experimental_CBV.bat` | Equilibrado + CBV in-place experimental (`VICTORY_PORT_CBV=1`) |
+| `presets\3_Native_No_FG_Zero_Latency.bat` | Nativo sin Frame Gen, latencia mínima |
+| `presets\4_Safe_Mode_8GB_12GB_VRAM.bat` | Safe Mode 8–12 GB VRAM (`65%` / `2048 MB` targets / `768 MB` búferes, VSync ON) |
+| `warm_shaders.bat` / `collect_logs.bat` | Precompilar PSOs / exportar reporte sanitizado con `logs\last_run.log` |
+
+Controles: **`F2` / `~`** alterna cámara con ratón (`Esc` libera cursor), **`F3`** alterna HUD FPS.
+
+## Inicio Rápido (Linux — Proton / Wine / VKD3D-Proton)
+
+1. Instala **Proton Experimental / GE-Proton** (`umu-run`, Steam o Lutris) con **Mesa RADV** en GPU AMD RDNA2+.
+2. Ejecuta `launch_linux_proton.sh` (configura automáticamente `WINEDLLOVERRIDES="d3d12,d3d12core=n"` para evitar que `D3D12Core.dll` de Windows 10 bloquee `vkd3d-proton` y cause 1 FPS / pantalla 3D vacía):
+   ```bash
+   chmod +x launch_linux_proton.sh
+   GAME_DIR="/path/to/unpacked" \
+   GAME_EXE="/path/to/unpacked/your_executable.exe" \
+   RUNNER="umu-run" \
+   XEN_PROFILE="safe" \
+   XEN_FRAMEGEN="0" \
+   ./launch_linux_proton.sh
+   ```
+
+## Seguridad, Falsos Positivos y Compilación desde Código Fuente
+
+Brave/Edge y Windows Defender ML pueden marcar ZIPs sin firmar con `.exe` + `.bat` + `.ps1` como **`Trojan:Script/Wacatac.H!ml`**. Verifica el SHA-256 o compila tú mismo desde `dev`:
+
+```powershell
+Get-FileHash .\RAZDA4A_XEN.exe -Algorithm SHA256
+```
+
+- Wave 11 `RAZDA4A_XEN.exe` (`x86-64-v3`) SHA-256: `4ab8fcf7e2614cb669ad54069011d8cb0bed74b3eac7b994854c278f2a862622` (todos los DLL en [`SHA256SUMS.txt`](SHA256SUMS.txt)).
 
 ```powershell
 git clone --branch dev https://github.com/crossducking/RAZDA4A-XEN.git
@@ -78,11 +110,9 @@ $env:RUSTFLAGS = "-C target-cpu=x86-64-v3"
 cargo build --release --locked -p victory
 ```
 
-SHA-256 de `RAZDA4A_XEN.exe`: `4ab8fcf7e2614cb669ad54069011d8cb0bed74b3eac7b994854c278f2a862622`
+## Ramas y Licencia
 
-## Ramas y licencia
+- `main`: binario precompilado, DLLs, presets, lanzador, checksums y documentación.
+- `dev`: código fuente Rust completo, tests, `xtask policy`, CI y `AGENTS.md`.
 
-- `main`: binario compilado, DLLs de ejecución, presets y documentación.
-- `dev`: código fuente completo en Rust, pruebas, CI y `AGENTS.md`.
-
-Derivado de VIctory bajo **GPL-3.0-or-later** ([LICENSE](LICENSE)). Código fuente completo en [`dev`](https://github.com/crossducking/RAZDA4A-XEN/tree/dev).
+Derivado de VIctory bajo **GPL-3.0-or-later** ([LICENSE](LICENSE)). Código completo en [`dev`](https://github.com/crossducking/RAZDA4A-XEN/tree/dev).
