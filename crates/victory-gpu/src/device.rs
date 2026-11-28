@@ -415,6 +415,22 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
                 tracing::info!(call = calls, code = format_args!("{code:016x}"), "P.4: 0x218 call");
             }
         }
+        // `VICTORY_NATIVE_ROOT_LOG=1`: each native program's root signature
+        // flags (heaps directly indexed: 0x400 views, 0x800 samplers) and
+        // parameter count, to check the translator's heap placement against
+        // the title's own root signatures (docs/royale/p4-shortcuts.md).
+        if std::env::var_os("VICTORY_NATIVE_ROOT_LOG").is_some() {
+            // SAFETY: the description's words 0 (root signature) and 5 (code).
+            let (root, code) = unsafe { (*(desc as *const usize), *(desc as *const u64).add(5)) };
+            if let Some(blob) = crate::root::blob(root as This) {
+                let (flags, params) = crate::root::blob_flags(blob).unwrap_or((u32::MAX, 0));
+                tracing::info!(
+                    flags = format_args!("{flags:#x}"),
+                    params,
+                    "P.4 root signature of program {code:016x}"
+                );
+            }
+        }
         if native_compute_skipped(desc as usize) {
             return E_NOTIMPL;
         }

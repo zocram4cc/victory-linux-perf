@@ -176,6 +176,45 @@ struct RootSignature {
     blob: Vec<u8>,
 }
 
+/// The serialized form (`RTS0`) of the title's root signature object `this`.
+/// SAFETY of use: `this` must be a root signature this module handed out.
+pub(crate) fn blob<'a>(this: This) -> Option<&'a [u8]> {
+    if this.is_null() {
+        return None;
+    }
+    // SAFETY: a root signature object of ours (the caller says so).
+    let root = unsafe { &*(this as *const RootSignature) };
+    Some(&root.blob)
+}
+
+/// The `RTS0` part of a serialized root signature: the blob is a DXBC
+/// container (part count at byte 28, part offsets after it; each part a
+/// four-character code, its size, then its bytes), or the bare part.
+pub(crate) fn rts0(blob: &[u8]) -> Option<&[u8]> {
+    let u32_at = |b: &[u8], at: usize| b.get(at..at + 4).map(|x| u32::from_le_bytes([x[0], x[1], x[2], x[3]]));
+    if !blob.starts_with(b"DXBC") {
+        return Some(blob);
+    }
+    let parts = u32_at(blob, 28)? as usize;
+    for k in 0..parts.min(64) {
+        let off = u32_at(blob, 32 + 4 * k)? as usize;
+        if blob.get(off..off + 4) == Some(b"RTS0") {
+            let size = u32_at(blob, off + 4)? as usize;
+            return blob.get(off + 8..off + 8 + size);
+        }
+    }
+    None
+}
+
+/// The flags and parameter count of a serialized root signature (`RTS0`:
+/// version, parameter count and offset, static sampler count and offset,
+/// then the flags).
+pub(crate) fn blob_flags(blob: &[u8]) -> Option<(u32, u32)> {
+    let r = rts0(blob)?;
+    let u32_at = |at: usize| r.get(at..at + 4).map(|x| u32::from_le_bytes([x[0], x[1], x[2], x[3]]));
+    Some((u32_at(20)?, u32_at(4)?))
+}
+
 /// Device method.
 pub(crate) extern "system" fn create(
     _: This,
