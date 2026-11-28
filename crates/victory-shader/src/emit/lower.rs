@@ -9257,7 +9257,12 @@ impl<'a> Lower<'a> {
                 let n = self.register_sampler(words, props.0 & 0x8000 != 0)?;
                 Ok(self.s.sampler_handle(self.cur, n))
             }
-            Source::Constant(_) => Err("a constant resource descriptor"),
+            Source::Constant(w) => {
+                if std::env::var_os("VICTORY_WHY_CONSTANT").is_some() {
+                    eprintln!("WHY-CONSTANT resource descriptor {:08x?} at {:#x} {}", w, self.x.p.blocks[site.0].insts[site.1].machine.offset, self.x.p.blocks[site.0].insts[site.1].name());
+                }
+                Err("a constant resource descriptor")
+            }
             Source::Built { .. } if self.root_copy.is_some() => self.root_copy.ok_or("no copy"),
             Source::Built { address, .. } => {
                 let rp = *self
@@ -13815,7 +13820,9 @@ impl<'a> Lower<'a> {
         // min and max, exchange; compare-exchange apart.
         let atomic = match name.strip_prefix("buffer_atomic_") {
             None => None,
-            Some("add") => Some(0),
+            // Subtraction: an add of the operand's two's complement (as the
+            // memory and image atomics do).
+            Some("add") | Some("sub") => Some(0),
             Some("and") => Some(1),
             Some("or") => Some(2),
             Some("xor") => Some(3),
@@ -14137,7 +14144,13 @@ impl<'a> Lower<'a> {
             } else {
                 let mut args = vec![h, self.s.m.i32(op)];
                 args.extend(coords);
-                args.push(vals[0]);
+                let x = if name == "buffer_atomic_sub" {
+                    let z = self.s.m.i32(0);
+                    self.s.m.bin(self.cur, Bin::Sub, z, vals[0])
+                } else {
+                    vals[0]
+                };
+                args.push(x);
                 self.s
                     .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
             };

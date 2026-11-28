@@ -203,6 +203,20 @@ TextureCube cubet : register(t8, space2);
 /// Compute shaders, each `cs`, dispatched as 2×2 groups of 8×8 threads
 /// over a 16×16 texture and a 256-dword buffer.
 const CS_CASES: &[(&str, &str)] = &[
+    // An atomic subtraction on a raw buffer (the console compiler's
+    // `buffer_atomic_sub`), with and without the old value.
+    (
+        "buffer atomic sub",
+        r#"CS {
+            uint n = d.y * 16 + d.x;
+            outb.Store(4 * n, 1000 + n);
+            DeviceMemoryBarrierWithGroupSync();
+            uint old;
+            outb.InterlockedAdd(4 * (n & 15), -(int)(n & 7), old);
+            DeviceMemoryBarrierWithGroupSync();
+            outb.Store(4 * (n + 512), old & 0);
+        }"#,
+    ),
     // A constant table indexed per lane: the console compiler keeps it in the
     // code and reads it through a buffer descriptor built around it
     // (P.4: "a descriptor built around a table in the code").

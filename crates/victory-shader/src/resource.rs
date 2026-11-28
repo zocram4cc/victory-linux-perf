@@ -271,12 +271,29 @@ pub fn track(
                     // address on), and the node's address is among the
                     // operands; any other descriptor must be a resource of
                     // the host.
+                    // Through joins that bring one constant on every path
+                    // (`one_leaf`): the title's builder of such descriptors
+                    // keeps them in registers across branches (P.4: 24 ray tests
+                    // of a constant descriptor came out "a constant resource").
                     let word = |k: u8| match *rsrc {
-                        Operand::Scalar { code, dwords } if k < dwords => {
-                            inst.read(Reg::S(code + k)).map(|v| t.origin(v))
-                        }
+                        Operand::Scalar { code, dwords } if k < dwords => inst.read(Reg::S(code + k)).map(|v| {
+                            let o = match t.origin(v) {
+                                Term::Value(x) if t.phis[x.0 as usize].is_some() => t.one_leaf(x).unwrap_or(Term::Value(x)),
+                                o => o,
+                            };
+                            // A constant made with `s_bfm_b*` of constants (as
+                            // descriptor words are folded in `classify`).
+                            t.bfm_folded(t.xor_cancelled(o))
+                        }),
                         _ => None,
                     };
+                    if std::env::var_os("VICTORY_WHY_BVH").is_some() {
+                        let def = |k: u8| match *rsrc {
+                            Operand::Scalar { code, .. } => inst.read(Reg::S(code + k)).and_then(|v| t.def(v)).map(|d| d.name().to_string()),
+                            _ => None,
+                        };
+                        eprintln!("WHY-BVH words 1,3: {:?} {:?} made by {:?} {:?}", word(1), word(3), def(1), def(3));
+                    }
                     match (word(1), word(3)) {
                         (Some(Term::Const(word1)), Some(Term::Const(word3)))
                             if word3 >> 28 == crate::bvh::DESCRIPTOR_TYPE =>
