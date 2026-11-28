@@ -107,6 +107,9 @@ pub(crate) struct Shadow {
     /// title's changed bytes held back (offsets).
     landed_pieces: Mutex<std::collections::HashMap<usize, u64>>,
     held_back: Mutex<HeldBack>,
+    /// [`hold_mode`] 2: the pieces (title address / 64 KiB) bytes are held in,
+    /// and the frame the first of them was held.
+    held_pieces: Mutex<std::collections::HashMap<usize, u64>>,
 }
 
 /// Whether the title's bytes that a refresh finds changed in a 64 KiB piece
@@ -135,20 +138,70 @@ pub(crate) struct Shadow {
 /// shader reads before the next submission that declares writes there, or
 /// one in a copy no submission declares writes to again.
 fn hold_back() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_FLIGHT_HOLD_BACK").is_some_and(|v| v == "1"))
+    hold_mode() != 0
 }
+
+/// `VICTORY_FLIGHT_HOLD_BACK`: 0 (off, unless set), 1 ([`hold_back`]: held
+/// bytes go up ahead of the next submission that declares writes to them),
+/// 2: held bytes go up when their piece has had no landing for
+/// [`IDLE_FRAMES`] frames, whatever is declared.
+///
+/// Mode 1 releases a piece's held bytes ahead of the frame's first skinning,
+/// as the skinning declares its whole buffer; a range drawn without being
+/// skinned again in that frame (or only partly rewritten) then shows them.
+/// Mode 2 leaves the card the piece while the card keeps writing it: the
+/// title's bytes there go up once the card stops (a character no longer
+/// skinned, a range given to something else). What it can hide: title data
+/// in a piece the card writes every frame, for as long as it does; the
+/// per-copy lines count the bytes held, released as idle, and the longest
+/// any piece was held, in frames.
+fn hold_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_FLIGHT_HOLD_BACK").as_deref() {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        _ => 0,
+    })
+}
+
+/// Mode 2 of [`hold_mode`]: frames with no landing in a piece after which the
+/// title's bytes held there go up. The skinning runs every frame for the
+/// characters in view (each captured frame has it); a piece the card has not
+/// written for two frames is no visible character's.
+const IDLE_FRAMES: u64 = 2;
+
+/// Whether a piece last landed into at `landed` is idle at frame `now`
+/// ([`IDLE_FRAMES`]); one never landed into is.
+fn piece_idle(landed: Option<u64>, now: u64) -> bool {
+    landed.is_none_or(|f| now.saturating_sub(f) >= IDLE_FRAMES)
+}
+
+/// The copies (by title start) holding bytes in mode 2 of [`hold_mode`].
+static HOLDERS: Mutex<std::collections::BTreeSet<u64>> = Mutex::new(std::collections::BTreeSet::new());
 
 /// [`hold_back`], before a submission's copies go up (after its refreshes,
 /// ahead of the plan of what goes to the card): the held bytes `declared`
 /// (this submission's declared shader writes, by copy) overlaps go up ahead
 /// of its lists.
 pub(crate) fn release_held_back(declared: &[(Arc<Shadow>, Vec<(usize, usize)>)]) {
-    if !hold_back() {
-        return;
-    }
-    for (shadow, ranges) in declared {
-        shadow.release_held(ranges);
+    match hold_mode() {
+        1 => {
+            for (shadow, ranges) in declared {
+                shadow.release_held(ranges);
+            }
+        }
+        2 => {
+            let now = crate::frame::current();
+            let holders: Vec<u64> = HOLDERS.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().collect();
+            for start in holders {
+                let shadow = find(start, 1).filter(|s| s.start == start);
+                let keep = shadow.as_ref().is_some_and(|s| s.release_idle(now));
+                if !keep {
+                    HOLDERS.lock().unwrap_or_else(|e| e.into_inner()).remove(&start);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -2340,6 +2393,11 @@ pub(crate) mod resent {
         /// of a submission that declared writes to them.
         pub(crate) held: u64,
         pub(crate) ahead: u64,
+        /// Mode 2 of [`super::hold_mode`]: title bytes sent up when their
+        /// piece went idle, and the longest a piece was held (frames; the
+        /// greatest, not a sum).
+        pub(crate) idle: u64,
+        pub(crate) longest: u64,
         /// [`super::land_dwords`]: dwords the card changed in part, landed
         /// whole (a byte merge would have kept the title's other bytes).
         pub(crate) dwords: u64,
@@ -2357,6 +2415,8 @@ pub(crate) mod resent {
             self.won += o.won;
             self.held += o.held;
             self.ahead += o.ahead;
+            self.idle += o.idle;
+            self.longest = self.longest.max(o.longest);
             self.dwords += o.dwords;
         }
 
@@ -2371,6 +2431,7 @@ pub(crate) mod resent {
                 "pages sent up {:.1} (title-written {:.1}, landing noted and differing {:.1}; whole {:.1}, as runs {:.1}), \
                  {:.1} KB differing from the card, echo pages left {:.1}, landing pages title memory missed {:.1}, \
                  card won over title bytes {:.1} KB, held back {:.1} KB, sent ahead of a declaring submission {:.1} KB, \
+                 released as idle {:.1} KB, longest held {} frames, \
                  dwords the card changed in part, landed whole {:.0}",
                 f(self.title + self.landed),
                 f(self.title),
@@ -2383,6 +2444,8 @@ pub(crate) mod resent {
                 f(self.won) / 1024.0,
                 f(self.held) / 1024.0,
                 f(self.ahead) / 1024.0,
+                f(self.idle) / 1024.0,
+                self.longest,
                 f(self.dwords)
             )
         }
@@ -3454,6 +3517,51 @@ mod landing_tests {
         assert_eq!(super::dword_bounds(0x1000, 60, 61, 62), (60, 61), "nor past it");
     }
 
+    /// Mode 2: bytes held in a piece stay while the piece keeps landing, go
+    /// up [`super::IDLE_FRAMES`] frames after its last landing whatever is
+    /// declared; a piece that never landed sends at once.
+    #[test]
+    fn mode_two_holds_while_the_piece_keeps_landing() {
+        use super::PAGE as PIECE;
+        let room = vec![5u8; 3 * PIECE];
+        let title = (room.as_ptr() as usize).next_multiple_of(PIECE);
+        let mut side = vec![5u8; PIECE + KERNEL_PAGE];
+        let copy = Shadow::unbacked(title as u64, side.as_mut_ptr(), side.len() as u64, true);
+        copy.note_landing(0, KERNEL_PAGE);
+        let now = crate::frame::current();
+        copy.landed_pieces.lock().unwrap().insert(title / PIECE, now);
+        let write = |at: usize| {
+            // SAFETY: in `room`.
+            unsafe { ((title + at) as *mut u32).write_volatile(0x0ffff800) }
+        };
+        write(64);
+        write(PIECE + 8);
+        let all = (title, title + PIECE + KERNEL_PAGE);
+        copy.take_with(all.0, all.1, true, true);
+        // The piece no landing touched: at once.
+        assert_eq!(copy.take_dirty(), [(PIECE + 8, PIECE + 12)]);
+        assert!(copy.holds_back());
+        // A frame on, the piece landed a frame ago: held.
+        assert!(copy.release_idle(now + 1));
+        assert_eq!(copy.take_dirty(), []);
+        copy.landed_pieces.lock().unwrap().insert(title / PIECE, now + 2);
+        assert!(copy.release_idle(now + 3), "landed a frame ago: still held");
+        assert_eq!(copy.take_dirty(), []);
+        // Two frames with no landing: up it goes.
+        assert!(!copy.release_idle(now + 4));
+        assert_eq!(copy.take_dirty(), [(64, 68)]);
+        assert_eq!(&side[64..68], &0x0ffff800u32.to_le_bytes());
+        assert!(!copy.holds_back());
+        drop(room);
+    }
+
+    #[test]
+    fn a_piece_is_idle_after_frames_with_no_landing() {
+        assert!(super::piece_idle(None, 0));
+        assert!(!super::piece_idle(Some(10), 10) && !super::piece_idle(Some(10), 11));
+        assert!(super::piece_idle(Some(10), 12));
+    }
+
     /// Which copies a refresh sends changed dwords of.
     #[test]
     fn changed_dwords_go_up_for_copies_shaders_write() {
@@ -3842,6 +3950,7 @@ impl Shadow {
             place: None,
             landed_pieces: Mutex::default(),
             held_back: Mutex::default(),
+            held_pieces: Mutex::default(),
         }
     }
 
@@ -4988,7 +5097,6 @@ impl Shadow {
         if self.card.is_none() {
             return;
         }
-        let start = self.start as usize;
         let declared: Vec<(usize, usize)> = declared
             .iter()
             .filter_map(|&(a, e)| {
@@ -5006,11 +5114,64 @@ impl Shadow {
         if ahead.is_empty() {
             return;
         }
+        let sent = self.send_held(ahead);
+        resent::note(self.start, self.len, resent::Resent { ahead: sent, ..Default::default() });
+    }
+
+    /// Mode 2 of [`hold_mode`], before a submission's copies go up: the bytes
+    /// held in pieces idle at frame `now` ([`piece_idle`]) go up. Whether
+    /// any are still held.
+    pub(crate) fn release_idle(&self, now: u64) -> bool {
+        if self.card.is_none() {
+            return false;
+        }
+        let idle: Vec<(usize, u64)> = {
+            let pieces = self.held_pieces.lock().unwrap_or_else(|e| e.into_inner());
+            let landed = self.landed_pieces.lock().unwrap_or_else(|e| e.into_inner());
+            pieces.iter().filter(|(p, _)| piece_idle(landed.get(p).copied(), now)).map(|(&p, &f)| (p, f)).collect()
+        };
+        if !idle.is_empty() {
+            let spans: Vec<(usize, usize)> = idle
+                .iter()
+                .filter_map(|&(p, _)| {
+                    let (from, to) = self.inside(p * PAGE, PAGE);
+                    (from < to).then_some((from, to))
+                })
+                .collect();
+            let due = {
+                let mut back = self.held_back.lock().unwrap_or_else(|e| e.into_inner());
+                let mut spans = spans;
+                spans.sort_unstable();
+                back.due(&spans)
+            };
+            let longest = idle.iter().map(|&(_, f)| now.saturating_sub(f)).max().unwrap_or(0);
+            {
+                let mut pieces = self.held_pieces.lock().unwrap_or_else(|e| e.into_inner());
+                for (p, _) in &idle {
+                    pieces.remove(p);
+                }
+            }
+            let sent = if due.is_empty() { 0 } else { self.send_held(due) };
+            resent::note(self.start, self.len, resent::Resent { idle: sent, longest, ..Default::default() });
+        }
+        let pieces = self.held_pieces.lock().unwrap_or_else(|e| e.into_inner());
+        // The longest still held, as a running figure.
+        if let Some(oldest) = pieces.values().min() {
+            resent::note(self.start, self.len, resent::Resent { longest: now.saturating_sub(*oldest), ..Default::default() });
+        }
+        !pieces.is_empty()
+    }
+
+    /// The held ranges `due` (offsets) go up as title memory has them now:
+    /// the CPU's side takes the dwords that differ, and they are sent. The
+    /// bytes sent.
+    fn send_held(&self, due: Vec<(usize, usize)>) -> u64 {
+        let start = self.start as usize;
         // The landings are kept out while the CPU's side takes them.
         let _merging = self.merging.write().unwrap_or_else(|e| e.into_inner());
         let mut title = Vec::new();
         let mut sent = 0u64;
-        for (from, to) in ahead {
+        for (from, to) in due {
             title.clear();
             title.resize(to - from, 0);
             if !crate::host::read_into((start + from) as *const u8, &mut title) {
@@ -5027,7 +5188,7 @@ impl Shadow {
             self.card_changed_runs(runs.iter().map(|&(a, len)| (from + a, from + a + len)));
             sent += runs.iter().map(|r| r.1 as u64).sum::<u64>();
         }
-        resent::note(self.start, self.len, resent::Resent { ahead: sent, ..Default::default() });
+        sent
     }
 
     /// Whether title bytes are held back ([`hold_back`]).
@@ -5156,6 +5317,10 @@ impl Shadow {
                         crate::frame::current(),
                     );
                 if held_now {
+                    if hold_mode() == 2 || cfg!(test) {
+                        self.held_pieces.lock().unwrap_or_else(|e| e.into_inner()).entry(at / PAGE).or_insert(crate::frame::current());
+                        HOLDERS.lock().unwrap_or_else(|e| e.into_inner()).insert(self.start);
+                    }
                     let mut back = self.held_back.lock().unwrap_or_else(|e| e.into_inner());
                     let fresh: usize = runs.iter().map(|&(a, len)| back.add(at - start + a, at - start + a + len)).sum();
                     drop(back);
