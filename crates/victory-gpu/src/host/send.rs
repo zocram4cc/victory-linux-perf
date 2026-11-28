@@ -202,66 +202,58 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     let short = |&(a, b): &(usize, usize)| short(a, b - a);
     let mut at = 0u64;
     let mut copies = Vec::with_capacity(dirty.len());
-    let mut total_move_bytes = 0u64;
-    let mut total_move_runs = 0u64;
-    let mut total_words = 0u64;
-    // Collect relative offsets in one pass over `dirty`, then apply `memory.data`.
-    let mut rel_parts: Vec<(usize, u64, usize)> = Vec::new();
-    let mut rel_work: Vec<(usize, &[(usize, usize)], u64)> = Vec::new();
-    const CHUNK: usize = 64 << 10;
-    for (shadow, ranges) in dirty {
-        let from = shadow.card_data() as usize;
+    for (_, ranges) in dirty {
         let mut runs = Vec::new();
-        let mut copy_words = 0usize;
-        let pairs_start = {
-            for &(a, b) in ranges {
-                let len = b - a;
-                if short(&(a, b)) {
-                    copy_words += len / 4;
-                } else {
-                    runs.push((a, at, len));
-                    total_move_bytes += len as u64;
-                    total_move_runs += 1;
-                    let mut off = 0;
-                    while off < len {
-                        let n = CHUNK.min(len - off);
-                        rel_parts.push((from + a + off, at + off as u64, n));
-                        off += n;
-                    }
-                    at += (len as u64).next_multiple_of(16);
-                }
-            }
-            at
-        };
-        if copy_words > 0 {
-            let mut to_off = pairs_start;
-            for chunk in ranges.chunks(RUNS_AT_A_TIME) {
-                let w: usize = chunk.iter().filter(|r| short(r)).map(|r| (r.1 - r.0) / 4).sum();
-                if w > 0 {
-                    rel_work.push((from, chunk, to_off));
-                    to_off += (w * 8) as u64;
-                }
-            }
-            total_words += copy_words as u64;
-            at += (copy_words as u64 * 8).next_multiple_of(16);
+        for &(a, b) in ranges.iter().filter(|r| !short(r)) {
+            runs.push((a, at, b - a));
+            at += ((b - a) as u64).next_multiple_of(16);
         }
-        copies.push(Copy { runs, pairs: (pairs_start, copy_words as u32) });
+        let words: usize = ranges.iter().filter(|r| short(r)).map(|r| (r.1 - r.0) / 4).sum();
+        copies.push(Copy { runs, pairs: (at, words as u32) });
+        at += (words as u64 * 8).next_multiple_of(16);
     }
     if at == 0 {
         return None;
     }
     let memory = memory(host, at)?;
-    STATS[0].fetch_add(total_move_bytes, Ordering::Relaxed);
-    STATS[1].fetch_add(total_move_runs, Ordering::Relaxed);
-    STATS[2].fetch_add(total_words, Ordering::Relaxed);
-    let base = memory.data;
-    let n_work = rel_work.len();
-    let total = n_work + rel_parts.len();
+    let mut moves: Vec<(usize, usize, usize)> = Vec::new();
+    let mut work: Vec<(usize, &[(usize, usize)], usize)> = Vec::new();
+    for ((shadow, ranges), copy) in dirty.iter().zip(&copies) {
+        let from = shadow.card_data() as usize;
+        moves.extend(copy.runs.iter().map(|&(a, to, n)| (from + a, memory.data + to as usize, n)));
+        // (80,000 runs of some words a frame: in pieces of work.)
+        let mut to = memory.data + copy.pairs.0 as usize;
+        for ranges in ranges.chunks(RUNS_AT_A_TIME) {
+            let words: usize = ranges.iter().filter(|r| short(r)).map(|r| (r.1 - r.0) / 4).sum();
+            if words > 0 {
+                work.push((from, ranges, to));
+                to += words * 8;
+            }
+        }
+    }
+    STATS[0].fetch_add(moves.iter().map(|m| m.2 as u64).sum(), Ordering::Relaxed);
+    STATS[1].fetch_add(moves.len() as u64, Ordering::Relaxed);
+    STATS[2].fetch_add(copies.iter().map(|c| u64::from(c.pairs.1)).sum(), Ordering::Relaxed);
+    // Chunk large moves into 64 KiB pieces and execute BOTH short-run pair
+    // packing and bulk moves in a single `wide_each` fan-out (one barrier
+    // instead of two).
+    const CHUNK: usize = 64 << 10;
+    let mut parts: Vec<(usize, usize, usize)> = Vec::with_capacity(moves.len());
+    for (src, dst, len) in moves {
+        let mut off = 0;
+        while off < len {
+            let n = CHUNK.min(len - off);
+            parts.push((src + off, dst + off, n));
+            off += n;
+        }
+    }
+    let n_work = work.len();
+    let total = n_work + parts.len();
     if total > 0 {
         crate::shadow::wide_each(total, |i| {
             if i < n_work {
-                let (from, ranges, to_off) = rel_work[i];
-                let mut to = (base + to_off as usize) as *mut [u32; 2];
+                let (from, ranges, to) = work[i];
+                let mut to = to as *mut [u32; 2];
                 for &(a, b) in ranges.iter().filter(|r| short(r)) {
                     for offset in (a..b).step_by(4) {
                         // SAFETY: inside the copy's mapping and inside `memory`.
@@ -273,56 +265,14 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
                     }
                 }
             } else {
-                let (src, dst_off, len) = rel_parts[i - n_work];
+                let (src, dst, len) = parts[i - n_work];
                 // SAFETY: non-overlapping ranges alive until `wide_each` returns.
-                unsafe { copy_wc(src as *const u8, (base + dst_off as usize) as *mut u8, len) };
+                unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
             }
         });
     }
     STATS[3].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
     Some(Own { memory, copies, used: at })
-}
-
-/// Copies `len` bytes from cached CPU memory `src` into write-combined upload
-/// memory `dst`. Uses 512-bit non-temporal streaming stores (`vmovntdq`) on
-/// AVX-512 CPUs to avoid RFO traffic and maximize WC write-combining bandwidth.
-#[inline]
-unsafe fn copy_wc(mut src: *const u8, mut dst: *mut u8, mut len: usize) {
-    #[cfg(target_feature = "avx512f")]
-    {
-        use std::arch::x86_64::{__m512i, _mm_sfence, _mm512_loadu_si512, _mm512_stream_si512};
-        if len >= 256 {
-            let mis = (dst as usize) & 63;
-            if mis != 0 {
-                let head = 64 - mis;
-                unsafe { std::ptr::copy_nonoverlapping(src, dst, head) };
-                src = unsafe { src.add(head) };
-                dst = unsafe { dst.add(head) };
-                len -= head;
-            }
-            while len >= 256 {
-                unsafe {
-                    let v0 = _mm512_loadu_si512(src as *const __m512i);
-                    let v1 = _mm512_loadu_si512(src.add(64) as *const __m512i);
-                    let v2 = _mm512_loadu_si512(src.add(128) as *const __m512i);
-                    let v3 = _mm512_loadu_si512(src.add(192) as *const __m512i);
-                    _mm512_stream_si512(dst as *mut __m512i, v0);
-                    _mm512_stream_si512(dst.add(64) as *mut __m512i, v1);
-                    _mm512_stream_si512(dst.add(128) as *mut __m512i, v2);
-                    _mm512_stream_si512(dst.add(192) as *mut __m512i, v3);
-                    src = src.add(256);
-                    dst = dst.add(256);
-                }
-                len -= 256;
-            }
-            if len > 0 {
-                unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
-            }
-            unsafe { _mm_sfence() };
-            return;
-        }
-    }
-    unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
 }
 
 impl Own {

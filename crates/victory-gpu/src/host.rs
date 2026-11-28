@@ -8062,11 +8062,6 @@ impl HostList {
         }
     }
 
-    /// Keeps `resource` alive until the list is reset (zero-cost upcast).
-    pub(crate) fn keep_resource(&self, resource: ID3D12Resource) {
-        self.deferred().kept.push(resource.into());
-    }
-
     /// Whether this is the first time since the reset that the list asks
     /// about `key` (a texture to bring up to date).
     pub(crate) fn first_use(&self, key: usize) -> bool {
@@ -8518,9 +8513,6 @@ struct Batch {
     /// `ahead` holds everything the submission refreshes
     /// ([`Batch::refresh_front`]).
     front: bool,
-    /// 1-entry fast cache `(shadow_ptr, from, to)` for consecutive `Batch::add`
-    /// hits in `ahead`.
-    last_ahead: (usize, usize, usize),
 }
 
 /// Whether the copies that a submission's shaders write are brought up to
@@ -8925,14 +8917,7 @@ impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
-        if self.last_ahead.0 == key && self.last_ahead.1 <= address && end <= self.last_ahead.2 {
-            return;
-        }
-        if let Some(&(from, to)) = self.ahead.get(&key)
-            && from <= address
-            && end <= to
-        {
-            self.last_ahead = (key, from, to);
+        if self.ahead.get(&key).is_some_and(|&(from, to)| from <= address && end <= to) {
             return;
         }
         match self.index.get(&key) {
@@ -8952,14 +8937,10 @@ impl Batch {
     fn flush_one(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>) {
         // From here on it is refreshed around what the shaders write. (What
         // is in front of all the steps was, up to here.)
-        let key = std::sync::Arc::as_ptr(shadow) as usize;
         if !self.front {
-            self.ahead.remove(&key);
-            if self.last_ahead.0 == key {
-                self.last_ahead.0 = 0;
-            }
+            self.ahead.remove(&(std::sync::Arc::as_ptr(shadow) as usize));
         }
-        let Some(at) = self.index.remove(&key) else {
+        let Some(at) = self.index.remove(&(std::sync::Arc::as_ptr(shadow) as usize)) else {
             return;
         };
         let (shadow, from, to) = self.refreshes.swap_remove(at);
@@ -9004,7 +8985,6 @@ impl Batch {
     fn title_written(&mut self) {
         self.flush();
         self.ahead.clear();
-        self.last_ahead.0 = 0;
         self.textures.clear();
     }
 

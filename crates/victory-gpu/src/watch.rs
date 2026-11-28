@@ -1346,154 +1346,22 @@ pub(crate) fn once() -> bool {
 }
 
 /// With [`once`]: asks about `ranges` (everything a submission's lists
-/// refresh) in a single parallel `spread_each` wave + single journal update,
-/// covering both grouped runs and alone ranges (chunked to 16 MiB), and lets
-/// that asking stand until [`ask_once_end`].
+/// refresh) as [`ask_ahead`] does, and lets that asking stand until
+/// [`ask_once_end`].
 pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     if !once() {
         return;
     }
-    let spent = crate::timeline::span("asking: once");
+    let mut spent = crate::timeline::span("asking: ahead");
     ask_once_end();
+    // Both parts under one hold of everything: a second hold waited for the
+    // other threads' askings again (0.5 ms a time, run fills-ab3), and no
+    // other asking comes between the two parts.
     let _all = Asking::hold_all();
-
-    let mut pieces: Vec<(usize, usize)> = ranges
-        .iter()
-        .filter(|r| r.0 < r.1 && !published(r.0, r.1) && !refused_as_view(r.0, r.1))
-        .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
-        .collect();
-    if pieces.is_empty() {
-        spent.end();
-        return;
-    }
-    pieces.sort_unstable();
-    // Deduplicate identical / contained page ranges so alone chunks aren't asked twice.
-    let mut deduped: Vec<(usize, usize)> = Vec::with_capacity(pieces.len());
-    for (first, last) in pieces {
-        if let Some(prev) = deduped.last()
-            && prev.0 <= first
-            && last <= prev.1
-        {
-            continue;
-        }
-        deduped.push((first, last));
-    }
-    let pieces = deduped;
-
-    const CHUNK_PAGES: usize = (16 << 20) / PAGE;
-    enum Task {
-        Run(std::ops::Range<usize>),
-        Chunk(usize, usize),
-    }
-    let mut tasks: Vec<Task> = Vec::new();
-    let mut i = 0;
-    while i < pieces.len() {
-        let first = pieces[i].0;
-        let mut last = pieces[i].1;
-        let mut k = i + 1;
-        while k < pieces.len()
-            && pieces[k].0 <= last + AHEAD_GAP
-            && last.max(pieces[k].1) - first <= AHEAD_MAX
-        {
-            last = last.max(pieces[k].1);
-            k += 1;
-        }
-        if k - i >= 2 {
-            tasks.push(Task::Run(i..k));
-        } else {
-            let mut p = first;
-            while p < last {
-                let next = (p + CHUNK_PAGES).min(last);
-                tasks.push(Task::Chunk(p, next));
-                p = next;
-            }
-        }
-        i = k;
-    }
-
-    let mut asked = Vec::new();
-    let mut written = Vec::new();
-    for (a, w) in spread_each(tasks.len(), |t| {
-        let (mut a, mut w) = (Vec::new(), Vec::new());
-        match &tasks[t] {
-            Task::Run(range) => ask_run_once(&pieces[range.clone()], &mut a, &mut w),
-            &Task::Chunk(first, last) => {
-                #[cfg(feature = "diagnostics")]
-                let asking = std::time::Instant::now();
-                let found = kernel_written(first, last);
-                #[cfg(feature = "diagnostics")]
-                alone(first * PAGE, last * PAGE, found.as_ref().map_or(0, Vec::len), asking.elapsed());
-                if let Some(pages) = found {
-                    w.extend(pages);
-                    a.push((first, last));
-                }
-            }
-        }
-        (a, w)
-    }) {
-        asked.extend(a);
-        written.extend(w);
-    }
-
-    note_hot(&written);
-    if port_journal() {
-        let now = note_shared(&written);
-        let mut j = journal_mut();
-        j.ahead_asked = now;
-        j.kept = !asked.is_empty();
-        KEPT.store(j.kept, std::sync::atomic::Ordering::Release);
-        j.ahead.set(asked);
-        spent.end();
-        return;
-    }
-    let mut j = journal_mut();
-    let now = next_asking();
-    j.ahead_asked = now;
-    for (page, parts) in written {
-        j.notes.note(page, parts, now);
-    }
-    j.kept = !asked.is_empty();
-    KEPT.store(j.kept, std::sync::atomic::Ordering::Release);
-    j.ahead.set(asked);
+    ask_ahead_held(ranges, true);
+    spent.next("asking: the rest");
+    ask_rest(ranges, true);
     spent.end();
-}
-
-/// Like [`ask_run`], but when a failed run splits down to a single piece it
-/// asks that piece directly (chunked to 16 MiB) so `ask_once` needs no second
-/// pass.
-fn ask_run_once(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: &mut Vec<(usize, u16)>) {
-    if pieces.is_empty() {
-        return;
-    }
-    if pieces.len() == 1 {
-        const CHUNK_PAGES: usize = (16 << 20) / PAGE;
-        let (first, last) = pieces[0];
-        let mut p = first;
-        while p < last {
-            let next = (p + CHUNK_PAGES).min(last);
-            #[cfg(feature = "diagnostics")]
-            let asking = std::time::Instant::now();
-            let found = kernel_written(p, next);
-            #[cfg(feature = "diagnostics")]
-            alone(p * PAGE, next * PAGE, found.as_ref().map_or(0, Vec::len), asking.elapsed());
-            if let Some(pages) = found {
-                written.extend(pages);
-                asked.push((p, next));
-            }
-            p = next;
-        }
-        return;
-    }
-    let first = pieces[0].0;
-    let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
-    if let Some(pages) = kernel_written(first, last) {
-        written.extend(pages);
-        asked.push((first, last));
-        return;
-    }
-    let (a, b) = pieces.split_at(pieces.len() / 2);
-    ask_run_once(a, asked, written);
-    ask_run_once(b, asked, written);
 }
 
 /// [`ask_once`] after its [`ask_ahead`]: what that left to `writes`, and the

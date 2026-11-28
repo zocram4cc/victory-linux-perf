@@ -83,12 +83,18 @@ pub(super) fn stage() -> u32 {
     })
 }
 
-/// `VICTORY_LEARNED_ON_CARD=1` (off by default): fills of learned places
-/// ([`late`]) done on the card from the title's memory in place, not waited
-/// for (see [`Host::take_steps`]).
-fn learned_on_card() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_LEARNED_ON_CARD").is_some_and(|v| v == "1"))
+/// `VICTORY_LEARNED_ON_CARD`:
+/// - `0` (default): learned late-written places wait for flights.
+/// - `1`: read live title memory in place on the card (`in_place_block`).
+/// - `2`: snapshot learned fills synchronously into a pooled upload buffer at
+///   submission time, then copy on the card (zero flight wait, no overwrite race).
+fn learned_mode() -> u32 {
+    static MODE: OnceLock<u32> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_LEARNED_ON_CARD").ok().as_deref() {
+        Some("1") => 1,
+        Some("2") => 2,
+        _ => 0,
+    })
 }
 
 /// Whether a copy at its place in a list ([`place`]) is only in the way of
@@ -526,9 +532,17 @@ fn fill_to(runs: &[&HostList], step: (usize, usize)) -> Option<FillTo> {
     }
 }
 
+/// Source bytes for a card step: either a host shadow copy (`Shadow`), or an
+/// offset inside `Own::snap` captured at submission time (`Snap`).
+enum Source {
+    Shadow(Arc<Shadow>),
+    Snap(u64),
+}
+
 /// A step done on the card.
 struct Op {
-    from: (Arc<Shadow>, usize),
+    from: Source,
+    title: usize,
     len: usize,
     /// Its place in the buffer between.
     at: u64,
@@ -546,6 +560,7 @@ enum To {
 }
 
 /// Records a level of what [`stage`] describes into `list` (open): `reads`
+/// and `snap_reads` (upload snapshot, always `GENERIC_READ`, never transitioned)
 /// are copied into `between` (source, offset in it, offset in `between`,
 /// bytes), then `writes` out of it (destination, offset in it, offset in
 /// `between`, bytes). `between` is left readable as constants (and must be
@@ -556,6 +571,7 @@ fn record(
     list: &ID3D12GraphicsCommandList,
     between: &ID3D12Resource,
     reads: &[(&ID3D12Resource, u64, u64, u64)],
+    snap_reads: &[(&ID3D12Resource, u64, u64, u64)],
     writes: &[(&ID3D12Resource, u64, u64, u64)],
 ) {
     // Every range is checked against its buffer and the staging buffer before
@@ -580,8 +596,9 @@ fn record(
         ok
     };
     let reads: Vec<_> = reads.iter().filter(fits).copied().collect();
+    let snap_reads: Vec<_> = snap_reads.iter().filter(fits).copied().collect();
     let writes: Vec<_> = writes.iter().filter(fits).copied().collect();
-    let (reads, writes) = (&reads[..], &writes[..]);
+    let (reads, snap_reads, writes) = (&reads[..], &snap_reads[..], &writes[..]);
     let common = D3D12_RESOURCE_STATE_COMMON;
     let (source, dest) = (D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
     let mut sources: Vec<&ID3D12Resource> = Vec::new();
@@ -619,6 +636,9 @@ fn record(
         for &(buffer, offset, at, len) in reads {
             list.CopyBufferRegion(between, at, buffer, offset, len);
         }
+        for &(buffer, offset, at, len) in snap_reads {
+            list.CopyBufferRegion(between, at, buffer, offset, len);
+        }
         list.ResourceBarrier(&barriers);
         for &(buffer, offset, at, len) in writes {
             list.CopyBufferRegion(buffer, offset, between, at, len);
@@ -633,6 +653,8 @@ fn record(
 struct Own {
     list: HostList,
     between: ID3D12Resource,
+    /// Upload snapshot buffer for `VICTORY_LEARNED_ON_CARD=2`.
+    snap: Option<(ID3D12Resource, *mut u8, usize)>,
     /// What the buffer between held, read back ([`late`]).
     back: Option<ID3D12Resource>,
 }
@@ -1580,6 +1602,7 @@ impl Host {
         // title's late write, as the console's draws read it then. No wait,
         // and only those few hundred bytes cross the bus. Its bytes are still
         // read back and compared at landing (`late`: "found written again").
+        let mode = learned_mode();
         let mut learned: std::collections::HashSet<usize> = std::collections::HashSet::new();
         if late::on() {
             let gate = gate::on();
@@ -1588,7 +1611,7 @@ impl Host {
                 if !late::written(*src, *src + *len) {
                     continue;
                 }
-                if learned_on_card() && *to && crate::shadow::in_place_block(*src as u64, *len as u64).is_some() {
+                if *to && (mode == 2 || mode == 1 && crate::shadow::in_place_block(*src as u64, *len as u64).is_some()) {
                     learned.insert(k);
                     continue;
                 }
@@ -1642,6 +1665,8 @@ impl Host {
         // The places read (host copy, address, bytes, level): where in the
         // buffer between their bytes are.
         let mut places: HashMap<(usize, usize, usize, u32), u64> = HashMap::default();
+        let mut snap_places: HashMap<(usize, usize, u32), (u64, u64)> = HashMap::default();
+        let mut snap_data: Vec<u8> = Vec::new();
         // Some 2,800 fills a frame, of a few hundred places: what holds each
         // is looked for once, as long as no copy is added to the writers.
         let mut held: HashMap<(usize, usize), Arc<Shadow>> = HashMap::default();
@@ -1657,34 +1682,55 @@ impl Host {
             if len == 0 {
                 return Err("nothing to read");
             }
-            let from = if learned.contains(&i) {
-                // `VICTORY_LEARNED_ON_CARD`: the title's memory itself.
-                crate::shadow::in_place_block(src as u64, len as u64).ok_or("no view in place of a learned place")?
-            } else {
-                match held.get(&(src, len)) {
-                    Some(from) => from.clone(),
+            let (from, at) = if mode == 2 && learned.contains(&i) {
+                match snap_places.get(&(src, len, level)) {
+                    Some(&(at, snap_off)) => (Source::Snap(snap_off), at),
                     None => {
-                        let from = holder(&writers, src, src + len)?;
-                        held.insert((src, len), from.clone());
-                        from
+                        if end + len as u64 > BETWEEN {
+                            return Err("too much at once");
+                        }
+                        let snap_off = snap_data.len();
+                        snap_data.resize(snap_off + len, 0);
+                        if !crate::host::read_into(src as *const u8, &mut snap_data[snap_off..snap_off + len]) {
+                            return Err("not all of what it reads is mapped");
+                        }
+                        let at = end;
+                        end = (end + len as u64).next_multiple_of(256);
+                        snap_places.insert((src, len, level), (at, snap_off as u64));
+                        (Source::Snap(snap_off as u64), at)
                     }
                 }
-            };
-            let place = (Arc::as_ptr(&from) as usize, src, len, level);
-            let at = match places.get(&place) {
-                Some(&at) => at,
-                None => {
-                    if end + len as u64 > BETWEEN {
-                        return Err("too much at once");
+            } else {
+                let shadow = if learned.contains(&i) {
+                    // `VICTORY_LEARNED_ON_CARD=1`: the title's memory itself.
+                    crate::shadow::in_place_block(src as u64, len as u64).ok_or("no view in place of a learned place")?
+                } else {
+                    match held.get(&(src, len)) {
+                        Some(from) => from.clone(),
+                        None => {
+                            let from = holder(&writers, src, src + len)?;
+                            held.insert((src, len), from.clone());
+                            from
+                        }
                     }
-                    if !mapped(src, src + len, &mut room) {
-                        return Err("not all of what it reads is mapped");
+                };
+                let place = (Arc::as_ptr(&shadow) as usize, src, len, level);
+                let at = match places.get(&place) {
+                    Some(&at) => at,
+                    None => {
+                        if end + len as u64 > BETWEEN {
+                            return Err("too much at once");
+                        }
+                        if !mapped(src, src + len, &mut room) {
+                            return Err("not all of what it reads is mapped");
+                        }
+                        let at = end;
+                        end = (end + len as u64).next_multiple_of(256);
+                        places.insert(place, at);
+                        at
                     }
-                    let at = end;
-                    end = (end + len as u64).next_multiple_of(256);
-                    places.insert(place, at);
-                    at
-                }
+                };
+                (Source::Shadow(shadow), at)
             };
             let to = match does[i] {
                 Does::Copy { .. } => {
@@ -1713,7 +1759,8 @@ impl Host {
                 },
             };
             ops.push(Op {
-                from: (from, src),
+                from,
+                title: src,
                 len,
                 at,
                 level,
@@ -1721,22 +1768,34 @@ impl Host {
             });
         }
         spent.next("steps on the card: the list");
-        let Some(own) = self.own_list() else {
+        let Some(mut own) = self.own_list() else {
             return Err("no host list or buffer for it");
         };
+        if !snap_data.is_empty() {
+            let need = snap_data.len();
+            if own.snap.as_ref().is_none_or(|s| s.2 < need) {
+                let cap = need.max(1 << 20).next_power_of_two();
+                let (buf, ptr) = self.upload_buffer(cap as u64).ok_or("no upload buffer for learned snapshot")?;
+                name(&buf, || "learned card step snapshot".into());
+                own.snap = Some((buf, ptr, cap));
+            }
+            let (_, ptr, _) = own.snap.as_ref().unwrap();
+            // SAFETY: `own.snap` is mapped for at least `need` bytes and not in use until `own.list` is sent.
+            unsafe { std::ptr::copy_nonoverlapping(snap_data.as_ptr(), *ptr, need) };
+        }
         // First every refresh, then the writes: the bytes compared with are
         // the title's. (One step for each host copy, over all that is read of
         // it: a flush brings a copy up to date from the first range asked for
         // to the last, whatever the steps.)
         let mut spans: ByCopy<(Arc<Shadow>, usize, usize)> = ByCopy::default();
         for op in &ops {
-            let to = match &op.to {
-                To::Copy(to, dst) => Some((to, *dst)),
-                _ => None,
-            };
-            for (shadow, at) in std::iter::once((&op.from.0, op.from.1)).chain(to) {
-                let span = spans.entry(Arc::as_ptr(shadow) as usize).or_insert_with(|| (shadow.clone(), at, at + op.len));
-                (span.1, span.2) = (span.1.min(at), span.2.max(at + op.len));
+            if let Source::Shadow(shadow) = &op.from {
+                let span = spans.entry(Arc::as_ptr(shadow) as usize).or_insert_with(|| (shadow.clone(), op.title, op.title + op.len));
+                (span.1, span.2) = (span.1.min(op.title), span.2.max(op.title + op.len));
+            }
+            if let To::Copy(to, dst) = &op.to {
+                let span = spans.entry(Arc::as_ptr(to) as usize).or_insert_with(|| (to.clone(), *dst, *dst + op.len));
+                (span.1, span.2) = (span.1.min(*dst), span.2.max(*dst + op.len));
             }
         }
         for (shadow, from, to) in spans.into_values() {
@@ -1752,15 +1811,28 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         own.list.note_op(|| format!("{} copies of title memory done on the card, {end} bytes (VICTORY_CARD_STEPS)", ops.len()));
         let levels = ops.iter().map(|op| op.level).max().unwrap_or(0);
+        let snap_buf = own.snap.as_ref().map(|s| &s.0);
         for level in 0..=levels {
             let mut reads = Vec::new();
+            let mut snap_reads = Vec::new();
             let mut writes = Vec::new();
             for op in ops.iter().filter(|op| op.level == level) {
                 let len = op.len as u64;
-                let read = (&op.from.0.buffer, op.from.0.offset(op.from.1 as u64), op.at, len);
-                // (Each place once.)
-                if places.remove(&(Arc::as_ptr(&op.from.0) as usize, op.from.1, op.len, level)).is_some() {
-                    reads.push(read);
+                match &op.from {
+                    Source::Shadow(shadow) => {
+                        let read = (&shadow.buffer, shadow.offset(op.title as u64), op.at, len);
+                        // (Each place once.)
+                        if places.remove(&(Arc::as_ptr(shadow) as usize, op.title, op.len, level)).is_some() {
+                            reads.push(read);
+                        }
+                    }
+                    &Source::Snap(snap_off) => {
+                        if let Some(buf) = snap_buf
+                            && snap_places.remove(&(op.title, op.len, level)).is_some()
+                        {
+                            snap_reads.push((buf, snap_off, op.at, len));
+                        }
+                    }
                 }
                 match &op.to {
                     To::Copy(to, dst) => writes.push((&to.buffer, to.offset(*dst as u64), op.at, len)),
@@ -1768,10 +1840,10 @@ impl Host {
                     To::Slot(..) => {}
                 }
             }
-            record(level == 0, &own.list.list, &own.between, &reads, &writes);
+            record(level == 0, &own.list.list, &own.between, &reads, &snap_reads, &writes);
         }
         // What the fills read, read back ([`late`]): each place once, and
-        // where its bytes are in the buffer between.
+        // where its bytes are in the buffer between (not needed for `Snap`).
         let mut sent: Vec<(usize, usize, u64)> = Vec::new();
         if let Some(back) = own.back.as_ref().filter(|_| late::on() && end > 0) {
             // (The buffer between is readable as constants and as a copy
@@ -1779,9 +1851,9 @@ impl Host {
             // SAFETY: an open list; both buffers live and `BETWEEN` long.
             unsafe { own.list.list.CopyBufferRegion(back, 0, &own.between, 0, end) };
             let mut seen: HashMap<(usize, usize), ()> = HashMap::default();
-            for op in ops.iter().filter(|op| !matches!(op.to, To::Copy(..))) {
-                if seen.insert((op.from.1, op.len), ()).is_none() {
-                    sent.push((op.from.1, op.len, op.at));
+            for op in ops.iter().filter(|op| !matches!(op.to, To::Copy(..)) && matches!(op.from, Source::Shadow(_))) {
+                if seen.insert((op.title, op.len), ()).is_none() {
+                    sent.push((op.title, op.len, op.at));
                 }
             }
         }
@@ -1864,7 +1936,7 @@ impl Host {
         name(&between, || "copies of title memory on the card".into());
         let list = self.new_list().ok()?;
         let back = if late::on() { self.read_back_buffer(BETWEEN) } else { None };
-        Some(Own { list, between, back })
+        Some(Own { list, between, snap: None, back })
     }
 }
 
@@ -1885,8 +1957,12 @@ fn noted(ops: &[Op]) {
             To::Copy(to, dst) => (to.span(), *dst),
             To::Slot(..) | To::Buffer(_) => ((0, 0), 0),
         };
-        let e = noted.entry((op.len, op.from.0.span(), to)).or_default();
-        *e = (e.0 + 1, op.from.1, dst);
+        let from_span = match &op.from {
+            Source::Shadow(shadow) => shadow.span(),
+            Source::Snap(_) => (0, 0),
+        };
+        let e = noted.entry((op.len, from_span, to)).or_default();
+        *e = (e.0 + 1, op.title, dst);
     }
 }
 
@@ -2322,10 +2398,11 @@ mod tests {
             &own.list.list,
             &own.between,
             &[(&a, 33, 0, 100), (&a, 2000, 256, 100), (&a, 5001, 512, 7), (&a, 9, 1024, 4)],
+            &[],
             &[(&a, 2000, 0, 100), (&a, 33, 256, 100), (&b, 77, 512, 7)],
         );
         // A level behind it, of what it wrote.
-        record(false, &own.list.list, &own.between, &[(&b, 77, 2048, 7)], &[(&b, 1077, 2048, 7)]);
+        record(false, &own.list.list, &own.between, &[(&b, 77, 2048, 7)], &[], &[(&b, 1077, 2048, 7)]);
         own.list.close();
         // A list behind it that uses the buffers in other ways.
         let next = host.new_list().unwrap();
