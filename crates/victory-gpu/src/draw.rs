@@ -31,6 +31,17 @@ use crate::pipeline::host::HostPipeline;
 #[cfg(feature = "diagnostics")]
 pub(crate) mod rtv_trace;
 
+/// The view heap precedes the sampler heap when both are bound. D3D12
+/// accepts only present heaps, which always occupy a contiguous slice here.
+fn descriptor_heap_bindings<T>(heaps: &[Option<T>; 2]) -> &[Option<T>] {
+    match heaps {
+        [Some(_), Some(_)] => heaps,
+        [Some(_), None] => &heaps[..1],
+        [None, Some(_)] => &heaps[1..],
+        [None, None] => &[],
+    }
+}
+
 fn is_depth_srv(desc: &[u32; 10]) -> bool {
     let format = DXGI_FORMAT(crate::resource::pc_format(desc[0]) as i32);
     // In a Texture2D SRV, the union starts at word 4 and PlaneSlice is word 6.
@@ -1904,18 +1915,14 @@ impl State {
             if sampler_heap.is_none() {
                 sampler_heap = crate::host::host().and_then(|h| h.fallback_sampler_heap().cloned());
             }
-            let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = Vec::with_capacity(2);
-            if let Some(h) = view_heap {
-                list.keep(&h);
-                heaps.push(Some(h));
+            let heaps = [view_heap, sampler_heap];
+            let bindings = descriptor_heap_bindings(&heaps);
+            for heap in bindings.iter().flatten() {
+                list.keep(heap);
             }
-            if let Some(h) = sampler_heap {
-                list.keep(&h);
-                heaps.push(Some(h));
-            }
-            if !heaps.is_empty() {
+            if !bindings.is_empty() {
                 // SAFETY: an open list and shader-visible heaps.
-                unsafe { l.SetDescriptorHeaps(&heaps) };
+                unsafe { l.SetDescriptorHeaps(bindings) };
             }
             self.host_heaps = self.heaps;
             self.host_heaps_set = true;
@@ -5747,7 +5754,17 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{View, is_depth_companion, is_depth_srv, next_texture_recheck, staging_budget_per_frame};
+    use super::{
+        View, descriptor_heap_bindings, is_depth_companion, is_depth_srv, next_texture_recheck, staging_budget_per_frame,
+    };
+
+    #[test]
+    fn descriptor_bindings_omit_empty_slots_and_preserve_heap_order() {
+        assert!(descriptor_heap_bindings::<u8>(&[None, None]).is_empty());
+        assert_eq!(descriptor_heap_bindings(&[Some(3), None]), &[Some(3)]);
+        assert_eq!(descriptor_heap_bindings(&[None, Some(7)]), &[Some(7)]);
+        assert_eq!(descriptor_heap_bindings(&[Some(3), Some(7)]), &[Some(3), Some(7)]);
+    }
 
     #[test]
     fn depth_srv_checks_the_plane_not_the_number_of_levels() {
