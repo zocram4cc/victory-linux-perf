@@ -483,7 +483,20 @@ pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
 /// The user SGPR a program uses as its view heap's 32-bit base, if its
 /// first straight-line instructions show it: a scalar load of 4 or 8 dwords
 /// from the pair (that SGPR, 0) at an offset shifted left by 5.
-fn view_heap_sgpr(code: &[u8], user_sgprs: u8) -> Option<u8> {
+thread_local! {
+    static HEAP_PREV: std::cell::RefCell<Option<(usize, String, (bool, bool))>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Dwords a scalar memory load of this name writes (`s_load_dwordx4`: 4).
+fn smem_dwords(name: &str) -> usize {
+    match name.rsplit_once("dword") {
+        Some((_, "")) => 1,
+        Some((_, n)) => n.trim_start_matches('x').parse().unwrap_or(16),
+        None => 16,
+    }
+}
+
+fn view_heap_sgpr(code: &[u8], user_sgprs: u8, taken: &[u8]) -> Option<u8> {
     #[derive(Clone, Copy, PartialEq)]
     enum S {
         User(u8),
@@ -517,6 +530,17 @@ fn view_heap_sgpr(code: &[u8], user_sgprs: u8) -> Option<u8> {
     // deep inside branches, e.g. `218_0000000f005f3e00` at 0x8a0); only the
     // last two user SGPRs count, the only places the census found.
     for inst in insts.iter() {
+        if std::env::var_os("VICTORY_WHY_HEAP").is_some() {
+            HEAP_PREV.with(|p| {
+                let mut p = p.borrow_mut();
+                if let Some((o, n, b)) = p.take()
+                    && b != (st[6] == S::User(6), st[7] == S::Zero)
+                {
+                    eprintln!("WHY-HEAP s6/s7 changed by {n} at {o:#x}");
+                }
+                *p = Some((inst.offset, inst.name().unwrap_or("?").to_string(), (st[6] == S::User(6), st[7] == S::Zero)));
+            });
+        }
         let w = inst.words[0];
         let sdst = ((w >> 16) & 0x7f) as usize;
         match inst.name() {
@@ -560,10 +584,12 @@ fn view_heap_sgpr(code: &[u8], user_sgprs: u8) -> Option<u8> {
             Some(name) if name.starts_with("s_buffer_") => {
                 let base = ((w & 0x3f) * 2) as usize;
                 if let Some(&(_, x)) = pending.iter().find(|p| p.0 == base) {
-                    return Some(x);
+                    if !taken.contains(&x) {
+                        return Some(x);
+                    }
                 }
                 let sdata = ((w >> 6) & 0x7f) as usize;
-                for s in st.iter_mut().skip(sdata).take(16) {
+                for s in st.iter_mut().skip(sdata).take(smem_dwords(name)) {
                     *s = S::Other;
                 }
             }
@@ -572,7 +598,9 @@ fn view_heap_sgpr(code: &[u8], user_sgprs: u8) -> Option<u8> {
                 // second dword, in units of four.
                 let rsrc = (((inst.words[1] >> 16) & 0x1f) * 4) as usize;
                 if let Some(&(_, x)) = pending.iter().find(|p| p.0 == rsrc) {
-                    return Some(x);
+                    if !taken.contains(&x) {
+                        return Some(x);
+                    }
                 }
             }
             Some("s_load_dwordx4" | "s_load_dwordx8") if inst.words.len() >= 2 => {
@@ -582,6 +610,17 @@ fn view_heap_sgpr(code: &[u8], user_sgprs: u8) -> Option<u8> {
                     let d = |x: S| match x { S::User(u) => format!("user{u}"), S::Plus(u) => format!("plus{u}"), S::Zero => "zero".into(), S::Times32 => "x32".into(), S::Other => "other".into() };
                     eprintln!("WHY-HEAP load at {:#x} base s{base} = {} / {}", inst.offset, d(st[base]), d(st[base + 1]));
                 }
+                // Eight dwords from (sX, 0) at any offset: an image descriptor,
+                // which only the view heap holds (a sampler is four dwords).
+                if inst.name() == Some("s_load_dwordx8")
+                    && base + 1 < st.len()
+                    && let (S::User(x), S::Zero) = (st[base], st[base + 1])
+                    && x + 2 >= user_sgprs
+                {
+                    if !taken.contains(&x) {
+                        return Some(x);
+                    }
+                }
                 // A heap address computed by an add (a waterfall loop's: the
                 // first lane's byte offset added to the heap's base).
                 if base + 1 < st.len()
@@ -590,7 +629,9 @@ fn view_heap_sgpr(code: &[u8], user_sgprs: u8) -> Option<u8> {
                 {
                     let sdata = ((w >> 6) & 0x7f) as usize;
                     if inst.name() == Some("s_load_dwordx8") {
+                        if !taken.contains(&x) {
                         return Some(x);
+                    }
                     }
                     pending.retain(|p| p.0 != sdata);
                     pending.push((sdata, x));
@@ -601,7 +642,9 @@ fn view_heap_sgpr(code: &[u8], user_sgprs: u8) -> Option<u8> {
                     && st[soffset] == S::Times32
                     && x + 2 >= user_sgprs
                 {
-                    return Some(x);
+                    if !taken.contains(&x) {
+                        return Some(x);
+                    }
                 }
                 let sdata = ((w >> 6) & 0x7f) as usize;
                 let n = if inst.name() == Some("s_load_dwordx8") { 8 } else { 4 };
@@ -623,7 +666,7 @@ fn view_heap_sgpr(code: &[u8], user_sgprs: u8) -> Option<u8> {
                 }
                 if name.starts_with("s_load") || name.starts_with("s_buffer_load") {
                     let sdata = ((w >> 6) & 0x7f) as usize;
-                    for s in st.iter_mut().skip(sdata).take(16) {
+                    for s in st.iter_mut().skip(sdata).take(smem_dwords(name)) {
                         *s = S::Other;
                     }
                 }
@@ -753,7 +796,15 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
     // the first kind wrong, and a root-constants record sized by its
     // descriptor dwords (`e[20]`) could cover it (family 0x33cb3490: half of
     // Jason's house culled, `docs/royale/p4-house-bug.md`).
-    let view_heap = view_heap_sgpr(code, user_sgprs);
+    // User SGPRs a listed table or root descriptor already holds: not the
+    // heap (the scan goes on past them: s5 found first hid s6 in
+    // `218_0000000f0e77c000`).
+    let taken: Vec<u8> = layout
+        .iter()
+        .filter(|p| matches!(p.root, RootType::Table | RootType::Descriptor))
+        .map(|p| p.user_data)
+        .collect();
+    let view_heap = view_heap_sgpr(code, user_sgprs, &taken);
     if std::env::var_os("VICTORY_WHY_HEAP").is_some() {
         eprintln!("WHY-HEAP user SGPRs {user_sgprs}, view heap from the code {view_heap:?}, layout {:?}", layout.iter().map(|p| (p.root, p.user_data, p.sgprs)).collect::<Vec<_>>());
     }

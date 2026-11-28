@@ -7599,7 +7599,7 @@ impl<'a> Lower<'a> {
                         if std::env::var_os("VICTORY_WHY_STALE").is_some() && rel == 1 && image.is_none() {
                             let root = self.scalar.get(&site).and_then(|a| self.x.native.layout.get(a.param).map(|p| p.root));
                             let param = self.scalar.get(&site).map(|a| a.param);
-                            eprintln!("WHY-STALE buffer d1 at {:#x} root {root:?} param {} used stride {:?} props {:#x}", inst.machine.offset, param.map_or("none".into(), |p| if p == crate::resource::MEMORY { "MEMORY".into() } else { p.to_string() }), used.map(|u| u.stride), props.0);
+                            eprintln!("WHY-STALE buffer d1 at {:#x} addr {:?} root {root:?} param {} used stride {:?} props {:#x}", inst.machine.offset, self.scalar.get(&site), param.map_or("none".into(), |p| if p == crate::resource::MEMORY { "MEMORY".into() } else { p.to_string() }), used.map(|u| u.stride), props.0);
                         }
                         self.vals.insert(v, Val::Missing(OTHER));
                         self.stale.insert(v);
