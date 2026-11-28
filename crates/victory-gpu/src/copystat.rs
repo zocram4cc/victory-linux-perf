@@ -907,7 +907,8 @@ fn log_memory() {
          lists were made; allocators taken anew (VICTORY_ALLOCATOR_TRIM): {} of lists, {} \
          of preludes; pooled preludes (VICTORY_PRELUDE_POOL): {} alive, {} made; indirect \
          budgets: {} buffers of their own, {} slabs of 256 (VICTORY_BUDGET_PACK) with {} \
-         slots in use; twins of depth textures: {:.0} MB; host copies of \
+         slots in use; host lists of landed flights given back at once \
+         (VICTORY_LANDED_POOL): {}; twins of depth textures: {:.0} MB; host copies of \
          placed textures whose title memory is not mapped any more (estimate): {:.0} MB, of \
          them still shown by a descriptor slot {:.0} MB; the pipeline library's mapped file \
          let go from memory so far: {:.0} MB; our own blocks of 32 MB and more, in MB: {}",
@@ -930,6 +931,7 @@ fn log_memory() {
         crate::host::BUDGETS[0].load(Relaxed),
         crate::host::BUDGETS[1].load(Relaxed),
         crate::host::BUDGETS[2].load(Relaxed),
+        crate::host::LANDED_AT_ONCE.load(Relaxed),
         mb(census[7]),
         mb(census[8]),
         mb(census[9]),

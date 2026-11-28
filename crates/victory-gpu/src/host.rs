@@ -493,7 +493,9 @@ pub(crate) fn retire_resource(object: ID3D12Resource) {
 /// is reset, about two frames: the device losses of the night of 2026-11-25
 /// were page faults in memory nothing of ours named any more, at no command
 /// in particular. Objects let go while nothing runs wait as well: lists
-/// recorded and not yet sent may name them. `VICTORY_BURY_LAG=0`: not.
+/// recorded and not yet sent may name them. With [`landed_pool`] a landed
+/// list is reset at once and only what it held waits ([`land`]).
+/// `VICTORY_BURY_LAG=0`: not.
 fn bury_lag() -> u64 {
     static LAG: OnceLock<u64> = OnceLock::new();
     *LAG.get_or_init(|| {
@@ -1631,6 +1633,15 @@ type States = std::collections::HashMap<
     usize,
     (u32, u32, std::sync::Arc<crate::resource::HostTexture>),
 >;
+
+/// What a host list that ran still held for its commands
+/// ([`HostList::take_held`]), kept through [`retire`].
+pub(crate) struct Held {
+    _deferred: Deferred,
+    _states: States,
+    _twins: std::collections::HashMap<usize, TwinUse>,
+    _coming: Option<(usize, std::sync::Arc<aside::Coming>)>,
+}
 
 /// What a list does with a depth texture that has a colour twin
 /// ([`crate::resource::Twin`]). Lists are recorded on many threads and run
@@ -3865,17 +3876,44 @@ pub(crate) fn settle_for_fence() {
 }
 
 /// Resets the host lists of settled flights and keeps them for reuse, as
-/// a queue does for the lists it ran (`crate::list::recycle`).
+/// a queue does for the lists it ran (`crate::list::recycle`), once
+/// [`bury_lag`] more flights have landed. With [`landed_pool`] at once
+/// (`crate::list::recycle_landed`): what their commands named waits the
+/// lag through [`retire`] instead, and the lists and their allocators are
+/// used again.
 fn land() {
+    let at_once = landed_pool();
     let landed: Vec<_> = {
         let mut line = line();
-        let n = line.landed.len().saturating_sub(bury_lag() as usize);
+        let n = if at_once { line.landed.len() } else { line.landed.len().saturating_sub(bury_lag() as usize) };
         line.landed.drain(..n).collect()
     };
     for (lists, order) in landed {
-        crate::list::recycle(lists, &order);
+        if at_once {
+            LANDED_AT_ONCE.fetch_add(lists.len() as u64, Ordering::Relaxed);
+            crate::list::recycle_landed(lists, &order);
+        } else {
+            crate::list::recycle(lists, &order);
+        }
     }
 }
+
+/// Whether the host lists of a landed flight go back to the pool at once
+/// (`VICTORY_LANDED_POOL=1`; off unless set). Held in the line of landed
+/// flights for [`bury_lag`] flights, 64 flights of lists (some 700 at the
+/// first world load in the origin's run, an RX 6700 XT) kept their
+/// allocators' command memory while new lists were made for new
+/// recordings. A list's fence has passed when its flight lands, so its
+/// allocator may be reset then; what its commands named still waits the
+/// lag. (Prior art 867330f.)
+fn landed_pool() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LANDED_POOL").is_some_and(|v| v == "1"))
+}
+
+/// Host lists of landed flights given back at once since the start
+/// ([`landed_pool`]; for the memory line).
+pub(crate) static LANDED_AT_ONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The thread that settles the flights once the card has run them all
 /// ([`late`]): without it a bottom-of-pipe write would reach the title only
@@ -7112,6 +7150,20 @@ impl HostList {
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
+    }
+
+    /// What the list holds for the commands it recorded: its deferred work,
+    /// the host textures and twins it names, the refreshes still being
+    /// found. Taken out to be kept through [`retire`] while the list itself
+    /// is reset and used again ([`land`]); [`HostList::reset`] then finds
+    /// them empty.
+    pub(crate) fn take_held(&self) -> Held {
+        Held {
+            _deferred: std::mem::take(&mut *self.deferred()),
+            _states: std::mem::take(&mut *self.states.lock().unwrap_or_else(|e| e.into_inner())),
+            _twins: std::mem::take(&mut *self.twins.lock().unwrap_or_else(|e| e.into_inner())),
+            _coming: self.coming.lock().unwrap_or_else(|e| e.into_inner()).take(),
+        }
     }
 
     /// Something changed in this list that bringing a draw's textures and

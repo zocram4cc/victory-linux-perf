@@ -275,10 +275,45 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
     if !pools() {
         return;
     }
-    for (i, Detached { host, _uploads, _state }) in lists.into_iter().enumerate() {
-        // The descriptor slots and the upload memory its commands named.
-        drop(_state);
-        drop(_uploads);
+    keep_idle(
+        lists.into_iter().map(|Detached { host, _uploads, _state }| {
+            // The descriptor slots and the upload memory its commands named.
+            drop(_state);
+            drop(_uploads);
+            host
+        }),
+        ran,
+    );
+}
+
+/// [`recycle`] for lists sent ahead whose flight has landed
+/// (`crate::host::land`): what their commands named (descriptor slots,
+/// upload memory, the host textures and refreshes they held) waits
+/// `crate::host::retire`'s lag, and the lists go back to the pool at once.
+///
+/// Held in the line of landed flights for that lag instead, 64 flights of
+/// lists (some 700 at the first world load) kept their allocators' command
+/// memory, and lists for new recordings were made meanwhile: on an RX 6700
+/// XT in a 32 GB PC the driver's 2 GB segment for that memory ran full and
+/// the device was removed (prior art 867330f; that tree's notes).
+#[cfg(windows)]
+pub(crate) fn recycle_landed(lists: Vec<Detached>, ran: &[usize]) {
+    let hosts = lists.into_iter().map(|Detached { host, _uploads, _state }| {
+        crate::host::retire((_state, _uploads, host.take_held()));
+        host
+    });
+    if pools() {
+        keep_idle(hosts, ran);
+    } else {
+        hosts.for_each(crate::host::retire);
+    }
+}
+
+/// Resets the host lists that ran and keeps them for [`fresh_list`], up to
+/// [`IDLE_MOST`]; the others go.
+#[cfg(windows)]
+fn keep_idle(hosts: impl Iterator<Item = crate::host::HostList>, ran: &[usize]) {
+    for (i, host) in hosts.enumerate() {
         if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
             continue;
         }
