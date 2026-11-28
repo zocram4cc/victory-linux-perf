@@ -834,6 +834,42 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
     })
 }
 
+/// Page ranges `(first, last)` the kernel refused to ask about in
+/// [`writes`] (`VICTORY_REFUSED_CACHE=1`; off by default: asked every time).
+static REFUSED: RwLock<Option<std::collections::HashSet<(usize, usize)>>> = RwLock::new(None);
+
+fn refused_cache() -> bool {
+    #[cfg(test)]
+    if REFUSED_IN_TEST.get() {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REFUSED_CACHE").is_some_and(|v| v == "1"))
+}
+
+fn refused_before(first: usize, last: usize) -> bool {
+    refused_cache() && REFUSED.read().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|r| r.contains(&(first, last)))
+}
+
+fn note_refused(first: usize, last: usize) {
+    if !refused_cache() {
+        return;
+    }
+    let mut r = REFUSED.write().unwrap_or_else(|e| e.into_inner());
+    let r = r.get_or_insert_with(Default::default);
+    // Bounded: memory mapped and unmapped for long would grow it.
+    if r.len() >= 1 << 16 {
+        r.clear();
+    }
+    r.insert((first, last));
+}
+
+fn forget_refused(first: usize, last: usize) {
+    if let Some(r) = REFUSED.write().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        r.remove(&(first, last));
+    }
+}
+
 /// The runs of dirty pages in `at` (ascending, `step` apart), for [`slow`].
 #[cfg(feature = "diagnostics")]
 fn dirty_runs(mut at: impl Iterator<Item = usize>, step: usize) -> usize {
@@ -1842,6 +1878,15 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     if !guarded && refused_as_view(start, end) {
         return None;
     }
+    // Refused by the kernel before (view memory, which has no write watch):
+    // not asked again. A refusal takes Wine's one lock for all of memory
+    // like any asking, and a texture there asked twice at every refresh
+    // (180 refusals a frame, 23 us each, run 135); the submission's askings
+    // waited behind them.
+    let known_refused = refused_before(first, last);
+    if !guarded && known_refused {
+        return None;
+    }
     // Asked, and the answer noted, with the range held: nothing else asks
     // about any of it in between.
     let _range = Asking::hold(first, last);
@@ -1857,17 +1902,31 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     if viewed {
         port6_count(P6_NOT_ASKED, 1);
     }
-    let refused = protected || viewed;
+    let refused = protected || viewed || known_refused;
     let pages = match if refused { None } else { kernel_written(first, last) } {
         Some(pages) => pages,
         None => {
             guards_asked = true;
+            if !refused {
+                note_refused(first, last);
+            }
             if !guarded {
                 return None;
             }
             #[cfg(feature = "diagnostics")]
             let guarding = std::time::Instant::now();
             let mut written = guard(first * PAGE, last * PAGE).map(|pages| pages.into_iter().map(|p| (p, WHOLE)).collect::<Vec<_>>());
+            if written.is_none() && known_refused && !viewed {
+                // Not view memory now (the guards would not take it): the
+                // refusal is forgotten and the kernel asked (and, refused
+                // again, it stands: neither the kernel nor the guards take
+                // such a range, one across reservations).
+                if let Some(pages) = kernel_written(first, last) {
+                    forget_refused(first, last);
+                    guards_asked = false;
+                    written = Some(pages);
+                }
+            }
             if written.is_none() && viewed {
                 // Not a view after all (other memory there now): forgotten as
                 // one, and the kernel asked as before.
@@ -2145,6 +2204,8 @@ thread_local! {
     pub(crate) static HOT_IN_TEST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// [`port_guard`], for what this thread does.
     pub(crate) static PORT_GUARD_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// [`refused_cache`], for what this thread does.
+    pub(crate) static REFUSED_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The blocks a thread holding [`GUARDS`] shared is changing the state of
@@ -5952,6 +6013,34 @@ mod tests {
             VirtualQuery(at as *const _, &mut info, size_of_val(&info));
             info.Protect
         }
+    }
+
+    /// With the refusal cache, a range the kernel refused once (a view: no
+    /// write watch) is not asked of it again by a caller that does not ask the
+    /// guards; the answer stays "not watched".
+    #[test]
+    fn a_range_the_kernel_refused_is_not_asked_again() {
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile};
+        // SAFETY: a pagefile section of two blocks, mapped read-write.
+        let view = unsafe {
+            let section = CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, (2 * BLOCK) as u32, std::ptr::null());
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK)
+        };
+        let at = view.Value as usize;
+        assert_ne!(at, 0);
+        REFUSED_IN_TEST.set(true);
+        let asked = || {
+            let before = ASKED_HERE.with(|c| c.get());
+            let answer = writes(at, at + 2 * BLOCK, false);
+            (answer.is_none(), ASKED_HERE.with(|c| c.get()) - before)
+        };
+        assert_eq!(asked(), (true, 1), "the first asking goes to the kernel, which refuses a view");
+        assert_eq!(asked(), (true, 0), "a refused range is not asked again");
+        REFUSED_IN_TEST.set(false);
+        forget_refused(at / PAGE, (at + 2 * BLOCK) / PAGE);
+        // SAFETY: our view.
+        unsafe { UnmapViewOfFile(view) };
     }
 
     /// A refresh between the opening of a kernel read's destination and the
