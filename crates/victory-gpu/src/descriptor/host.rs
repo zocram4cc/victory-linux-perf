@@ -7307,12 +7307,13 @@ pub(crate) fn prepare_list_views() {
     });
 }
 
-/// The view the record `words` names, as this thread made it in [`ListViews`].
-pub(crate) fn listed_view(words: [u32; 3]) -> Option<View> {
+/// Borrows the view the record `words` names in [`ListViews`] without cloning
+/// it, running `f(&View)` if present.
+pub(crate) fn with_listed_view<R>(words: [u32; 3], f: impl FnOnce(&View) -> R) -> Option<R> {
     LIST_VIEWS.with(|views| {
         let views = views.borrow();
-        let views = views.as_ref()?;
-        views.made.get(&words).map(|m| m.view.clone())
+        let made = views.as_ref()?.made.get(&words)?;
+        Some(f(&made.view))
     })
 }
 

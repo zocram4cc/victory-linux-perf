@@ -4384,9 +4384,12 @@ impl State {
                             if listed.ready.3 {
                                 TESTED_DEPTH.set((tested.0, true));
                             }
-                        } else if let Some(view) = crate::descriptor::host::listed_view(words) {
+                        } else if crate::descriptor::host::with_listed_view(words, |view| {
                             TESTED_DEPTH.set((tested.0, false));
-                            readable(list, kind, &view);
+                            readable(list, kind, view);
+                        })
+                        .is_some()
+                        {
                             let depth = TESTED_DEPTH.get().1;
                             TESTED_DEPTH.set((tested.0, tested.1 || depth));
                             if kind == ResourceType::Srv {
