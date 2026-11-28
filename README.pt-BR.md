@@ -65,6 +65,8 @@ Testado em **Ryzen 5 5500X3D, Radeon RX 7600 8 GB, 32 GB DDR4, Windows 11 (26340
 
 1. Baixe `main` (**Code -> Download ZIP** ou `git clone --branch main https://github.com/crossducking/RAZDA4A-XEN.git`) e extraia. Inclui `D3D12\D3D12Core.dll` e `fidelityfx\*.dll`.
 2. Execute **`RAZDA4A XEN.bat`**, clique em **Browse...** para escolher **`your_executable.exe`** (salvo em UTF-8 no `config.bat`), escolha o perfil e Frame Generation e clique em **Launch**.
+   - Não dê dois cliques no executável do jogo. O Windows pede DLLs de console que só o launcher fornece.
+   - Mantenha a pasta descompactada inteira, inclusive `D3D12\`, `fidelityfx\` e `presets\`.
    - Launchers externos (`VILauncher`, etc.): use **`RAZDA4A XEN.bat --no-gui`**.
 
 | Arquivo | Uso |

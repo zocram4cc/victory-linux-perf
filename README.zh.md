@@ -65,6 +65,8 @@
 
 1. 下载 `main` 分支（**Code -> Download ZIP** 或 `git clone --branch main https://github.com/crossducking/RAZDA4A-XEN.git`）并解压。内置 `D3D12\D3D12Core.dll` 与 `fidelityfx\*.dll`。
 2. 运行 **`RAZDA4A XEN.bat`**，点击 **Browse...** 选择 **`your_executable.exe`**（以 UTF-8 自动保存到 `config.bat`，支持中文路径），选择配置与 Frame Generation 开关后点击 **Launch**。
+   - 不要直接双击游戏可执行文件。Windows 会提示缺少仅由启动器提供的主机 DLL。
+   - 解压后的整个文件夹要留在一起，包括 `D3D12\`、`fidelityfx\` 和 `presets\`。
    - 第三方启动器 / 命令行：配置好 `config.bat` 后可运行 **`RAZDA4A XEN.bat --no-gui`**。
 
 | 文件 | 说明 |

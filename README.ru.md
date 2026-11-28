@@ -65,6 +65,8 @@ Direct3D 12 Windows-рантайм для **видеокарт AMD RDNA2 / RDNA3
 
 1. Скачайте ветку `main` (**Code -> Download ZIP** или `git clone --branch main https://github.com/crossducking/RAZDA4A-XEN.git`) и распакуйте (например, в `D:\RAZDA4A-XEN\`). Все DLL (`D3D12\D3D12Core.dll`, `fidelityfx\*.dll`) уже внутри.
 2. Запустите **`RAZDA4A XEN.bat`**, через **Browse...** выберите **`ваш_запускной_файл.exe`** (сохранится в `config.bat` в UTF-8, включая русские пути), выберите профиль и галочку Frame Generation и нажмите **Launch**.
+   - Не запускайте игровой файл двойным щелчком. Windows запросит консольные DLL, которые подставляет только лаунчер.
+   - Распакованная папка должна остаться целиком, включая `D3D12\`, `fidelityfx\` и `presets\`.
    - Для сторонних лаунчеров (`VILauncher` и т.д.): используйте **`RAZDA4A XEN.bat --no-gui`** после настройки `config.bat`.
 
 | Файл | Назначение |
