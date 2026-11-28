@@ -32,6 +32,15 @@ spot: 8,500-9,200 draws a frame), `-FrameGen` settings: mimalloc 24.8 standing /
 its walk through a lighter scene (6,700 draws). No gain within run-to-run spread; left as a
 build feature, not the default.
 
+### Tried, not kept: helper threads above normal priority
+trustno1-coder/VIctory-NVIDIA 80c70b71 (`VICTORY_HELPER_PRIORITY`): the threads the submitting
+thread waits for (wide pool, landing pools, heap records, the pass beside the lists) raised above
+normal; they measured +1 fps on a six-core i5-12400F. Ported and measured here in an in-run A/B
+(diagnostics build, the user's 70 % save, `-FrameGen` settings, 20 s phases, 8,400-9,400 draws):
+frames 42.3 against 43.6 and 43.0 ms, 43.4 against 43.0 and 45.4, 47.2 against 45.4 and 47.4,
+47.5 against 47.4 and 48.4; about -0.3 ms, within noise. Here the list threads already run below
+normal, so these helpers get their turns. Not kept.
+
 ### Tried, not ported: OP-lite's faster guards and lists kept open
 `VICTORY_GUARDS_FAST` takes the title's write faults out of the guards' lock: here renderer port 6
 (`VICTORY_PORT_GUARD`, in `-FrameGen`) already shares that lock, and the lock waits are 1.6 ms a
