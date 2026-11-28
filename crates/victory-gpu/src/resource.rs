@@ -1873,8 +1873,17 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
         // (`crate::shadow::card_room_kept`) and for the render targets a
         // world makes in its first frame ([`targets_room_kept`]) counts as
         // used.
+        // With textures first, `used` as the texture rules see it
+        // ([`textures_first_used`]): the windows on the card move to the
+        // PC's memory before a texture waits. (It was the card's whole use
+        // here while `let_go_idle` saw it less the windows: run
+        // t1128-2117-1-B waited on 3,200 textures, 6.4 GB, for minutes at
+        // 77 % of the card, as black, and let none go, as the room rule saw
+        // the card under its line.)
         Some([budget, used, ..]) => {
-            used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept()
+            textures_first_used(budget, used).saturating_sub(crate::pool::texture_room())
+                + crate::shadow::card_room_kept()
+                + targets_room_kept()
                 < budget / 100 * room_percent()
         }
         None => filled < WITHOUT_BUDGET,
