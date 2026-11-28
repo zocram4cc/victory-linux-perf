@@ -587,7 +587,11 @@ impl Tiled {
             }
         };
         let shown = (0..self.levels).find(|&level| has(level) && with_tiles(level)).unwrap_or(u32::MAX);
-        self.shown.swap(shown, Ordering::Relaxed) != shown
+        let changed = self.shown.swap(shown, Ordering::Relaxed) != shown;
+        if changed {
+            crate::descriptor::host::invalidate_list_views();
+        }
+        changed
     }
 
     /// The first level a view of the texture may show; `None` while no
