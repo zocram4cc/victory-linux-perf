@@ -541,10 +541,18 @@ fn native_compute(desc: usize) -> Option<Vec<u8>> {
     }
     // FSPX: "FSPX", u32 1, u32 entries, u32 size; entries of 16 B (kind,
     // offset, size, 0); then the pieces, 16-byte aligned.
-    let pieces: [(u32, &[u8]); 4] = [(0, &packet), (1, &hash), (6, &code), (7, &meta)];
+    // Ours: the title's root signature flags (word 0's root signature), so
+    // the translator places the heaps by the title's own data.
+    let flags = crate::root::blob(w(0) as This)
+        .and_then(crate::root::blob_flags)
+        .map(|(f, _)| f.to_le_bytes());
+    let mut pieces: Vec<(u32, &[u8])> = vec![(0, &packet), (1, &hash), (6, &code), (7, &meta)];
+    if let Some(f) = &flags {
+        pieces.push((victory_shader::native::FSPX_ROOT_FLAGS, f));
+    }
     let mut fspx = vec![0u8; 0x10 + 16 * pieces.len()];
     let mut table = Vec::new();
-    for (kind, bytes) in pieces {
+    for &(kind, bytes) in &pieces {
         while fspx.len() % 16 != 0 {
             fspx.push(0);
         }

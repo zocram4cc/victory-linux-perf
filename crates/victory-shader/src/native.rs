@@ -691,6 +691,11 @@ fn view_heap_sgpr(code: &[u8], user_sgprs: u8, taken: &[u8]) -> Option<u8> {
     None
 }
 
+/// An `FSPX` piece of ours (not the console's): the title's root signature
+/// flags (`D3D12_ROOT_SIGNATURE_FLAGS`, u32), added where the pieces are put
+/// back together (the layer's `device::native_compute`, the P.4 harness).
+pub const FSPX_ROOT_FLAGS: u32 = 0x7F;
+
 pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
     if u32_at(part, 4)? != FSPX_VERSION {
         return Err(Malformed("unknown FSPX version"));
@@ -810,6 +815,59 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
         .filter(|p| matches!(p.root, RootType::Table | RootType::Descriptor))
         .map(|p| p.user_data)
         .collect();
+    // The title's root signature flags, where the pieces carry them
+    // ([`FSPX_ROOT_FLAGS`]): real data, checked against the code over all
+    // 2,680 programs (docs/royale/p4-shortcuts.md, "Heaps from the title's
+    // root signatures"). The heaps take the last user SGPRs: both indexed
+    // (0x400 | 0x800), views in s[n-2] and samplers in s[n-1]; one alone,
+    // it in s[n-1].
+    if let Ok(f) = entry(FSPX_ROOT_FLAGS).and_then(|b| u32_at(b, 0)) {
+        let views = f & 0x400 != 0;
+        let samplers = f & 0x800 != 0;
+        let mut heaps = Vec::new();
+        if views {
+            heaps.push((RootType::ResourceHeap, if samplers { 2 } else { 1 }, 0xFE));
+        }
+        if samplers {
+            heaps.push((RootType::SamplerHeap, 1, 0xFF));
+        }
+        for (root, at, slot) in heaps {
+            let Some(x) = user_sgprs.checked_sub(at) else { continue };
+            if taken.contains(&x) {
+                // A listed table there contradicts the flags: refused
+                // rather than guessed.
+                return Err(Malformed("a heap where the root signature puts a table"));
+            }
+            for p in layout.iter_mut() {
+                if p.root == RootType::Constants && p.user_data < x && u32::from(p.user_data) + p.sgprs > u32::from(x) {
+                    p.sgprs = u32::from(x - p.user_data);
+                }
+            }
+            layout.push(RootParam {
+                root,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: x,
+                slot,
+            });
+        }
+        if std::env::var_os("VICTORY_WHY_HEAP").is_some() {
+            eprintln!("WHY-HEAP from the root signature flags {f:#x}: layout {:?}", layout.iter().map(|p| (p.root, p.user_data, p.sgprs)).collect::<Vec<_>>());
+        }
+        return Ok(NativeProgram {
+            stage: HwStage::Cs,
+            wave64,
+            vgprs,
+            layout,
+            used,
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: u32_at(packet, PACKET_RSRC2)?,
+                threads: [threads(0)?, threads(1)?, threads(2)?],
+            }),
+            code: code.to_vec(),
+        });
+    }
     let view_heap = view_heap_sgpr(code, user_sgprs, &taken);
     if std::env::var_os("VICTORY_WHY_HEAP").is_some() {
         eprintln!("WHY-HEAP user SGPRs {user_sgprs}, view heap from the code {view_heap:?}, layout {:?}", layout.iter().map(|p| (p.root, p.user_data, p.sgprs)).collect::<Vec<_>>());

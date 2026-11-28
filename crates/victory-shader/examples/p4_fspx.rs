@@ -15,11 +15,15 @@ fn piece(dir: &std::path::Path, word: usize) -> Option<Vec<u8>> {
     })
 }
 
-pub fn assemble(packet: &[u8], hash: &[u8], code: &[u8], meta: &[u8]) -> Vec<u8> {
-    let pieces: [(u32, &[u8]); 4] = [(0, packet), (1, hash), (6, code), (7, meta)];
+pub fn assemble(packet: &[u8], hash: &[u8], code: &[u8], meta: &[u8], root_flags: Option<u32>) -> Vec<u8> {
+    let flags = root_flags.map(u32::to_le_bytes);
+    let mut pieces: Vec<(u32, &[u8])> = vec![(0, packet), (1, hash), (6, code), (7, meta)];
+    if let Some(f) = &flags {
+        pieces.push((victory_shader::native::FSPX_ROOT_FLAGS, f));
+    }
     let mut fspx = vec![0u8; 0x10 + 16 * pieces.len()];
     let mut table = Vec::new();
-    for (kind, bytes) in pieces {
+    for &(kind, bytes) in &pieces {
         while fspx.len() % 16 != 0 {
             fspx.push(0);
         }
@@ -60,6 +64,18 @@ fn main() {
     // programs that translate, one a line.
     let ok_file = args.iter().position(|a| a == "--ok").and_then(|i| args.get(i + 1)).cloned();
     let mut ok_list = Vec::new();
+    let root_flags: std::collections::HashMap<String, u32> = if std::env::var_os("K_ROOT_FLAGS").is_some_and(|v| v == "0") {
+        Default::default()
+    } else {
+        std::fs::read_to_string(std::env::var("K_ROOT_FLAGS").unwrap_or_else(|_| "bench/p4-root-flags.txt".into()))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| {
+                let mut w = l.split_whitespace();
+                Some((w.next()?.to_owned(), u32::from_str_radix(w.next()?.trim_start_matches("0x"), 16).ok()?))
+            })
+            .collect()
+    };
     let mut errors: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let (mut ok, mut total) = (0, 0);
     let mut dirs: Vec<_> = std::fs::read_dir(&dir).expect("dump dir").flatten().map(|e| e.path()).collect();
@@ -74,7 +90,10 @@ fn main() {
             errors.entry("a piece missing from the dump".into()).or_default().push(name);
             continue;
         };
-        let c = assemble(&packet, &hash, &code, &meta);
+        // The title's root signature flags of this program, collected in game
+        // (`VICTORY_NATIVE_ROOT_LOG`; `K_ROOT_FLAGS=0`: without them).
+        let flags = root_flags.get(name.trim_start_matches("218_")).copied();
+        let c = assemble(&packet, &hash, &code, &meta, flags);
         if std::env::var_os("VICTORY_WHY_ADDRESS").is_some() || std::env::var_os("VICTORY_WHY_DESCRIPTOR").is_some() || std::env::var_os("VICTORY_WHY_DEAD").is_some() {
             eprintln!("PROGRAM {name}");
         }
