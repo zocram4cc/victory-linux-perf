@@ -2,6 +2,8 @@
 
 codec_d's cool_fox build of [VIctory](https://github.com/Marvisak/VIctory), carried on for **Linux under Proton** (tested on an NVIDIA RTX 5080), with the Wine and NVIDIA fixes of the forks credited below and tooling to measure playtests. The Windows instructions and the upstream AMD fork's notes follow unchanged.
 
+> **Status (2026-11-28):** The runtime reaches gameplay but is slow, about 15-17 fps in the prison opening on an RTX 5080, and has picture faults: stretched character geometry, noisy skin on some faces, shimmering reflections. A large share of each frame goes to copying memory between the title and the graphics card, and the worst picture faults come from the same copying. Work to take that copying out happens on the branch `no-copies`. First, the translated shaders record exactly which memory they wrote, so only that is copied back. Later, the card reads the title's memory in place. That branch may be broken at any time; `main` stays the branch to run.
+
 **This repository contains no game files, code or assets.** You need your own
 copy of the game. It is not affiliated with or endorsed by the game's developer
 or publisher.
