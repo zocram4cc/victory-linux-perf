@@ -348,15 +348,16 @@ pub(crate) fn ml_enabled() -> bool {
     api().is_some_and(|api| api.legacy_providers.is_none()) && !ML_FELL_BACK.load(Ordering::Relaxed)
 }
 
-/// `VICTORY_FRAMEGEN_AHEAD=1`: with frame generation the present's list is
-/// sent ahead like any other (`Host::present_planes`), and the card finishes
-/// the frame while the next one is prepared. Off (the default) it runs at
-/// once and every present waits for all the card's work first: 24 ms a frame
-/// in run t1128-2117-1-B, with the card idle 31 ms a frame behind it.
+/// With frame generation the present's list is sent ahead like any other
+/// (`Host::present_planes`), and the card finishes the frame while the next
+/// one is prepared (the default; the launchers set it since 7b02c83: 13.7-14.3
+/// real fps against 9.4). `VICTORY_FRAMEGEN_AHEAD=0`: it runs at once and
+/// every present waits for all the card's work first: 24 ms a frame in run
+/// t1128-2117-1-B and 17.8 in t1128-2117-2-A, with the card idle behind it.
 pub(crate) fn ahead() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var("VICTORY_FRAMEGEN_AHEAD").is_ok_and(|v| v.trim() == "1");
+        let on = !std::env::var("VICTORY_FRAMEGEN_AHEAD").is_ok_and(|v| v.trim() == "0");
         tracing::info!(on, "FidelityFX frame generation: presents sent ahead (VICTORY_FRAMEGEN_AHEAD)");
         on
     })
