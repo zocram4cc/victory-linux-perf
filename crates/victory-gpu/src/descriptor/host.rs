@@ -3162,12 +3162,16 @@ impl HostHeap {
         self.keep_srv(index, kept.flatten(), view);
     }
 
-    /// Makes slot `index` (a dynamic one) the view the record `words` names,
-    /// from this thread's descriptor of it if the recording `recording` has
-    /// made one, else as [`HostHeap::make_at`] does, and keeps that
-    /// ([`ListViews`]). What is known of the record in this recording;
-    /// `None` (the slot is not made): not a view kept so.
-    pub(crate) fn make_listed(&self, recording: u64, words: [u32; 3], index: u32) -> Option<Listed> {
+    /// Prepares slot `index` (a dynamic one) for the view the record `words`
+    /// names, reusing this thread's cached descriptor across command lists
+    /// within the same frame and epoch ([`ListViews`]). Returns the cached
+    /// metadata and the source CPU descriptor handle(s) for batched copying
+    /// via [`HostHeap::copy_batch_from`].
+    pub(crate) fn make_listed(
+        &self,
+        words: [u32; 3],
+        index: u32,
+    ) -> Option<(Listed, D3D12_CPU_DESCRIPTOR_HANDLE, Option<D3D12_CPU_DESCRIPTOR_HANDLE>)> {
         if self.sampler {
             return None;
         }
@@ -3177,12 +3181,10 @@ impl HostHeap {
                 *views = Some(ListViews::new()?);
             }
             let views = views.as_mut()?;
-            if views.recording != recording {
-                views.recording = recording;
-                views.made.clear();
-            }
             let twins = self.twins.get(index as usize).is_some();
             if !views.made.contains_key(&words) {
+                #[cfg(feature = "diagnostics")]
+                LIST_VIEWS_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let view = super::view_at(words[1], words[2])?;
                 let at = 2 * views.made.len() as u32;
                 if at >= ListViews::SLOTS {
@@ -3190,8 +3192,9 @@ impl HostHeap {
                 }
                 let (twin, kept) = if let View::Constant(address, size) = view {
                     // With `VICTORY_PORT_CBV=1`, in-place constant buffers have
-                    // a fixed GPU address for the whole list and can be cached
-                    // in `ListViews` just like SRVs/UAVs.
+                    // a fixed GPU address for the whole frame (unless freed,
+                    // which bumps `LIST_VIEWS_EPOCH`) and can be cached in
+                    // `ListViews` just like SRVs/UAVs.
                     if !crate::port_cbv::in_place_on() {
                         return None;
                     }
@@ -3240,7 +3243,7 @@ impl HostHeap {
                 let listed = Listed {
                     kind: crate::draw::view_kind(&view),
                     texture: is_texture_view(&view),
-                    ready: (0, 0, false),
+                    ready: (0, 0, 0, false),
                     tabled: None,
                 };
                 let word = slot_word(&view);
@@ -3261,34 +3264,64 @@ impl HostHeap {
                     0
                 };
                 views.made.insert(words, ListView { view, at, twin, kept, listed, word, release_dim });
+            } else {
+                #[cfg(feature = "diagnostics")]
+                LIST_VIEWS_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             let made = &views.made[&words];
             self.table_word(index, made.word);
-            self.copy_from(index, views.slot(made.at));
-            if made.twin && twins {
-                self.copy_from(self.raw + index, views.slot(made.at + 1));
+            let main_src = views.slot(made.at);
+            let twin_src = if made.twin && twins {
                 self.twins[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
+                Some(views.slot(made.at + 1))
             } else {
                 self.clear_twin(index);
-            }
+                None
+            };
             self.keep(index, made.kept.as_ref().map(Cow::Borrowed));
             if made.release_dim != 0 {
                 self.note_release_view(index, made.release_dim);
             }
-            Some(made.listed)
+            Some((made.listed, main_src, twin_src))
         })
     }
 
-    /// As [`HostHeap::copy_to`], from the slot `from`, which the card does not
-    /// see.
-    fn copy_from(&self, to: u32, from: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    /// Copies a contiguous run of descriptors from non-shader-visible CPU
+    /// handles into slots `to .. to + srcs.len()` (or their raw twin slots when
+    /// `raw` is true) in a single D3D12 `CopyDescriptors` call.
+    pub(crate) fn copy_batch_from(&self, to: u32, raw: bool, srcs: &[D3D12_CPU_DESCRIPTOR_HANDLE]) {
+        if srcs.is_empty() {
+            return;
+        }
+        let dst_index = if raw { self.raw + to } else { to };
         #[cfg(feature = "diagnostics")]
-        if let Some(written) = self.written.get(to as usize) {
-            written.store(crate::host::coarse_ms() as u32, std::sync::atomic::Ordering::Relaxed);
+        {
+            let now = crate::host::coarse_ms() as u32;
+            for i in 0..srcs.len() {
+                if let Some(written) = self.written.get(dst_index as usize + i) {
+                    written.store(now, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
         }
         let Some(host) = host() else { return };
-        // SAFETY: a slot of our heap, and one of this thread's heap.
-        unsafe { host.device.CopyDescriptorsSimple(1, self.cpu(to), from, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
+        let dst = self.cpu(dst_index);
+        // SAFETY: contiguous slots in our heap and valid TLS CPU-only handles.
+        unsafe {
+            if srcs.len() == 1 {
+                host.device.CopyDescriptorsSimple(1, dst, srcs[0], D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            } else {
+                let count = srcs.len() as u32;
+                host.device.CopyDescriptors(
+                    1,
+                    &dst,
+                    Some(&count),
+                    count,
+                    srcs.as_ptr(),
+                    None,
+                    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                );
+            }
+        }
     }
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
@@ -4809,16 +4842,16 @@ fn constant_bytes(size: u32) -> u32 {
 fn constant_twinned(
     buffer: &ID3D12Resource,
     gpu: u64,
+    offset: u64,
+    width: u64,
     size: u32,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
     twin: Option<D3D12_CPU_DESCRIPTOR_HANDLE>,
 ) -> bool {
     let Some(host) = host() else { return false };
-    // SAFETY: a live buffer.
-    let (base, width) = unsafe { (buffer.GetGPUVirtualAddress(), buffer.GetDesc().Width) };
-    let Some(offset) = gpu.checked_sub(base).filter(|&o| o < width && crate::port_cbv::raw_ok(o)) else {
+    if offset >= width || !crate::port_cbv::raw_ok(offset) {
         return false;
-    };
+    }
     let room = width - offset;
     let cbv = if gpu.is_multiple_of(256) && room >= 256 {
         D3D12_CONSTANT_BUFFER_VIEW_DESC {
@@ -4881,7 +4914,8 @@ fn make_twinned(
                 // Renderer port 5: shaders read constant buffers as raw bytes
                 // through the twin; a constant buffer view there would be read
                 // raw, with no end on AMD.
-                return constant_twinned(&shadow.buffer, gpu, size, at, twin).then(|| Some(shadow.buffer.clone()));
+                return constant_twinned(&shadow.buffer, gpu, shadow.offset(address), shadow.width(), size, at, twin)
+                    .then(|| Some(shadow.buffer.clone()));
             }
             if gpu % 256 != 0 {
                 once!(
@@ -7159,11 +7193,11 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
 pub(crate) struct Listed {
     pub(crate) kind: Option<victory_shader::native::ResourceType>,
     pub(crate) texture: bool,
-    /// Read at this epoch of the list ([`crate::host::HostList::epoch`]) with
-    /// this depth target tested: up to date; and whether it is that target's.
-    pub(crate) ready: (u64, usize, bool),
-    /// The title's slot last noted for it, and whether the draw read it.
-    pub(crate) tabled: Option<(u32, bool)>,
+    /// Read in this `(recording, list_epoch, tested_depth)`: up to date; and
+    /// whether it is that depth target's.
+    pub(crate) ready: (u64, u64, usize, bool),
+    /// The `(recording, title_slot, read)` last noted for it.
+    pub(crate) tabled: Option<(u64, u32, bool)>,
 }
 
 struct ListView {
@@ -7179,18 +7213,27 @@ struct ListView {
     release_dim: u8,
 }
 
-/// The descriptors a thread made for one recording of a list, by the record
-/// they were made from, in a heap the card does not see.
-///
-/// The title's culling and lighting dispatches each bind a table of their own
-/// that differs in one constant buffer, and the same thirty views beside it:
-/// each was found, checked, made and brought up to date anew for every
-/// dispatch, some 2,500 indirect dispatches in the one recording job the
-/// frame waits for last (timeline waits-2: 24 of 65 ms). Here a list makes a
-/// view once, as it makes a table once (`crate::draw::State::tables`), and
-/// copies its descriptor.
+/// Bumped whenever a descriptor table entry is forgotten, an in-place shadow is
+/// let go, or a tiled texture's first shown mip changes, so every thread's
+/// [`ListViews`] cache clears on its next table.
+static LIST_VIEWS_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+#[cfg(feature = "diagnostics")]
+static LIST_VIEWS_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn list_views_stats() -> [u64; 3] {
+    [0, 1, 2].map(|i| LIST_VIEWS_STATS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+pub(crate) fn invalidate_list_views() {
+    LIST_VIEWS_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
+/// The descriptors a thread made in the current [`LIST_VIEWS_EPOCH`], by the
+/// record they were made from, in a heap the card does not see.
 struct ListViews {
-    recording: u64,
+    epoch: u64,
     heap: ID3D12DescriptorHeap,
     step: usize,
     start: usize,
@@ -7198,7 +7241,7 @@ struct ListViews {
 }
 
 impl ListViews {
-    const SLOTS: u32 = 8192;
+    const SLOTS: u32 = 32768;
 
     fn new() -> Option<ListViews> {
         let host = host()?;
@@ -7214,7 +7257,13 @@ impl ListViews {
                 .ok()?;
             let step = host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
             let start = heap.GetCPUDescriptorHandleForHeapStart().ptr;
-            Some(ListViews { recording: 0, heap, step, start, made: Default::default() })
+            Some(ListViews {
+                epoch: LIST_VIEWS_EPOCH.load(std::sync::atomic::Ordering::Acquire),
+                heap,
+                step,
+                start,
+                made: Default::default(),
+            })
         }
     }
 
@@ -7228,19 +7277,38 @@ thread_local! {
     static LIST_VIEWS: std::cell::RefCell<Option<ListViews>> = const { std::cell::RefCell::new(None) };
 }
 
-/// The view the record `words` names, as this thread made it for `recording`.
-pub(crate) fn listed_view(recording: u64, words: [u32; 3]) -> Option<View> {
+/// Refreshes this thread's [`ListViews`] cache once per table: clears it only
+/// when [`LIST_VIEWS_EPOCH`] has advanced (resource/shadow/tile invalidation)
+/// or when the TLS CPU heap is nearly full, so cached descriptors survive
+/// across command lists and frames and stay stable during a batched
+/// `CopyDescriptors` pass.
+pub(crate) fn prepare_list_views() {
+    let epoch = LIST_VIEWS_EPOCH.load(std::sync::atomic::Ordering::Acquire);
+    LIST_VIEWS.with(|views| {
+        if let Some(views) = views.borrow_mut().as_mut()
+            && (views.epoch != epoch || 2 * views.made.len() as u32 + 256 >= ListViews::SLOTS)
+        {
+            views.epoch = epoch;
+            views.made.clear();
+            #[cfg(feature = "diagnostics")]
+            LIST_VIEWS_STATS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+}
+
+/// The view the record `words` names, as this thread made it in [`ListViews`].
+pub(crate) fn listed_view(words: [u32; 3]) -> Option<View> {
     LIST_VIEWS.with(|views| {
         let views = views.borrow();
-        let views = views.as_ref().filter(|v| v.recording == recording)?;
+        let views = views.as_ref()?;
         views.made.get(&words).map(|m| m.view.clone())
     })
 }
 
-/// Notes what is known of the record `words` in `recording`.
-pub(crate) fn note_listed(recording: u64, words: [u32; 3], listed: Listed) {
+/// Notes what is known of the record `words` in [`ListViews`].
+pub(crate) fn note_listed(words: [u32; 3], listed: Listed) {
     LIST_VIEWS.with(|views| {
-        if let Some(views) = views.borrow_mut().as_mut().filter(|v| v.recording == recording)
+        if let Some(views) = views.borrow_mut().as_mut()
             && let Some(made) = views.made.get_mut(&words)
         {
             made.listed = listed;

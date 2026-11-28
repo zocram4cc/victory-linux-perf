@@ -5554,16 +5554,18 @@ pub(crate) fn in_place_block(src: u64, len: u64) -> Option<Arc<Shadow>> {
 pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     let end = at.saturating_add(len);
     // Views in place of learned blocks over the memory go too.
-    {
+    let blocks_gone = {
         let mut blocks = BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
         let keys: Vec<(u64, u64)> = blocks.keys().filter(|(s, e)| *s < end && *e > at).copied().collect();
+        let count = keys.len();
         for key in keys {
             if let Some(shadow) = blocks.remove(&key) {
                 crate::host::retire(shadow);
             }
         }
         BLOCK_COUNT.store(blocks.len() as u64, Ordering::Relaxed);
-    }
+        count
+    };
     let mut gone: Vec<Arc<Shadow>> = Vec::new();
     {
         let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
@@ -5584,6 +5586,9 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
         }
     }
     let n = gone.len() as u64;
+    if n > 0 || blocks_gone > 0 {
+        crate::descriptor::host::invalidate_list_views();
+    }
     for shadow in gone {
         crate::host::retire(shadow);
     }
