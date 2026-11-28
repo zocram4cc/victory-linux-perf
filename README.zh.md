@@ -1,4 +1,4 @@
-﻿[English](README.md) | [Русский](README.ru.md) | 简体中文 | [Español](README.es.md) | [Português (BR)](README.pt-BR.md)
+[English](README.md) | [Русский](README.ru.md) | 简体中文 | [Español](README.es.md) | [Português (BR)](README.pt-BR.md)
 
 # RAZDA4A XEN
 
@@ -78,7 +78,7 @@ $env:RUSTFLAGS = "-C target-cpu=znver3"
 cargo build --release --locked -p victory
 ```
 
-预编译 `RAZDA4A_XEN.exe` SHA-256: `7fcb4ba60b6dee7a6b71b6e110cf01cd86c5576c38bfcbe707a618c6e8f37c5d`
+预编译 `RAZDA4A_XEN.exe` SHA-256: `00d6d6f90466de9541eb61266715c8ce4993c6926ca3c78f7b339d518cfec3db`
 
 ## 分支与协议
 
