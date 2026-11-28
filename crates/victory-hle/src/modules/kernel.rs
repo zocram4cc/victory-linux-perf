@@ -766,7 +766,10 @@ mod tests {
         );
         // Host DLLs outside the host policy do not exist for the title.
         assert!(LoadLibraryW(w("wininet.dll").as_ptr()).is_null());
-        assert!(LoadLibraryA(c"C:\\Windows\\System32\\urlmon".as_ptr().cast()).is_null());
+        // By its full path too: the host's own, or the load would fail whatever the policy says.
+        let urlmon = std::env::var("SystemRoot").unwrap() + r"\System32\urlmon";
+        let urlmon = std::ffi::CString::new(urlmon).unwrap();
+        assert!(LoadLibraryA(urlmon.as_ptr().cast()).is_null());
         assert!(GetModuleHandleW(w("WININET.DLL").as_ptr()).is_null());
         assert_eq!(
             // SAFETY: reads this thread's last error.

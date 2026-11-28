@@ -2550,22 +2550,29 @@ mod tests {
             nodes: 1,
         };
         let mut h = std::ptr::null();
-        assert_eq!(
-            create(
-                desc,
-                Placement {
-                    address,
-                    size: 64 * 32
-                },
-                &mut h
-            ),
-            S_OK
-        );
+        let placement = Placement { address, size: 64 * 32 };
+        assert_eq!(create(desc, placement, &mut h), S_OK);
         assert_eq!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
         assert_eq!(slot::<extern "system" fn(This) -> u64>(h, 0x50)(h), address);
+        // Remove the placed heap from the registry before its memory can
+        // be reused by another heap.
+        release(h);
         // A size that does not match the count is not a placement.
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+        release(h);
+
+        #[cfg(windows)]
+        {
+            // Reuse the address without relying on the allocator to give it
+            // to another test. The descriptor write must reach the new heap.
+            assert_eq!(create(desc, placement, &mut h), S_OK);
+            create_srv(std::ptr::null(), std::ptr::null(), std::ptr::null(), address);
+            let reused = heap(h);
+            let queued = reused.pending.lock().unwrap().as_slice() == [0];
+            release(h);
+            assert!(queued, "the descriptor write reached the heap at the reused address");
+        }
     }
 
     #[test]

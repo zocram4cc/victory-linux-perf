@@ -3,6 +3,7 @@
 //! used here under GPL-3.0-or-later as that licence allows). Pairs are
 //! (symbol, code length) in canonical code order.
 
+#[rustfmt::skip]
 pub(super) const CRITICAL_FREQ: [u16; 28] = [
     100, 200, 300, 400, 510, 630, 770, 920,
     1080, 1270, 1480, 1720, 2000, 2320, 2700, 3150,
@@ -10,6 +11,7 @@ pub(super) const CRITICAL_FREQ: [u16; 28] = [
     20675, 28575, 41375, 63875,
 ];
 
+#[rustfmt::skip]
 pub(super) const SCALE: [(u16, u8); 121] = [
     (58, 5), (64, 6), (66, 7), (65, 7), (62, 5), (63, 6), (68, 9), (69, 10),
     (54, 15), (19, 19), (20, 19), (21, 19), (22, 19), (23, 19), (24, 19), (25, 19),
@@ -29,6 +31,7 @@ pub(super) const SCALE: [(u16, u8); 121] = [
     (60, 1),
 ];
 
+#[rustfmt::skip]
 pub(super) const SCALE_RL: [(u16, u8); 120] = [
     (103, 7), (80, 11), (60, 11), (18, 10), (56, 10), (21, 12), (90, 12), (58, 11),
     (27, 11), (69, 12), (84, 15), (48, 15), (86, 14), (47, 13), (19, 10), (32, 9),
@@ -47,6 +50,7 @@ pub(super) const SCALE_RL: [(u16, u8); 120] = [
     (85, 15), (74, 14), (76, 10), (114, 7), (29, 5), (54, 6), (13, 6), (3, 2),
 ];
 
+#[rustfmt::skip]
 pub(super) const SCALE_RL_RUN: [u8; 120] = [
     0, 0, 0, 0, 1, 2, 3, 4,
     5, 6, 7, 8, 9, 10, 11, 12,
@@ -65,6 +69,7 @@ pub(super) const SCALE_RL_RUN: [u8; 120] = [
     9, 10, 0, 1, 0, 1, 0, 1,
 ];
 
+#[rustfmt::skip]
 pub(super) const SCALE_RL_LEVEL: [u8; 120] = [
     0, 0, 1, 2, 2, 2, 2, 2,
     2, 2, 2, 2, 2, 2, 2, 2,
@@ -83,6 +88,7 @@ pub(super) const SCALE_RL_LEVEL: [u8; 120] = [
     6, 6, 7, 7, 8, 8, 9, 9,
 ];
 
+#[rustfmt::skip]
 pub(super) const COEF0_LENS: [u8; 272] = [
     2, 9, 14, 14, 13, 12, 13, 14,
     15, 15, 12, 10, 10, 10, 13, 14,
@@ -120,6 +126,7 @@ pub(super) const COEF0_LENS: [u8; 272] = [
     12, 12, 9, 7, 6, 3, 4, 4,
 ];
 
+#[rustfmt::skip]
 pub(super) const COEF0_SYMS: [u16; 272] = [
     2, 25, 111, 94, 69, 58, 87, 93,
     136, 135, 59, 37, 34, 36, 82, 182,
@@ -157,6 +164,7 @@ pub(super) const COEF0_SYMS: [u16; 272] = [
     167, 245, 229, 17, 12, 4, 152, 6,
 ];
 
+#[rustfmt::skip]
 pub(super) const COEF1: [(u16, u8); 244] = [
     (2, 2), (3, 3), (102, 3), (4, 4), (148, 6), (134, 9), (171, 10), (18, 10),
     (11, 8), (159, 8), (14, 9), (156, 14), (235, 15), (61, 15), (38, 13), (153, 13),
@@ -191,6 +199,7 @@ pub(super) const COEF1: [(u16, u8); 244] = [
     (124, 16), (123, 16), (150, 11), (1, 7),
 ];
 
+#[rustfmt::skip]
 pub(super) const COEF0_RUN: [u16; 272] = [
     0, 0, 0, 1, 2, 3, 4, 5,
     6, 7, 8, 9, 10, 11, 12, 13,
@@ -228,6 +237,7 @@ pub(super) const COEF0_RUN: [u16; 272] = [
     1, 0, 1, 0, 1, 0, 1, 0,
 ];
 
+#[rustfmt::skip]
 pub(super) const COEF0_LEVEL: [f32; 272] = [
     0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
     1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
@@ -265,6 +275,7 @@ pub(super) const COEF0_LEVEL: [f32; 272] = [
     24.0, 25.0, 25.0, 26.0, 26.0, 27.0, 27.0, 28.0,
 ];
 
+#[rustfmt::skip]
 pub(super) const COEF1_RUN: [u16; 244] = [
     0, 0, 0, 1, 2, 3, 4, 5,
     6, 7, 8, 9, 10, 11, 12, 13,
@@ -299,6 +310,7 @@ pub(super) const COEF1_RUN: [u16; 244] = [
     1, 0, 0, 0,
 ];
 
+#[rustfmt::skip]
 pub(super) const COEF1_LEVEL: [f32; 244] = [
     0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
     1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
@@ -333,6 +345,7 @@ pub(super) const COEF1_LEVEL: [f32; 244] = [
     49.0, 50.0, 51.0, 52.0,
 ];
 
+#[rustfmt::skip]
 pub(super) const VEC4_LENS: [u8; 127] = [
     1, 6, 8, 10, 10, 10, 10, 8,
     8, 10, 10, 9, 8, 8, 9, 12,
@@ -352,6 +365,7 @@ pub(super) const VEC4_LENS: [u8; 127] = [
     9, 9, 8, 8, 7, 7, 7,
 ];
 
+#[rustfmt::skip]
 pub(super) const VEC4_SYMS: [u16; 127] = [
     0, 4370, 275, 8195, 4146, 12545, 8225, 290,
     4625, 515, 20, 8706, 8210, 4355, 4131, 16385,
@@ -371,6 +385,7 @@ pub(super) const VEC4_SYMS: [u16; 127] = [
     4401, 4866, 8721, 291, 8450, 8465, 4115,
 ];
 
+#[rustfmt::skip]
 pub(super) const VEC2: [(u16, u8); 137] = [
     (19, 5), (165, 10), (211, 11), (46, 11), (75, 10), (177, 11), (12, 11), (86, 8),
     (83, 7), (38, 7), (133, 9), (178, 10), (28, 10), (104, 9), (73, 9), (35, 5),
@@ -392,6 +407,7 @@ pub(super) const VEC2: [(u16, u8); 137] = [
     (34, 4),
 ];
 
+#[rustfmt::skip]
 pub(super) const VEC1: [(u16, u8); 101] = [
     (7, 5), (32, 8), (59, 10), (60, 10), (83, 11), (82, 11), (62, 10), (33, 8),
     (45, 9), (61, 10), (84, 11), (85, 11), (1, 6), (13, 5), (19, 6), (25, 7),
@@ -408,3 +424,246 @@ pub(super) const VEC1: [(u16, u8); 101] = [
     (81, 10), (43, 8), (44, 8), (24, 6), (12, 4),
 ];
 
+#[cfg(test)]
+mod tests {
+    use super::super::{Bits, FRAME_SAMPLES, MAX_BANDS, Vlc, codes};
+    use super::*;
+
+    /// Every prefix code as `codes()` builds it, with the name to report.
+    fn built_codes() -> [(&'static str, &'static Vlc); 7] {
+        let c = codes();
+        [
+            ("scale", &c.scale),
+            ("scale_rl", &c.scale_rl),
+            ("coef0", &c.coef[0]),
+            ("coef1", &c.coef[1]),
+            ("vec4", &c.vec4),
+            ("vec2", &c.vec2),
+            ("vec1", &c.vec1),
+        ]
+    }
+
+    /// Decodes `word` as the first 32 bits after a frame's length field.
+    fn read_code(vlc: &Vlc, word: u32) -> (i32, usize) {
+        let bytes = word.to_be_bytes();
+        let mut bits = Bits {
+            data: &bytes,
+            pos: 0,
+            end: 32,
+        };
+        (vlc.read(&mut bits), bits.consumed())
+    }
+
+    /// Asserts `symbols` is exactly `0..symbols.len()`, each value once.
+    fn assert_permutation(name: &str, symbols: &[u16]) {
+        let mut sorted = symbols.to_vec();
+        sorted.sort_unstable();
+        let expected: Vec<u16> = (0..symbols.len() as u16).collect();
+        assert_eq!(
+            sorted, expected,
+            "{name}: not a permutation of the table indices"
+        );
+    }
+
+    /// Lengths handed out in table order must be a complete prefix code:
+    /// every code starts where the last one ended, and the blocks tile the
+    /// whole 32-bit space (Kraft equality). A gap would leave bit patterns
+    /// that decode to nothing; an overlap would make two symbols share a
+    /// prefix.
+    #[test]
+    fn prefix_codes_are_canonical_complete_and_prefix_free() {
+        for (name, vlc) in built_codes() {
+            assert!(!vlc.codes.is_empty(), "{name}: empty code");
+            // `read` does `partition_point(..) - 1`, so code zero must exist
+            // or that subtraction underflows.
+            assert_eq!(vlc.codes[0].0, 0, "{name}: the first code is not zero");
+            let mut next = 0u64;
+            for (i, &(code, len, _)) in vlc.codes.iter().enumerate() {
+                assert!(
+                    (1..=32).contains(&len),
+                    "{name}[{i}]: length {len} out of range"
+                );
+                assert_eq!(code as u64, next, "{name}[{i}]: code is not canonical");
+                // A length-`len` code owns the `2^(32-len)` words that start
+                // with it, so its block must begin on its own boundary.
+                assert_eq!(
+                    next & ((1u64 << (32 - len)) - 1),
+                    0,
+                    "{name}[{i}]: code not aligned"
+                );
+                next += 1u64 << (32 - len);
+                assert!(next <= 1u64 << 32, "{name}[{i}]: over-subscribed code");
+            }
+            assert_eq!(next, 1u64 << 32, "{name}: code is incomplete");
+        }
+    }
+
+    /// The lookup is `partition_point(|code| code <= word) - 1`: the exact
+    /// code, every word that only extends it, and the next code's first word
+    /// must all land in the expected entry and consume the right bit count.
+    #[test]
+    fn every_entry_decodes_at_its_code_and_across_its_block() {
+        for (name, vlc) in built_codes() {
+            for (i, &(code, len, symbol)) in vlc.codes.iter().enumerate() {
+                assert_eq!(
+                    read_code(vlc, code),
+                    (symbol, len as usize),
+                    "{name}[{i}]: at its code"
+                );
+                // The last word before the next code still starts with this
+                // one; the last entry's block runs to `u32::MAX`.
+                let top = vlc
+                    .codes
+                    .get(i + 1)
+                    .map_or(u32::MAX, |&(next, ..)| next - 1);
+                assert_eq!(
+                    read_code(vlc, top),
+                    (symbol, len as usize),
+                    "{name}[{i}]: last word of its block"
+                );
+                if let Some(&(next, next_len, next_symbol)) = vlc.codes.get(i + 1) {
+                    assert_eq!(
+                        read_code(vlc, next),
+                        (next_symbol, next_len as usize),
+                        "{name}[{i}]: boundary with the next code"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Run and level tables are indexed by the decoded symbol, so every code
+    /// symbol must address exactly one entry, and the split tables must agree
+    /// in length with the symbol list that names their entries.
+    #[test]
+    fn symbols_address_the_entries_they_index() {
+        assert_permutation("SCALE", &SCALE.iter().map(|&(s, _)| s).collect::<Vec<_>>());
+        assert_permutation(
+            "SCALE_RL",
+            &SCALE_RL.iter().map(|&(s, _)| s).collect::<Vec<_>>(),
+        );
+        assert_permutation("COEF1", &COEF1.iter().map(|&(s, _)| s).collect::<Vec<_>>());
+        assert_permutation("VEC1", &VEC1.iter().map(|&(s, _)| s).collect::<Vec<_>>());
+        assert_permutation("COEF0_SYMS", &COEF0_SYMS);
+
+        assert_eq!(COEF0_LENS.len(), COEF0_SYMS.len());
+        assert_eq!(COEF0_RUN.len(), COEF0_SYMS.len());
+        assert_eq!(COEF0_LEVEL.len(), COEF0_SYMS.len());
+        assert_eq!(COEF1_RUN.len(), COEF1.len());
+        assert_eq!(COEF1_LEVEL.len(), COEF1.len());
+        assert_eq!(SCALE_RL_RUN.len(), SCALE_RL.len());
+        assert_eq!(SCALE_RL_LEVEL.len(), SCALE_RL.len());
+
+        // VEC1 signals the escape by the value `VEC1.len() - 1`, which the
+        // permutation above covers because it spans `0..len`.
+        assert!(VEC1.iter().any(|&(s, _)| usize::from(s) == VEC1.len() - 1));
+    }
+
+    /// The biases `codes()` applies to the raw tables: scale factors by -60,
+    /// packed vectors by -1 (so zero can be their escape), the rest as is.
+    #[test]
+    fn built_symbols_apply_the_expected_offsets() {
+        let c = codes();
+        let sorted = |vlc: &Vlc| {
+            let mut v: Vec<i32> = vlc.codes.iter().map(|&(_, _, s)| s).collect();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(sorted(&c.scale), (-60..=60).collect::<Vec<i32>>());
+        assert_eq!(sorted(&c.scale_rl), (0..=119).collect::<Vec<i32>>());
+        assert_eq!(sorted(&c.coef[0]), (0..=271).collect::<Vec<i32>>());
+        assert_eq!(sorted(&c.coef[1]), (0..=243).collect::<Vec<i32>>());
+        assert_eq!(sorted(&c.vec1), (0..=100).collect::<Vec<i32>>());
+
+        let mut want: Vec<i32> = VEC4_SYMS.iter().map(|&s| i32::from(s) - 1).collect();
+        want.sort_unstable();
+        assert_eq!(sorted(&c.vec4), want);
+        let mut want: Vec<i32> = VEC2.iter().map(|&(s, _)| i32::from(s) - 1).collect();
+        want.sort_unstable();
+        assert_eq!(sorted(&c.vec2), want);
+    }
+
+    /// VEC4 and VEC2 subtract one before use, so the raw zero is the escape
+    /// and every other raw value packs four or two nibbles of magnitude
+    /// without repeating: a duplicate would make a magnitude unreachable.
+    #[test]
+    fn packed_vector_symbols_have_one_escape_and_no_duplicates() {
+        for (name, symbols, nibbles) in [
+            (
+                "VEC4",
+                VEC4_SYMS.iter().map(|&s| u32::from(s)).collect::<Vec<_>>(),
+                4u32,
+            ),
+            (
+                "VEC2",
+                VEC2.iter().map(|&(s, _)| u32::from(s)).collect::<Vec<_>>(),
+                2u32,
+            ),
+        ] {
+            let mut seen = vec![false; 1usize << (4 * nibbles)];
+            let mut escapes = 0;
+            for &symbol in &symbols {
+                if symbol == 0 {
+                    escapes += 1;
+                    continue;
+                }
+                let packed = symbol - 1;
+                assert!(
+                    packed < 1u32 << (4 * nibbles),
+                    "{name}: symbol {symbol} does not fit"
+                );
+                let slot = &mut seen[packed as usize];
+                assert!(!*slot, "{name}: duplicate packed value {packed}");
+                *slot = true;
+            }
+            assert_eq!(escapes, 1, "{name}: expected exactly one escape");
+        }
+    }
+
+    /// Symbols 0 and 1 are the escape and the end marker, which the run-level
+    /// decoder treats specially and never writes; every other entry must
+    /// carry a nonzero level, and no run may skip past a whole frame or the
+    /// scale-factor band table.
+    #[test]
+    fn run_level_entries_are_well_formed() {
+        for (name, run, level) in [
+            ("COEF0", &COEF0_RUN[..], &COEF0_LEVEL[..]),
+            ("COEF1", &COEF1_RUN[..], &COEF1_LEVEL[..]),
+        ] {
+            assert_eq!(run[0], 0, "{name}: the escape has a run");
+            assert_eq!(run[1], 0, "{name}: the end marker has a run");
+            assert_eq!(level[0], 0.0, "{name}: the escape has a level");
+            assert_eq!(level[1], 0.0, "{name}: the end marker has a level");
+            for (i, (&run, &level)) in run.iter().zip(level).enumerate().skip(2) {
+                assert!(level > 0.0, "{name}[{i}]: a coded coefficient has no level");
+                assert!(
+                    (run as usize) < FRAME_SAMPLES,
+                    "{name}[{i}]: run {run} skips a frame"
+                );
+            }
+        }
+        for (i, (&run, &level)) in SCALE_RL_RUN.iter().zip(&SCALE_RL_LEVEL).enumerate().skip(2) {
+            assert!(
+                (run as usize) < MAX_BANDS,
+                "scale_rl[{i}]: run {run} leaves no band"
+            );
+            assert!(
+                level > 0,
+                "scale_rl[{i}]: a coded scale factor has no level"
+            );
+        }
+    }
+
+    /// `Decoder::new` reads `MAX_BANDS - 1` band edges and closes the last
+    /// band with the subframe length, so the table must be exactly that long
+    /// and strictly ascending or a band would be empty.
+    #[test]
+    fn critical_frequencies_are_ascending_band_edges() {
+        assert_eq!(CRITICAL_FREQ.len(), MAX_BANDS - 1);
+        assert!(CRITICAL_FREQ.iter().all(|&f| f > 0));
+        assert!(
+            CRITICAL_FREQ.windows(2).all(|w| w[0] < w[1]),
+            "critical frequencies must strictly increase"
+        );
+    }
+}

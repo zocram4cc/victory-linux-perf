@@ -77,14 +77,25 @@ pub fn log_crash(text: &str) {
 }
 
 fn append_to_log(text: &str) {
-    use std::io::Write;
     let Some(file) = LOG.get() else { return };
+    let _ = append_record(file, text);
+}
+
+fn append_record(file: &std::path::Path, text: &str) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind, Write};
+
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let opened = std::fs::OpenOptions::new().create(true).append(true).open(file);
-    if let Ok(mut f) = opened {
-        let _ = write!(f, "unix time {now}, process {}\n{text}\n", std::process::id());
+    let record = format!("unix time {now}, process {}\n{text}\n", std::process::id());
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(file)?;
+    // Formatting directly into the file can append fragments separately.
+    // Use one append, with no lock to acquire from an exception handler.
+    if file.write(record.as_bytes())? == record.len() {
+        Ok(())
+    } else {
+        // Retrying a short write could put another report between its pieces.
+        Err(Error::new(ErrorKind::WriteZero, "incomplete crash record append"))
     }
 }
 
@@ -1112,6 +1123,49 @@ mod tests {
         EXCEPTION_RECORD, RtlCaptureContext, RtlCaptureStackBackTrace,
     };
 
+    #[test]
+    fn concurrent_crash_records_stay_together() {
+        const THREADS: usize = 8;
+        const RECORDS: usize = 16;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("synthetic-crashes.txt");
+        let ready = std::sync::Barrier::new(THREADS);
+        let body = "x".repeat(8192);
+        std::thread::scope(|scope| {
+            for thread in 0..THREADS {
+                let (file, ready, body) = (&file, &ready, &body);
+                scope.spawn(move || {
+                    ready.wait();
+                    for record in 0..RECORDS {
+                        super::append_record(file, &format!("record {thread}:{record}\n{body}"))
+                            .unwrap();
+                    }
+                });
+            }
+        });
+
+        let log = std::fs::read_to_string(file).unwrap();
+        let mut lines = log.lines();
+        let mut seen = std::collections::BTreeSet::new();
+        let process = std::process::id().to_string();
+        while let Some(header) = lines.next() {
+            let (time, pid) = header
+                .strip_prefix("unix time ")
+                .and_then(|line| line.split_once(", process "))
+                .expect("each record starts with a complete header");
+            assert!(time.parse::<u64>().is_ok());
+            assert_eq!(pid, process);
+            assert!(seen.insert(lines.next().expect("record identifier")));
+            assert!(lines.next().is_some_and(|line| line == body));
+        }
+        for thread in 0..THREADS {
+            for record in 0..RECORDS {
+                assert!(seen.remove(format!("record {thread}:{record}").as_str()));
+            }
+        }
+        assert!(seen.is_empty());
+    }
+
     /// What [`capture_frames`] saw: our [`unwind`], then the system's walk.
     type Captured = (Vec<u64>, Vec<usize>);
 
@@ -1737,6 +1791,124 @@ mod tests {
         let code = [0x0f, 0x01, 0xfc, 0x48, 0x83, 0xc0, 0x20, 0x4c, 0x39, 0xd0, 0x72, 0xf4];
         assert!(emulate_in(&code, 0, &mut context));
         assert_eq!(context.Rip, 3);
+        assert_eq!(zeroed(&mem), [false, true, false]);
+    }
+
+    #[test]
+    fn emulated_clzero_loop_stops_when_the_limit_is_on_a_line_boundary() {
+        #[repr(align(64))]
+        struct Lines([u8; 256]);
+        // clzero; add rax, 0x40; cmp rax, r10; jb, with r10 exactly two lines
+        // on: the loop ends when rax reaches the limit (`>=`, not `>`).
+        let mut mem = Lines([0xff; 256]);
+        let start = mem.0.as_mut_ptr() as u64;
+        // SAFETY: an all-zero context is valid.
+        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+        context.Rax = start;
+        context.R10 = start + 128;
+        let code = [
+            0x0f, 0x01, 0xfc, 0x48, 0x83, 0xc0, 0x40, 0x4c, 0x39, 0xd0, 0x72, 0xf4,
+        ];
+        assert!(emulate_in(&code, 0, &mut context));
+        assert_eq!((context.Rip, context.Rax), (12, start + 128));
+        assert_eq!(
+            context.EFlags & CMP_FLAGS,
+            native_compare(start + 128, start + 128)
+        );
+        let zeroed: Vec<bool> = (0..4).map(|i| mem.0[i * 64] == 0).collect();
+        assert_eq!(zeroed, [true, true, false, false]);
+    }
+
+    #[test]
+    fn emulated_clzero_second_loop_with_extended_registers() {
+        #[repr(align(64))]
+        struct Lines([u8; 256]);
+        // mov rax, r9; add r9, 0x40; clzero; cmp r9, r12; jb. `a` = r9 needs
+        // REX.R in the mov and REX.B in the add and in the cmp; `b` = r12
+        // needs REX.R in the cmp.
+        let mut mem = Lines([0xff; 256]);
+        let start = mem.0.as_mut_ptr() as u64;
+        // SAFETY: an all-zero context is valid.
+        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+        context.Rax = start;
+        context.R9 = start + 64;
+        context.R12 = start + 192;
+        let code = [
+            0x4c, 0x89, 0xc8, 0x49, 0x83, 0xc1, 0x40, 0x0f, 0x01, 0xfc, 0x4d, 0x39, 0xe1, 0x72,
+            0xf1,
+        ];
+        assert!(emulate_in(&code, 7, &mut context));
+        assert_eq!(
+            (context.Rip, context.Rax, context.R9),
+            (15, start + 128, start + 192)
+        );
+        assert_eq!(
+            context.EFlags & CMP_FLAGS,
+            native_compare(start + 192, start + 192)
+        );
+        let zeroed: Vec<bool> = (0..4).map(|i| mem.0[i * 64] == 0).collect();
+        assert_eq!(zeroed, [true, true, true, false]);
+        // Every `a` in r9..r15 (r12 as the limit, so skip it as `a`).
+        for a in [9_u8, 10, 11, 13, 14, 15] {
+            let mut mem = Lines([0xff; 256]);
+            let start = mem.0.as_mut_ptr() as u64;
+            // SAFETY: an all-zero context is valid.
+            let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+            context.Rax = start;
+            *gpr(&mut context, a) = start + 64;
+            context.R12 = start + 192;
+            let n = a & 7;
+            let code = [
+                0x4c,
+                0x89,
+                0xc0 | n << 3,
+                0x49,
+                0x83,
+                0xc0 | n,
+                0x40,
+                0x0f,
+                0x01,
+                0xfc,
+                0x4d,
+                0x39,
+                0xe0 | n,
+                0x72,
+                0xf1,
+            ];
+            assert!(emulate_in(&code, 7, &mut context), "r{a}");
+            assert_eq!(context.Rip, 15, "r{a}");
+            assert_eq!(*gpr(&mut context, a), start + 192, "r{a}");
+            assert_eq!(context.Rax, start + 128, "r{a}");
+            let zeroed: Vec<bool> = (0..4).map(|i| mem.0[i * 64] == 0).collect();
+            assert_eq!(zeroed, [true, true, true, false], "r{a}");
+        }
+    }
+
+    #[test]
+    fn emulated_clzero_loops_with_rax_as_the_limit_are_one_line() {
+        #[repr(align(64))]
+        struct Lines([u8; 192]);
+        let zeroed = |l: &Lines| [l.0[0] == 0, l.0[64] == 0, l.0[128] == 0];
+        // mov rax, rdx; add rdx, 0x40; clzero; cmp rdx, rax; jb: the limit
+        // would be the line just zeroed, not a loop: one line, the next
+        // instruction, flags untouched.
+        let mut mem = Lines([0xff; 192]);
+        let start = mem.0.as_mut_ptr() as u64;
+        // SAFETY: an all-zero context is valid.
+        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+        context.Rax = start + 64;
+        context.Rdx = start + 128;
+        context.EFlags = 0x202;
+        let code = [
+            0x48, 0x89, 0xd0, 0x48, 0x83, 0xc2, 0x40, 0x0f, 0x01, 0xfc, 0x48, 0x39, 0xc2, 0x72,
+            0xf1,
+        ];
+        assert!(emulate_in(&code, 7, &mut context));
+        assert_eq!(
+            (context.Rip, context.Rax, context.Rdx),
+            (10, start + 64, start + 128)
+        );
+        assert_eq!(context.EFlags, 0x202);
         assert_eq!(zeroed(&mem), [false, true, false]);
     }
 

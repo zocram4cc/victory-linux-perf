@@ -138,17 +138,55 @@ fn dll_flags(v: u16) -> String {
         (DYNAMIC_BASE, "dynamic-base"),
         (FORCE_INTEGRITY, "force-integrity"),
         (NX_COMPAT, "nx"),
+        (NO_ISOLATION, "no-isolation"),
+        (NO_SEH, "no-seh"),
+        (NO_BIND, "no-bind"),
         (APPCONTAINER, "appcontainer"),
+        (WDM_DRIVER, "wdm-driver"),
         (GUARD_CF, "cfg"),
+        (TERMINAL_SERVER_AWARE, "terminal-server-aware"),
     ];
-    let set: Vec<_> = names
+    let mut set: Vec<String> = names
         .iter()
         .filter(|(f, _)| v & f != 0)
-        .map(|(_, n)| *n)
+        .map(|(_, n)| (*n).to_string())
         .collect();
+    // Bits without a name (the reserved ones) are shown rather than dropped.
+    let unnamed = names.iter().fold(v, |rest, (f, _)| rest & !f);
+    if unnamed != 0 {
+        set.push(format!("{unnamed:#06x}"));
+    }
     if set.is_empty() {
         String::new()
     } else {
         format!("  ({})", set.join(", "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dll_flags_names_every_bit_the_title_sets() {
+        // The title executable of Series 1.0.2.1 carries 0x8160.
+        assert_eq!(
+            dll_flags(0x8160),
+            "  (high-entropy-va, dynamic-base, nx, terminal-server-aware)"
+        );
+        assert_eq!(
+            dll_flags(0x4160),
+            "  (high-entropy-va, dynamic-base, nx, cfg)"
+        );
+    }
+
+    #[test]
+    fn dll_flags_shows_bits_without_a_name() {
+        assert_eq!(dll_flags(0), "");
+        assert_eq!(dll_flags(0x0001), "  (0x0001)");
+        assert_eq!(
+            dll_flags(0x0e41),
+            "  (dynamic-base, no-isolation, no-seh, no-bind, 0x0001)"
+        );
     }
 }

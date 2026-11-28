@@ -387,10 +387,17 @@ pub(crate) fn compute_vram_policy(
             local_budget_bytes,
             shared_budget_bytes,
             texture_keep_percent: 68,
-            texture_room_percent: 78,
-            targets_room_mb: 1024,
+            // An 8 GB card's boot budget (~7.4 GB) is not its gameplay
+            // budget. DWM and the title's first world frame commonly lower
+            // the live budget to ~5.9 GB, so admitting textures at 78% of
+            // the boot budget leaves the process 0.5-1.3 GB over budget.
+            // Reserve a larger slice for invisible targets and stop the
+            // bindless queue earlier; safe mode's 40% keep watermark then
+            // drains idle copies without starving the visible working set.
+            texture_room_percent: 65,
+            targets_room_mb: 2048,
             card_buffers_min_kb: 512,
-            card_buffers_max_mb: (budget_mb / 6).clamp(768, 1024),
+            card_buffers_max_mb: (budget_mb / 8).clamp(512, 768),
             card_windows_mb: 0,
             card_windows_percent: 72,
             windows_bar_mb: 0,
@@ -658,7 +665,9 @@ mod tests {
         assert!(p16_16ram.texture_keep_percent < p16_32ram.texture_keep_percent);
         assert!(p16_32ram.texture_keep_percent < p24.texture_keep_percent);
         assert_eq!(p8.texture_keep_percent, 68);
-        assert_eq!(p8.texture_room_percent, 78);
+        assert_eq!(p8.texture_room_percent, 65);
+        assert_eq!(p8.targets_room_mb, 2048);
+        assert_eq!(p8.card_buffers_max_mb, 768);
         // 16 GB GPU on 16 GB RAM evicts idle textures at 86% while keeping 94% room_pct
         // so `resource::room()` never false-latches `!room` at 12.8/14.9 GB VRAM.
         assert_eq!(p16_16ram.texture_keep_percent, 86);

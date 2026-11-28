@@ -1950,8 +1950,13 @@ unsafe fn note(this: Ptr, cmd: impl FnOnce(&Recorder) -> Cmd) {
 unsafe extern "system" fn list_close(this: Ptr) -> HRESULT {
     // SAFETY: as above.
     unsafe {
+        let table = hook::table(this);
+        let state = of(this);
         let hr = own!(this, ID3D12GraphicsCommandList_Vtbl.Close)(this);
-        if let Some((_, state)) = of(this) {
+        // Agility SDK 1.620+ swaps the command list's vtable pointer on Close()
+        // as well as Reset(), so re-install the shim before subsequent Reset().
+        hook::again(this, table, list_table);
+        if let Some((_, state)) = state {
             let mut inner = lock(&state.inner);
             let bytes = std::mem::take(&mut inner.bytes);
             let changes = Arc::new(std::mem::take(&mut inner.changes));

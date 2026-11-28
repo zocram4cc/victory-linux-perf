@@ -63,11 +63,16 @@ impl Cache {
         let (tmp, mut file) = tempfile_in(dir)?;
         let written = file.write_all(&output);
         drop(file);
-        let published = written.and_then(|()| std::fs::rename(&tmp, &path));
-        if published.is_err() {
+        if let Err(err) = written {
             let _ = std::fs::remove_file(&tmp);
+            return Err(err.into());
         }
-        published?;
+        if let Err(err) = std::fs::rename(&tmp, &path) {
+            let _ = std::fs::remove_file(&tmp);
+            if !path.is_file() {
+                return Err(err.into());
+            }
+        }
         Ok(path)
     }
 }
@@ -150,6 +155,63 @@ mod tests {
 
         assert!(cache.get_or_convert(&conv, b"abc").is_err());
         assert!(path.is_dir());
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn accepts_entry_published_concurrently_while_open() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        struct RacingUpper {
+            cache: Cache,
+            held: std::sync::Mutex<Option<std::fs::File>>,
+        }
+
+        impl Converter for RacingUpper {
+            fn id(&self) -> &'static str {
+                "test.upper"
+            }
+            fn version(&self) -> u32 {
+                1
+            }
+            fn convert(&self, input: &[u8]) -> Result<Vec<u8>> {
+                let output = input.to_ascii_uppercase();
+                let key = CacheKey::new(self, input);
+                let path = self.cache.path_for(&key);
+                let dir = path.parent().unwrap();
+                std::fs::create_dir_all(dir)?;
+                std::fs::write(&path, &output)?;
+                // FILE_SHARE_READ permits readers but prevents replacement while held.
+                *self.held.lock().unwrap() = Some(
+                    std::fs::OpenOptions::new()
+                        .read(true)
+                        .share_mode(1)
+                        .open(&path)?,
+                );
+                let (probe, mut probe_file) = tempfile_in(dir)?;
+                probe_file.write_all(&output)?;
+                drop(probe_file);
+                assert!(
+                    std::fs::rename(&probe, &path).is_err(),
+                    "the open reader must prevent replacing the published entry"
+                );
+                std::fs::remove_file(probe)?;
+                Ok(output)
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = Cache::open(tmp.path().join("cache")).unwrap();
+        let conv = RacingUpper {
+            cache: cache.clone(),
+            held: std::sync::Mutex::new(None),
+        };
+        let path = cache.get_or_convert(&conv, b"abc").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"ABC");
         assert_eq!(
             std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
             1

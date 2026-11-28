@@ -559,10 +559,14 @@ fn translate(
         }
         return;
     }
-    let programs = match native_programs(dxil) {
+    let mut programs = match native_programs(dxil) {
         Ok(p) => p,
         Err(e) => return t.fail(e.to_string(), example),
     };
+    // (the form a run translates: `victory_shader::emit::translate` does the same)
+    for program in &mut programs {
+        emit::host_form(&container, program);
+    }
     // `VICTORY_FAIL_DUMP=<dir>`: the first 3 containers of each failure reason, as the title
     // has them (`.cdxil`), to work on a translator gap offline
     let dump = std::env::var_os("VICTORY_FAIL_DUMP");

@@ -19,6 +19,12 @@ fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
 }
 
+/// A DLL every host has, to stand in for one a title ships. The Windows folder is not always
+/// `C:\Windows`.
+fn host_dll() -> PathBuf {
+    PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join(r"System32\version.dll")
+}
+
 /// Builds the fixture into its own target dir (the outer cargo holds the
 /// lock on the main one while tests run), in the outer one's scratch folder
 /// for tests, so that it follows `CARGO_TARGET_DIR` like the rest of the
@@ -130,11 +136,7 @@ fn loads_binds_and_calls_probe() {
 
     // The "title" ships victory-probe-title.dll: any real DLL will do.
     let title_dir = tempfile::tempdir().unwrap();
-    std::fs::copy(
-        r"C:\Windows\System32\version.dll",
-        title_dir.path().join("victory-probe-title.dll"),
-    )
-    .unwrap();
+    std::fs::copy(host_dll(), title_dir.path().join("victory-probe-title.dll")).unwrap();
     let dlls =
         victory_loader::load_title_dlls(image.info(), title_dir.path(), dir.path(), &|_| true)
             .unwrap();
@@ -251,11 +253,7 @@ fn maps_a_title_dll_the_title_loads_itself() {
     let title_dir = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
     // Any real DLL will do; it imports only host DLLs, which are not in the folder.
-    std::fs::copy(
-        r"C:\Windows\System32\version.dll",
-        title_dir.path().join("Late.dll"),
-    )
-    .unwrap();
+    std::fs::copy(host_dll(), title_dir.path().join("Late.dll")).unwrap();
     let load = |name: &str, wanted: &dyn Fn(&str) -> bool| {
         victory_loader::load_title_dll(name, title_dir.path(), cache.path(), wanted).unwrap()
     };

@@ -52,8 +52,13 @@ pub mod dll_flags {
     pub const DYNAMIC_BASE: u16 = 0x0040;
     pub const FORCE_INTEGRITY: u16 = 0x0080;
     pub const NX_COMPAT: u16 = 0x0100;
+    pub const NO_ISOLATION: u16 = 0x0200;
+    pub const NO_SEH: u16 = 0x0400;
+    pub const NO_BIND: u16 = 0x0800;
     pub const APPCONTAINER: u16 = 0x1000;
+    pub const WDM_DRIVER: u16 = 0x2000;
     pub const GUARD_CF: u16 = 0x4000;
+    pub const TERMINAL_SERVER_AWARE: u16 = 0x8000;
 }
 
 /// `IMAGE_OPTIONAL_HEADER64::Subsystem` values.

@@ -540,6 +540,7 @@ fn half(h: u16) -> f32 {
     let (sign, exp, man) = ((h >> 15) as u32, ((h >> 10) & 0x1f) as i32, (h & 0x3ff) as f32);
     let v = match exp {
         0 => man * 2f32.powi(-24),
+        31 if man != 0.0 => f32::NAN,
         31 => f32::INFINITY,
         e => (1.0 + man / 1024.0) * 2f32.powi(e - 15),
     };
@@ -552,6 +553,7 @@ fn small_float(bits: u32, man: u32) -> f32 {
     let (exp, m) = ((bits >> man) & 0x1f, (bits & ((1 << man) - 1)) as f32);
     match exp {
         0 => m / (1 << man) as f32 * 2f32.powi(-14),
+        31 if m != 0.0 => f32::NAN,
         31 => f32::INFINITY,
         e => (1.0 + m / (1 << man) as f32) * 2f32.powi(e as i32 - 15),
     }
@@ -562,20 +564,34 @@ fn small_float(bits: u32, man: u32) -> f32 {
 /// scale to the highest finite value, with single channels shown in grey
 /// from their lowest to highest value. Returns `None` for unhandled formats.
 fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(w * h * 4);
     let px = |x: usize, y: usize, n: usize| &rows[y * pitch + x * n..][..n];
     let u16_at = |b: &[u8], i: usize| u16::from_le_bytes([b[2 * i], b[2 * i + 1]]);
     let u32_at = |b: &[u8], i: usize| u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap_or([0; 4]));
+    if matches!(format, 42 | 43) {
+        let words = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| u32_at(px(x, y, 4), 0));
+        return Some(r32_integer_to_rgba(format, words));
+    }
+    let mut out = Vec::with_capacity(w * h * 4);
     // Channel values as floats, then scaled.
     type Decode = Box<dyn Fn(&[u8]) -> [f32; 3]>;
     let (n, decode): (usize, Decode) = match format {
         27..=32 => {
+            // The PNG drops alpha: its range and how many texels have each
+            // channel zero are logged.
+            let (mut low, mut high, mut zero) = ([255u8; 4], [0u8; 4], [0usize; 4]);
             for y in 0..h {
                 for x in 0..w {
                     let p = px(x, y, 4);
+                    for c in 0..4 {
+                        (low[c], high[c]) = (low[c].min(p[c]), high[c].max(p[c]));
+                        zero[c] += usize::from(p[c] == 0);
+                    }
                     out.extend([p[0], p[1], p[2], 255]);
                 }
             }
+            tracing::info!(format, ?low, ?high, ?zero, texels = w * h, "target values (8-bit, RGBA)");
             return Some(out);
         }
         // B8G8R8A8 and B8G8R8X8 (89 is R10G10B10_XR_BIAS_A2, below).
@@ -630,7 +646,7 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         35..=38 => (4, Box::new(move |b| [f32::from(u16_at(b, 0)), f32::from(u16_at(b, 1)), 0.0])),
         48..=52 => (2, Box::new(move |b| [f32::from(b[0]), f32::from(b[1]), 0.0])),
         // Single channels (and depth planes): shown as grey.
-        39..=43 => (4, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
+        39..=41 => (4, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
         19..=22 => (8, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
         44..=47 => (4, Box::new(move |b| [(u32_at(b, 0) & 0xff_ffff) as f32; 3])),
         53..=54 => (2, Box::new(move |b| [half(u16_at(b, 0)); 3])),
@@ -642,7 +658,7 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         .flat_map(|y| (0..w).map(move |x| (x, y)))
         .map(|(x, y)| decode(px(x, y, n)))
         .collect();
-    let grey = matches!(format, 19..=22 | 39..=47 | 53..=65);
+    let grey = matches!(format, 19..=22 | 39..=41 | 44..=47 | 53..=65);
     let finite = values.iter().flatten().copied().filter(|v| v.is_finite());
     let (low, high) = if grey {
         finite.fold((f32::MAX, f32::MIN), |(l, h), v| (l.min(v), h.max(v)))
@@ -737,6 +753,46 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         out.extend([c[0], c[1], c[2], 255]);
     }
     Some(out)
+}
+
+fn r32_integer_to_rgba(format: u32, words: impl Iterator<Item = u32>) -> Vec<u8> {
+    let signed = format == 43;
+    let mut values: Vec<i64> = words
+        .map(|word| if signed { i64::from(word as i32) } else { i64::from(word) })
+        .collect();
+    let first = values.first().copied().unwrap_or(0);
+    let (low, high) = values.iter().copied().fold((first, first), |(low, high), value| {
+        (low.min(value), high.max(value))
+    });
+    // The full 32-bit span scaled by 255 fits in i64, without float rounding.
+    let range = (high - low).max(1);
+    let flat_nonzero = high == low && low != 0;
+    let mut out = Vec::with_capacity(values.len() * 4);
+    for &value in &values {
+        let grey = if flat_nonzero {
+            255
+        } else {
+            ((value - low) * 255 / range) as u8
+        };
+        out.extend([grey, grey, grey, 255]);
+    }
+
+    let total = values.len();
+    values.retain(|&value| value != 0);
+    let nonzero = values.len() as f64 / total.max(1) as f64;
+    for value in &mut values {
+        *value = value.abs();
+    }
+    let mut at = |q: f64| -> i64 {
+        if values.is_empty() {
+            return 0;
+        }
+        let k = ((values.len() - 1) as f64 * q).round() as usize;
+        *values.select_nth_unstable(k).1
+    };
+    let (p50, p99) = (at(0.5), at(0.99));
+    tracing::info!(format, low, high, p50, p99, nonzero, not_finite = 0, "target values");
+    out
 }
 
 /// Pixels per side of the grid [`probe`] reads.
@@ -868,6 +924,56 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn half_classifies_special_and_finite_values() {
+        use super::half;
+
+        assert!(half(0x7c01).is_nan());
+        assert!(half(0xfe00).is_nan());
+        assert_eq!(half(0x7c00), f32::INFINITY);
+        assert_eq!(half(0xfc00), f32::NEG_INFINITY);
+        assert_eq!(half(0x0000).to_bits(), 0.0f32.to_bits());
+        assert_eq!(half(0x8000).to_bits(), (-0.0f32).to_bits());
+        assert_eq!(half(0x0001), 2f32.powi(-24));
+        assert_eq!(half(0xbe00), -1.5);
+    }
+
+    #[test]
+    fn packed_float_classifies_special_and_finite_values() {
+        use super::small_float;
+
+        for mantissa_bits in [5, 6] {
+            let special = 31 << mantissa_bits;
+            assert!(small_float(special | 1, mantissa_bits).is_nan());
+            assert!(small_float(special | (1 << (mantissa_bits - 1)), mantissa_bits).is_nan());
+            assert_eq!(small_float(special, mantissa_bits), f32::INFINITY);
+            assert_eq!(small_float(0, mantissa_bits).to_bits(), 0.0f32.to_bits());
+            assert_eq!(small_float(1, mantissa_bits), 2f32.powi(-14 - mantissa_bits as i32));
+            assert_eq!(small_float(15 << mantissa_bits, mantissa_bits), 1.0);
+        }
+    }
+
+    #[test]
+    fn hdr_targets_render_nan_and_infinity_as_distinct_channel_values() {
+        // R16G16B16A16_FLOAT: [NaN, +Inf, NaN], [1, 0.5, 0].
+        let half = [0x7c01u16, 0x7c00, 0xfe00, 0, 0x3c00, 0x3800, 0, 0];
+        let half: Vec<_> = half.into_iter().flat_map(u16::to_le_bytes).collect();
+        // R11G11B10_FLOAT: the same values with 6-bit and 5-bit mantissas.
+        let packed = [
+            0x7c1u32 | (0x7c0 << 11) | (0x3e1 << 22),
+            0x3c0 | (0x380 << 11),
+        ];
+        let packed: Vec<_> = packed.into_iter().flat_map(u32::to_le_bytes).collect();
+        let expected = [0, 255, 0, 255, 255, 127, 0, 255];
+        for (format, row) in [(10, half), (26, packed)] {
+            assert_eq!(
+                super::to_rgba(format, 2, 1, row.len(), &row).as_deref(),
+                Some(&expected[..]),
+                "format {format}"
+            );
+        }
+    }
+
+    #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
     }
@@ -906,5 +1012,55 @@ mod tests {
         assert_eq!(super::to_rgba(89, 1, 1, 4, &xr), Some(vec![255, 127, 0, 255]));
         // B8G8R8A8 still swaps to RGBA.
         assert_eq!(super::to_rgba(87, 1, 1, 4, &[1, 2, 3, 4]), Some(vec![3, 2, 1, 255]));
+    }
+}
+
+#[cfg(test)]
+mod r32_tests {
+    #[test]
+    fn r32_integer_captures_scale_numeric_values() {
+        let unsigned = [1u32, 2, 3].map(u32::to_le_bytes).concat();
+        let signed = [-2i32, -1, 0].map(i32::to_le_bytes).concat();
+        let expected = Some(vec![0, 0, 0, 255, 127, 127, 127, 255, 255, 255, 255, 255]);
+
+        assert_eq!(super::to_rgba(42, 3, 1, 12, &unsigned), expected);
+        assert_eq!(super::to_rgba(43, 3, 1, 12, &signed), expected);
+    }
+
+    #[test]
+    fn r32_integer_captures_keep_adjacent_contrast() {
+        let unsigned = [16_777_216u32, 16_777_217].map(u32::to_le_bytes).concat();
+        let signed = [-16_777_217i32, -16_777_216].map(i32::to_le_bytes).concat();
+        let expected = Some(vec![0, 0, 0, 255, 255, 255, 255, 255]);
+
+        assert_eq!(super::to_rgba(42, 2, 1, 8, &unsigned), expected);
+        assert_eq!(super::to_rgba(43, 2, 1, 8, &signed), expected);
+    }
+
+    #[test]
+    fn r32_integer_captures_handle_full_range_and_row_pitch() {
+        let signed = [i32::MIN, -1, i32::MIN, 0, i32::MAX].map(i32::to_le_bytes).concat();
+        let expected = Some(vec![0, 0, 0, 255, 127, 127, 127, 255, 127, 127, 127, 255, 255, 255, 255, 255]);
+
+        assert_eq!(super::to_rgba(43, 2, 2, 12, &signed), expected);
+    }
+
+    #[test]
+    fn r32_integer_captures_constant_uint_is_white() {
+        let rows = [7u32; 2].map(u32::to_le_bytes).concat();
+        assert_eq!(super::to_rgba(42, 2, 1, 8, &rows), Some(vec![255; 8]));
+    }
+
+    #[test]
+    fn r32_integer_captures_constant_sint_is_white() {
+        let rows = [-7i32; 2].map(i32::to_le_bytes).concat();
+        assert_eq!(super::to_rgba(43, 2, 1, 8, &rows), Some(vec![255; 8]));
+    }
+
+    #[test]
+    fn r32_integer_captures_constant_zero_is_black() {
+        let expected = Some([0, 0, 0, 255].repeat(2));
+        assert_eq!(super::to_rgba(42, 2, 1, 8, &[0; 8]), expected);
+        assert_eq!(super::to_rgba(43, 2, 1, 8, &[0; 8]), expected);
     }
 }

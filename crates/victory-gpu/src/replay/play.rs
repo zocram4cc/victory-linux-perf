@@ -2270,6 +2270,10 @@ impl Player {
             let parts = self.delta_parts.get(i).filter(|p| !p.is_empty());
             let delta = match (parts, &self.deltas) {
                 (Some(parts), Some(from)) => {
+                    if let Some(q) = &self.info {
+                        // SAFETY: clearing queue before recording this list.
+                        unsafe { q.ClearStoredMessages() };
+                    }
                     let open = self.open(&heap, &mut next)?;
                     // SAFETY: an open list; live buffers.
                     unsafe {
@@ -2298,12 +2302,19 @@ impl Player {
                             self.wait_for_all(&open.1);
                         }
                     }
-                    Some(self.close(open, &heap, &mut next, Vec::new())?)
+                    Some(
+                        self.close(open, &heap, &mut next, Vec::new())
+                            .with_context(|| format!("submit {i} delta list"))?,
+                    )
                 }
                 _ => None,
             };
             let mut built = Vec::new();
-            for cmds in lists {
+            for (li, cmds) in lists.iter().enumerate() {
+                if let Some(q) = &self.info {
+                    // SAFETY: clearing queue before recording this list.
+                    unsafe { q.ClearStoredMessages() };
+                }
                 let open = self.open(&heap, &mut next)?;
                 let stamps = self.translate(
                     &open.1,
@@ -2312,7 +2323,10 @@ impl Player {
                     o.detailed.then_some((&heap, &mut next)),
                     o.wait_all,
                 );
-                built.push(self.close(open, &heap, &mut next, stamps)?);
+                built.push(
+                    self.close(open, &heap, &mut next, stamps)
+                        .with_context(|| format!("submit {i} list {li} ({} cmds)", cmds.len()))?,
+                );
             }
             steps.push((delta, built));
         }
@@ -2431,8 +2445,14 @@ impl Player {
         // SAFETY: as above.
         unsafe {
             list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, *next);
-            list.Close()
-                .context("a list of the frame could not be recorded again")?;
+            if let Err(e) = list.Close() {
+                if let Some(q) = &self.info {
+                    for msg in debug_messages(q) {
+                        tracing::error!("{msg}");
+                    }
+                }
+                return Err(e).context("a list of the frame could not be recorded again");
+            }
         }
         *next += 1;
         Ok(Built {
@@ -3018,6 +3038,16 @@ impl Player {
                 before,
                 after,
             } => {
+                // Committed resources cannot participate in aliasing barriers (D3D12 error 528).
+                let is_committed = |id: u32| {
+                    id != NONE
+                        && self.objects.get(&id).is_some_and(|o| {
+                            !matches!(self.frame.resources[o.index].place, Place::Placed { .. })
+                        })
+                };
+                if is_committed(*before) || is_committed(*after) {
+                    return None;
+                }
                 let side = |id: &u32| -> std::mem::ManuallyDrop<Option<ID3D12Resource>> {
                     // SAFETY: a borrowed pointer (or none) never released.
                     self.resource(*id)
@@ -3500,6 +3530,9 @@ fn make_device(frame: &Frame, debug: bool, breadcrumbs: bool) -> Result<(ID3D12D
         }
         let device = device.context("no device")?;
         let info = device.cast::<ID3D12InfoQueue>().ok();
+        if let Some(q) = &info {
+            let _ = q.SetMessageCountLimit(65536);
+        }
         Ok((device, info))
     }
 }

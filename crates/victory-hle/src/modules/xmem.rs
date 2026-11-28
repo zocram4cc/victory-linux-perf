@@ -149,7 +149,7 @@ pub extern "system" fn XMemVirtualAlloc(
     }
     // SAFETY: the title's own arguments, cleaned of console bits; the
     // parameter points at `requirements`, which outlives the call.
-    let at = unsafe {
+    let allocate = |parameter: &mut MEM_EXTENDED_PARAMETER| unsafe {
         VirtualAlloc2(
             GetCurrentProcess(),
             base,
@@ -157,13 +157,19 @@ pub extern "system" fn XMemVirtualAlloc(
             kind,
             protect,
             if constrained {
-                &mut parameter
+                parameter
             } else {
                 std::ptr::null_mut()
             },
             constrained.into(),
         )
     };
+    let mut at = allocate(&mut parameter);
+    // A 32-bit request that found no room below 4 GiB: the guards there
+    // make way for it.
+    if at.is_null() && constrained && highest < FOUR_GIB {
+        at = low_guards::retry(size, || allocate(&mut parameter));
+    }
     if at.is_null() {
         let error = std::io::Error::last_os_error();
         if kind & MEM_COMMIT != 0 {
@@ -2996,5 +3002,195 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+}
+
+/// The space below 4 GiB, which the title's 32-bit memory (`XMemVirtualAlloc`
+/// with the 32-bit address flag) has to fit in.
+const FOUR_GIB: usize = 1 << 32;
+
+/// Guards over the space below 4 GiB. Windows places allocations bottom up,
+/// so the host's own memory (the driver's, heaps, the shader and pipeline
+/// caches read at startup) filled it first: with a large pipeline cache only
+/// 22 MB was left, in pieces, when Grand Theft Auto VI asked for a 185 MB
+/// 32-bit placeholder at startup, the request was refused
+/// (`ERROR_NOT_ENOUGH_MEMORY`) and the title stopped at an assertion. The
+/// debug layer's memory did the same. So the free space below 4 GiB is
+/// reserved at startup, past [`low_guards::SLACK`] left for the host, and a
+/// 32-bit request that finds no room releases guards and tries again.
+pub mod low_guards {
+    use std::sync::Mutex;
+
+    use windows_sys::Win32::System::Memory::{
+        MEM_FREE, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualAlloc,
+        VirtualFree, VirtualQuery,
+    };
+
+    use super::FOUR_GIB;
+
+    /// Free space left to the host below 4 GiB (the lowest free space).
+    pub(crate) const SLACK: usize = 256 << 20;
+    /// The allocation granularity of Windows.
+    const GRANULE: usize = 64 << 10;
+
+    /// The guards, `(base, bytes)`.
+    static GUARDS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+    fn guards() -> std::sync::MutexGuard<'static, Vec<(usize, usize)>> {
+        GUARDS.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The free runs in `[from, to)`, granule-aligned.
+    fn free_runs(from: usize, to: usize) -> Vec<(usize, usize)> {
+        let mut runs = Vec::new();
+        let mut at = from.max(GRANULE);
+        while at < to {
+            // SAFETY: plain data filled in by the query.
+            let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid out pointer of the right size.
+            if unsafe { VirtualQuery(at as *const _, &mut m, size_of_val(&m)) } == 0 {
+                break;
+            }
+            let base = m.BaseAddress as usize;
+            let end = (base + m.RegionSize).min(to);
+            if m.State == MEM_FREE {
+                let (start, end) = (
+                    base.max(from).next_multiple_of(GRANULE),
+                    end & !(GRANULE - 1),
+                );
+                if end > start {
+                    runs.push((start, end - start));
+                }
+            }
+            at = base + m.RegionSize;
+        }
+        runs
+    }
+
+    /// Reserves `[base, base + bytes)` as a guard; false if something took it.
+    fn guard(base: usize, bytes: usize) -> bool {
+        // SAFETY: a reservation of free address space; nothing refers to it.
+        let at = unsafe { VirtualAlloc(base as *const _, bytes, MEM_RESERVE, PAGE_NOACCESS) };
+        at as usize == base
+    }
+
+    /// Reserves the free space below 4 GiB but the lowest [`SLACK`]. Call
+    /// once, before the host allocates much (the GPU device, the caches).
+    pub fn install() {
+        let mut guards = guards();
+        let mut slack = SLACK;
+        for (mut base, mut bytes) in free_runs(0, FOUR_GIB) {
+            let left = slack.min(bytes);
+            (base, bytes, slack) = (base + left, bytes - left, slack - left);
+            if bytes > 0 && guard(base, bytes) {
+                guards.push((base, bytes));
+            }
+        }
+        let total: usize = guards.iter().map(|g| g.1).sum();
+        tracing::info!(
+            guards = guards.len(),
+            mb = total >> 20,
+            "space below 4 GiB kept for the title"
+        );
+    }
+
+    /// Try the smallest fitting guards first, then try smaller guards in
+    /// descending size order. A replacement guard cannot be retried here.
+    pub(crate) fn retry(
+        bytes: usize,
+        mut allocate: impl FnMut() -> *mut std::ffi::c_void,
+    ) -> *mut std::ffi::c_void {
+        use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+
+        // Preserve the allocation error across address queries and reservations.
+        // SAFETY: reads this thread's last-error value.
+        let mut error = unsafe { GetLastError() };
+        let mut guards = guards();
+        let mut candidates = guards.clone();
+        candidates.sort_unstable_by_key(|&(_, size)| {
+            let fits = size >= bytes;
+            (!fits, if fits { size } else { usize::MAX - size })
+        });
+        for (base, size) in candidates {
+            // SAFETY: our own reservation, with no allocations inside it.
+            if unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) } == 0 {
+                continue;
+            }
+            guards.retain(|&(b, _)| b != base);
+            let at = allocate();
+            // SAFETY: reads this thread's last-error value.
+            error = unsafe { GetLastError() };
+            for (start, len) in free_runs(base, base + size) {
+                if guard(start, len) {
+                    guards.push((start, len));
+                }
+            }
+            if !at.is_null() {
+                return at;
+            }
+        }
+        // SAFETY: sets this thread's last-error value.
+        unsafe { SetLastError(error) };
+        std::ptr::null_mut()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        static TEST: Mutex<()> = Mutex::new(());
+
+        #[test]
+        fn a_refused_retry_leaves_the_guards_in_place() {
+            let _one = TEST.lock().unwrap();
+            // SAFETY: a fresh reservation, released at once.
+            let hole =
+                unsafe { VirtualAlloc(std::ptr::null(), 4 * GRANULE, MEM_RESERVE, PAGE_NOACCESS) };
+            assert!(!hole.is_null());
+            let first = hole as usize;
+            // SAFETY: ours.
+            assert_ne!(unsafe { VirtualFree(hole, 0, MEM_RELEASE) }, 0);
+            assert!(guard(first, 4 * GRANULE));
+            guards().push((first, 4 * GRANULE));
+            let mut attempts = 0;
+            let result = retry(4 * GRANULE, || {
+                attempts += 1;
+                std::ptr::null_mut()
+            });
+            assert!(result.is_null());
+            assert_eq!(attempts, 1);
+            assert!(guards().contains(&(first, 4 * GRANULE)));
+            guards().retain(|&(base, _)| base != first);
+            // SAFETY: the guard the retry put back, ours.
+            assert_ne!(unsafe { VirtualFree(hole, 0, MEM_RELEASE) }, 0);
+        }
+
+        /// A released guard is guarded again around what took part of it.
+        #[test]
+        fn a_released_guard_is_guarded_again_around_what_took_it() {
+            let _one = TEST.lock().unwrap();
+            // A known hole of four granules: reserved, then freed.
+            // SAFETY: a fresh reservation, released at once.
+            let hole =
+                unsafe { VirtualAlloc(std::ptr::null(), 4 * GRANULE, MEM_RESERVE, PAGE_NOACCESS) }
+                    as usize;
+            assert_ne!(hole, 0);
+            // SAFETY: ours.
+            unsafe { VirtualFree(hole as *mut _, 0, MEM_RELEASE) };
+            assert!(guard(hole, 4 * GRANULE));
+            guards().push((hole, 4 * GRANULE));
+            let taken = retry(GRANULE, || {
+                // SAFETY: a reservation of the first granule at a known address.
+                unsafe { VirtualAlloc(hole as *const _, GRANULE, MEM_RESERVE, PAGE_NOACCESS) }
+            }) as usize;
+            assert_eq!(taken, hole);
+            assert!(guards().contains(&(hole + GRANULE, 3 * GRANULE)));
+            guards().retain(|&(b, _)| b != hole + GRANULE);
+            // SAFETY: ours.
+            unsafe {
+                VirtualFree(taken as *mut _, 0, MEM_RELEASE);
+                VirtualFree((hole + GRANULE) as *mut _, 0, MEM_RELEASE);
+            }
+        }
     }
 }

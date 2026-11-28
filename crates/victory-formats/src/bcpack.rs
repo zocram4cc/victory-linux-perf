@@ -1277,6 +1277,25 @@ mod tests {
     }
 
     #[test]
+    fn bc1_endpoint_prediction_and_quadrant_order() {
+        let t = Tables::parse(&tables()).unwrap();
+        // Block 1 predicts its endpoints from block 0. Both use fresh indices.
+        let records = [
+            vec![0, 0, 2, 1, 4, 3, 6, 2, 0x13, 0x27, 0x54, 0x71],
+            vec![2, 0, 3, 2, 1, 4, 1, 3, 0x71, 0x54, 0x27, 0x13],
+        ];
+        let widths = [7, 7, 4, 5, 4, 4, 5, 4, 7, 7, 7, 7];
+        let src = stream(&t, &widths, 1, &records);
+        let mut dst = [0u8; 16];
+        decode(1, &src, &mut dst, &t).unwrap();
+
+        // bcpack-rs gives these RGB565 endpoints and index words with fresh indices
+        // and the fixture's ranks mapped to BC1 wire codes.
+        assert_eq!(dst[..8], 0x9a28_3291_f061_0fe2u64.to_le_bytes());
+        assert_eq!(dst[8..], 0x2319_a982_005f_f801u64.to_le_bytes());
+    }
+
+    #[test]
     fn bc4_blocks_with_and_without_references() {
         let t = Tables::parse(&tables()).unwrap();
         // Block 0: endpoints 10, -3 (+128 stored), indices p -> p & 7.

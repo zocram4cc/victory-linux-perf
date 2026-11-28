@@ -15,8 +15,9 @@ fn ignores_dlls_in_current_folder() {
     assert!(HostPolicy::default().allows("vcruntime140_1.dll"));
 
     let dir = tempfile::tempdir().unwrap();
-    // Any loadable DLL will do.
-    std::fs::copy(r"C:\Windows\System32\version.dll", dir.path().join(name)).unwrap();
+    // Any loadable DLL will do. The Windows folder is not always `C:\Windows`.
+    let windows = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap());
+    std::fs::copy(windows.join(r"System32\version.dll"), dir.path().join(name)).unwrap();
     std::env::set_current_dir(dir.path()).unwrap();
 
     let symbol = ImportSymbol::Name {
