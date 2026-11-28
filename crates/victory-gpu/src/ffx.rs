@@ -43,6 +43,10 @@ const CREATE_UPSCALE: u64 = 0x0001_0000;
 const DISPATCH_UPSCALE: u64 = 0x0001_0001;
 const QUERY_GET_VERSIONS: u64 = 4;
 const QUERY_JITTER_PHASE_COUNT: u64 = 0x0001_0004;
+/// `ffxCreateContextDescUpscaleVersion`.
+const CREATE_UPSCALE_VERSION: u64 = 0x0001_000b;
+/// `FFX_UPSCALER_VERSION` of SDK 2.4 (4.1.2).
+const FFX_UPSCALER_VERSION: u32 = (4 << 22) | (1 << 12) | 2;
 /// The console's backend description; the device is at +0x10, as in the
 /// PC's DX12 one.
 const CONSOLE_BACKEND: u64 = 0x0100_0002;
@@ -158,6 +162,17 @@ fn simple_mode() -> bool {
         on
     })
 }
+
+/// `VICTORY_FFX_FSR4=1`: the upscale context is asked with the FSR 4.1.2
+/// version named, so the loader can pick FSR 4 (on RDNA 2 its INT8 model);
+/// refused, the title's upscaler is made instead for the rest of the run.
+fn fsr4_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FFX_FSR4").is_some_and(|v| v == "1"))
+}
+
+/// Set when the FSR 4.1.2 upscale context was refused.
+static FSR4_REFUSED: AtomicBool = AtomicBool::new(false);
 
 /// The context handed to the title in simple mode: never dereferenced.
 const SIMPLE_CONTEXT: usize = 0x5157_0001;
@@ -279,17 +294,18 @@ pub extern "C" fn ffxCreateContext(
         return ERROR_PARAMETER;
     };
     // The console's version and provider descriptions name console builds;
-    // the PC loader picks the newest upscaler the GPU runs.
-    let mut dx12 = BackendDx12 {
-        header: Header {
-            kind: BACKEND_DX12,
-            next: std::ptr::null_mut(),
-        },
-        device,
-    };
-    upscale.next = (&raw mut dx12).cast();
-    // SAFETY: the SDK's call with a chain that outlives it.
-    let r = unsafe { (api.create)(context, (&raw mut upscale).cast(), std::ptr::null()) };
+    // the PC loader picks the newest upscaler the GPU runs, the FSR 4.1.2
+    // version named with `VICTORY_FFX_FSR4=1`.
+    let fsr4 = fsr4_on() && !FSR4_REFUSED.load(Ordering::Relaxed);
+    let mut r = create_upscale(api, context, &mut upscale, device, fsr4);
+    let refused = fallback_to_legacy(fsr4, r);
+    if refused {
+        FSR4_REFUSED.store(true, Ordering::Relaxed);
+        tracing::warn!(result = r, "ffx: FSR 4.1.2 upscaler refused (VICTORY_FFX_FSR4=1): the title's upscaler is made instead, for the rest of the run");
+        // SAFETY: the title's out pointer, checked for null.
+        unsafe { *context = std::ptr::null_mut() };
+        r = create_upscale(api, context, &mut upscale, device, false);
+    }
     if r == OK && framegen_on() {
         let mut fg = FRAMEGEN.lock().unwrap_or_else(|e| e.into_inner());
         (fg.upscale_flags, fg.max_render) = (upscale.flags, upscale.max_render);
@@ -297,9 +313,45 @@ pub extern "C" fn ffxCreateContext(
     let provider = provider_name(context);
     tracing::info!(
         render = ?upscale.max_render, upscale = ?upscale.max_upscale, flags = upscale.flags, result = r, provider,
+        fsr4_asked = fsr4_on(), fsr4_refused = refused,
         "ffx: upscale context on the host GPU"
     );
+    if fsr4 && !refused && r == OK {
+        tracing::warn!(provider, "ffx: FSR 4.1.2 version named (VICTORY_FFX_FSR4=1); the upscaler the loader picked is the provider named here");
+    }
     r
+}
+
+/// Links the upscale description to the backend, with the FSR 4.1.2 upscaler
+/// version in between when `fsr4` (`VICTORY_FFX_FSR4=1`).
+fn link_upscale(upscale: &mut CreateUpscale, version: &mut Version, backend: &mut BackendDx12, fsr4: bool) {
+    if fsr4 {
+        version.header.next = (&raw mut *backend).cast();
+        upscale.next = (&raw mut *version).cast();
+    } else {
+        upscale.next = (&raw mut *backend).cast();
+    }
+}
+
+/// Whether a context asked with the FSR 4.1.2 version is made again without it.
+fn fallback_to_legacy(fsr4: bool, r: ReturnCode) -> bool {
+    fsr4 && r != OK
+}
+
+/// The upscale context made on the host device, with the FSR 4.1.2 version
+/// named if `fsr4`.
+fn create_upscale(api: &Api, context: *mut *mut c_void, upscale: &mut CreateUpscale, device: *mut c_void, fsr4: bool) -> ReturnCode {
+    let mut dx12 = BackendDx12 {
+        header: header(BACKEND_DX12),
+        device,
+    };
+    let mut version = Version {
+        header: header(CREATE_UPSCALE_VERSION),
+        version: FFX_UPSCALER_VERSION,
+    };
+    link_upscale(upscale, &mut version, &mut dx12, fsr4);
+    // SAFETY: the SDK's call with a chain that outlives it.
+    unsafe { (api.create)(context, (&raw mut *upscale).cast(), std::ptr::null()) }
 }
 
 /// The upscaler version the loader chose for a context, for the log.
@@ -1254,5 +1306,38 @@ mod tests {
         // Display resolution and jittered motion vectors, infinite depth.
         assert_eq!(framegen_flags(0b1_0110), 0b1_0110);
         assert_eq!(framegen_flags(0x3ff), 0b1_1110);
+    }
+
+    #[test]
+    fn the_fsr4_chain_names_the_4_1_2_version_between_the_upscale_and_the_backend() {
+        let mut backend = BackendDx12 {
+            header: header(BACKEND_DX12),
+            device: std::ptr::null_mut(),
+        };
+        let mut version = Version {
+            header: header(CREATE_UPSCALE_VERSION),
+            version: FFX_UPSCALER_VERSION,
+        };
+        let mut upscale = CreateUpscale {
+            kind: CREATE_UPSCALE,
+            next: std::ptr::null_mut(),
+            flags: 41,
+            max_render: [1280, 720],
+            max_upscale: [1920, 1080],
+            message: std::ptr::null(),
+        };
+        link_upscale(&mut upscale, &mut version, &mut backend, true);
+        assert_eq!(upscale.next, (&raw mut version).cast());
+        assert_eq!(version.header.next, (&raw mut backend).cast());
+        assert_eq!(version.version, 0x0100_1002);
+        link_upscale(&mut upscale, &mut version, &mut backend, false);
+        assert_eq!(upscale.next, (&raw mut backend).cast());
+    }
+
+    #[test]
+    fn a_refused_fsr4_context_falls_back_to_the_title_upscaler() {
+        assert!(fallback_to_legacy(true, ERROR));
+        assert!(!fallback_to_legacy(true, OK));
+        assert!(!fallback_to_legacy(false, ERROR));
     }
 }
