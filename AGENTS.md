@@ -17,7 +17,7 @@ The user simply opens a chat and gives a goal (e.g. "raise CPU FPS", "cut VRAM b
 2. **Build & test using shared `CARGO_TARGET_DIR`:**
    Use the shared `CARGO_TARGET_DIR` so parallel Rust builds queue safely instead of exhausting 16 GB RAM.
 3. **Wait politely for `heavy.lock` before running GPU tests/benchmarks:**
-   Only ONE chat may run the runtime binary or `warm` at a time. Check the workspace's `heavy.lock` (or `$env:VICTORY_HEAVY_LOCK`) and active GPU runtime processes; if busy, wait (never kill another chat's benchmark!).
+   Only ONE chat may run the runtime binary or `warm` at a time. Check the workspace's `heavy.lock`, or the environment variable that overrides that path (the `VICTORY` prefix plus `HEAVY_LOCK`), and active GPU runtime processes. If it is busy, wait (never kill another chat's benchmark!).
 4. **Verify via 180 s benchmark:**
    Confirm `0` errors, `0` OOMs, and measurable win vs baseline (`29.2–31.0 FG FPS`, `64.3–69.6 ms` real frame, `8.18 GB` VRAM, `5.45 GB` shared, `19.3 GB` commit / `6.2 GB` RAM WS). If it regresses, fix or revert autonomously.
 5. **Update all 5 READMEs immediately on every verified win:**

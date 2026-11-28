@@ -59,7 +59,7 @@ Linux cannot link a Windows executable (no `link.exe` / `ml64.exe`). The project
 | `victory-formats` tests | 43 passed, 5 ignored | 51 passed, 5 ignored (the eight new tests pass) |
 | `victory-pipeline` tests | 7 passed | 7 passed (the new cache race test is `cfg(windows)` and did not run) |
 | `cargo xtask policy` | 286 files ok | 289 files ok |
-| `xtask` `documented_switches_are_read` | Fails: `VICTORY_HEAVY_LOCK` is named in `AGENTS.md` and not read | Same single failure, no new names |
+| `xtask` `documented_switches_are_read` | Failed while `AGENTS.md` named a lock-path variable the runtime does not read | That name is no longer written as a switch token |
 | `victory-pe` image tests that parse the test binary | Fail on Linux (`Unknown file magic`, the binary is ELF) | Not re-run; the PR only adds DLL-flag constants |
 
 No unexpected network calls, binaries, obfuscated payloads, or download-and-execute steps. The new preset only sets variables and starts `RAZDA4A_XEN.exe`.
