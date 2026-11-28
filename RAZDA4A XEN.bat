@@ -173,6 +173,14 @@ if /I "%XEN_PROFILE%"=="safe" (
     set "VICTORY_SNAPSHOT_POOL=24"
     set "VICTORY_FILE_PHYSICAL=1"
 )
+if /I "%XEN_PROFILE%"=="wave13_fps" (
+    REM Opt-in. Same three switches as presets\5_Wave13_FPS_Experimental.bat.
+    REM Run warm_shaders.bat first: a 16 ms pipeline budget drops draws whose
+    REM pipeline is not ready. Does not lower VICTORY_COMPUTE_WAIT_MS.
+    set "VICTORY_HEAP_RECHECK=0"
+    set "VICTORY_PIPELINE_WAIT_MS=16"
+    set "VICTORY_LANE_CORE=1"
+)
 
 REM RDNA4 crash-shader shield
 set "VICTORY_SKIP_PIPELINES=240cb516c1af0bc3"
