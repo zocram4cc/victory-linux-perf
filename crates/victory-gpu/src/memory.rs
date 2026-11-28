@@ -297,7 +297,7 @@ impl Memory {
             return false;
         }
         let at = (page * PAGE) as usize;
-        let ours = crate::texture::committed(at as *const u8, PAGE as usize)
+        let ours = crate::texture::asked_committed(at as *const u8, PAGE as usize)
             && crate::watch::writes(at, at + PAGE as usize, true).is_some();
         if !ours {
             self.refused.insert(page);
@@ -439,7 +439,7 @@ impl Memory {
     /// Whether the packed structure at `address` is still in title memory.
     fn there(&self, address: u64) -> bool {
         let mut header = [0u8; 8];
-        crate::texture::committed(address as *const u8, 8) && {
+        crate::texture::asked_committed(address as *const u8, 8) && {
             crate::host::copy_mapped(header.as_mut_ptr(), address as *const u8, 8, false);
             self.packed.get(&address).is_some_and(|p| p.header == u64::from_le_bytes(header))
         }
@@ -574,7 +574,7 @@ impl Memory {
     /// the write watch here: the submission's asking stands.)
     fn land(&mut self, address: u64) {
         let page = address / PAGE;
-        if !crate::texture::committed((page * PAGE) as *const u8, PAGE as usize) {
+        if !crate::texture::asked_committed((page * PAGE) as *const u8, PAGE as usize) {
             return;
         }
         let Some((len, header)) = self.packed_at(address) else {
@@ -626,7 +626,7 @@ impl Memory {
     fn place(&mut self, page: u64) -> bool {
         if page < 0x1_0000
             || page >= u64::from(MEMORY_PAGES) - 1
-            || !crate::texture::committed((page * PAGE) as *const u8, PAGE as usize)
+            || !crate::texture::asked_committed((page * PAGE) as *const u8, PAGE as usize)
             || crate::shadow::in_buffer(page * PAGE, PAGE).is_some()
         {
             return false;

@@ -132,7 +132,7 @@ impl Mapped {
             if mapping.is_null() {
                 return None;
             }
-            let at = MapViewOfFile(mapping, if write { FILE_MAP_WRITE } else { FILE_MAP_READ }, 0, 0, 0);
+            let at = victory_core::mapping::changing(|| MapViewOfFile(mapping, if write { FILE_MAP_WRITE } else { FILE_MAP_READ }, 0, 0, 0));
             CloseHandle(mapping);
             at
         };
@@ -189,7 +189,7 @@ impl Mapped {
 impl Drop for Mapped {
     fn drop(&mut self) {
         // SAFETY: our view.
-        unsafe { windows_sys::Win32::System::Memory::UnmapViewOfFile(self.at) };
+        victory_core::mapping::changing(|| unsafe { windows_sys::Win32::System::Memory::UnmapViewOfFile(self.at) });
     }
 }
 

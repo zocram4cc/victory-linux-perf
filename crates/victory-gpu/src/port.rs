@@ -276,13 +276,13 @@ fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usiz
     }
     // SAFETY: the section of a view the title has; the runtime keeps its
     // handle open while a view of it is there, and the range is inside it.
-    let view = unsafe { mem::MapViewOfFile(section as _, mem::FILE_MAP_WRITE, (offset >> 32) as u32, offset as u32, bytes as usize) }.Value as usize;
+    let view = victory_core::mapping::changing(|| unsafe { mem::MapViewOfFile(section as _, mem::FILE_MAP_WRITE, (offset >> 32) as u32, offset as u32, bytes as usize) }).Value as usize;
     if view == 0 {
         return Err((5, format!("no view of the stretch: {}", std::io::Error::last_os_error())));
     }
     let unmap = || {
         // SAFETY: our own view, nothing opened on it.
-        unsafe { mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
+        victory_core::mapping::changing(|| unsafe { mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) });
     };
     if !committed(view, bytes as usize) {
         unmap();

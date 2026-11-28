@@ -1049,7 +1049,7 @@ impl Memory {
             .map_err(|_| E_INVALIDARG)?;
         let attributes = resource_attributes(info, heap_kind);
         let ptr =
-            NonNull::new(alloc(layout.size(), attributes).cast::<u8>()).ok_or(E_OUTOFMEMORY)?;
+            NonNull::new(victory_core::mapping::changing(|| alloc(layout.size(), attributes)).cast::<u8>()).ok_or(E_OUTOFMEMORY)?;
         // SAFETY: the allocator handed out `size` bytes.
         unsafe { ptr.as_ptr().write_bytes(0, layout.size()) };
         Ok(Memory {
@@ -1076,7 +1076,7 @@ impl Memory {
             .and_then(|(size, align)| Layout::from_size_align(size, align).ok())
             .ok_or(E_INVALIDARG)?;
         // SAFETY: the size is non-zero.
-        let ptr = NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or(E_OUTOFMEMORY)?;
+        let ptr = NonNull::new(victory_core::mapping::changing(|| unsafe { alloc_zeroed(layout) })).ok_or(E_OUTOFMEMORY)?;
         // The big ones are named in the log: the memory line counts our own
         // allocations by size, and these are the title's memory given out
         // of ours (a heap it made through the device, a descriptor heap).
@@ -1094,9 +1094,9 @@ impl Memory {
 impl Drop for Memory {
     fn drop(&mut self) {
         match (self.attributes, ALLOCATOR.get()) {
-            (Some(attributes), Some(&(_, free))) => free(self.ptr.as_ptr().cast(), attributes),
+            (Some(attributes), Some(&(_, free))) => victory_core::mapping::changing(|| free(self.ptr.as_ptr().cast(), attributes)),
             // SAFETY: allocated in `new` with this layout.
-            _ => unsafe { dealloc(self.ptr.as_ptr(), self.layout) },
+            _ => victory_core::mapping::changing(|| unsafe { dealloc(self.ptr.as_ptr(), self.layout) }),
         }
     }
 }
@@ -2197,6 +2197,14 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
         let [let_go, let_go_mb, again, again_mb, made] = [since[0], since[1] >> 20, since[2], since[3] >> 20, since[4]];
         let walk_ms = began.elapsed().as_millis() as u64;
         let [by_level_n, by_level_mb] = [on_demand[0], on_demand[1] >> 20];
+        #[cfg(feature = "diagnostics")]
+        let kept = format!(
+            "; mapped and committed answers kept {}, asked {} since the line before",
+            crate::texture::ANSWERED[0].swap(0, Relaxed),
+            crate::texture::ANSWERED[1].swap(0, Relaxed),
+        );
+        #[cfg(not(feature = "diagnostics"))]
+        let kept = String::new();
         tracing::info!(
             "card accounting: room {room}, the card {used_mb} MB in use of a budget of {budget_mb} MB; host copies of textures the title \
              fills: {copies_n} alive {copies_mb} MB, of which {unmapped_mb} MB are levels whose title memory is not mapped ({partly} copies \
@@ -2208,7 +2216,7 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
              copy was let go ({gone_mb} MB: {gone_whole} all mapped {gone_whole_mb} MB, {gone_part} in part {gone_part_mb} MB mapped, \
              {gone_none} not mapped); since the line before: {let_go} host copies let go {let_go_mb} MB, {again} made again {again_mb} MB, \
              {made} made in all; noting took {noted_us} us on the frame's thread, the walk {walk_ms} ms on its own; of the host \
-             copies {by_level_n} are made level by level and hold {by_level_mb} MB of tiles (in the MB alive, not in the levels not mapped)"
+             copies {by_level_n} are made level by level and hold {by_level_mb} MB of tiles (in the MB alive, not in the levels not mapped){kept}"
         );
         WALKING.store(false, Relaxed);
     };

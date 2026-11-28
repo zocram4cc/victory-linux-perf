@@ -4,9 +4,11 @@
 //! * [`policy`]: the runtime half of rule #1, refusing to write
 //!   game-derived data into the source tree.
 //! * [`logging`]: one tracing setup for all binaries.
+//! * [`mapping`]: the title's memory map as a generation, for the answers kept about it.
 
 pub mod config;
 pub mod logging;
+pub mod mapping;
 pub mod policy;
 
 pub use config::Config;

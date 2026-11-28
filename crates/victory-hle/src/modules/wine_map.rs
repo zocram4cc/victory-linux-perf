@@ -122,7 +122,7 @@ static DIRECT: LazyLock<Option<Direct>> = LazyLock::new(|| {
     if !std::env::var_os("VICTORY_WINE_MAP").is_some_and(|v| v == "1") {
         return None;
     }
-    match find().and_then(|direct| probe(&direct).map(|()| direct)) {
+    match find().and_then(|direct| victory_core::mapping::changing(|| probe(&direct)).map(|()| direct)) {
         Ok(direct) => {
             tracing::info!(
                 "title pages are shown with the host's mmap, beside Wine's server (VICTORY_WINE_MAP=1)"
@@ -257,7 +257,7 @@ fn own_proc(what: &str) -> Result<String, &'static str> {
 
 /// This process's memory map as the host has it (`/proc/<pid>/maps`).
 fn own_maps() -> Result<String, &'static str> {
-    own_proc("maps")
+    victory_core::mapping::changing(|| own_proc("maps"))
 }
 
 /// One line of `/proc/<pid>/maps`: start, end, executable, file offset, path.
@@ -640,8 +640,8 @@ pub(crate) fn own(base: usize, len: usize) -> bool {
             .ok()
     });
     let shown = match shared {
-        Some((memfd, _)) => direct.show(base, len, memfd, 0),
-        None => direct.fresh(base, len),
+        Some((memfd, _)) => victory_core::mapping::changing(|| direct.show(base, len, memfd, 0)),
+        None => victory_core::mapping::changing(|| direct.fresh(base, len)),
     };
     if direct.bo.is_some() {
         direct.made_home(base, len, shared, shown);
@@ -770,14 +770,14 @@ pub(crate) fn close(fd: i32) {
 pub(crate) fn show(base: usize, len: usize, fd: i32, offset: u64) -> bool {
     DIRECT
         .as_ref()
-        .is_some_and(|direct| direct.show(base, len, fd, offset))
+        .is_some_and(|direct| victory_core::mapping::changing(|| direct.show(base, len, fd, offset)))
 }
 
 /// Takes away what [`show`] put at `[base, base + len)`: reserved, as before.
 pub(crate) fn hide(base: usize, len: usize) -> bool {
     // SAFETY: a range of a reservation of the title's; under Wine a decommit maps fresh
     // inaccessible memory over it, whatever was there.
-    unsafe { VirtualFree(base as *mut c_void, len, MEM_DECOMMIT) != 0 }
+    victory_core::mapping::changing(|| unsafe { VirtualFree(base as *mut c_void, len, MEM_DECOMMIT) != 0 })
 }
 
 /// The reservations that stand for placeholders, in the pieces the title cut

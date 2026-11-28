@@ -195,10 +195,10 @@ wrapped! {
         measured("VirtualQuery", 0, || unsafe { real(at, info, size) })
     };
     25 VirtualAlloc(at: Handle, size: usize, kind: u32, protect: u32) -> Handle => |real: unsafe extern "system" fn(Handle, usize, u32, u32) -> Handle| {
-        measured("VirtualAlloc", size, || unsafe { real(at, size, kind, protect) })
+        measured("VirtualAlloc", size, || victory_core::mapping::changing(|| unsafe { real(at, size, kind, protect) }))
     };
     26 VirtualFree(at: Handle, size: usize, kind: u32) -> i32 => |real: unsafe extern "system" fn(Handle, usize, u32) -> i32| {
-        measured("VirtualFree", size, || unsafe { real(at, size, kind) })
+        measured("VirtualFree", size, || victory_core::mapping::changing(|| unsafe { real(at, size, kind) }))
     };
     27 _Mtx_lock(lock: Handle) -> i32 => |real: unsafe extern "system" fn(Handle) -> i32| {
         wait("_Mtx_lock", lock as u64, || unsafe { real(lock) })
