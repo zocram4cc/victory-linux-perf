@@ -1,16 +1,19 @@
 @echo off
 setlocal
+rem This file is in the Other-Launchers folder: victory.exe, the fsr and D3D12
+rem folders, early-pipelines.txt and game-folder.txt are one folder up.
+for %%R in ("%~dp0..") do set "root=%%~fR\"
 rem VIctory-BigCheese: checks a GTA VI Xbox 1.0.2.1 game folder: every file the game needs there,
 rem at the right size (names and sizes only; nothing is changed or sent).
 echo Checking your game folder against the list of files in a working one...
 echo.
-cd /d "%~dp0"
+cd /d "%root%"
 rem Dragged onto this file, the folder the launchers remember, next to this
 rem file or one folder up, or else asked.
 set "GAME_DIR=%~1"
-if not defined GAME_DIR if exist "%~dp0game-folder.txt" set /p GAME_DIR=<"%~dp0game-folder.txt"
-if not defined GAME_DIR if exist "%~dp0game_scarlett_master.exe" set "GAME_DIR=%~dp0"
-if not defined GAME_DIR if exist "%~dp0..\game_scarlett_master.exe" for %%G in ("%~dp0..") do set "GAME_DIR=%%~fG"
+if not defined GAME_DIR if exist "%root%game-folder.txt" set /p GAME_DIR=<"%root%game-folder.txt"
+if not defined GAME_DIR if exist "%root%game_scarlett_master.exe" set "GAME_DIR=%root%"
+if not defined GAME_DIR if exist "%root%..\game_scarlett_master.exe" for %%G in ("%root%..") do set "GAME_DIR=%%~fG"
 if not defined GAME_DIR (
   for /f "usebackq delims=" %%D in (`powershell -NoProfile -STA -Command "Add-Type -AssemblyName System.Windows.Forms; $o = New-Object System.Windows.Forms.Form -Property @{TopMost = $true; ShowInTaskbar = $false}; $d = New-Object System.Windows.Forms.FolderBrowserDialog; $d.Description = 'Choose your game folder (the folder with game_scarlett_master.exe)'; $d.ShowNewFolderButton = $false; if ($d.ShowDialog($o) -eq 'OK') { $d.SelectedPath }; $o.Dispose()" 2^>nul`) do set "GAME_DIR=%%D"
 )

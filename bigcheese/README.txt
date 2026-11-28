@@ -14,13 +14,16 @@ endorsed by the game's developer or publisher.
 How to play
 -----------
 1. Extract the whole zip anywhere (its own folder, or inside your game folder).
-   Keep the fsr folder and early-pipelines.txt next to Play-16GB-RAM.cmd.
+   Keep the folders (launcher, Other-Launchers, fsr, D3D12) and
+   early-pipelines.txt next to victory.exe.
 2. Double-click BigCheese-Launcher.cmd: a window asks for your game folder,
    then for ray tracing, 16 GB of RAM, an 8 GB graphics card and Series X or
    S (X: the full detail; it played well on a 16 GB PC with the 16 GB box
    ticked), and has a button for the saves folder. Play starts one of the
-   .cmd files below with those choices; it remembers them in launcher\settings.txt.
-   Or, without the window:
+   .cmd files in Other-Launchers with those choices; it remembers them in
+   launcher\settings.txt. Its first start also puts a shortcut with the cheese
+   icon next to it (VIctory-BigCheese): use that from then on.
+   Or, without the window, in the Other-Launchers folder:
    Double-click Play-16GB-RAM.cmd (16 GB of RAM) or Play.cmd (32 GB or more).
    The first time, it asks for your game folder (a "choose folder" window) and
    remembers it. If you extracted the zip inside your game folder, it finds the
@@ -29,7 +32,7 @@ How to play
 3. The first start translates the game's shaders once (a few minutes). Then the
    game starts. Keep the black window open; closing it quits the game.
 
-Which launcher?
+Which launcher? (in the Other-Launchers folder)
   Play-16GB-RAM.cmd  the 16 GB tweaks: the game sees a Series S (about 7.6 GB
                      for the game instead of 13.5), more buffers in the card's
                      memory (the card window line at 90%), smaller upload and
@@ -58,10 +61,10 @@ Windows SmartScreen may warn about victory.exe because it is not signed:
 If the game crashes, the black window shows the crash report under the exit
 code. A crash in the first seconds, every time, is often a game folder with a
 file missing or cut short (an unfinished copy or download): double-click
-Check-Game-Folder.cmd, which compares every file in your game folder with a
+Other-Launchers\Check-Game-Folder.cmd, which compares every file in your game folder with a
 working 1.0.2.1 one (names and sizes only; it changes nothing) and names any
 that are missing or the wrong size. If the files are fine, try
-Play-No-FG.cmd: Play-16GB-RAM.cmd with frame generation off for the run.
+Other-Launchers\Play-No-FG.cmd: Play-16GB-RAM.cmd with frame generation off for the run.
 
 "memory allocation of ... bytes failed" (exit code -1073740791) means Windows
 ran out of memory for programs: RAM plus the page file, so it happens with

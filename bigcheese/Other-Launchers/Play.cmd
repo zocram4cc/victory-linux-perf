@@ -1,12 +1,16 @@
 @echo off
 rem VIctory-BigCheese-AMD: eikkapine's victory-amd with VIctory-BigCheese's changes,
-rem tuned for a PC with 16 GB of RAM. With 32 GB or more, also try Play.cmd
-rem (victory-amd's normal settings) and keep the faster one.
+rem with victory-amd's normal settings: for a PC with 32 GB of RAM or more.
+rem On 16 GB use Play-16GB-RAM.cmd (with more RAM, try both and keep the
+rem faster one; they share the game folder, shader cache and saves).
 rem Double-click it. If GAME_DIR below is empty, the first start asks for your
 rem game folder (the one with game_scarlett_master.exe) and remembers it in
 rem game-folder.txt. Every setting below can be overridden by setting the
 rem variable before starting this file.
 setlocal EnableExtensions DisableDelayedExpansion
+rem This file is in the Other-Launchers folder: victory.exe, the fsr and D3D12
+rem folders, early-pipelines.txt and game-folder.txt are one folder up.
+for %%R in ("%~dp0..") do set "root=%%~fR\"
 
 rem ======================= SET YOUR GAME HERE (or leave empty) =======================
 rem GAME_DIR: the folder with game_scarlett_master.exe and shaders.rpf in it,
@@ -17,15 +21,15 @@ set "GAME_DIR="
 set "GAME_EXE="
 rem ==================================================================================
 
-title VIctory-BigCheese-AMD
-cd /d "%~dp0"
-set "runner=%~dp0victory.exe"
+title VIctory-BigCheese-AMD (normal)
+cd /d "%root%"
+set "runner=%root%victory.exe"
 if not exist "%runner%" (
-  echo victory.exe is missing next to this file. Extract the whole zip first.
+  echo victory.exe is missing in the folder above this one. Extract the whole zip first.
   goto :fail
 )
-if not exist "%~dp0D3D12\D3D12Core.dll" (
-  echo The D3D12 folder with D3D12Core.dll is missing next to this file.
+if not exist "%root%D3D12\D3D12Core.dll" (
+  echo The D3D12 folder with D3D12Core.dll is missing in the folder above this one.
   echo Windows 10 cannot run the game without it: extract the whole zip again.
 )
 
@@ -45,9 +49,9 @@ if defined VICTORY_GAME_DIR (
   echo There is no %exe_name% in "%VICTORY_GAME_DIR%".
   set "VICTORY_GAME_DIR="
 )
-if exist "%~dp0game-folder.txt" set /p VICTORY_GAME_DIR=<"%~dp0game-folder.txt"
-if not defined VICTORY_GAME_DIR if exist "%~dp0game_scarlett_master.exe" set "VICTORY_GAME_DIR=%~dp0"
-if not defined VICTORY_GAME_DIR if exist "%~dp0..\game_scarlett_master.exe" for %%G in ("%~dp0..") do set "VICTORY_GAME_DIR=%%~fG"
+if exist "%root%game-folder.txt" set /p VICTORY_GAME_DIR=<"%root%game-folder.txt"
+if not defined VICTORY_GAME_DIR if exist "%root%game_scarlett_master.exe" set "VICTORY_GAME_DIR=%root%"
+if not defined VICTORY_GAME_DIR if exist "%root%..\game_scarlett_master.exe" for %%G in ("%root%..") do set "VICTORY_GAME_DIR=%%~fG"
 call :check_game && goto :game_found
 
 echo First start: choose your game folder (the folder with game_scarlett_master.exe).
@@ -65,7 +69,7 @@ echo There is no %exe_name% in "%VICTORY_GAME_DIR%". Choose the folder that has 
 goto :ask
 
 :game_found
->"%~dp0game-folder.txt" echo(%VICTORY_GAME_DIR%
+>"%root%game-folder.txt" echo(%VICTORY_GAME_DIR%
 echo Game folder: %VICTORY_GAME_DIR%
 
 rem ---------------------------------------------------------------- where things are kept
@@ -79,56 +83,15 @@ if not defined VICTORY_DATA_DIR set "VICTORY_DATA_DIR=%LOCALAPPDATA%\victory\dat
 if not exist "%VICTORY_CACHE_DIR%" mkdir "%VICTORY_CACHE_DIR%"
 if not exist "%VICTORY_DATA_DIR%" mkdir "%VICTORY_DATA_DIR%"
 
-rem The console model the game sees: series-s gives it about 7.6 GB, which a
-rem 16 GB PC needs (series-x: about 13.5). set VICTORY_CONSOLE=series-x before
-rem this file to use it anyway.
-if not defined VICTORY_CONSOLE set "VICTORY_CONSOLE=series-s"
+rem The console model the game sees: series-x gives it about 13.5 GB of memory
+rem (series-s: about 7.6, what Play-16GB-RAM.cmd uses).
+if not defined VICTORY_CONSOLE set "VICTORY_CONSOLE=series-x"
 
-rem --- 16 GB of RAM (measured on cool_fox, which shares this memory code) ---
-rem The card's memory below is sized for a 16 GB graphics card. With an 8 GB
-rem card use Play-16GB-RAM-8GB-VRAM.cmd: it sets smaller sizes, then runs this.
-rem Buffers the CPU fills go in the card's memory (needs Resizable BAR / Smart
-rem Access Memory on) instead of the PC's memory; at 1024 the game ran out of
-rem memory in the prologue, at 6144 it ran 15 minutes without a crash.
-if not defined VICTORY_WINDOWS_BAR_MB set "VICTORY_WINDOWS_BAR_MB=6144"
-rem Copies of the game's buffers kept in the card's memory, in MB (default 2048
-rem on a 16 GB card, which filled in the prologue and spilled into PC memory).
-if not defined VICTORY_CARD_BUFFERS_MB set "VICTORY_CARD_BUFFERS_MB=4096"
-rem Smaller bursts of upload memory when a new scene loads.
-if not defined VICTORY_TEXTURE_STAGE_MB set "VICTORY_TEXTURE_STAGE_MB=64"
-rem Texture uploads not sent ahead (the installer has 1: up to 96 MB more in flight).
-if not defined VICTORY_UPLOAD_AHEAD set "VICTORY_UPLOAD_AHEAD=0"
-rem Staging memory for the game's file streaming (default 256 MB).
-if not defined VICTORY_DSTORAGE_STAGING_MB set "VICTORY_DSTORAGE_STAGING_MB=64"
-rem How full the card's memory may get, in percent, before those buffers go into
-rem the PC's memory (default 80). At 80 the open world fell to about 10 real fps
-rem as Windows paged; at 90 it held 17. Lower it if the card runs out.
-if not defined VICTORY_WINDOW_CARD_PERCENT set "VICTORY_WINDOW_CARD_PERCENT=90"
-rem Less of the PC's memory (RAZDA4A-XEN settings; 16 GB RAM filled to 14.8 GB):
-rem when free RAM falls under 3 GB, texture prefetch is held to 64 MB a frame
-rem and idle upload/scratch memory is given back; copies of game memory kept
-rem in the PC are capped at 96 MB (768 before); 24 spare snapshot buffers.
-if not defined VICTORY_RESIDENCY set "VICTORY_RESIDENCY=1"
-if not defined VICTORY_WINDOW_BUDGET_MB set "VICTORY_WINDOW_BUDGET_MB=96"
-if not defined VICTORY_SNAPSHOT_POOL set "VICTORY_SNAPSHOT_POOL=24"
-rem Fewer freezes on 16 GB (overnight run n3-E-ram against n1-A-now: frames
-rem 35% faster at the same scene size, worst tenth 136 ms against 353):
-rem copies of game memory that spilled into the PC's RAM move back to the card
-rem when it has room; game memory the card can read where it is is not copied
-rem (up to 1.5 GB); fewer helper threads, so the game's own threads get the CPU.
-if not defined VICTORY_WINDOW_PROMOTE set "VICTORY_WINDOW_PROMOTE=1"
-if not defined VICTORY_INPLACE set "VICTORY_INPLACE=1"
-if not defined VICTORY_INPLACE_MB set "VICTORY_INPLACE_MB=1536"
-if not defined VICTORY_THIN_THREADS set "VICTORY_THIN_THREADS=4"
-if not defined VICTORY_UNDER_THREADS set "VICTORY_UNDER_THREADS=3"
-if not defined VICTORY_LAND_THREADS set "VICTORY_LAND_THREADS=3"
-rem Less of the PC's RAM held (from LibsMQG/hle-d3d12-amd, 28 Nov 2026): our
-rem command lists hold a driver list only while they record (about 400 fewer,
-rem 1-2 MB each), and tables and read buffers a burst grew are given back.
-rem His windows-on-the-card share (VICTORY_WINDOWS_BAR_PCT) is left off here:
-rem it takes card memory from textures, which a 16 GB card is short of.
-if not defined VICTORY_LIST_LAZY set "VICTORY_LIST_LAZY=1"
-if not defined VICTORY_SHRINK_KEPT set "VICTORY_SHRINK_KEPT=1"
+rem --- Memory: victory-amd's normal settings ---
+rem None of Play-16GB-RAM.cmd's memory tweaks: the default budgets for buffers
+rem in the card's memory, upload and streaming memory, and the card window line
+rem at 80% of the card. Texture uploads are sent ahead (up to 96 MB more in flight).
+if not defined VICTORY_UPLOAD_AHEAD set "VICTORY_UPLOAD_AHEAD=1"
 
 rem --- victory-amd's installer settings (eikkapine) ---
 if not defined VICTORY_LOG set "VICTORY_LOG=info"
@@ -170,8 +133,8 @@ if not defined VICTORY_CARD_BUFFERS_MIN_MB set "VICTORY_CARD_BUFFERS_MIN_MB=1"
 if not defined VICTORY_PORT_GUARD set "VICTORY_PORT_GUARD=1"
 if not defined VICTORY_PORT_JOURNAL set "VICTORY_PORT_JOURNAL=1"
 rem (VIctory-BigCheese) The game's 30 fps cap lifted to 60: menus and light
-rem scenes run at up to 60, and gameplay as fast as the PC can (under 60 on a
-rem 16 GB PC, so it is never held back). victory-amd's installer has 33.333 and
+rem scenes run at up to 60, and gameplay as fast as the PC can up to 60 (120
+rem shown with frame generation). victory-amd's installer has 33.333 and
 rem VICTORY_FPS_CAP=30: set those before this file to lock everything to 30.
 if not defined VICTORY_FRAME_INTERVAL_MS set "VICTORY_FRAME_INTERVAL_MS=16.667"
 if not defined VICTORY_FPS_CAP set "VICTORY_FPS_CAP=60"
@@ -204,8 +167,8 @@ rem AMD FidelityFX SDK DLLs (FSR 4 on an RX 9000 card), from the fsr (or
 rem fidelityfx-sdk) folder next to this file. The installer's "BEST" launcher also sets
 rem VICTORY_FSR_4K=performance (a 3840x2160 output from 1920x1080): left off
 rem here, for a 1080p screen and the card's memory.
-if not defined VICTORY_FIDELITYFX_DIR if exist "%~dp0fsr\amd_fidelityfx_upscaler_dx12.dll" set "VICTORY_FIDELITYFX_DIR=%~dp0fsr"
-if not defined VICTORY_FIDELITYFX_DIR if exist "%~dp0fidelityfx-sdk\amd_fidelityfx_upscaler_dx12.dll" set "VICTORY_FIDELITYFX_DIR=%~dp0fidelityfx-sdk"
+if not defined VICTORY_FIDELITYFX_DIR if exist "%root%fsr\amd_fidelityfx_upscaler_dx12.dll" set "VICTORY_FIDELITYFX_DIR=%root%fsr"
+if not defined VICTORY_FIDELITYFX_DIR if exist "%root%fidelityfx-sdk\amd_fidelityfx_upscaler_dx12.dll" set "VICTORY_FIDELITYFX_DIR=%root%fidelityfx-sdk"
 rem FSR 4 frame generation (the installer's "FSR4 + Frame Gen 4" launcher): a
 rem generated frame between each two real ones. It doubles what you see, not
 rem how fast the game runs. FSR 4's needs an RX 9000 card: on an older card
@@ -225,17 +188,17 @@ rem put in the cache, and added to the cache's own list whenever a new zip
 rem brings a changed one (the game keeps each pipeline once).
 set "early=%VICTORY_CACHE_DIR%\pipelines\early-pipelines.txt"
 set "shipped=%VICTORY_CACHE_DIR%\pipelines\early-pipelines-shipped.txt"
-if exist "%~dp0early-pipelines.txt" (
+if exist "%root%early-pipelines.txt" (
   if not exist "%VICTORY_CACHE_DIR%\pipelines" mkdir "%VICTORY_CACHE_DIR%\pipelines"
-  fc /b "%~dp0early-pipelines.txt" "%shipped%" >nul 2>&1 || (
+  fc /b "%root%early-pipelines.txt" "%shipped%" >nul 2>&1 || (
     if exist "%early%" (
       >"%early%.nl" echo.
-      copy /b "%early%"+"%early%.nl"+"%~dp0early-pipelines.txt" "%early%.new" >nul && move /y "%early%.new" "%early%" >nul
+      copy /b "%early%"+"%early%.nl"+"%root%early-pipelines.txt" "%early%.new" >nul && move /y "%early%.new" "%early%" >nul
       del "%early%.nl" 2>nul
     ) else (
-      copy /y "%~dp0early-pipelines.txt" "%early%" >nul
+      copy /y "%root%early-pipelines.txt" "%early%" >nul
     )
-    copy /y "%~dp0early-pipelines.txt" "%shipped%" >nul
+    copy /y "%root%early-pipelines.txt" "%shipped%" >nul
   )
 )
 

@@ -15,7 +15,9 @@ $folderFile = Join-Path $root 'game-folder.txt'
 
 # The zip's names, or the play folder's.
 function Find-Launcher([string[]]$names) {
-    foreach ($n in $names) { $p = Join-Path $root $n; if (Test-Path $p) { return $p } }
+    foreach ($dir in (Join-Path $root 'Other-Launchers'), $root) {
+        foreach ($n in $names) { $p = Join-Path $dir $n; if (Test-Path $p) { return $p } }
+    }
     return $null
 }
 $normalCmd = Find-Launcher @('Play.cmd', 'Play-BigCheese-AMD.cmd')
@@ -71,6 +73,25 @@ $form.MaximizeBox = $false
 $form.StartPosition = 'CenterScreen'
 $form.ClientSize = New-Object System.Drawing.Size([int](280 * $scale), [int](504 * $scale))
 $form.BackColor = [System.Drawing.Color]::Black
+$iconFile = Join-Path $here 'the_big_cheese.ico'
+if (Test-Path $iconFile) { try { $form.Icon = New-Object System.Drawing.Icon($iconFile) } catch {} }
+
+# A shortcut with the cheese icon next to BigCheese-Launcher.cmd (a .cmd file
+# cannot have an icon of its own), made again at each start so it follows the
+# folder if it moves.
+$launcherCmd = Join-Path $root 'BigCheese-Launcher.cmd'
+if ((Test-Path $launcherCmd) -and (Test-Path $iconFile) -and -not $env:BIGCHEESE_LAUNCHER_SHOT) {
+    try {
+        $link = (New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $root 'VIctory-BigCheese.lnk'))
+        $link.TargetPath = $launcherCmd
+        $link.WorkingDirectory = $root
+        $link.IconLocation = "$iconFile,0"
+        $link.WindowStyle = 7
+        $link.Description = 'VIctory-BigCheese launcher'
+        $link.Save()
+    } catch {}
+}
+
 $picture = Join-Path $here 'the_big_cheese.png'
 if (Test-Path $picture) {
     $form.BackgroundImage = [System.Drawing.Image]::FromFile($picture)
@@ -206,7 +227,7 @@ $play.Add_Click({
     $dir = $folderBox.Text.Trim().Trim('"').TrimEnd('\')
     $cmd = $(if ($ram16.Checked) { $smallCmd } else { $normalCmd })
     if (-not $cmd) {
-        [void][System.Windows.Forms.MessageBox]::Show($form, "The .cmd launchers are missing next to the launcher folder. Extract the whole zip again.", 'VIctory-BigCheese')
+        [void][System.Windows.Forms.MessageBox]::Show($form, "The .cmd launchers are missing from the Other-Launchers folder. Extract the whole zip again.", 'VIctory-BigCheese')
         return
     }
     $settings.rt = $(if ($rt.Checked) { '1' } else { '0' })
