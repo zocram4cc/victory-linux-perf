@@ -401,6 +401,11 @@ pub(crate) fn submitted(lists: &[This]) -> Arc<[Arc<Recording>]> {
         .collect()
 }
 
+#[cfg(feature = "diagnostics")]
+static OP_NS: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
+#[cfg(feature = "diagnostics")]
+static OP_COUNT: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
+
 /// For the frame-rate line.
 pub(crate) fn line(frames: f64) {
     if !wanted() || !on() {
@@ -415,6 +420,22 @@ pub(crate) fn line(frames: f64) {
         CHUNKS.swap(0, Relaxed) as f64 / frames,
         s[3]
     );
+    #[cfg(feature = "diagnostics")]
+    {
+        let mut ops: Vec<(u64, u64, usize)> = (0..64)
+            .map(|i| (OP_NS[i].swap(0, Relaxed), OP_COUNT[i].swap(0, Relaxed), i))
+            .filter(|&(ns, _, _)| ns > 0)
+            .collect();
+        ops.sort_unstable_by_key(|&(ns, _, _)| std::cmp::Reverse(ns));
+        let top: Vec<String> = ops
+            .into_iter()
+            .take(10)
+            .map(|(ns, c, op)| format!("op{op}={:.1}ms/{:.0}x", ns as f64 / 1e6 / frames, c as f64 / frames))
+            .collect();
+        if !top.is_empty() {
+            tracing::info!("VICTORY_THIN top ops per frame (all threads): {}", top.join(", "));
+        }
+    }
 }
 
 #[inline]
@@ -766,7 +787,14 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
         if skip && op != CLOSE && op != RESET {
             continue;
         }
+        #[cfg(feature = "diagnostics")]
+        let op_start = std::time::Instant::now();
         if run_plain(op, list, w) {
+            #[cfg(feature = "diagnostics")]
+            if (op as usize) < 64 {
+                OP_NS[op as usize].fetch_add(op_start.elapsed().as_nanos() as u64, Relaxed);
+                OP_COUNT[op as usize].fetch_add(1, Relaxed);
+            }
             continue;
         }
         let n = w.first().map_or(0, |&n| n as usize);
@@ -844,6 +872,11 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
                 );
             }
             _ => {}
+        }
+        #[cfg(feature = "diagnostics")]
+        if (op as usize) < 64 {
+            OP_NS[op as usize].fetch_add(op_start.elapsed().as_nanos() as u64, Relaxed);
+            OP_COUNT[op as usize].fetch_add(1, Relaxed);
         }
     }
     (calls, closed)

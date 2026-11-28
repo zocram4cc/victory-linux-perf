@@ -9114,19 +9114,32 @@ impl Batch {
         }
         #[cfg(feature = "diagnostics")]
         FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
-        crate::shadow::wide_each(spans.len() + due.len(), move |i| {
+        const SPAN_CHUNK: usize = 32;
+        let span_chunks = spans.len().div_ceil(SPAN_CHUNK);
+        crate::shadow::wide_each(due.len() + span_chunks, move |i| {
             // The textures first: they are the longer pieces.
-            let Some(i) = i.checked_sub(due.len()) else {
+            let Some(chunk) = i.checked_sub(due.len()) else {
                 due[i].refresh();
                 return;
             };
-            let (shadow, from, to) = &spans[i];
-            if many && shadow.nothing_new(*from, *to - *from) {
-                #[cfg(feature = "diagnostics")]
-                FLUSHES[2].fetch_add(1, Ordering::Relaxed);
-                return;
+            let start = chunk * SPAN_CHUNK;
+            let end = (start + SPAN_CHUNK).min(spans.len());
+            #[cfg(feature = "diagnostics")]
+            let mut skipped = 0u64;
+            for (shadow, from, to) in &spans[start..end] {
+                if many && shadow.nothing_new(*from, *to - *from) {
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        skipped += 1;
+                    }
+                    continue;
+                }
+                Self::update(shadow, *from, *to);
             }
-            Self::update(shadow, *from, *to);
+            #[cfg(feature = "diagnostics")]
+            if skipped > 0 {
+                FLUSHES[2].fetch_add(skipped, Ordering::Relaxed);
+            }
         });
         if ahead {
             crate::watch::ask_ahead_done();

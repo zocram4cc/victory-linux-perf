@@ -1057,8 +1057,9 @@ fn with_other_views(first: usize, last: usize, pages: &mut Vec<(usize, u16)>) {
 /// call that resets written pages costs 30-70 microseconds whatever the
 /// range).
 const AHEAD_GAP: usize = (4 << 20) / PAGE;
-/// The most one asking covers (its answer needs 8 bytes per 4 KiB page).
-const AHEAD_MAX: usize = (1 << 30) / PAGE;
+/// The most one asking covers (16 MiB so `spread_each` fans large ranges out
+/// across threads for lock-free `PAGEMAP_SCAN` instead of stalling one thread).
+const AHEAD_MAX: usize = (16 << 20) / PAGE;
 /// Asks the kernel about many ranges `(start, end)` at once, before the
 /// [`writes`] of each: ranges close together are one asking, and `writes`
 /// then answers from the journal until [`ask_ahead_done`]. The world's
@@ -1394,7 +1395,7 @@ fn ask_rest(ranges: &[(usize, usize)], held: bool) {
     // Split large single ranges (> 32 MiB) into parallel chunks so our
     // lock-free `PAGEMAP_SCAN` in Wine runs across `victory-wide` threads
     // instead of stalling 5+ ms on a single thread.
-    const CHUNK_PAGES: usize = (32 << 20) / PAGE;
+    const CHUNK_PAGES: usize = (16 << 20) / PAGE;
     let mut chunks: Vec<(usize, usize)> = Vec::with_capacity(alone_ranges.len());
     for &(first, last) in &alone_ranges {
         let mut p = first;

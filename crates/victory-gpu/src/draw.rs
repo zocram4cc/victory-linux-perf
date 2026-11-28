@@ -410,19 +410,25 @@ pub(crate) fn lone_clamp_line(frames: f64) {
 /// Since the last line: indirect executions with arguments in place, those
 /// clamped alone for it, and the 1 MiB ranges they came from (diagnostics).
 static IN_PLACE_INDIRECT: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+#[cfg(feature = "diagnostics")]
 static IN_PLACE_RANGES: std::sync::Mutex<std::collections::BTreeMap<u64, [u64; 3]>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// An indirect execution of `kind` with its arguments at `arguments` in place.
 fn in_place_indirect(arguments: u64, kind: u32) {
     IN_PLACE_INDIRECT[0].fetch_add(1, Ordering::Relaxed);
     IN_PLACE_INDIRECT[1].fetch_add(u64::from(in_place_order()), Ordering::Relaxed);
-    let slot = match kind {
-        2 => 1,
-        10 => 2,
-        _ => 0,
-    };
-    let mut ranges = IN_PLACE_RANGES.lock().unwrap_or_else(|e| e.into_inner());
-    ranges.entry(arguments >> 20).or_default()[slot] += 1;
+    #[cfg(feature = "diagnostics")]
+    {
+        let slot = match kind {
+            2 => 1,
+            10 => 2,
+            _ => 0,
+        };
+        let mut ranges = IN_PLACE_RANGES.lock().unwrap_or_else(|e| e.into_inner());
+        ranges.entry(arguments >> 20).or_default()[slot] += 1;
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = (arguments, kind);
 }
 
 /// With the frame line: indirect executions with arguments in place per
@@ -432,20 +438,29 @@ pub(crate) fn in_place_indirect_line(frames: f64) {
     if all == 0 {
         return;
     }
-    let ranges = std::mem::take(&mut *IN_PLACE_RANGES.lock().unwrap_or_else(|e| e.into_inner()));
-    let mut by: Vec<(u64, [u64; 3])> = ranges.into_iter().collect();
-    by.sort_by_key(|(_, n)| std::cmp::Reverse(n.iter().sum::<u64>()));
-    let top: Vec<String> = by
-        .iter()
-        .take(6)
-        .map(|(mb, n)| format!("{:#x}+1MiB: {:.0} draws {:.0} dispatches {:.0} mesh", mb << 20, n[0] as f64 / frames, n[1] as f64 / frames, n[2] as f64 / frames))
-        .collect();
+    #[cfg(feature = "diagnostics")]
+    {
+        let ranges = std::mem::take(&mut *IN_PLACE_RANGES.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut by: Vec<(u64, [u64; 3])> = ranges.into_iter().collect();
+        by.sort_by_key(|(_, n)| std::cmp::Reverse(n.iter().sum::<u64>()));
+        let top: Vec<String> = by
+            .iter()
+            .take(6)
+            .map(|(mb, n)| format!("{:#x}+1MiB: {:.0} draws {:.0} dispatches {:.0} mesh", mb << 20, n[0] as f64 / frames, n[1] as f64 / frames, n[2] as f64 / frames))
+            .collect();
+        tracing::info!(
+            "renderer port 1: indirect executions with arguments or count in place per frame: {:.0}, of them {:.0} clamped after every shader write before them (VICTORY_PORT_CONSTANTS_ORDER); from {} ranges of 1 MiB, the busiest: {}",
+            all as f64 / frames,
+            alone as f64 / frames,
+            by.len(),
+            top.join("; ")
+        );
+    }
+    #[cfg(not(feature = "diagnostics"))]
     tracing::info!(
-        "renderer port 1: indirect executions with arguments or count in place per frame: {:.0}, of them {:.0} clamped after every shader write before them (VICTORY_PORT_CONSTANTS_ORDER); from {} ranges of 1 MiB, the busiest: {}",
+        "renderer port 1: indirect executions with arguments or count in place per frame: {:.0}, of them {:.0} clamped after every shader write before them (VICTORY_PORT_CONSTANTS_ORDER)",
         all as f64 / frames,
         alone as f64 / frames,
-        by.len(),
-        top.join("; ")
     );
 }
 
@@ -574,9 +589,9 @@ pub(crate) struct State {
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
     /// copy the address would find by then (`shadow.rs` `tails`).
-    root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
     /// Root UAVs bound as one-view tables in this list, likewise.
-    root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
     /// This recording, for [`crate::descriptor::host::HostHeap::make_listed`]
@@ -2437,18 +2452,21 @@ impl State {
         if compute || (early_ms == 0 && bake_ms == 0) {
             return;
         }
-        let bake = bake_ms > 0
-            && p.stages.iter().any(|s| BAKE_PIXEL_SHADERS.contains(&s.shader.hash.as_str()));
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         // The milliseconds this frame's bake draws have taken so far: a
         // frame has several, and together they get `bake_ms`.
         static BAKED_MS: AtomicU64 = AtomicU64::new(0);
         let frame = crate::frame::current();
-        let first = FRAME.swap(frame, Ordering::Relaxed) != frame;
+        let first = FRAME.load(Ordering::Relaxed) != frame && FRAME.swap(frame, Ordering::Relaxed) != frame;
         if first {
             BAKED_MS.store(0, Ordering::Relaxed);
         }
         let left = bake_ms.saturating_sub(BAKED_MS.load(Ordering::Relaxed));
+        if !first && left == 0 {
+            return;
+        }
+        let bake = left > 0
+            && p.stages.iter().any(|s| BAKE_PIXEL_SHADERS.contains(&s.shader.hash.as_str()));
         let budget = if bake && left > 0 {
             // What a bake may read must be there now: up to 2 GiB.
             (left, 2 << 30)
@@ -3994,10 +4012,10 @@ impl State {
             let Some(host) = heap.host() else {
                 continue;
             };
-            let mut selected: Vec<u32> = group
-                .indexed
-                .iter()
-                .map(|index| {
+            let mut selected: Vec<u32> = Vec::new();
+            if !group.indexed.is_empty() || !half.is_empty() {
+                selected.reserve(group.indexed.len());
+                for index in &group.indexed {
                     let constant = self.user_value(
                         compute,
                         index.constant_slot,
@@ -4005,20 +4023,14 @@ impl State {
                         index.constant_dword,
                     );
                     // The shader adds i32 byte offsets and shifts by 5.
-                    index.byte_offset.wrapping_add(constant << index.shift) / 32
-                })
-                .collect();
-            // The descriptors the shader moves halves through are made too,
-            // and the table reaches them: they may lie past the range starts
-            // the entries give (a range of several views names only its
-            // first; review on #927).
-            selected.extend(
-                half.iter()
-                    .filter(|&&(s, _)| s == slot)
-                    .map(|&(_, at)| at / 8),
-            );
-            selected.sort_unstable();
-            selected.dedup();
+                    selected.push(index.byte_offset.wrapping_add(constant << index.shift) / 32);
+                }
+                for &(_, at) in half.iter().filter(|&&(s, _)| s == slot) {
+                    selected.push(at / 8);
+                }
+                selected.sort_unstable();
+                selected.dedup();
+            }
             let n = (group.max_dword / 8).max(selected.last().copied().unwrap_or(0)) + 1;
             let last = table.checked_add(u64::from(n - 1) * 32);
             if n > crate::descriptor::host::DYNAMIC

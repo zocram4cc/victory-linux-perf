@@ -318,8 +318,8 @@ pub(crate) fn card_room_kept() -> u64 {
     card_limits().1.min(SEEN).saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
 }
 
-/// The copies in the card's memory.
-static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
+/// The copies in the card's memory: `(start, end, weak)`.
+static CARDED: Mutex<Vec<(usize, usize, std::sync::Weak<Shadow>)>> = Mutex::new(Vec::new());
 
 /// Since the last frame line: bytes copied to card sides and the ranges
 /// they were; pieces compared on the card, pieces fetched and their
@@ -341,7 +341,7 @@ pub(crate) fn card_stats() -> [u64; 10] {
     for (i, stat) in CARD_STATS.iter().enumerate() {
         out[i] = stat.swap(0, Ordering::Relaxed);
     }
-    out[7] = CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|w| w.strong_count() > 0).count() as u64;
+    out[7] = CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|(_, _, w)| w.strong_count() > 0).count() as u64;
     out[8] = CARD_BYTES[0].load(Ordering::Relaxed)
         + WINDOW_CARD_BYTES.load(Ordering::Relaxed)
         + WINDOW_MAPPED_BYTES.load(Ordering::Relaxed);
@@ -647,7 +647,9 @@ fn carded(shadow: &Arc<Shadow>) {
     if let Some(card) = &shadow.card {
         let _ = card.me.set(Arc::downgrade(shadow));
     }
-        CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(shadow));
+    let start = shadow.start as usize;
+    let end = (shadow.start + shadow.len) as usize;
+    CARDED.lock().unwrap_or_else(|e| e.into_inner()).push((start, end, Arc::downgrade(shadow)));
 }
 
 pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
@@ -687,7 +689,7 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
         }
         return out;
     }
-    carded.retain(|weak| {
+    carded.retain(|(_, _, weak)| {
         let Some(shadow) = weak.upgrade() else {
             return false;
         };
@@ -778,14 +780,26 @@ pub(crate) fn copy_all(copies: Vec<(usize, usize, usize)>) {
 /// CPU side held the same before or not. Left out is what shaders in the air
 /// may be writing (such a copy waits for them, or is done on the card).
 pub(crate) fn send_copied(dst: usize, len: usize) {
-    for shadow in carded_copies() {
+    let dst_end = dst + len;
+    let hits: Vec<Arc<Shadow>> = {
+        let carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+        carded
+            .iter()
+            .filter(|&&(start, end, _)| start < dst_end && end > dst)
+            .filter_map(|(_, _, weak)| weak.upgrade())
+            .collect()
+    };
+    for shadow in hits {
         let (start, end) = (shadow.start as usize, (shadow.start + shadow.len) as usize);
-        let (from, to) = (dst.max(start), (dst + len).min(end));
+        let (from, to) = (dst.max(start), dst_end.min(end));
         if from >= to {
             continue;
         }
-        let busy: Vec<(usize, usize)> =
-            shadow.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().filter(|&(a, b)| a < to && b > from).collect();
+        let busy: Vec<(usize, usize)> = if shadow.has_pending.load(Ordering::Acquire) {
+            shadow.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().filter(|&(a, b)| a < to && b > from).collect()
+        } else {
+            Vec::new()
+        };
         for (a, b) in outside(from, to, busy) {
             shadow.copy(a, b);
         }
@@ -794,7 +808,7 @@ pub(crate) fn send_copied(dst: usize, len: usize) {
 
 /// The copies in the card's memory (diagnostics: `crate::host::upcheck`).
 pub(crate) fn carded_copies() -> Vec<Arc<Shadow>> {
-    CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(std::sync::Weak::upgrade).collect()
+    CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(|(_, _, w)| w.upgrade()).collect()
 }
 
 /// Ranges in order, those that overlap or touch as one.
@@ -4198,30 +4212,32 @@ impl Shadow {
         if from >= to {
             return 0;
         }
-        let mut busy: Vec<(usize, usize)> = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .copied()
-            .filter(|&(a, e)| a < to && e > from)
-            .collect();
-        if !busy.is_empty() {
-            // Around ranges shaders are writing: the gaps, each as below
-            // (in the world most submissions have such ranges; copying the
-            // gaps whole cost ~1 s per frame).
-            busy.sort_unstable();
-            let (mut at, mut bytes) = (from, 0);
-            for (a, e) in busy {
-                if a > at {
-                    bytes += self.update_free(at, a);
+        if self.has_pending.load(Ordering::Acquire) {
+            let mut busy: Vec<(usize, usize)> = self
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .copied()
+                .filter(|&(a, e)| a < to && e > from)
+                .collect();
+            if !busy.is_empty() {
+                // Around ranges shaders are writing: the gaps, each as below
+                // (in the world most submissions have such ranges; copying the
+                // gaps whole cost ~1 s per frame).
+                busy.sort_unstable();
+                let (mut at, mut bytes) = (from, 0);
+                for (a, e) in busy {
+                    if a > at {
+                        bytes += self.update_free(at, a);
+                    }
+                    at = at.max(e);
                 }
-                at = at.max(e);
+                if at < to {
+                    bytes += self.update_free(at, to);
+                }
+                return bytes;
             }
-            if at < to {
-                bytes += self.update_free(at, to);
-            }
-            return bytes;
         }
         self.update_free(from, to)
     }
