@@ -203,6 +203,23 @@ TextureCube cubet : register(t8, space2);
 /// Compute shaders, each `cs`, dispatched as 2×2 groups of 8×8 threads
 /// over a 16×16 texture and a 256-dword buffer.
 const CS_CASES: &[(&str, &str)] = &[
+    // A constant table indexed per lane: the console compiler keeps it in the
+    // code and reads it through a buffer descriptor built around it
+    // (P.4: "a descriptor built around a table in the code").
+    (
+        "constant table indexed per lane",
+        r#"static const uint lut[24] = {
+            0x9e3779b9, 0x7f4a7c15, 0xf39cc060, 0x5ced96c6, 0x1b873593, 0xcc9e2d51,
+            0x85ebca6b, 0xc2b2ae35, 0x27d4eb2f, 0x165667b1, 0xd3a2646c, 0xfd7046c5,
+            0xb55a4f09, 0x8ebc6af0, 0x5bd1e995, 0x6a09e667, 0xbb67ae85, 0x3c6ef372,
+            0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19, 0x428a2f98 };
+        CS {
+            uint n = d.y * 16 + d.x;
+            uint a = lut[(n * 7) % 24];
+            uint b = lut[(raw.Load(4 * (n & 31)) + n) % 24];
+            outb.Store2(8 * n, uint2(a, b ^ a));
+        }"#,
+    ),
     // A compare against a quad neighbour's value: the console compiler can
     // fold the lane read into the compare as DPP (P.4: `v_cmp_* … dpp`).
     (

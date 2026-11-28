@@ -13919,6 +13919,39 @@ impl<'a> Lower<'a> {
             off = self.s.m.bin(c, Bin::Add, at, off);
             index = None;
         }
+        // A buffer descriptor built around a table in the program's own code
+        // (`s_getpc` + offset): its bytes are the code's, known here. Plain
+        // dword loads read them (`code_dword`, as the scalar loads through
+        // such descriptors do); stores and typed or indexed loads are refused.
+        if let Source::Built { address, words, .. } = src
+            && address.param == CODE
+        {
+            // Dword 2, the record count: bytes for a raw view (stride 0 here).
+            let records = words[0];
+            if store || typed || index.is_some() {
+                return Err("a descriptor built around a table in the code");
+            }
+            let Some(Operand::Vector { reg, .. }) = *data else {
+                return Err("a buffer result");
+            };
+            if !name.starts_with("buffer_load_dword") {
+                return Err("a descriptor built around a table in the code");
+            }
+            // Past the record count the console reads 0, as here.
+            let rel = self.s.m.i32(address.offset);
+            for k in 0..count {
+                let four = self.s.m.i32(4 * k);
+                let a = self.s.m.bin(c, Bin::Add, off, four);
+                let x = self.code_dword(a)?;
+                let within = self.s.m.bin(c, Bin::Sub, a, rel);
+                let end = self.s.m.i32(records.saturating_sub(3));
+                let inside = self.s.m.cmp(c, pred::IULT, within, end);
+                let z = self.s.m.i32(0);
+                let x = self.s.m.select(c, inside, x, z);
+                self.write(inst, Reg::V(reg + k as u8), x, guard);
+            }
+            return Ok(());
+        }
         if used.is_some_and(|u| u.kind == ResourceType::Cbv) && !typed {
             // A constant buffer read per lane (a dynamically indexed array).
             // shortcut: the console's CBV descriptor is taken to have a 16-byte
