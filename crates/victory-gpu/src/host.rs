@@ -7310,9 +7310,12 @@ impl HostList {
         }
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
-            fail(format_args!(
-                "a host command list did not close ({e}): a command recorded into it was invalid"
-            ));
+            let reason = if e.code() == windows::Win32::Foundation::E_OUTOFMEMORY {
+                "D3D12 ran out of memory while recording it"
+            } else {
+                "D3D12 refused the recorded list"
+            };
+            fail(format_args!("a host command list did not close ({e}): {reason}"));
         }
     }
 

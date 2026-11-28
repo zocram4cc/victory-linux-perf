@@ -401,19 +401,35 @@ impl CpuMeter {
         if count == 0 {
             return;
         }
-        let now: Vec<(i64, i64)> = buf[..count].iter().map(|p| (p.idle, p.kernel + p.user)).collect();
-        if self.prev.len() == count {
-            self.cores_pct.clear();
+        let now = buf[..count].iter().map(|p| (p.idle, p.kernel.saturating_add(p.user))).collect();
+        self.update(now);
+    }
+
+    fn update(&mut self, now: Vec<(i64, i64)>) {
+        if self.prev.len() == now.len() {
+            self.cores_pct.resize(now.len(), 0.0);
             let mut sum = 0.0f32;
-            for (&(pi, pt), &(ni, nt)) in self.prev.iter().zip(&now) {
-                let dt = (nt - pt).max(1) as f32;
-                let di = (ni - pi).clamp(0, nt - pt) as f32;
-                let busy = ((1.0 - di / dt) * 100.0).clamp(0.0, 100.0);
-                self.cores_pct.push(busy);
+            let mut valid = 0;
+            for ((&(was_idle, was_total), &(idle, total)), percent) in self.prev.iter().zip(&now).zip(&mut self.cores_pct) {
+                let (Some(elapsed), Some(idle)) = (total.checked_sub(was_total), idle.checked_sub(was_idle)) else {
+                    continue;
+                };
+                if elapsed <= 0 || idle < 0 {
+                    continue;
+                }
+                let busy = (1.0 - idle.min(elapsed) as f32 / elapsed as f32) * 100.0;
+                *percent = busy;
                 sum += busy;
+                valid += 1;
             }
-            self.total_pct = sum / count as f32;
+            if valid != 0 {
+                self.total_pct = sum / valid as f32;
+            }
+        } else {
+            self.cores_pct.clear();
+            self.total_pct = 0.0;
         }
+        // A reset or repeated sample becomes the baseline for the next poll.
         self.prev = now;
     }
 }
@@ -973,6 +989,25 @@ impl Panel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cpu_meter_recovers_after_a_counter_goes_backwards() {
+        let mut meter = CpuMeter::default();
+        meter.update(vec![(50_000, 200_000), (100, 200)]);
+        meter.update(vec![(150_000, 400_000), (120, 300)]);
+        assert!((meter.total_pct - 65.0).abs() < 0.01);
+
+        meter.update(vec![(100_000, 243_750), (145, 400)]);
+        assert_eq!(meter.cores_pct, [50.0, 75.0]);
+        assert_eq!(meter.total_pct, 75.0);
+
+        meter.update(vec![(100_000, 243_750), (145, 400)]);
+        assert_eq!(meter.total_pct, 75.0);
+
+        meter.update(vec![(125_000, 343_750), (195, 500)]);
+        assert_eq!(meter.cores_pct, [75.0, 50.0]);
+        assert_eq!(meter.total_pct, 62.5);
+    }
 
     /// Every character the HUD uses has its own picture, and no two look alike.
     #[test]
