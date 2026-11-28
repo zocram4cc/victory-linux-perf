@@ -1293,6 +1293,33 @@ fn widen_to_dwords(addr: usize, now: &[u8], held: &mut [u8], title: Option<&[u8]
     (widened, mixed)
 }
 
+/// Since the last frame-rate line, of [`land_dwords`]: widenings, bytes looked
+/// at, dwords widened, nanoseconds spent.
+static DWORD_PATH: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// [`widen_to_dwords`], timed into [`DWORD_PATH`].
+fn widen_timed(addr: usize, now: &[u8], held: &mut [u8], title: Option<&[u8]>) -> (u64, u64) {
+    let began = std::time::Instant::now();
+    let out = widen_to_dwords(addr, now, held, title);
+    DWORD_PATH[0].fetch_add(1, Ordering::Relaxed);
+    DWORD_PATH[1].fetch_add(now.len() as u64, Ordering::Relaxed);
+    DWORD_PATH[2].fetch_add(out.0, Ordering::Relaxed);
+    DWORD_PATH[3].fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    out
+}
+
+/// For the frame-rate line, over `frames` frames: what [`land_dwords`] cost.
+pub(crate) fn dword_path_line(frames: f64) -> Option<String> {
+    let [n, bytes, widened, ns] = [0, 1, 2, 3].map(|i| DWORD_PATH[i].swap(0, Ordering::Relaxed) as f64 / frames.max(1.0));
+    (n > 0.0).then(|| {
+        format!(
+            "dword landing per frame: {n:.0} stretches, {:.1} MB looked at, {widened:.0} dwords widened, {:.2} ms",
+            bytes / 1e6,
+            ns / 1e6
+        )
+    })
+}
+
 /// `[first, last]` (byte offsets in a stretch from title address `addr` of
 /// `n` bytes) widened to whole dwords by title address, within the stretch.
 fn dword_bounds(addr: usize, first: usize, last: usize, n: usize) -> (usize, usize) {
@@ -2502,6 +2529,9 @@ pub(crate) mod resent {
         let line = take_line();
         if !line.is_empty() {
             tracing::info!("copies in the card's memory sent up again per frame: {}", line.said(frames));
+        }
+        if let Some(dwords) = super::dword_path_line(frames) {
+            tracing::info!("{dwords}");
         }
         {
             let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
@@ -5032,7 +5062,7 @@ impl Shadow {
             let card = unsafe { std::slice::from_raw_parts(now.add(a), b - a) };
             // SAFETY: inside the mapping of the CPU's side (the caller's).
             let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(lo + a), b - a) };
-            widened += widen_to_dwords(start + lo + a, card, held, None).0;
+            widened += widen_timed(start + lo + a, card, held, None).0;
         }
         widened
     }
@@ -5636,7 +5666,7 @@ impl Shadow {
             // As in `copy_back`: the card's byte where it is not what it
             // was before the submission, else the title's.
             if dwords {
-                let (mixed, _) = widen_to_dwords(start + at, gpu, old, None);
+                let (mixed, _) = widen_timed(start + at, gpu, old, None);
                 if mixed > 0 {
                     resent::note(self.start, self.len, resent::Resent { dwords: mixed, ..Default::default() });
                 }
@@ -5730,7 +5760,7 @@ impl Shadow {
         for (a, b) in outside(at, at + n, skip) {
             let (a, b) = (a - at, b - at);
             if dwords {
-                mixed += widen_to_dwords(start + at + a, &gpu[a..b], &mut held[a..b], None).0;
+                mixed += widen_timed(start + at + a, &gpu[a..b], &mut held[a..b], None).0;
             }
             // Title memory that is not mapped: the CPU's side keeps what
             // the card wrote, as before; `title` is scratch then.
