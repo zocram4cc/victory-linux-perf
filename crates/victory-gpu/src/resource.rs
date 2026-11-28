@@ -1333,6 +1333,17 @@ struct Hosted {
     wanted: std::sync::atomic::AtomicU32,
     /// The next host copy takes the place of one with fewer levels.
     grown: std::sync::atomic::AtomicBool,
+    /// The host GPU wrote it by a copy or resolve (`crate::texture`
+    /// `host_written`): what a draw's read asks, without that set's lock.
+    host_written: std::sync::atomic::AtomicBool,
+    /// The first level its staging buffer holds (`crate::texture`
+    /// `STAGING`), `u32::MAX` while it has none: what a draw's read asks,
+    /// without that table's lock. Written under it.
+    staged_first: std::sync::atomic::AtomicU32,
+    /// [`alias_of`]'s kept answer that no texture the host writes lies at
+    /// its memory: 1 + the change count of its memory's bucket
+    /// ([`TARGET_CHANGES`]) when it was found; 0 while none is kept.
+    no_target: std::sync::atomic::AtomicU32,
 }
 
 /// Whether a texture the title places in memory is read, kept and uploaded
@@ -1557,6 +1568,61 @@ impl Drop for Held {
 static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+/// Change counts of [`TARGETS_AT`], by bucket of the memory's 64 KiB
+/// block: bumped under its lock each time a texture enters it there. A
+/// texture's kept "no target" answer ([`Hosted::no_target`]) holds while
+/// its bucket's count is unchanged (a texture leaving the table makes no
+/// answer "none" wrong), so a draw's read of it takes no lock.
+#[cfg(windows)]
+static TARGET_CHANGES: [std::sync::atomic::AtomicU32; TARGET_BUCKETS] =
+    [const { std::sync::atomic::AtomicU32::new(0) }; TARGET_BUCKETS];
+#[cfg(windows)]
+const TARGET_BUCKETS: usize = 1024;
+
+/// The [`TARGET_CHANGES`] count of the memory at `address`.
+#[cfg(windows)]
+fn target_changes(address: u64) -> &'static std::sync::atomic::AtomicU32 {
+    &TARGET_CHANGES[(address >> 16) as usize % TARGET_BUCKETS]
+}
+
+/// [`TARGETS_AT`], locked (tests that hold it).
+#[cfg(all(test, windows))]
+pub(crate) fn hold_targets() -> std::sync::MutexGuard<'static, std::collections::BTreeMap<u64, usize>> {
+    TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The host GPU wrote title texture `this` by a copy or resolve.
+#[cfg(windows)]
+pub(crate) fn mark_host_written(this: This) {
+    if !this.is_null() {
+        resource(this).host.host_written.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Whether [`mark_host_written`] was said of `this`.
+#[cfg(windows)]
+pub(crate) fn host_written_mark(this: This) -> bool {
+    !this.is_null() && resource(this).host.host_written.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Notes the first level `this`'s staging buffer holds (`u32::MAX`: it
+/// has none). Called under the staging table's lock.
+#[cfg(windows)]
+pub(crate) fn set_staged_first(this: This, first: u32) {
+    if !this.is_null() {
+        resource(this).host.staged_first.store(first, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// The first level `this`'s staging buffer holds, `u32::MAX` if none.
+#[cfg(windows)]
+pub(crate) fn staged_first(this: This) -> u32 {
+    if this.is_null() {
+        return u32::MAX;
+    }
+    resource(this).host.staged_first.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// For `this`, a texture made for a view the title placed in memory
 /// ([`texture_at`]): the title texture the host writes that lies in the
 /// same memory, if there is one of the same size, levels and layers with
@@ -1622,9 +1688,21 @@ fn alias_with<R>(this: This, found: impl FnOnce(This) -> R) -> Option<R> {
     if !r.host.placed.load(Relaxed) || !fills(&r.desc) || !one(&r.desc) {
         return None;
     }
+    // Most placed textures have no target at their memory: that answer is
+    // kept while no texture entered the table near it since.
+    let changes = target_changes(r.data() as u64);
+    let kept = r.host.no_target.load(std::sync::atomic::Ordering::Acquire);
+    if kept != 0 && kept == changes.load(std::sync::atomic::Ordering::Acquire).wrapping_add(1) {
+        return None;
+    }
     // Under the table's lock: a texture leaves it before it is freed.
     let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
-    let other = *targets.get(&(r.data() as u64))? as This;
+    let Some(&other) = targets.get(&(r.data() as u64)) else {
+        let count = changes.load(Relaxed);
+        r.host.no_target.store(count.wrapping_add(1), std::sync::atomic::Ordering::Release);
+        return None;
+    };
+    let other = other as This;
     let o = resource(other);
     const DEPTH: u32 = 0x2;
     let same = one(&o.desc)
@@ -3177,6 +3255,9 @@ fn hand_out_resource(
             placed: std::sync::atomic::AtomicBool::new(false),
             wanted: std::sync::atomic::AtomicU32::new(u32::MAX),
             grown: std::sync::atomic::AtomicBool::new(false),
+            host_written: std::sync::atomic::AtomicBool::new(false),
+            staged_first: std::sync::atomic::AtomicU32::new(u32::MAX),
+            no_target: std::sync::atomic::AtomicU32::new(0),
         },
     });
     // The host copy waits for the texture's first use ([`Hosted`]).
@@ -3186,10 +3267,9 @@ fn hand_out_resource(
         textures().insert(at);
         crate::texback::replaced(resource.data() as usize);
         if !fills(&desc) {
-            TARGETS_AT
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(resource.data() as u64, at);
+            let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+            targets.insert(resource.data() as u64, at);
+            target_changes(resource.data() as u64).fetch_add(1, std::sync::atomic::Ordering::Release);
         }
         if !lazy() {
             let _ = hosted(at as This, true);
@@ -3552,11 +3632,72 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     // that fills at world entry. They are not part of what a texture is.
     // `VICTORY_PLACED_FILLER=1`: kept in the key, as before.
     static KEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    #[cfg(feature = "diagnostics")]
     let raw = *desc;
-    let mut key = *desc;
-    if !*KEPT.get_or_init(|| std::env::var_os("VICTORY_PLACED_FILLER").is_some_and(|v| v == "1")) {
-        key = without_filler(desc);
+    if let Some(r) = placed_seen(address, &raw) {
+        return Some(r);
+    }
+    let kept = *KEPT.get_or_init(|| std::env::var_os("VICTORY_PLACED_FILLER").is_some_and(|v| v == "1"));
+    let found = texture_at_locked(address, raw, kept)?;
+    keep_placed_seen(address, &raw, found);
+    Some(found)
+}
+
+/// Placed textures each thread found lately, by address and description
+/// as asked: draws read the same placed views over and over, and each
+/// lookup in [`PLACED_TEXTURES`] took its lock. A placed texture stays in
+/// that table for the run (nothing takes one out), so what a thread found
+/// holds.
+#[cfg(windows)]
+const PLACED_SEEN: usize = 256;
+
+#[cfg(windows)]
+type PlacedSeen = (u64, [u32; 14], usize);
+
+#[cfg(windows)]
+thread_local! {
+    static SEEN: std::cell::RefCell<Vec<PlacedSeen>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(windows)]
+fn placed_slot(address: u64, desc: &[u32; 14]) -> usize {
+    let mut h = address.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    for &w in desc {
+        h = (h ^ u64::from(w)).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (h >> 40) as usize % PLACED_SEEN
+}
+
+#[cfg(windows)]
+fn placed_seen(address: u64, desc: &[u32; 14]) -> Option<This> {
+    SEEN.with_borrow(|seen| {
+        let &(a, d, r) = seen.get(placed_slot(address, desc))?;
+        (a == address && d == *desc && r != 0).then_some(r as This)
+    })
+}
+
+#[cfg(windows)]
+fn keep_placed_seen(address: u64, desc: &[u32; 14], found: This) {
+    SEEN.with_borrow_mut(|seen| {
+        if seen.is_empty() {
+            seen.resize(PLACED_SEEN, (0, [0; 14], 0));
+        }
+        seen[placed_slot(address, desc)] = (address, *desc, found as usize);
+    });
+}
+
+/// [`PLACED_TEXTURES`], locked (tests that hold it).
+#[cfg(all(test, windows))]
+pub(crate) fn hold_placed() -> std::sync::MutexGuard<'static, std::collections::BTreeMap<(u64, [u32; 14]), usize>> {
+    PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// [`texture_at`] under the table's lock; `kept`: the filler words stay
+/// in the key (`VICTORY_PLACED_FILLER=1`).
+#[cfg(windows)]
+fn texture_at_locked(address: u64, raw: [u32; 14], kept: bool) -> Option<This> {
+    let mut key = raw;
+    if !kept {
+        key = without_filler(&raw);
     }
     // How many resources the filler alone would have added (a count for
     // the log: `placed_filler_twins`).

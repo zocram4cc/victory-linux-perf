@@ -613,10 +613,13 @@ pub(crate) fn let_go_idle() {
     // is reset: one only the table holds is named by no list, recorded or
     // running.
     let (mut went, mut bytes) = (0u64, 0u64);
-    map.retain(|_, s| {
+    map.retain(|&resource, s| {
         let keep = Arc::strong_count(s) > 1
             || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES);
         if !keep {
+            // (A live texture: one the title releases leaves the table
+            // first, under this lock, in `forget`.)
+            crate::resource::set_staged_first(resource as This, u32::MAX);
             LET_GO[0].fetch_add(1, Relaxed);
             LET_GO[1].fetch_add(s.bytes, Relaxed);
             went += 1;
@@ -629,6 +632,18 @@ pub(crate) fn let_go_idle() {
     }
 }
 
+/// [`HOST_WRITTEN`] and [`STAGING`], locked (tests that hold them).
+#[cfg(test)]
+pub(crate) fn hold_tables() -> (
+    std::sync::MutexGuard<'static, Option<std::collections::HashSet<usize>>>,
+    std::sync::MutexGuard<'static, Option<HashMap<usize, Arc<Staging>>>>,
+) {
+    (
+        HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()),
+        STAGING.lock().unwrap_or_else(|e| e.into_inner()),
+    )
+}
+
 /// Textures the host GPU wrote by a copy or resolve: their contents are on
 /// the host, not in title memory, which stays as it was.
 static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
@@ -639,6 +654,7 @@ pub(crate) fn host_written(resource: This) {
         let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
         set.get_or_insert_with(Default::default).insert(resource as usize)
     };
+    crate::resource::mark_host_written(resource);
     // Diagnostics (run 177): where its title memory is, for placed views
     // the title reads that memory through ([`placed_in_host_written`]).
     if new && let Some((at, desc)) = crate::resource::texture_memory(resource) {
@@ -822,11 +838,10 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     } else {
         0
     };
-    let host_written = HOST_WRITTEN
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .is_some_and(|set| set.contains(&(resource as usize)));
+    // (This and the staged level below are asked of the texture itself,
+    // not of the shared tables: every read of every texture by every
+    // recording thread asked them, each under the table's lock.)
+    let host_written = crate::resource::host_written_mark(resource);
     // shortcut: a texture the host copied into keeps the host's contents
     // even if the title later writes its memory too.
     if host_written {
@@ -837,7 +852,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     if !list.first_use(1 << 63 | (resource as usize) << 4 | first as usize & 15) {
         return;
     }
-    if !list.first_use(resource as usize) && staged_from(resource) <= first {
+    if !list.first_use(resource as usize) && crate::resource::staged_first(resource) <= first {
         return;
     }
     let Some(copy) = crate::resource::host_copy(resource) else {
@@ -1837,8 +1852,10 @@ impl Staging {
 /// anew.
 pub(crate) fn unstage(resource: This) {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(map) = map.as_mut() {
-        map.remove(&(resource as usize));
+    if let Some(map) = map.as_mut()
+        && map.remove(&(resource as usize)).is_some()
+    {
+        crate::resource::set_staged_first(resource, u32::MAX);
     }
 }
 
@@ -1894,6 +1911,7 @@ pub(crate) fn staged_state(resource: This) -> Option<(bool, bool)> {
 
 /// The first level a title texture's staging buffer holds; `u32::MAX`
 /// without one.
+#[cfg(test)]
 fn staged_from(resource: This) -> u32 {
     let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     map.as_ref()
@@ -2286,8 +2304,12 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         exact: std::sync::atomic::AtomicBool::new(BAKING.get()),
     });
     map.insert(resource as usize, s.clone());
+    crate::resource::set_staged_first(resource, s.first);
     Some(s)
 }
+
+#[cfg(all(test, windows))]
+mod read_marks_tests;
 
 #[cfg(test)]
 mod title_memory_tests {
