@@ -4440,6 +4440,24 @@ impl<'a> Lower<'a> {
         )
     }
 
+    /// A 32-bit denormal as the console's float mode reads it: a zero of its
+    /// sign, decided on the bits (the host's own denormal mode varies).
+    /// From upstream `77053a0` (the flush used by min, max and med3).
+    fn ftz(&mut self, f: V) -> V {
+        let c = self.cur;
+        let x = self.as_int(f);
+        let (exp, sign, zero) = (
+            self.s.m.i32(0x7F80_0000),
+            self.s.m.i32(0x8000_0000),
+            self.s.m.i32(0),
+        );
+        let e = self.s.m.bin(c, Bin::And, x, exp);
+        let den = self.s.m.cmp(c, pred::EQ, e, zero);
+        let s = self.s.m.bin(c, Bin::And, x, sign);
+        let r = self.s.m.select(c, den, s, x);
+        self.as_float(r)
+    }
+
     /// The hardware's maximum (`max`) or minimum of two floats: as DXIL's
     /// FMax/FMin, but -0 orders below +0 (RDNA2 ISA, `v_max_f32`), where
     /// the compare and select DXIL specifies gives either zero.
@@ -4601,11 +4619,15 @@ impl<'a> Lower<'a> {
                 return self.binary(36, t, high);
             }
         }
-        let lo = self.binary(36, a, b);
-        let hi = self.binary(35, a, b);
-        let t = self.binary(36, hi, third);
-        let median = self.binary(35, lo, t);
-        let least = self.binary(36, lo, third);
+        // Denormals read as signed zero, then the same min/max as
+        // `v_min_f32`/`v_max_f32`, which order -0 below +0. A plain FMin/FMax
+        // chain (DXIL) gives either zero. Upstream `77053a0`.
+        let (a, b, third) = (self.ftz(a), self.ftz(b), self.ftz(third));
+        let lo = self.max_min(false, a, b);
+        let hi = self.max_min(true, a, b);
+        let t = self.max_min(false, hi, third);
+        let median = self.max_min(true, lo, t);
+        let least = self.max_min(false, lo, third);
         let nan_a = self.is_nan_f32(a);
         let nan_b = self.is_nan_f32(b);
         let nan_3 = self.is_nan_f32(third);
@@ -4672,9 +4694,17 @@ impl<'a> Lower<'a> {
         self.s.m.cast(c, Cast::Trunc, hi, self.s.t.i32)
     }
 
-    /// `0 × anything = 0`, as in D3D9.
+    /// `0 × anything = 0`, as in D3D9. A denormal operand counts as zero
+    /// (RDNA2 flushes it), tested on the exponent bits so the host's own
+    /// denormal mode cannot keep it (upstream `704d25eddb`).
     fn legacy_mul(&mut self, a: V, b: V) -> V {
         let c = self.cur;
+        let (exp_mask, izero) = (self.s.m.i32(0x7F80_0000), self.s.m.i32(0));
+        let exp_zero = |l: &mut Self, v: V| {
+            let bits = l.as_int(v);
+            let e = l.s.m.bin(c, Bin::And, bits, exp_mask);
+            l.s.m.cmp(c, pred::EQ, e, izero)
+        };
         if host_rdna() & super::rdna::LEGACY != 0 {
             let m = self.s.m.bin(c, Bin::Mul, a, b);
             let zero = self.s.m.f32(0);
@@ -4694,13 +4724,13 @@ impl<'a> Lower<'a> {
                     self.binary(36, a, b)
                 }
             };
-            let z = self.s.m.cmp(c, pred::OEQ, asked, zero);
+            let z = exp_zero(self, asked);
             return self.s.m.select(c, z, zero, m);
         }
         let m = self.s.m.bin(c, Bin::Mul, a, b);
         let zero = self.s.m.f32(0);
-        let az = self.s.m.cmp(c, pred::OEQ, a, zero);
-        let bz = self.s.m.cmp(c, pred::OEQ, b, zero);
+        let az = exp_zero(self, a);
+        let bz = exp_zero(self, b);
         let z = self.s.m.bin(c, Bin::Or, az, bz);
         self.s.m.select(c, z, zero, m)
     }
@@ -8807,8 +8837,11 @@ impl<'a> Lower<'a> {
             "v_cubeid_f32" | "v_cubesc_f32" | "v_cubetc_f32" | "v_cubema_f32" => {
                 // Cube-map face coordinates (AMD's ISA): the major axis is z
                 // when |z| >= |x| and |z| >= |y|, else y when |y| >= |x|,
-                // else x.
+                // else x. Denormal coordinates read as zeros of their sign
+                // (upstream `77fd81959a`): picked as they are, they come out
+                // as the host's denormal instead of the console's zero.
                 let (x, y, z) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
+                let (x, y, z) = (self.ftz(x), self.ftz(y), self.ftz(z));
                 let (ax, ay, az) = (self.unary(6, x), self.unary(6, y), self.unary(6, z));
                 let zx = self.s.m.cmp(c, pred::OGE, az, ax);
                 let zy = self.s.m.cmp(c, pred::OGE, az, ay);
@@ -9714,6 +9747,43 @@ impl<'a> Lower<'a> {
             _ => {
                 let r = self.integer(inst, name)?;
                 int(self, r)
+            }
+        }
+    }
+
+    /// Operand `k` of a 64-bit instruction as its low and high dwords (i32),
+    /// as [`Self::src64`] reads it. Compared as dwords so AMD's driver cannot
+    /// swap them (`cc7ec2a531`).
+    fn src64_dwords(&mut self, inst: &Inst, k: usize) -> Result<(V, V), Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        if v.abs >> k & 1 != 0 || v.neg >> k & 1 != 0 || v.sdwa.is_some() || v.dpp.is_some() {
+            return Err("64-bit operand modifiers");
+        }
+        let op = *v.src.get(k).ok_or("a missing operand")?;
+        let pair = |l: &mut Self, r: Reg, r1: Reg| -> Result<(V, V), Why> {
+            let lo = l.i32_of(inst.read(r).ok_or("an unread operand")?)?;
+            let hi = l.i32_of(inst.read(r1).ok_or("an unread operand")?)?;
+            Ok((lo, hi))
+        };
+        match op {
+            Operand::Vector { reg, .. } => pair(self, Reg::V(reg), Reg::V(reg + 1)),
+            Operand::Scalar { code, .. } if code != NULL => {
+                pair(self, Reg::S(code), Reg::S(code + 1))
+            }
+            Operand::Const(k @ 128..=208) => {
+                let x = crate::resource::inline(k).ok_or("a special operand")?;
+                let hi = if (x as i32) < 0 { u32::MAX } else { 0 };
+                Ok((self.s.m.i32(x), self.s.m.i32(hi)))
+            }
+            Operand::Literal(x) if inst.name().ends_with("_i64") => {
+                let hi = if (x as i32) < 0 { u32::MAX } else { 0 };
+                Ok((self.s.m.i32(x), self.s.m.i32(hi)))
+            }
+            _ => {
+                let x = self.operand(inst, &op)?;
+                Ok((x, self.s.m.i32(0)))
             }
         }
     }
@@ -11151,22 +11221,46 @@ impl<'a> Lower<'a> {
                 }
             }
             "u64" | "i64" => {
-                let (a, b) = (self.src64(inst, 0)?, self.src64(inst, 1)?);
+                // On the two dwords, not as i64: AMD's D3D12 shader compiler
+                // orders 64-bit integers as if their dwords were swapped
+                // (equality is unaffected), where WARP compares them right.
+                // The high dwords decide, signed for i64; equal ones leave it
+                // to the low dwords, unsigned. Upstream `cc7ec2a531`.
+                let (alo, ahi) = self.src64_dwords(inst, 0)?;
+                let (blo, bhi) = self.src64_dwords(inst, 1)?;
                 let signed = ty == "i64";
-                let p = match op {
-                    "eq" => pred::EQ,
-                    "ne" | "lg" => pred::NE,
-                    "lt" if signed => pred::SLT,
-                    "le" if signed => pred::SLE,
-                    "gt" if signed => pred::SGT,
-                    "ge" if signed => pred::SGE,
-                    "lt" => pred::IULT,
-                    "le" => pred::IULE,
-                    "gt" => pred::IUGT,
-                    "ge" => pred::IUGE,
+                let cmp = |l: &mut Self, p, x, y| l.s.m.cmp(c, p, x, y);
+                match op {
+                    "eq" | "ne" | "lg" => {
+                        let lo = cmp(self, pred::EQ, alo, blo);
+                        let hi = cmp(self, pred::EQ, ahi, bhi);
+                        let eq = self.s.m.bin(c, Bin::And, lo, hi);
+                        if op == "eq" {
+                            eq
+                        } else {
+                            let yes = self.s.m.bool(true);
+                            self.s.m.bin(c, Bin::Xor, eq, yes)
+                        }
+                    }
+                    "lt" | "le" | "gt" | "ge" => {
+                        let (hi_p, lo_p) = match (op, signed) {
+                            ("lt", true) => (pred::SLT, pred::IULT),
+                            ("le", true) => (pred::SLT, pred::IULE),
+                            ("gt", true) => (pred::SGT, pred::IUGT),
+                            ("ge", true) => (pred::SGT, pred::IUGE),
+                            ("lt", false) => (pred::IULT, pred::IULT),
+                            ("le", false) => (pred::IULT, pred::IULE),
+                            ("gt", false) => (pred::IUGT, pred::IUGT),
+                            _ => (pred::IUGT, pred::IUGE),
+                        };
+                        let hi = cmp(self, hi_p, ahi, bhi);
+                        let hi_eq = cmp(self, pred::EQ, ahi, bhi);
+                        let lo = cmp(self, lo_p, alo, blo);
+                        let lo = self.s.m.bin(c, Bin::And, hi_eq, lo);
+                        self.s.m.bin(c, Bin::Or, hi, lo)
+                    }
                     _ => return Err("a 64-bit compare"),
-                };
-                self.s.m.cmp(c, p, a, b)
+                }
             }
             "u32" | "i32" | "u16" | "i16" => {
                 let (a, b) = if ty.ends_with("16") {

@@ -816,7 +816,15 @@ fn serialise(library: &ID3D12PipelineLibrary1, tmp: &std::path::Path, size: usiz
         // SAFETY: a buffer of the size the library asks for.
         return unsafe { library.Serialize(file.bytes_mut()) }.map_err(failed);
     }
-    let mut bytes = vec![0u8; size];
+    // Fallible: an infallible buffer of the library's whole size aborted
+    // the process when the file could not be mapped (upstream `321a4bc1`,
+    // about 1.7 GB of pipeline machine code). The pipelines stay counted
+    // as added, and a later save tries again.
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(size)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    bytes.resize(size, 0);
     // SAFETY: a buffer of the size the library asks for.
     unsafe { library.Serialize(&mut bytes) }.map_err(failed)?;
     std::fs::write(tmp, &bytes)
