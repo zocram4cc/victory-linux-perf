@@ -6514,6 +6514,40 @@ impl<'a> Lower<'a> {
                     self.set(scc, Val::Bit(s));
                     Ok(())
                 }
+                "s_flbit_i32_b64" => {
+                    // The first set bit from the top of 64 (DXIL's first bit
+                    // high counts from the top too), -1 for none.
+                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    let i32t = self.s.t.i32;
+                    let fa = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 33, &[a]);
+                    let fb = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 33, &[b]);
+                    let (z, k32, none) = (self.s.m.i32(0), self.s.m.i32(32), self.s.m.i32(u32::MAX));
+                    let fa = self.s.m.bin(c, Bin::Add, fa, k32);
+                    let low = self.s.m.cmp(c, pred::NE, a, z);
+                    let fa = self.s.m.select(c, low, fa, none);
+                    let high = self.s.m.cmp(c, pred::NE, b, z);
+                    let r = self.s.m.select(c, high, fb, fa);
+                    self.set(lo, Val::I32(r));
+                    Ok(())
+                }
+                "s_bfm_b64" => {
+                    // ((1 << S0[5:0]) - 1) << S1[5:0], 64 bits.
+                    let (w, o) = (half(self, 0, 0)?, half(self, 1, 0)?);
+                    let k63 = self.s.m.i32(63);
+                    let (w, o) = (self.s.m.bin(c, Bin::And, w, k63), self.s.m.bin(c, Bin::And, o, k63));
+                    self.s.flags |= flags::INT64;
+                    let i64t = self.s.m.int(64);
+                    let w = self.s.m.cast(c, Cast::ZExt, w, i64t);
+                    let o = self.s.m.cast(c, Cast::ZExt, o, i64t);
+                    let one = self.s.m.int_const(i64t, 1);
+                    let m = self.s.m.bin(c, Bin::Shl, one, w);
+                    let m = self.s.m.bin(c, Bin::Sub, m, one);
+                    let m = self.s.m.bin(c, Bin::Shl, m, o);
+                    let (l, h) = self.split64(m);
+                    self.set(lo, Val::I32(l));
+                    self.set(hi, Val::I32(h));
+                    Ok(())
+                }
                 "s_ff1_i32_b64" => {
                     // The lowest set bit; -1 for none (as DXIL's first bit low).
                     let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
@@ -9528,6 +9562,34 @@ impl<'a> Lower<'a> {
                 }
                 let a = s(self, 0)?;
                 int(self, a)
+            }
+            "v_ldexp_f32" => {
+                // x * 2^n, exact as the hardware's (no rounding but at the
+                // range's ends): 2^n built from exponent bits, as three
+                // factors so each is a normal float (n clamped to +-252:
+                // past it any float is infinite or zero already).
+                let (a, n) = (f(self, 0)?, s(self, 1)?);
+                let i32t = self.s.t.i32;
+                let (lo, hi) = (self.s.m.i32((-252i32) as u32), self.s.m.i32(252));
+                let n = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 37, &[n, lo]);
+                let n = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 38, &[n, hi]);
+                let k2 = self.s.m.i32(2);
+                let quarter = self.s.m.bin(c, Bin::AShr, n, k2);
+                let k1 = self.s.m.i32(1);
+                let twice = self.s.m.bin(c, Bin::Shl, quarter, k1);
+                let rest = self.s.m.bin(c, Bin::Sub, n, twice);
+                let pow = |l: &mut Self, e: V| {
+                    let k127 = l.s.m.i32(127);
+                    let k23 = l.s.m.i32(23);
+                    let b = l.s.m.bin(c, Bin::Add, e, k127);
+                    let b = l.s.m.bin(c, Bin::Shl, b, k23);
+                    l.as_float(b)
+                };
+                let (p1, p3) = (pow(self, quarter), pow(self, rest));
+                let r = self.s.m.bin(c, Bin::Mul, a, p1);
+                let r = self.s.m.bin(c, Bin::Mul, r, p1);
+                let r = self.s.m.bin(c, Bin::Mul, r, p3);
+                float(self, r)
             }
             "v_add_f32" | "v_sub_f32" | "v_subrev_f32" | "v_mul_f32" | "v_mul_legacy_f32"
             | "v_max_f32" | "v_min_f32" => {
