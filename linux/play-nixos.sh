@@ -1,10 +1,17 @@
 #!/usr/bin/env bash
 # Play clankerVI (victory-proton) on this NixOS machine: release build, your own input (no scripted
 # keys), patched Proton Wine (with UFFD_WP section write-watch + lock-free PAGEMAP_SCAN), gamescope.
-#   ./play-nixos.sh                   Series S (~33.8+ fps sustained)
-#   CONSOLE=series-x ./play-nixos.sh  Series X @ 2560x1440 (~30.6-31.3 fps)
+#   ./play-nixos.sh                   Series S (~33.5-33.8 fps sustained)
+#   CONSOLE=series-x ./play-nixos.sh  Series X @ 2560x1440 (~32.2 fps)
 # Log: ~/.cache/scarlettport-autotest/play-<time>/run.log
 CONSOLE="${CONSOLE:-series-s}"
+if [ -z "${PROFILE+x}" ]; then
+    if [ -x "$HOME/.cache/vp-upstream-win/x86_64-pc-windows-msvc/fast/victory.exe" ]; then
+        PROFILE=fast
+    else
+        PROFILE=release
+    fi
+fi
 args=()
 extra=()
 if [ "$CONSOLE" != series-x ]; then
@@ -12,7 +19,7 @@ if [ "$CONSOLE" != series-x ]; then
 else
     extra=(VICTORY_OUTPUT=2560x1440)
 fi
-PROFILE=release KEYS=0 exec "$(dirname "$0")/nixos-run.sh" "play-$(date +%H%M%S)" 86400 \
+PROFILE="$PROFILE" KEYS=0 exec "$(dirname "$0")/nixos-run.sh" "play-$(date +%H%M%S)" 86400 \
     "${args[@]}" "${extra[@]}" \
     VICTORY_PIPELINE_WAIT_MS=40 \
     VICTORY_PIPELINE_WAIT_EACH_MS=100 \

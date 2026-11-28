@@ -9001,26 +9001,31 @@ impl Batch {
         if crate::watch::port_guard_plan() && runs.len() >= 2 && steps >= WIDE_PLAN_STEPS {
             #[derive(Clone, Copy)]
             struct Lists(*const *const HostList, usize);
-            // SAFETY: the lists outlive the call, which waits for every job.
+            #[derive(Clone, Copy)]
+            struct Out(*mut ListFront, usize);
+            // SAFETY: `lists` and `fronts` outlive `wide_each`, which joins all
+            // workers before returning; each worker `n` writes exclusively to
+            // its own disjoint slot `out[n]`.
             unsafe impl Send for Lists {}
             unsafe impl Sync for Lists {}
+            unsafe impl Send for Out {}
+            unsafe impl Sync for Out {}
             let lists: Vec<*const HostList> = runs.iter().map(|&list| std::ptr::from_ref(list)).collect();
+            let mut fronts: Vec<ListFront> = (0..runs.len()).map(|_| ListFront::default()).collect();
             let at = Lists(lists.as_ptr(), lists.len());
-            let fronts: std::sync::Arc<Vec<std::sync::Mutex<Option<ListFront>>>> =
-                std::sync::Arc::new((0..runs.len()).map(|_| std::sync::Mutex::new(None)).collect());
-            let out = fronts.clone();
+            let out = Out(fronts.as_mut_ptr(), fronts.len());
             let textures = wide_textures();
             crate::shadow::wide_each(runs.len(), move |n| {
                 let at = at;
-                // SAFETY: as above; a list's deferred steps are behind its lock.
+                let out = out;
+                // SAFETY: as above; each `n` is unique in `0..runs.len()`.
                 let list = unsafe { &**at.0.add(n) };
-                debug_assert!(n < at.1);
+                debug_assert!(n < at.1 && n < out.1);
                 let front = list_front(&list.deferred().copies, textures);
-                *out[n].lock().unwrap_or_else(|e| e.into_inner()) = Some(front);
+                unsafe { *out.0.add(n) = front };
             });
             drop(lists);
             planning.next("refreshes in front: the spans");
-            let fronts: Vec<ListFront> = fronts.iter().map(|m| m.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default()).collect();
             for front in &fronts {
                 for staging in &front.textures {
                     if self.texture_due(staging) {
