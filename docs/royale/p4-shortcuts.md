@@ -141,3 +141,24 @@ Result: **1,265 → 1,267.** The census (`VICTORY_WHY_IDENTITY=1`) of what still
 | others | < 300 each | |
 
 **Next with real data: the stride for every buffer descriptor, not only heap-picked ones.** The FSPX metadata record of the table entry gives it (`e[16..20]`, step 9) where the load is from a table at a known entry, and the layer knows every view's stride. Pass it through the same host word mechanism (`RootType::Other`) per table entry, or look it up by the descriptor's slot computed from the table address (`heap_index`), which is the same as for heap-picked ones once the table base is known.
+
+## Verifying with real data: console-compiled test shaders (28 Nov, ~02:00)
+
+The user has legitimate access to the console SDK, kept locally. Rule: reference only, nothing copied into the repository (see `NEXT.md`, "Reference material").
+
+**What works now, offline on Linux:**
+- The console's own shader compiler runs under Wine (a plain prefix, `~/.wine-xdxc`; no game, no GPU).
+- Its native-code variant writes the same `ACCC` part the title ships, beside the DXIL.
+- `cargo run --release -p victory-shader --example translate_file -- FILE` translates such a file. First test: a compute shader that loads a texture and writes a structured buffer translates (2,540 bytes of DXIL).
+
+**What this gives us.** Console code from HLSL we wrote, so we know exactly what it must compute. For each shortcut or blocker we can:
+- write a small HLSL case that makes the console compiler emit the same pattern (a waterfall over descriptors, an alpha-only image store, an occlusion test with gathers, a lane-mask merge, a descriptor kept in spill lanes);
+- check that our translation of it is correct;
+- add it to the tests.
+
+**Executing both and comparing results** is what `emit/diff_tests.rs` already does (it wants `VICTORY_CONSOLE_DXC` and a PC `dxc.exe`), but those tests are Windows-only (D3D12). Plan:
+1. Build the test binary for Windows (`cargo xwin test --no-run -p victory-shader --target x86_64-pc-windows-msvc`).
+2. Run it under the game's Proton, whose D3D12 is vkd3d-proton on the real GPU.
+3. Point `VICTORY_CONSOLE_DXC` at a small wrapper that runs the console compiler under Wine.
+
+That gives real side-by-side runs of console-compiled-and-translated against PC-compiled shaders: the strongest check we can have short of a console.
