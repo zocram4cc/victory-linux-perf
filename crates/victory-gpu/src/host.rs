@@ -9423,21 +9423,25 @@ impl Batch {
         note_refresh_copies(spans.iter().map(|s| &s.0));
         #[cfg(feature = "diagnostics")]
         let wall = std::time::Instant::now();
-        crate::shadow::wide_each(spans.len() + due.len(), move |i| {
+        const SPAN_CHUNK: usize = 32;
+        let span_chunks = spans.len().div_ceil(SPAN_CHUNK);
+        crate::shadow::wide_each(due.len() + span_chunks, move |i| {
             // The textures first: they are the longer pieces.
-            let Some(i) = i.checked_sub(due.len()) else {
+            let Some(chunk) = i.checked_sub(due.len()) else {
                 due[i].refresh();
                 return;
             };
+            let end = ((chunk + 1) * SPAN_CHUNK).min(spans.len());
             // A copy's ranges are refreshed by one thread, one after the other.
-            let (shadow, ranges) = &spans[i];
-            for &(from, to) in ranges {
-                if many && refresh_timed(0, || shadow.nothing_new(from, to - from)) {
-                    #[cfg(feature = "diagnostics")]
-                    FLUSHES[2].fetch_add(1, Ordering::Relaxed);
-                    continue;
+            for (shadow, ranges) in &spans[chunk * SPAN_CHUNK..end] {
+                for &(from, to) in ranges {
+                    if many && refresh_timed(0, || shadow.nothing_new(from, to - from)) {
+                        #[cfg(feature = "diagnostics")]
+                        FLUSHES[2].fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    refresh_timed(1, || Self::update(shadow, from, to));
                 }
-                refresh_timed(1, || Self::update(shadow, from, to));
             }
         });
         #[cfg(feature = "diagnostics")]
