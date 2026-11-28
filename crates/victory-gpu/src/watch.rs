@@ -1327,11 +1327,116 @@ fn ask_submission(ranges: &[(usize, usize)], textures: &[(usize, usize)], keep: 
         // other asking comes between the two parts.
         let _all = Asking::hold_all();
         let merged: Vec<(usize, usize)> = ranges.iter().chain(textures).copied().collect();
-        ask_ahead_held(&merged, true);
-        spent.next("asking: the rest");
-        ask_rest(ranges, true);
+        if one_wave() {
+            spent.next("asking: once, one wave");
+            ask_one_wave(&merged, ranges);
+        } else {
+            ask_ahead_held(&merged, true);
+            spent.next("asking: the rest");
+            ask_rest(ranges, true);
+        }
     }
     spent.end();
+}
+
+/// `VICTORY_ASK_ONE_WAVE=1` (off by default; A/B-able by that name): the
+/// submission's asking ([`ask_submission`]) is one wave over the threads
+/// beside: the runs [`ask_ahead_held`] would ask and the ranges alone
+/// [`ask_rest`] would ask (cut into 16 MiB pieces) together, and one number
+/// for all of it, instead of two waves one after the other.
+fn one_wave() -> bool {
+    #[cfg(test)]
+    if ONE_WAVE_IN_TEST.get() {
+        return true;
+    }
+    if let Some(on) = crate::ab::pick("VICTORY_ASK_ONE_WAVE") {
+        return on;
+    }
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("VICTORY_ASK_ONE_WAVE").is_some_and(|v| v == "1"));
+    *ON
+}
+
+/// [`ask_ahead_held`] of `merged` and [`ask_rest`] of `ranges` as one wave
+/// ([`one_wave`]), the asking held. After Some1sm/clankerVI 802160fdd.
+fn ask_one_wave(merged: &[(usize, usize)], ranges: &[(usize, usize)]) {
+    let usable = |r: &&(usize, usize)| r.0 < r.1 && !published(r.0, r.1) && !refused_as_view(r.0, r.1);
+    let pages = |&(start, end): &(usize, usize)| (start / PAGE, end.div_ceil(PAGE));
+    let mut pieces: Vec<(usize, usize)> = merged.iter().filter(usable).map(pages).collect();
+    pieces.sort_unstable();
+    // Ranges asked alone are the refreshes' (not the textures'), as in `ask_rest`.
+    let mut own: Vec<(usize, usize)> = ranges.iter().filter(usable).map(pages).collect();
+    own.sort_unstable();
+    const CHUNK: usize = (16 << 20) / PAGE;
+    enum Task {
+        Run(std::ops::Range<usize>),
+        Chunk(usize, usize),
+    }
+    let mut tasks: Vec<Task> = Vec::new();
+    let mut singles: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < pieces.len() {
+        let first = pieces[i].0;
+        let mut last = pieces[i].1;
+        let mut k = i + 1;
+        while k < pieces.len() && pieces[k].0 <= last + AHEAD_GAP && last.max(pieces[k].1) - first <= AHEAD_MAX {
+            last = last.max(pieces[k].1);
+            k += 1;
+        }
+        if k - i >= 2 {
+            tasks.push(Task::Run(i..k));
+        } else if own.binary_search(&pieces[i]).is_ok() && !singles.iter().any(|&(a, b)| a <= first && last <= b) {
+            singles.push((first, last));
+            let mut p = first;
+            while p < last {
+                let next = (p + CHUNK).min(last);
+                tasks.push(Task::Chunk(p, next));
+                p = next;
+            }
+        }
+        i = k;
+    }
+    let (mut asked, mut written) = (Vec::new(), Vec::new());
+    for (a, w) in spread_each(tasks.len(), |t| {
+        let (mut a, mut w) = (Vec::new(), Vec::new());
+        match &tasks[t] {
+            Task::Run(range) => ask_run(&pieces[range.clone()], &mut a, &mut w),
+            &Task::Chunk(first, last) => {
+                #[cfg(feature = "diagnostics")]
+                let asking = std::time::Instant::now();
+                let found = kernel_written(first, last);
+                #[cfg(feature = "diagnostics")]
+                alone(first * PAGE, last * PAGE, found.as_ref().map_or(0, Vec::len), asking.elapsed());
+                if let Some(pages) = found {
+                    w.extend(pages);
+                    a.push((first, last));
+                }
+            }
+        }
+        (a, w)
+    }) {
+        asked.extend(a);
+        written.extend(w);
+    }
+    // A failed run's pieces alone are left to `writes`, as `ask_run` leaves them.
+    let asked = joined_ranges(asked);
+    note_hot(&written);
+    if port_journal() {
+        let now = note_shared(&written);
+        let mut j = journal_mut();
+        j.ahead_asked = now;
+        j.kept = !asked.is_empty();
+        j.ahead.set(asked);
+        return;
+    }
+    let mut j = journal_mut();
+    let now = next_asking();
+    j.ahead_asked = now;
+    for (page, parts) in written {
+        j.notes.note(page, parts, now);
+    }
+    j.kept = !asked.is_empty();
+    j.ahead.set(asked);
 }
 
 /// Pages of a quiet block: 1 MiB.
@@ -1592,6 +1697,20 @@ fn ask_rest(ranges: &[(usize, usize)], held: bool) {
     }
     j.kept = !ahead.is_empty();
     j.ahead.set(ahead);
+}
+
+/// `ranges` in order, those that touch joined: a range asked in pieces is
+/// held whole (`Ahead::holds` looks for one range holding all of it).
+fn joined_ranges(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    ranges.sort_unstable();
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (first, last) in ranges {
+        match out.last_mut() {
+            Some(prev) if first <= prev.1 => prev.1 = prev.1.max(last),
+            _ => out.push((first, last)),
+        }
+    }
+    out
 }
 
 /// Diagnostics: the ranges a submission's asking asks about alone
@@ -2145,6 +2264,8 @@ thread_local! {
     pub(crate) static HOT_IN_TEST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// [`port_guard`], for what this thread does.
     pub(crate) static PORT_GUARD_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// [`one_wave`], for what this thread does.
+    pub(crate) static ONE_WAVE_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The blocks a thread holding [`GUARDS`] shared is changing the state of
@@ -5700,6 +5821,44 @@ mod tests {
         PORT_JOURNAL_IN_TEST.set(false);
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// `VICTORY_ASK_ONE_WAVE`: the one wave asks what the two passes ask: a run of two
+    /// ranges, a 40 MiB range alone (in pieces) with a write near its end, a texture's
+    /// range near a buffer's; a lone texture's range is left to its own asking.
+    #[test]
+    fn one_wave_asks_what_the_two_passes_ask() {
+        const MIB: usize = 1 << 20;
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe { VirtualAlloc(std::ptr::null(), 200 * MIB, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+        assert_ne!(p, 0);
+        let a = p.next_multiple_of(MIB);
+        let run = [(a, a + PAGE), (a + 3 * PAGE, a + 4 * PAGE)];
+        let alone = (a + 70 * MIB, a + 110 * MIB);
+        let texture = (a + 2 * MIB, a + 2 * MIB + PAGE);
+        let lone = (a + 180 * MIB, a + 180 * MIB + PAGE);
+        // SAFETY: committed pages of ours.
+        unsafe {
+            ((a + 109 * MIB + 8) as *mut u8).write(1);
+            ((a + 2 * MIB + 8) as *mut u8).write(1);
+        }
+        ONE_WAVE_IN_TEST.set(true);
+        ask_once(&[run[0], run[1], alone], &[texture, lone]);
+        let held = |r: (usize, usize)| asked(r.0, r.1);
+        let (run_held, alone_found, texture_found, lone_held) = (
+            held(run[0]).is_some() && held(run[1]).is_some(),
+            held(alone).map(|(_, pages)| pages.iter().any(|&(page, _)| page == (a + 109 * MIB) / PAGE)),
+            held(texture).map(|(_, pages)| pages.iter().any(|&(page, _)| page == (a + 2 * MIB) / PAGE)),
+            held(lone).is_some(),
+        );
+        ask_once_end();
+        ONE_WAVE_IN_TEST.set(false);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+        assert!(run_held, "the run is asked");
+        assert_eq!(alone_found, Some(true), "the range alone is asked, its write found");
+        assert_eq!(texture_found, Some(true), "the texture near a buffer joins");
+        assert!(!lone_held, "a lone texture is left to its own asking");
     }
 
     /// `VICTORY_ASK_TEXTURES`: a texture's range near a buffer's is asked about with it, in the
