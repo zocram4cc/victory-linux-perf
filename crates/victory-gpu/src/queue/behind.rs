@@ -1226,6 +1226,49 @@ mod tests {
         lane.look(limit);
     }
 
+    #[test]
+    fn slot_pressure_preserves_commands_and_fence_order() {
+        fn run(by_landing: bool, needed: u64) -> Vec<String> {
+            let lane = Lane::new();
+            let log: Log = Default::default();
+            let f = fence();
+            for (i, command) in ["copy", "dispatch", "draw"].into_iter().enumerate() {
+                lane.push(1, [T::Run(command, log.clone()), T::Signal(f, i as u64 + 1, log.clone())]);
+            }
+            // Each completed command releases one slot. The next table needs
+            // two contiguous slots, or four in the permanently exhausted case.
+            let table = crate::host::slot_wait::retry(
+                || (value(f) >= needed).then_some(7),
+                by_landing,
+                || look(&lane),
+                || {
+                    let before = value(f);
+                    lane.look(2 * (before + 1));
+                    value(f) > before
+                },
+            );
+            assert_eq!(value(f), if by_landing { needed.min(3) } else { 3 });
+            if table.is_some() {
+                lane.push(1, [T::Run("draw with table", log.clone())]);
+            }
+            lane.push(1, [T::Signal(f, 4, log.clone())]);
+            look(&lane);
+            assert_eq!(value(f), 4);
+            crate::object::slot::<extern "system" fn(This) -> u32>(f as This, 0x10)(f as This);
+            Arc::try_unwrap(log).unwrap().into_inner().unwrap()
+        }
+        for needed in [2, 4] {
+            let settled = run(false, needed);
+            let mut expected = vec!["copy", "signal 1", "dispatch", "signal 2", "draw", "signal 3"];
+            if needed == 2 {
+                expected.push("draw with table");
+            }
+            expected.push("signal 4");
+            assert_eq!(settled, expected);
+            assert_eq!(run(true, needed), settled);
+        }
+    }
+
     /// A queue's order is kept, a wait for another queue's signal holds only
     /// what is behind it on its own queue, and the oldest goes first.
     #[test]

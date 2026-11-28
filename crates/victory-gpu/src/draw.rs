@@ -1005,14 +1005,15 @@ fn dynamic_or_settle(host: &crate::descriptor::host::HostHeap, n: u32) -> Option
     }
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
-    crate::host::settle_for_fence();
+    // The settle of old, or with `VICTORY_SLOT_WAIT=1` a wait for the
+    // landings that give slots back, outside the submission lock; asks again.
+    let first = crate::host::slot_wait::after_miss(|| host.dynamic(n));
     #[cfg(feature = "diagnostics")]
     {
         use crate::copystat::{C, add};
         add(C::DynamicSettles, 1);
         add(C::DynamicSettleUs, started.elapsed().as_micros() as u64);
     }
-    let first = host.dynamic(n);
     #[cfg(feature = "diagnostics")]
     if first.is_none() {
         crate::copystat::add(crate::copystat::C::DynamicLost, 1);
