@@ -196,7 +196,7 @@ $seriesX = New-Object System.Windows.Forms.RadioButton
 $seriesX.Text = 'Series X (recommended)'
 $seriesX.SetBounds(14, 214, $page2.Width - 28, 24)
 $seriesS = New-Object System.Windows.Forms.RadioButton
-$seriesS.Text = 'Series S (less detail, less memory)'
+$seriesS.Text = 'Series S (less detail, less memory, trees flicker)'
 $seriesS.SetBounds(14, 240, $page2.Width - 28, 24)
 foreach ($r in $seriesX, $seriesS) {
     $r.Font = $bold; $r.ForeColor = [System.Drawing.Color]::White

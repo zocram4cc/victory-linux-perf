@@ -205,7 +205,9 @@ Known problems
 --------------
 - Busy scenes are limited by one CPU thread that hands every frame to the card.
 - Textures of what just came into view can appear late.
-- Trees, plants and far buildings flicker outdoors in some places.
+- Series S only (the 16 GB launchers without the launcher window, or Series S
+  picked in it): trees, plants and far buildings flicker outdoors in some
+  places. Series X does not.
 
 
 Licence and source
