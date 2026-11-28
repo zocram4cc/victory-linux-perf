@@ -357,7 +357,7 @@ pub(crate) fn card_room_kept() -> u64 {
 
 /// The live copies in the card's memory, by id, for statistics and
 /// diagnostics, and for [`card_dirty`] when [`dirty_queued`] is off.
-static CARDED: Mutex<BTreeMap<u64, std::sync::Weak<Shadow>>> = Mutex::new(BTreeMap::new());
+static CARDED: Mutex<BTreeMap<u64, (usize, usize, std::sync::Weak<Shadow>)>> = Mutex::new(BTreeMap::new());
 
 /// Copies with a change not yet taken, queued by their first change
 /// (see [`dirty_queued`]).
@@ -417,7 +417,8 @@ fn share(mut shadow: Shadow) -> Arc<Shadow> {
         shadow.card.as_mut().unwrap().owner = Some(owner.clone());
         shadow
     });
-    CARDED.lock().unwrap_or_else(|e| e.into_inner()).insert(shadow.id, Arc::downgrade(&shadow));
+    let (start, end) = (shadow.start as usize, (shadow.start + shadow.len) as usize);
+    CARDED.lock().unwrap_or_else(|e| e.into_inner()).insert(shadow.id, (start, end, Arc::downgrade(&shadow)));
     shadow
 }
 
@@ -738,7 +739,7 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
     let (fetched, copies) = {
         let carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
         let fetched = RELAY_FETCHED.load(Ordering::Acquire);
-        (fetched, carded.values().filter_map(std::sync::Weak::upgrade).collect::<Vec<_>>())
+        (fetched, carded.values().filter_map(|(_, _, weak)| weak.upgrade()).collect::<Vec<_>>())
     };
     let mut out = Vec::new();
     for shadow in copies {
@@ -842,9 +843,17 @@ pub(crate) fn copy_all(copies: Vec<(usize, usize, usize)>) {
 /// CPU side held the same before or not. Left out is what shaders in the air
 /// may be writing (such a copy waits for them, or is done on the card).
 pub(crate) fn send_copied(dst: usize, len: usize) {
-    for shadow in carded_copies() {
+    let dst_end = dst + len;
+    let hits: Vec<Arc<Shadow>> = CARDED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .filter(|(start, end, _)| *start < dst_end && *end > dst)
+        .filter_map(|(_, _, weak)| weak.upgrade())
+        .collect();
+    for shadow in hits {
         let (start, end) = (shadow.start as usize, (shadow.start + shadow.len) as usize);
-        let (from, to) = (dst.max(start), (dst + len).min(end));
+        let (from, to) = (dst.max(start), dst_end.min(end));
         if from >= to {
             continue;
         }
@@ -858,7 +867,7 @@ pub(crate) fn send_copied(dst: usize, len: usize) {
 
 /// The copies in the card's memory (diagnostics: `crate::host::upcheck`).
 pub(crate) fn carded_copies() -> Vec<Arc<Shadow>> {
-    CARDED.lock().unwrap_or_else(|e| e.into_inner()).values().filter_map(std::sync::Weak::upgrade).collect()
+    CARDED.lock().unwrap_or_else(|e| e.into_inner()).values().filter_map(|(_, _, weak)| weak.upgrade()).collect()
 }
 
 /// Ranges in order, those that overlap or touch as one.
