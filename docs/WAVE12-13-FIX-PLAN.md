@@ -83,6 +83,7 @@ Not a player bug. Windows CI on `dev` (`46723850`) already fails, and this branc
 |---|---|---|
 | `9f33ef0` | `lower` / `lower_counted` allowed as dead in the non-test build. Water-tile length check uses `is_multiple_of` | `git revert --no-edit 9f33ef0` |
 | `721b263` | Diagnostics feature: bitset read, and the UAV closure does not borrow `self` | `git revert --no-edit 721b263` |
+| `fix(ci): clippy on victory-gpu and the stale keep-line tests` | Collapsible conditions and a derivable `Default`, no behavior change except the two tests. HDR dumps of formats 9–10 and 26 already use a cube root, so a half-bright channel is not 127. Past 93% of the budget the keep line trims to 76%, which is 19 GiB of a 100 GiB example, not 11 | `git revert` that commit if a keep-line number looks wrong in game |
 
 Checked here: Windows-target `cargo check --workspace --all-targets`, the same check with `--all-features`, shader/format/pipeline/xtask tests, `cargo xtask policy`. The only test failure left is the pre-existing `documented_switches_are_read` hit for a switch named in `AGENTS.md` and not read by Rust. No new failures from these commits. GitHub CI has not been re-run yet.
 

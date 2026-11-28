@@ -186,10 +186,8 @@ impl Ranges {
         let mut best: Option<(u64, u64, u64)> = None;
         for (&start, &size) in &self.0 {
             let at = start.next_multiple_of(align);
-            if at + len <= start + size {
-                if best.is_none_or(|(_, best_size, _)| size < best_size) {
-                    best = Some((start, size, at));
-                }
+            if at + len <= start + size && best.is_none_or(|(_, best_size, _)| size < best_size) {
+                best = Some((start, size, at));
             }
         }
         let (start, size, at) = best?;

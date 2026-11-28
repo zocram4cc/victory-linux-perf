@@ -145,6 +145,7 @@ static RIP_COUNT: [[AtomicU64; 2]; SLOTS] = [const { [const { AtomicU64::new(0) 
 /// Touches whose instruction found no slot.
 static RIPS_FULL: AtomicU64 = AtomicU64::new(0);
 
+#[allow(clippy::explicit_counter_loop)]
 fn count_rip(rip: usize, write: bool) {
     let mut i = rip.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56;
     for _ in 0..SLOTS {

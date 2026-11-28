@@ -698,7 +698,7 @@ mod tests {
         // Low commit (<3 GiB) steps watermark down to 73% (~11.3 GB) to avoid OOM
         assert_eq!(vram_keep_for(budget, 12_000 * MIB, 83, Some(2 * GIB)).0, 5_000);
         // Critical commit (<1.5 GiB) steps watermark down to 63% (~9.7 GB)
-        assert_eq!(vram_keep_for(budget, 12_000 * MIB, 83, Some(1 * GIB)).0, 3_000);
+        assert_eq!(vram_keep_for(budget, 12_000 * MIB, 83, Some(GIB)).0, 3_000);
         // 16 GB RAM hosts do not false-latch pool wipes on Windows standby dips when commit >= 3.5 GiB
         assert!(!next_pressure_for_host(false, 768 * MIB, 6 * GIB, 16 * GIB));
         assert!(!next_pressure_for_host(false, 362 * MIB, 5594 * MIB, 16 * GIB));

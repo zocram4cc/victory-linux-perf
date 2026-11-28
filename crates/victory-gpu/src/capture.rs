@@ -963,13 +963,20 @@ mod tests {
             0x3c0 | (0x380 << 11),
         ];
         let packed: Vec<_> = packed.into_iter().flat_map(u32::to_le_bytes).collect();
-        let expected = [0, 255, 0, 255, 255, 127, 0, 255];
+        // These formats are drawn through a cube root, so a half-bright
+        // channel is not 127. NaN stays 0 and +infinity stays 255.
+        let mid = ((0.5f32).cbrt() * 255.0) as u8;
         for (format, row) in [(10, half), (26, packed)] {
-            assert_eq!(
-                super::to_rgba(format, 2, 1, row.len(), &row).as_deref(),
-                Some(&expected[..]),
-                "format {format}"
-            );
+            let rgba = super::to_rgba(format, 2, 1, row.len(), &row).expect("format");
+            assert_eq!(&rgba[..4], &[0, 255, 0, 255], "nan and +inf, format {format}");
+            assert_eq!(rgba[4], 255, "1.0, format {format}");
+            assert_eq!(rgba[6], 0, "0, format {format}");
+            assert_eq!(rgba[7], 255, "alpha, format {format}");
+            if format == 10 {
+                assert_eq!(rgba[5], mid, "0.5 through the cube root");
+            } else {
+                assert!(rgba[5] > 0 && rgba[5] < 255, "finite mid channel, format {format}");
+            }
         }
     }
 

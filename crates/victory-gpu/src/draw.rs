@@ -700,17 +700,18 @@ impl CopySpans {
     #[inline]
     fn insert_slot(&mut self, slot: u32, from: u64, to: u64) -> bool {
         let prev = self.slots.insert(slot as usize, (from, to));
-        if let Some((old_from, old_to)) = prev {
-            if !self.dirty && (old_from <= self.merged.0 || old_to >= self.merged.1) {
-                if from <= old_from && to >= old_to {
-                    // Strictly widened or kept the boundary: no rescan needed!
-                    self.merged.0 = self.merged.0.min(from);
-                    self.merged.1 = self.merged.1.max(to);
-                    return false;
-                }
-                self.dirty = true;
-                return true;
+        if let Some((old_from, old_to)) = prev
+            && !self.dirty
+            && (old_from <= self.merged.0 || old_to >= self.merged.1)
+        {
+            if from <= old_from && to >= old_to {
+                // Strictly widened or kept the boundary: no rescan needed!
+                self.merged.0 = self.merged.0.min(from);
+                self.merged.1 = self.merged.1.max(to);
+                return false;
             }
+            self.dirty = true;
+            return true;
         }
         if !self.dirty {
             self.merged.0 = self.merged.0.min(from);
@@ -754,6 +755,7 @@ impl CopySpans {
 }
 
 /// let go starts afresh (codec-d/cool_fox c64fc9b4).
+#[derive(Default)]
 pub(crate) struct BufferSweep {
     passes: u64,
     /// Per-slot lightweight record `(copy_key, from, to)` (no per-slot `Arc` clone/drop).
@@ -768,20 +770,6 @@ pub(crate) struct BufferSweep {
     active_views: u32,
     // Last refresh frame and covered interval for throttled, unwatched copies.
     unwatched: std::collections::HashMap<u64, (u64, u64, u64)>,
-}
-
-impl Default for BufferSweep {
-    fn default() -> Self {
-        Self {
-            passes: 0,
-            slot_info: Vec::new(),
-            slot_meta: Vec::new(),
-            copies: Default::default(),
-            dirty_copies: Vec::new(),
-            active_views: 0,
-            unwatched: Default::default(),
-        }
-    }
 }
 
 impl BufferSweep {
@@ -866,27 +854,24 @@ impl BufferSweep {
         match (old, range) {
             (None, None) => {
                 crate::phase2_prof::inc(crate::phase2_prof::c::SWEEP_SET_NOOP);
-                return;
             }
             (Some((ok, of, ot)), Some((ns, nf, nt))) if ok == std::sync::Arc::as_ptr(&ns) as usize && of == nf && ot == nt => {
                 crate::phase2_prof::inc(crate::phase2_prof::c::SWEEP_SET_NOOP);
-                return;
             }
             (old_opt, new_opt) => {
                 if new_opt.is_some() && sidx >= self.slot_info.len() {
                     self.slot_info.resize(sidx + 1, None);
                 }
                 let new_key_opt = new_opt.as_ref().map(|(ns, _, _)| std::sync::Arc::as_ptr(ns) as usize);
-                if let Some((ok, _, _)) = old_opt {
-                    if new_key_opt != Some(ok) {
-                        if let Some(entry) = self.copies.get_mut(&ok) {
-                            let (empty, became_dirty) = entry.remove_slot(slot);
-                            if empty {
-                                self.copies.remove(&ok);
-                            } else if became_dirty {
-                                self.dirty_copies.push(ok);
-                            }
-                        }
+                if let Some((ok, _, _)) = old_opt
+                    && new_key_opt != Some(ok)
+                    && let Some(entry) = self.copies.get_mut(&ok)
+                {
+                    let (empty, became_dirty) = entry.remove_slot(slot);
+                    if empty {
+                        self.copies.remove(&ok);
+                    } else if became_dirty {
+                        self.dirty_copies.push(ok);
                     }
                 }
                 match (old_opt, new_opt) {
@@ -957,6 +942,7 @@ impl<T> HeapRanges<T> {
         self.0.iter_mut().skip(part as usize).step_by(parts as usize).for_each(|r| *r = None);
     }
 
+    #[allow(dead_code)]
     fn part_ranges(&self, part: u32, parts: u32) -> impl Iterator<Item = &(T, u64, u64)> {
         self.0.iter().skip(part as usize).step_by(parts as usize).flatten()
     }
@@ -1232,7 +1218,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         let _p2_chg = crate::phase2_prof::span(crate::phase2_prof::t::HBP_CHANGES);
         host.buffer_changes()
     };
-    let all = kept.passes == 0 || (kept.passes % HEAP_ROUND == 0 && !heap_spread());
+    let all = kept.passes == 0 || (kept.passes.is_multiple_of(HEAP_ROUND) && !heap_spread());
     let spread = !all && heap_spread();
     crate::phase2_prof::inc(if all {
         crate::phase2_prof::c::HBP_PASS_ALL

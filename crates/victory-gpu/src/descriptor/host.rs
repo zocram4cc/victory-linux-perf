@@ -3122,6 +3122,7 @@ impl HostHeap {
     /// Single-probe fast path on `ListViews::made` hits; also returns `Some(View)`
     /// when the caller still needs `readable()` for this slot, avoiding a second
     /// TLS borrow and HashMap lookup (`listed_view`).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn make_listed_into(
         &self,
         recording: u64,
@@ -3180,11 +3181,9 @@ impl HostHeap {
                     };
                     let direct_kind = if shadow.in_place() {
                         1u8
-                    } else if smode == 1 && shadow.carded() {
-                        2u8
-                    } else if smode == 2
-                        && shadow.carded()
-                        && !shadow.is_gpu_written_in(address, u64::from(size))
+                    } else if shadow.carded()
+                        && (smode == 1
+                            || (smode == 2 && !shadow.is_gpu_written_in(address, u64::from(size))))
                     {
                         2u8
                     } else {

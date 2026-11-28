@@ -1327,9 +1327,7 @@ impl Staging {
             with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
                 let hash = digest(read);
-                if last.hash == Some(hash) {
-                    last.asked = now;
-                } else if last.convert(Some(hash), || self.detile(read)) {
+                if last.hash == Some(hash) || last.convert(Some(hash), || self.detile(read)) {
                     last.asked = now;
                 }
             });

@@ -601,7 +601,7 @@ pub(crate) fn line(frames: f64) {
         let by = WRITERS.lock().unwrap_or_else(|e| e.into_inner());
         let mut v: Vec<_> = by.iter().map(|(&rip, &count)| (rip, count)).collect();
         drop(by);
-        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v.sort_by_key(|a| std::cmp::Reverse(a.1));
         v.into_iter().take(6).map(|(rip, n)| format!("{} {n}", writer_name(rip))).collect::<Vec<_>>().join(", ")
     };
     tracing::info!(

@@ -293,7 +293,7 @@ mod tests {
     fn lines_cut_short_or_damaged_are_left_out() {
         let k = key(&sampler(0, 0));
         let whole = line(&k);
-        assert_eq!(parse(&whole[..whole.len() - 3]).is_some_and(|p| p == k), false);
+        assert!(!parse(&whole[..whole.len() - 3]).is_some_and(|p| p == k));
         assert_eq!(parse("1 2 3"), None);
         assert_eq!(parse(&format!("{whole} 7")), None);
         assert_eq!(parse("zz 0 0 0 0 0 0 0 0 0 0 0 0"), None);

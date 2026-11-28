@@ -11583,7 +11583,7 @@ impl Host {
             let mut showing = crate::timeline::span("the host's Present");
             // With VICTORY_ALLOW_TEARING=1 (and VSync off), present without
             // 60 Hz VSync quantization so frame-gen does not drop 30 -> 20 -> 15.
-            let vsync = vsync_asked().unwrap_or_else(|| generated && !p.tearing);
+            let vsync = vsync_asked().unwrap_or(generated && !p.tearing);
             let mut status = if p.tearing && !vsync {
                 p.swap_chain.Present(0, DXGI_PRESENT_ALLOW_TEARING)
             } else {
@@ -13176,9 +13176,10 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         let (idle, most) = super::vram_keep(budget, 90 * gib);
         assert_eq!(idle, 5_000);
         assert_eq!(most, 90 * gib - budget / 100 * 80);
+        // At or above 93 % (85 + 8) the short line trims back to 76 % (85 - 9).
         let (idle, most) = super::vram_keep(budget, 95 * gib);
         assert_eq!(idle, 3_000);
-        assert_eq!(most, 95 * gib - budget / 100 * 84);
+        assert_eq!(most, 95 * gib - budget / 100 * 76);
     }
 
     #[test]
@@ -13221,7 +13222,7 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(vram_keep(100 * gib, 84 * gib).0, 600_000);
         // Past it: the longest idle ones, enough to come down.
         assert_eq!(vram_keep(100 * gib, 88 * gib), (5_000, 8 * gib));
-        assert_eq!(vram_keep(100 * gib, 95 * gib), (3_000, 11 * gib));
+        assert_eq!(vram_keep(100 * gib, 95 * gib), (3_000, 19 * gib));
         assert_eq!(vram_keep(100 * gib, 120 * gib), (3_000, 36 * gib));
         assert_eq!(vram_keep(0, 7).0, 5_000);
     }

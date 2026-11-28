@@ -1471,10 +1471,11 @@ impl TlsViewsCache {
 /// `LIST_VIEWS` HashMap probes and `view_at()` dispatch when `PORT_CBV=0`.
 #[inline]
 pub(crate) fn inline_constant(words: [u32; 3]) -> Option<(u64, u32)> {
-    if words[0] == VIEW_TAG && (words[2] >> KIND_SHIFT) == CONSTANT {
-        if let View::Constant(address, size) = constant_of(words[1], words[2]) {
-            return Some((address, size));
-        }
+    if words[0] == VIEW_TAG
+        && (words[2] >> KIND_SHIFT) == CONSTANT
+        && let View::Constant(address, size) = constant_of(words[1], words[2])
+    {
+        return Some((address, size));
     }
     None
 }
