@@ -275,8 +275,9 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
     while !more.is_empty() {
         // (Joined once for the round: one by one the 2,800 fills of a frame
         // sorted the ranges each time, 16 ms of the submitting thread.)
-        let (mut reads, mut writes) = (Vec::new(), Vec::new());
-        for i in std::mem::take(&mut more) {
+        let round = std::mem::take(&mut more);
+        let (mut reads, mut writes) = (Vec::with_capacity(round.len()), Vec::with_capacity(round.len()));
+        for i in round {
             takes(&does[i])?;
             taken[i] = true;
             if let Some((r, w)) = reads_writes(&does[i]) {
@@ -359,16 +360,19 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
         let mut level = 0;
         // Behind what writes what this reads or writes, and, if this
         // writes, behind what reads it.
-        let ahead: Box<dyn Iterator<Item = usize>> =
-            if writes { Box::new(0..out.len()) } else { Box::new(copies.iter().copied()) };
-        for k in ahead {
+        let mut visit = |k: usize| {
             let (j, at): (usize, u32) = out[k];
-            let Some((jr, jw)) = reads_writes(&does[j]) else {
-                continue;
-            };
-            if at >= level && (meet(jw, r) || meet(jw, w) || meet(jr, w)) {
+            if let Some((jr, jw)) = reads_writes(&does[j])
+                && at >= level
+                && (meet(jw, r) || meet(jw, w) || meet(jr, w))
+            {
                 level = at + 1;
             }
+        };
+        if writes {
+            (0..out.len()).for_each(&mut visit);
+        } else {
+            copies.iter().copied().for_each(&mut visit);
         }
         if writes {
             copies.push(out.len());
@@ -413,10 +417,11 @@ fn holder(writers: &[Writer], from: usize, to: usize) -> Result<Arc<Shadow>, &'s
 /// What the steps of `runs` do, and which step each is (its list by address,
 /// its place in it). `written`: what flights may write.
 fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(usize, usize)>) {
-    let mut does = Vec::new();
+    let total: usize = runs.iter().map(|list| list.deferred().copies.len()).sum();
+    let mut does = Vec::with_capacity(total);
     // Which step each is. One list's lock at a time: a submission may
     // name a list twice.
-    let mut steps = Vec::new();
+    let mut steps = Vec::with_capacity(total);
     for list in runs {
         for (i, step) in list.deferred().copies.iter().enumerate() {
             does.push(match step {
