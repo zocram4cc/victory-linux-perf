@@ -2184,40 +2184,54 @@ fn by_query() -> bool {
 /// Of the kernel's pages that hold `[at, at + len)` (`len > 0`): how many
 /// can be read, and how many there are; with `all`, it stops at the first
 /// that cannot. One question to the kernel for up to 256 pages at once
-/// (`QueryWorkingSetEx`: the state of each page asked about, no walk); a
-/// page not in the working set may still be there (never touched, or
-/// trimmed), and a one-byte read through the kernel says.
+/// (`QueryWorkingSetEx`: the state of each page asked about, no walk; or,
+/// with `VICTORY_PAGEMAP_READ=1`, the present bits of our own page table,
+/// see [`pagemap_read`]); a page not in the working set may still be there
+/// (never touched, or trimmed), and a one-byte read through the kernel says.
 /// A page that is committed and may not be read counts as not there, which
 /// is what the callers ask for: they read or write the memory next.
 fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
+    readable_by(at, len, all, pagemap_read())
+}
+
+/// [`readable`] with the source of the working-set answers given: our page
+/// table if `Some`, the query if `None`.
+fn readable_by(at: usize, len: usize, all: bool, file: Option<&std::fs::File>) -> (usize, usize) {
     use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     const KERNEL_PAGE: usize = 4096;
     let (first, last) = (at / KERNEL_PAGE, at.saturating_add(len - 1) / KERNEL_PAGE);
     let of = last - first + 1;
     let mut there = 0;
-    // SAFETY: plain data.
-    let mut info: [PSAPI_WORKING_SET_EX_INFORMATION; 256] = unsafe { std::mem::zeroed() };
     let mut page = first;
     while page <= last {
-        let n = (last - page + 1).min(info.len());
-        for (i, entry) in info[..n].iter_mut().enumerate() {
-            entry.VirtualAddress = ((page + i) * KERNEL_PAGE) as *mut _;
+        let n = (last - page + 1).min(256);
+        let mut resident = [false; 256];
+        if let Some(file) = file {
+            present(file, page, &mut resident[..n]);
+        } else {
+            // SAFETY: plain data.
+            let mut info: [PSAPI_WORKING_SET_EX_INFORMATION; 256] = unsafe { std::mem::zeroed() };
+            for (i, entry) in info[..n].iter_mut().enumerate() {
+                entry.VirtualAddress = ((page + i) * KERNEL_PAGE) as *mut _;
+            }
+            // SAFETY: `n` entries of the size given; our own process.
+            let asked = unsafe {
+                K32QueryWorkingSetEx(
+                    GetCurrentProcess(),
+                    info.as_mut_ptr().cast(),
+                    (n * size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32,
+                )
+            } != 0;
+            for (i, entry) in info[..n].iter().enumerate() {
+                // Bit 0 of the answer: the page is in the working set.
+                // SAFETY: plain data the query filled in.
+                resident[i] = asked && unsafe { entry.VirtualAttributes.Flags } & 1 != 0;
+            }
         }
-        // SAFETY: `n` entries of the size given; our own process.
-        let asked = unsafe {
-            K32QueryWorkingSetEx(
-                GetCurrentProcess(),
-                info.as_mut_ptr().cast(),
-                (n * size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32,
-            )
-        } != 0;
-        for (i, entry) in info[..n].iter().enumerate() {
-            // Bit 0 of the answer: the page is in the working set.
-            // SAFETY: plain data the query filled in.
-            let valid = asked && unsafe { entry.VirtualAttributes.Flags } & 1 != 0;
+        for (i, &held) in resident[..n].iter().enumerate() {
             let mut byte = [0u8];
-            if valid || crate::host::read_into(((page + i) * KERNEL_PAGE) as *const u8, &mut byte) {
+            if held || crate::host::read_into(((page + i) * KERNEL_PAGE) as *const u8, &mut byte) {
                 there += 1;
             } else if all {
                 return (there, of);
@@ -2226,6 +2240,90 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
         page += n;
     }
     (there, of)
+}
+
+/// The page table [`readable`] takes the present bits from
+/// (`VICTORY_PAGEMAP_READ=1`), rather than `K32QueryWorkingSetEx`, which Wine
+/// answers under `virtual_mutex`. A present page counts as there whatever its
+/// protection; Wine's answer says no for a guard or no-access page, and that
+/// is the one difference from the query.
+fn pagemap_read() -> Option<&'static std::fs::File> {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("VICTORY_PAGEMAP_READ").is_some_and(|v| v == "1")
+    });
+    if *ON { pagemap() } else { None }
+}
+
+/// Wine's `ProcessWineUnixPid` information class: the unix pid of a process.
+const PROCESS_WINE_UNIX_PID: i32 = 1101;
+
+#[link(name = "ntdll", kind = "raw-dylib")]
+unsafe extern "system" {
+    fn NtQueryInformationProcess(
+        process: windows_sys::Win32::Foundation::HANDLE,
+        class: i32,
+        info: *mut std::ffi::c_void,
+        len: u32,
+        ret_len: *mut u32,
+    ) -> i32;
+}
+
+/// Our own page table, `/proc/<pid>/pagemap`, opened once for the life of the
+/// process: `None`, logged once, if it cannot be opened. Wine opens files in
+/// the wineserver, whose `/proc/self` is the server, so the file is named by
+/// our pid, which Wine gives.
+fn pagemap() -> Option<&'static std::fs::File> {
+    static PAGEMAP: std::sync::LazyLock<Option<std::fs::File>> = std::sync::LazyLock::new(|| {
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let mut pid = 0i32;
+        let mut len = 0u32;
+        // SAFETY: an int, as the class gives it, for our own process.
+        let status = unsafe {
+            NtQueryInformationProcess(
+                GetCurrentProcess(),
+                PROCESS_WINE_UNIX_PID,
+                (&raw mut pid).cast(),
+                size_of::<i32>() as u32,
+                &mut len,
+            )
+        };
+        if status != 0 {
+            once!(
+                status,
+                "the unix pid is not known: the working set is asked"
+            );
+            return None;
+        }
+        std::fs::File::open(format!(r"\\?\unix\proc\{pid}\pagemap"))
+            .inspect_err(|e| {
+                once!(
+                    ?e,
+                    "our page table cannot be opened: the working set is asked"
+                )
+            })
+            .ok()
+    });
+    PAGEMAP.as_ref()
+}
+
+/// Whether each page from `first` on is present in our page table (bit 63 of
+/// its entry), for `out.len()` pages (at most 256). A page whose entry could
+/// not be read is not present, and its one-byte read decides.
+fn present(file: &std::fs::File, first: usize, out: &mut [bool]) {
+    use std::os::windows::fs::FileExt;
+    let mut raw = [[0u8; 8]; 256];
+    let got = file
+        .seek_read(raw[..out.len()].as_flattened_mut(), (first * 8) as u64)
+        .unwrap_or_else(|e| {
+            once!(
+                ?e,
+                "our page table cannot be read: its pages are read through the kernel"
+            );
+            0
+        });
+    for (i, (answer, entry)) in out.iter_mut().zip(&raw).enumerate() {
+        *answer = (i + 1) * 8 <= got && u64::from_le_bytes(*entry) >> 63 == 1;
+    }
 }
 
 fn committed_by_query(at: *const u8, len: usize) -> bool {
@@ -3109,5 +3207,58 @@ mod bake_delta_tests {
         assert!(quiet_since(10, &[]), "no write since tracking began");
         assert!(quiet_since(10, &[(0x10, 3), (0x11, 10)]), "writes up to the asking the buffer was filled after");
         assert!(!quiet_since(10, &[(0x10, 3), (0x11, 11)]), "a write after it");
+    }
+}
+
+#[cfg(test)]
+mod pagemap_tests {
+    use super::{pagemap, present, readable_by};
+    use windows_sys::Win32::System::Memory::*;
+
+    /// Four committed pages, the first and third written, then two reserved
+    /// and not committed. The present bits are read before anything reads the
+    /// pages (a read maps a page never written to the zero page, which is
+    /// present too), and the answers are the same from the page table and
+    /// from the working-set query.
+    #[test]
+    fn the_page_table_and_the_working_set_answer_alike() {
+        const PAGE: usize = 4096;
+        // SAFETY: a private reservation of our own; only its committed pages
+        // are written.
+        unsafe {
+            let base =
+                VirtualAlloc(std::ptr::null(), 6 * PAGE, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            assert!(!VirtualAlloc(base.cast(), 4 * PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
+            base.write_volatile(1);
+            base.add(2 * PAGE).write_volatile(1);
+            let file = pagemap().expect("our page table could not be opened");
+
+            let mut bits = [false; 6];
+            present(file, base as usize / PAGE, &mut bits);
+            assert_eq!(
+                bits,
+                [true, false, true, false, false, false],
+                "the present bits"
+            );
+
+            for (at, len, all, want) in [
+                (base as usize, 6 * PAGE, false, (4, 6)),
+                (base as usize, 6 * PAGE, true, (4, 6)),
+                (base.add(4 * PAGE) as usize, PAGE, true, (0, 1)),
+            ] {
+                assert_eq!(
+                    readable_by(at, len, all, None),
+                    want,
+                    "the working-set query, at {at:#x}"
+                );
+                assert_eq!(
+                    readable_by(at, len, all, Some(file)),
+                    want,
+                    "the page table, at {at:#x}"
+                );
+            }
+            VirtualFree(base.cast(), 0, MEM_RELEASE);
+        }
     }
 }
