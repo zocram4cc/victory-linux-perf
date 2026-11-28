@@ -203,6 +203,20 @@ TextureCube cubet : register(t8, space2);
 /// Compute shaders, each `cs`, dispatched as 2×2 groups of 8×8 threads
 /// over a 16×16 texture and a 256-dword buffer.
 const CS_CASES: &[(&str, &str)] = &[
+    // An LDS counter bumped by 1 in some lanes, the old value kept: the
+    // console compiler makes it `ds_append` (P.4: family 0x1cd48770).
+    (
+        "lds append",
+        r#"groupshared uint cnt[4];
+        CS {
+            if (i < 4) cnt[i] = 0;
+            GroupMemoryBarrierWithGroupSync();
+            uint old = 0;
+            if ((d.x & 3) != 0) InterlockedAdd(cnt[2], 1, old);
+            GroupMemoryBarrierWithGroupSync();
+            outb.Store(4 * (d.y * 16 + d.x), old + cnt[2] * 1000);
+        }"#,
+    ),
     // P.4 step 27 (docs/royale/p4-shortcuts.md #1): a store of the alpha
     // channel alone, which the console compiler makes an image store of
     // mask 0x8 and the translation a read of the texel, the channel

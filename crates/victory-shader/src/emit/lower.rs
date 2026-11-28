@@ -5988,6 +5988,51 @@ impl<'a> Lower<'a> {
         if self.s.lds_dwords == 0 {
             return Err("LDS the program does not allocate");
         }
+        // `ds_append` / `ds_consume`: the LDS dword at the instruction's offset
+        // (M0's base, which the console compiler leaves at 0: its code sets no
+        // M0 for them, and the offset is the HLSL counter's own, checked with
+        // the console compiler) gains (loses) the number of active lanes; every
+        // active lane gets the old value (the compiler then adds `v_mbcnt`).
+        // The console wave's lanes must be one host wave's, or the count and
+        // the old value would differ: refused when a console wave runs as two
+        // host halves (with console lanes the host wave is the console's size).
+        if matches!(name, "ds_append" | "ds_consume") {
+            if self.halves.is_some() {
+                return Err("an LDS append across two host waves");
+            }
+            let at = self.begin_guarded(guard);
+            let c = self.cur;
+            let i32t = self.s.t.i32;
+            self.s.flags |= flags::WAVE_OPS;
+            let yes = self.s.m.bool(true);
+            let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+            let b = self.s.op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[yes]);
+            let mut count = self.s.m.i32(0);
+            for k in 0..4 {
+                let w = self.s.m.extract(c, b, k);
+                let n = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 31, &[w]);
+                count = self.s.m.bin(c, Bin::Add, count, n);
+            }
+            let i1t = self.s.t.i1;
+            let first = self.s.op(c, "waveIsFirstLane", Attr::NoUnwind, i1t, 110, &[]);
+            let z = self.s.m.i32(0);
+            let add = self.s.m.select(c, first, count, z);
+            let lds = self.s.lds();
+            let k = self.s.m.i32(offset / 4);
+            let ptr = self.s.m.element(c, lds, k);
+            let rmw = if name == "ds_append" { super::bitcode::Rmw::Add } else { super::bitcode::Rmw::Sub };
+            let old = self.s.m.atomic(c, rmw, ptr, add);
+            let base = self.s.op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[old]);
+            let outside = match dst_reg.and_then(|r| inst.read(Reg::V(r))) {
+                Some(v) => self.i32_of(v).unwrap_or(z),
+                None => z,
+            };
+            let r = self.end_guarded(at, &[(base, outside)])[0];
+            if let Some(reg) = dst_reg {
+                self.write(inst, Reg::V(reg), r, None);
+            }
+            return Ok(());
+        }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
         // shortcut: LDS addresses are taken as dword-aligned and in bounds
         // (out-of-bounds console accesses read 0 and drop writes).

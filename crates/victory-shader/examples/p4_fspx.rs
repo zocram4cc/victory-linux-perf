@@ -57,6 +57,13 @@ pub fn assemble(packet: &[u8], hash: &[u8], code: &[u8], meta: &[u8], root_flags
 }
 
 fn main() {
+    // The host the game runs on, as the layer tells the translator from the
+    // device's caps (victory-gpu host.rs): an AMD RDNA card, waves of 32 and
+    // 64 (the RX 7900 XT). `K_HOST=generic`: no host-specific forms.
+    if std::env::var("K_HOST").map_or(true, |v| v != "generic") {
+        victory_shader::emit::set_host_max_wave(64);
+        victory_shader::emit::set_host_rdna(true);
+    }
     let args: Vec<String> = std::env::args().collect();
     let dir = std::path::PathBuf::from(args.get(1).expect("DUMP_DIR"));
     let verbose = args.iter().any(|a| a == "-v");
