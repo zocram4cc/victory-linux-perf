@@ -10,6 +10,21 @@ fn main() {
         Ok(c) => {
             let parts: Vec<String> = c.parts.iter().map(|p| format!("{:?} ({} bytes)", p.fourcc, p.data.len())).collect();
             println!("parts: {}", parts.join(", "));
+            // `--code OUT`: the console's native code, for a disassembler.
+            if let Some(out) = std::env::args().skip_while(|a| a != "--code").nth(1)
+                && let Some(accc) = c.part(victory_shader::FourCC::ACCC)
+            {
+                match victory_shader::native_programs(accc.data) {
+                    Ok(ps) => {
+                        for (n, p) in ps.iter().enumerate() {
+                            let file = if ps.len() == 1 { out.clone() } else { format!("{out}.{n}") };
+                            std::fs::write(&file, &p.code).expect("write code");
+                            println!("native code: {} bytes -> {file}", p.code.len());
+                        }
+                    }
+                    Err(e) => println!("native programs: {e}"),
+                }
+            }
         }
         Err(e) => {
             println!("not a container: {e}");

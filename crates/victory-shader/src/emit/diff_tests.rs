@@ -203,6 +203,37 @@ TextureCube cubet : register(t8, space2);
 /// Compute shaders, each `cs`, dispatched as 2×2 groups of 8×8 threads
 /// over a 16×16 texture and a 256-dword buffer.
 const CS_CASES: &[(&str, &str)] = &[
+    // P.4 step 27 (docs/royale/p4-shortcuts.md #1): a store of the alpha
+    // channel alone, which the console compiler makes an image store of
+    // mask 0x8 and the translation a read of the texel, the channel
+    // replaced, all four written.
+    (
+        "alpha-only store, read and written back",
+        // The texel read, its alpha changed, written back: the colour is
+        // the one read, so the console compiler may store the alpha alone.
+        r#"CS {
+            float4 c = outt[d.xy];
+            if (((d.x ^ d.y) & 1) != 0) {
+                c.w = k.z + d.x;
+                outt[d.xy] = c;
+            } else {
+                outt[d.xy] = float4(d.x * 0.25, d.y * 0.5, k.x, 1.0);
+            }
+        }"#,
+    ),
+    (
+        "alpha-only store",
+        // Each thread writes its texel; after the barrier, half of them set
+        // the alpha of their neighbour's texel, whose colour they do not
+        // know: the compiler must keep it (one writer per texel there).
+        r#"CS {
+            outt[d.xy] = float4(d.x * 0.25, d.y * 0.5, k.x, 0.125);
+            DeviceMemoryBarrierWithGroupSync();
+            if ((d.x & 1) != 0) {
+                outt[uint2(d.x ^ 1, d.y)].w = k.z + d.x;
+            }
+        }"#,
+    ),
     (
         "ids and stores",
         r#"CS {

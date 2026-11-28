@@ -12025,6 +12025,9 @@ impl<'a> Lower<'a> {
             // one texel at once could lose one's write.
             // `VICTORY_PARTIAL_IMAGE_STORES=0` refuses them, as before.
             let merge = *dmask != 0xF && !counter && !prefix;
+            if merge && std::env::var_os("VICTORY_WHY_MERGE").is_some() {
+                eprintln!("WHY-MERGE image store of mask {dmask:#x} merged with a read of the texel at {:#x}", inst.machine.offset);
+            }
             if merge && std::env::var_os("VICTORY_PARTIAL_IMAGE_STORES").is_some_and(|v| v == "0") {
                 return Err("an image store of some channels");
             }
