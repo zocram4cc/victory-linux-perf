@@ -1,0 +1,100 @@
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index 3efac71..13ef2e9 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -3805,19 +3805,32 @@ static unsigned int virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG_P
+     res = map_file_into_view( view, unix_handle, 0, size, offset.QuadPart, vprot, needs_close );
+     if (res == STATUS_SUCCESS)
+     {
++        void *view_base = view->base;
++
+         /* file mappings must always be accessible */
+         mprotect_range( view->base, view->size, VPROT_COMMITTED, 0 );
+ 
++        /* The server round trip runs without virtual_mutex (see unmap_view_of_section): no other
++         * thread knows the new view's address before this call returns, so nothing unmaps it
++         * meanwhile; it is looked up again when the lock is taken back. */
++        server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+         SERVER_START_REQ( map_view )
+         {
+             req->mapping = wine_server_obj_handle( handle );
+             req->access  = access;
+-            req->base    = wine_server_client_ptr( view->base );
++            req->base    = wine_server_client_ptr( view_base );
+             req->size    = size;
+             req->start   = offset.QuadPart;
+             res = wine_server_call( req );
+         }
+         SERVER_END_REQ;
++        server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++        if (find_view( view_base, 0 ) != view)
++        {
++            ERR( "view %p went while the server mapped it\n", view_base );
++            if (NT_SUCCESS(res)) res = STATUS_UNSUCCESSFUL;
++            goto done;
++        }
+     }
+     else ERR( "mapping %p %lx %s failed\n", view->base, size, wine_dbgstr_longlong(offset.QuadPart) );
+ 
+@@ -5516,6 +5529,14 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
+             }
+             SERVER_END_REQ;
+         }
++        if (!status && (type & MEM_WRITE_WATCH) && !(view->protect & VPROT_WRITEWATCH))
++        {
++            view->protect |= VPROT_WRITEWATCH;
++            if (use_kernel_writewatch)
++                kernel_writewatch_register_range( view, view->base, view->size );
++            else
++                reset_write_watches( view->base, view->size );
++        }
+     }
+ 
+     if (!status && (attributes & MEM_EXTENDED_PARAMETER_EC_CODE))
+@@ -6916,12 +6937,28 @@ static NTSTATUS unmap_view_of_section( HANDLE process, PVOID addr, ULONG flags )
+         }
+     }
+ 
+-    SERVER_START_REQ( unmap_view )
++    /* The server round trip runs without virtual_mutex: holding it across the wineserver made
++     * every memory call of every thread wait (a title that maps and unmaps thousands of section
++     * views a second held the lock for most of each second). The view stays in place until it is
++     * deleted below, so no other mapping can take its address meanwhile; a second unmap of the
++     * same view finds it gone when the lock is taken again. */
+     {
+-        req->base = wine_server_client_ptr( view->base );
+-        status = wine_server_call( req );
++        void *view_base = view->base;
++
++        server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++        SERVER_START_REQ( unmap_view )
++        {
++            req->base = wine_server_client_ptr( view_base );
++            status = wine_server_call( req );
++        }
++        SERVER_END_REQ;
++        server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++        if (!(view = find_view( view_base, 0 )) || view->base != view_base || is_view_valloc( view ))
++        {
++            if (!status) status = STATUS_NOT_MAPPED_VIEW;
++            goto done;
++        }
+     }
+-    SERVER_END_REQ;
+     if (!status)
+     {
+         if (view->protect & SEC_IMAGE)
+@@ -7128,6 +7165,13 @@ NTSTATUS WINAPI NtGetWriteWatch( HANDLE process, ULONG flags, PVOID base, SIZE_T
+ 
+     if (is_write_watch_range( base, size ))
+     {
++        if (use_kernel_writewatch && !enable_write_exceptions)
++        {
++            server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++            kernel_get_write_watches( base, size, addresses, count, flags & WRITE_WATCH_FLAG_RESET );
++            *granularity = page_size;
++            return STATUS_SUCCESS;
++        }
+         ULONG_PTR pos = 0;
+         char *addr = base;
+         char *end = addr + size;

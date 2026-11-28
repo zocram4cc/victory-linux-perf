@@ -193,6 +193,8 @@ pub(crate) struct HostHeap {
     /// waited for most (5.6 % of their time, profile waits-1: each descriptor
     /// made for a draw takes it, and lets go of what the slot held under it).
     kept: Box<[Mutex<Option<ID3D12Resource>>]>,
+    /// Raw COM pointer mirror of `kept` for lock-free unchanged fast-path.
+    kept_raw: Box<[std::sync::atomic::AtomicUsize]>,
     /// Opt-in only. The matching null SRV dimension for a dynamic slot, or
     /// RAW_UAV for a root UAV. Zero leaves the defensive slot hold in place.
     release_views: Vec<std::sync::atomic::AtomicU8>,
@@ -1902,6 +1904,7 @@ impl HostHeap {
             waiting: Mutex::default(),
             away: Mutex::default(),
             kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
+            kept_raw: (0..count + extra).map(|_| std::sync::atomic::AtomicUsize::new(0)).collect(),
             release_views: (0..if reclaim_dynamic() { extra } else { 0 }).map(|_| 0.into()).collect(),
             next: Mutex::new((0, vec![false; extra as usize])),
             free: std::sync::atomic::AtomicU32::new(extra),
@@ -3090,7 +3093,23 @@ impl HostHeap {
                     tabled: None,
                 };
                 let word = slot_word(&view);
-                views.made.insert(words, ListView { view, at, twin, kept, listed, word });
+                let release_dim = if !self.release_views.is_empty() {
+                    let dim = match &view {
+                        View::Placed(false, desc, srv) if desc[0] != 1 => srv[1],
+                        View::Shader(_, Some(srv)) => srv[1],
+                        _ => 0,
+                    };
+                    if (2..=10).contains(&dim)
+                        && kept.as_ref().is_some_and(|r| unsafe { r.GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_BUFFER })
+                    {
+                        dim as u8
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                };
+                views.made.insert(words, ListView { view, at, twin, kept, listed, word, release_dim });
             }
             let made = &views.made[&words];
             self.table_word(index, made.word);
@@ -3101,7 +3120,10 @@ impl HostHeap {
             } else {
                 self.clear_twin(index);
             }
-            self.keep_srv(index, made.kept.clone(), &made.view);
+            self.keep(index, made.kept.as_ref().map(Cow::Borrowed));
+            if made.release_dim != 0 {
+                self.note_release_view(index, made.release_dim);
+            }
             Some(made.listed)
         })
     }
@@ -3160,14 +3182,23 @@ impl HostHeap {
 
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, mut resource: Option<Cow<'_, ID3D12Resource>>) {
+        use windows::core::Interface;
         self.note_release_view(index, 0);
         let Some(slot) = self.kept.get(index as usize) else {
             return;
         };
+        let want = resource.as_ref().map_or(0, |r| r.as_raw() as usize);
+        if self.kept_raw[index as usize].load(Ordering::Acquire) == want {
+            return;
+        }
         let old = {
-            use windows::core::Interface;
             let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
-            replace_kept(&mut slot, &mut resource, Interface::as_raw)
+            let old = replace_kept(&mut slot, &mut resource, Interface::as_raw);
+            self.kept_raw[index as usize].store(
+                slot.as_ref().map_or(0, |r| r.as_raw() as usize),
+                Ordering::Release,
+            );
+            old
         };
         // A running submission may still read the old resource through
         // this slot.
@@ -6995,6 +7026,8 @@ struct ListView {
     listed: Listed,
     /// Its dword in the table by slot ([`slot_word`]).
     word: u32,
+    /// Cached release-view dimension (0 if not a texture SRV needing nulling).
+    release_dim: u8,
 }
 
 /// The descriptors a thread made for one recording of a list, by the record

@@ -722,6 +722,73 @@ fn once() -> bool {
 /// cryptographic one, which took 0.27 ms a megabyte, four times the detiling
 /// it was to spare; nobody makes up textures to collide.)
 pub(crate) fn digest(bytes: &[u8]) -> Digest {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if bytes.len() >= 128 && std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: AVX2 checked above.
+            return unsafe { digest_avx2(bytes) };
+        }
+    }
+    digest_scalar(bytes)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn digest_avx2(bytes: &[u8]) -> Digest {
+    use std::arch::x86_64::*;
+    let p1 = _mm256_set1_epi32(0x9e37_79b1u32 as i32);
+    let p2 = _mm256_set1_epi32(0x85eb_ca77u32 as i32);
+    let mut a0 = _mm256_set_epi64x(0xa076_1d64_78bd_642fu64 as i64, 0xe703_7ed1_a0b4_28dbu64 as i64, 0x8ebc_6af0_9c88_c6e3u64 as i64, 0x5899_65cc_7537_4cc3u64 as i64);
+    let mut a1 = _mm256_set_epi64x(0x1d8e_4e27_c47d_124fu64 as i64, 0xeb44_acca_b455_d165u64 as i64, 0x9e37_79b9_7f4a_7c15u64 as i64, 0xc2b2_ae3d_27d4_eb4fu64 as i64);
+    let mut a2 = _mm256_xor_si256(a0, p1);
+    let mut a3 = _mm256_xor_si256(a1, p2);
+    let mut ptr = bytes.as_ptr();
+    let mut left = bytes.len();
+    while left >= 128 {
+        // SAFETY: `left >= 128` bytes available at `ptr`.
+        let v0 = unsafe { _mm256_loadu_si256(ptr.cast::<__m256i>()) };
+        let v1 = unsafe { _mm256_loadu_si256(ptr.add(32).cast::<__m256i>()) };
+        let v2 = unsafe { _mm256_loadu_si256(ptr.add(64).cast::<__m256i>()) };
+        let v3 = unsafe { _mm256_loadu_si256(ptr.add(96).cast::<__m256i>()) };
+        let m0 = _mm256_mul_epu32(_mm256_xor_si256(v0, a0), _mm256_shuffle_epi32(v0, 0x31));
+        let m1 = _mm256_mul_epu32(_mm256_xor_si256(v1, a1), _mm256_shuffle_epi32(v1, 0x31));
+        let m2 = _mm256_mul_epu32(_mm256_xor_si256(v2, a2), _mm256_shuffle_epi32(v2, 0x31));
+        let m3 = _mm256_mul_epu32(_mm256_xor_si256(v3, a3), _mm256_shuffle_epi32(v3, 0x31));
+        a0 = _mm256_add_epi64(_mm256_add_epi64(a0, v1), m0);
+        a1 = _mm256_add_epi64(_mm256_add_epi64(a1, v0), m1);
+        a2 = _mm256_add_epi64(_mm256_add_epi64(a2, v3), m2);
+        a3 = _mm256_add_epi64(_mm256_add_epi64(a3, v2), m3);
+        ptr = unsafe { ptr.add(128) };
+        left -= 128;
+    }
+    let mut acc = [0u64; 16];
+    // SAFETY: `acc` holds 16 u64s = 4 __m256i.
+    unsafe {
+        _mm256_storeu_si256(acc.as_mut_ptr().cast::<__m256i>(), a0);
+        _mm256_storeu_si256(acc.as_mut_ptr().add(4).cast::<__m256i>(), a1);
+        _mm256_storeu_si256(acc.as_mut_ptr().add(8).cast::<__m256i>(), a2);
+        _mm256_storeu_si256(acc.as_mut_ptr().add(12).cast::<__m256i>(), a3);
+    }
+    let fold = |a: u64, b: u64| {
+        let p = u128::from(a) * u128::from(b);
+        p as u64 ^ (p >> 64) as u64
+    };
+    let tail = if left > 0 {
+        // SAFETY: `left` bytes remain at `ptr`.
+        digest_scalar(unsafe { std::slice::from_raw_parts(ptr, left) }).0
+    } else {
+        0
+    };
+    let mut lo = (bytes.len() as u64) ^ (tail as u64);
+    let mut hi = 0x9e37_79b9_7f4a_7c15u64 ^ ((tail >> 64) as u64);
+    for i in 0..8 {
+        lo = fold(lo ^ acc[i], acc[i + 8] ^ 0xa076_1d64_78bd_642f);
+        hi = fold(hi ^ acc[i + 8].rotate_left(29), acc[i] ^ 0xe703_7ed1_a0b4_28db);
+    }
+    Digest(u128::from(lo) << 64 | u128::from(hi))
+}
+
+fn digest_scalar(bytes: &[u8]) -> Digest {
     const K: [u64; 8] = [
         0xa076_1d64_78bd_642f,
         0xe703_7ed1_a0b4_28db,

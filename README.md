@@ -1,3 +1,36 @@
+# clankerVI (`victory-proton` Performance Fork)
+
+Performance-focused Linux/Proton fork of `victory-proton` targeting native **30+ fps** playable performance without frame generation on AMD Ryzen 7 9700X + Radeon RX 7900 XTX (RADV, NixOS).
+
+## Key Optimizations Implemented
+- **Wine `ntdll.so` patch** ([linux/wine-virtual-writewatch.patch](linux/wine-virtual-writewatch.patch)):
+  - Enables Linux kernel write-watch (`UFFDIO_REGISTER_MODE_WP` + `PAGEMAP_SCAN`) on `MapViewOfFile3` section views (`VirtualAlloc(..., MEM_COMMIT | MEM_WRITE_WATCH, ...)`), so `VICTORY_SECTION_ALLOC=wc` backs the 2.15 GB write-combined GPU heap with a section + `VICTORY_LAND_BESIDE=1` without page faults, cutting `GetWriteWatch` dirty pages by **76%** (6,323 → 1,518) and `VICTORY_SEND_OWN` upload volume by **45%** (39 MB → 21 MB/frame).
+  - Releases Wine's global `virtual_mutex` before `ioctl(pagemap_fd, PAGEMAP_SCAN)` in `NtGetWriteWatch`, enabling true parallel kernel write-watch scans under `VICTORY_ASK_SPREAD=1`.
+- **Submission lane & worker pool (`victory-gpu`)**:
+  - Zero-allocation scoped `EachPool` with chunked atomic dispatch for `wide_each` and parallel `copy_all` / `take_snapshots` (`crates/victory-gpu/src/shadow.rs`).
+  - `Shadow::landed` (`VICTORY_LAND_TAKEN=1`) extended to kernel write-watched sections (`watched == 1`), eliminating ~15–18 MB/frame of redundant copy-back re-uploads.
+  - Lock-free `KEPT` fast-path for `ask_once` / `ask_ahead`, per-shard `max_written: [AtomicU64; SHARDS]` + single-page lookup fast-path in `watch::Notes::all_unordered_since`, and 64 MiB chunked parallel `ask_ahead_held` (`crates/victory-gpu/src/watch.rs`).
+  - Per-thread `TLS_VIEWS` / `TLS_SHAPES` caches (`descriptor.rs`) and lock-free `HostHeap::keep` fast-path (`descriptor/host.rs`).
+  - AVX2 4×32B vectorized `texture::digest` (`texture.rs`), 128B AVX2 fast-path in `victory_safe_merge` (`safecopy.rs`), and inline small-copy fast-path in `fastmem.rs` (`VICTORY_FAST_MEMCPY=1`).
+  - `VICTORY_SLEEP0_YIELD=1` in `victory-hle/src/modules/kernel.rs` to throttle tight `Sleep(0)` spin loops (eliminates a 68% CPU spin thread).
+  - Thin LTO (`lto = "thin"`) and `x86-64-v3` (AVX2/BMI2/FMA) codegen.
+
+## Measured Progress (Xbox Series X @ 2560×1440, `VICTORY_UPSCALER=6`)
+| Milestone | Series X @ 1440p FPS | Frame Time | `victory-submit` / `preparing` |
+|---|---:|---:|---:|
+| Baseline (`f353c97`) | 24.7–25.3 fps | 39.6–40.4 ms | 32–34 ms preparing |
+| Waves 1–5 (TLS views, `HostHeap::keep`, `EachPool`, `Sleep(0)`, `shard_max`, AVX2 digest) | 26.0–27.7 fps | 36.0–38.4 ms | 28.5–31.8 ms preparing |
+| Wave 8c/8d (Wine `UFFD_WP` section write-watch + `LAND_TAKEN` + parallel `PAGEMAP_SCAN` + `JOIN_BARRIERS=1`) | **28.5–28.8 fps** | **34.8–35.1 ms** | **23.6–26.3 ms preparing** |
+
+## Build
+```bash
+CARGO_TARGET_DIR="$HOME/.cache/vp-upstream-win" \
+RUSTFLAGS="-C target-cpu=x86-64-v3" \
+cargo xwin build --release -p victory --target x86_64-pc-windows-msvc
+```
+
+---
+
 # victory-proton
 
 [VIctory](https://github.com/Marvisak/VIctory), the compatibility layer that runs

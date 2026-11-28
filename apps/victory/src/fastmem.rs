@@ -386,3 +386,187 @@ mod tests {
         assert!(checked > 1000);
     }
 }
+
+/// `memcpy` and `memmove` of our own, `rep movsb` for copies of
+/// [`copy::BIG`] bytes and more (`VICTORY_FAST_MEMCPY=1`; off by default:
+/// Wine's, as without this).
+///
+/// Why: Wine's `ucrtbase.dll` copies with SSE2 stores (`sse2_memmove`): 18.5 %
+/// of the submitting thread at Series X 1440p (run c-o-nl-x-perf,
+/// 2026-11-27), the hottest code of that thread. An AVX2 loop was measured no
+/// faster above 64 KiB (above), but both make the processor read every
+/// destination line before writing it; `rep movsb` on a processor with ERMS
+/// and FSRM (Zen 3 and later) writes whole lines without that read.
+/// Smaller copies, and a `memmove` whose destination overlaps the source from
+/// behind, stay with Wine's.
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub(crate) mod copy {
+    use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering::*};
+
+    type Copy = unsafe extern "C" fn(*mut u8, *const u8, usize) -> *mut u8;
+
+    /// Below this, Wine's (a call there costs about what `rep movsb` starts up in).
+    pub(crate) const BIG: usize = 512;
+    /// 0 not decided, 1 deciding, 2 ours for big copies, 3 Wine's always.
+    static MODE: AtomicU8 = AtomicU8::new(0);
+    static WINE_COPY: AtomicUsize = AtomicUsize::new(0);
+    static WINE_MOVE: AtomicUsize = AtomicUsize::new(0);
+
+    /// # Safety
+    /// `dst` writable and `src` readable for `n` bytes; forward is safe for them.
+    #[inline(always)]
+    unsafe fn forward(dst: *mut u8, src: *const u8, n: usize) {
+        // SAFETY: as the caller says; the direction flag is clear by the ABI.
+        unsafe {
+            core::arch::asm!("rep movsb", inout("rcx") n => _, inout("rdi") dst => _, inout("rsi") src => _,
+                options(nostack, preserves_flags));
+        }
+    }
+
+    /// # Safety
+    /// `dst` writable and `src` readable for `n` bytes (`n > 0`).
+    #[inline(always)]
+    unsafe fn backward(dst: *mut u8, src: *const u8, n: usize) {
+        // SAFETY: as the caller says; the flag is set back before returning.
+        unsafe {
+            core::arch::asm!("std", "rep movsb", "cld", inout("rcx") n => _, inout("rdi") dst.add(n - 1) => _,
+                inout("rsi") src.add(n - 1) => _, options(nostack));
+        }
+    }
+
+    /// Looked up without any allocation or copy of ours.
+    fn decide() -> u8 {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetModuleHandleW(name: *const u16) -> *mut core::ffi::c_void;
+            fn GetProcAddress(module: *mut core::ffi::c_void, name: *const u8) -> usize;
+            fn GetEnvironmentVariableW(name: *const u16, buffer: *mut u16, size: u32) -> u32;
+        }
+        if MODE.compare_exchange(0, 1, AcqRel, Acquire).is_err() {
+            return MODE.load(Acquire);
+        }
+        const UCRT: [u16; 13] = utf16(b"ucrtbase.dll\0");
+        const NAME: [u16; 20] = utf16(b"VICTORY_FAST_MEMCPY\0");
+        let mut value = [0u16; 4];
+        // SAFETY: plain lookups of a loaded system library's exports and of
+        // an environment variable into a buffer of its size.
+        let (copy, moving, asked) = unsafe {
+            let module = GetModuleHandleW(UCRT.as_ptr());
+            let (c, m) = if module.is_null() {
+                (0, 0)
+            } else {
+                (GetProcAddress(module, c"memcpy".as_ptr().cast()), GetProcAddress(module, c"memmove".as_ptr().cast()))
+            };
+            let len = GetEnvironmentVariableW(NAME.as_ptr(), value.as_mut_ptr(), value.len() as u32);
+            (c, m, len == 1 && value[0] == u16::from(b'1'))
+        };
+        WINE_COPY.store(copy, Release);
+        WINE_MOVE.store(moving, Release);
+        let mode = if asked || copy == 0 || moving == 0 { 2 } else { 3 };
+        MODE.store(mode, Release);
+        mode
+    }
+
+    const fn utf16<const N: usize>(s: &[u8; N]) -> [u16; N] {
+        let mut out = [0u16; N];
+        let mut i = 0;
+        while i < N {
+            out[i] = s[i] as u16;
+            i += 1;
+        }
+        out
+    }
+
+    #[inline(always)]
+    fn mode() -> u8 {
+        match MODE.load(Relaxed) {
+            0 => decide(),
+            m => m,
+        }
+    }
+
+    /// Fast inline copy for `n < BIG` (forward/non-overlapping): avoids calling
+    /// into Wine's `ucrtbase.dll` `sse2_memmove`.
+    #[inline(always)]
+    unsafe fn small(dst: *mut u8, src: *const u8, n: usize) {
+        unsafe {
+            if n == 0 {
+                return;
+            }
+            if n <= 4 {
+                if n >= 2 {
+                    let a = (src as *const u16).read_unaligned();
+                    let b = (src.add(n - 2) as *const u16).read_unaligned();
+                    (dst as *mut u16).write_unaligned(a);
+                    (dst.add(n - 2) as *mut u16).write_unaligned(b);
+                } else {
+                    *dst = *src;
+                }
+                return;
+            }
+            if n <= 8 {
+                let a = (src as *const u32).read_unaligned();
+                let b = (src.add(n - 4) as *const u32).read_unaligned();
+                (dst as *mut u32).write_unaligned(a);
+                (dst.add(n - 4) as *mut u32).write_unaligned(b);
+                return;
+            }
+            if n <= 16 {
+                let a = (src as *const u64).read_unaligned();
+                let b = (src.add(n - 8) as *const u64).read_unaligned();
+                (dst as *mut u64).write_unaligned(a);
+                (dst.add(n - 8) as *mut u64).write_unaligned(b);
+                return;
+            }
+            if n <= 32 {
+                let a = (src as *const u128).read_unaligned();
+                let b = (src.add(n - 16) as *const u128).read_unaligned();
+                (dst as *mut u128).write_unaligned(a);
+                (dst.add(n - 16) as *mut u128).write_unaligned(b);
+                return;
+            }
+            // 33..512 bytes: FSRM on Zen 3/4/5 handles `rep movsb` fast down to 33B.
+            forward(dst, src, n);
+        }
+    }
+
+    /// # Safety
+    /// C's `memcpy`: `dst` writable, `src` readable, `n` bytes, not overlapping.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn memcpy(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+        // SAFETY: forwarded from the caller.
+        unsafe {
+            match mode() {
+                2 if n >= BIG => forward(dst, src, n),
+                2 => small(dst, src, n),
+                3 if WINE_COPY.load(Relaxed) != 0 => {
+                    return core::mem::transmute::<usize, Copy>(WINE_COPY.load(Relaxed))(dst, src, n);
+                }
+                _ => forward(dst, src, n),
+            }
+        }
+        dst
+    }
+
+    /// # Safety
+    /// C's `memmove`: `dst` writable, `src` readable, `n` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn memmove(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+        // Forward is right unless the destination begins inside the source.
+        let ahead = (dst as usize).wrapping_sub(src as usize) >= n;
+        // SAFETY: forwarded from the caller.
+        unsafe {
+            match mode() {
+                2 if n >= BIG && ahead => forward(dst, src, n),
+                2 if ahead => small(dst, src, n),
+                2 | 3 if WINE_MOVE.load(Relaxed) != 0 => {
+                    return core::mem::transmute::<usize, Copy>(WINE_MOVE.load(Relaxed))(dst, src, n);
+                }
+                _ if ahead => forward(dst, src, n),
+                _ if n > 0 => backward(dst, src, n),
+                _ => {}
+            }
+        }
+        dst
+    }
+}

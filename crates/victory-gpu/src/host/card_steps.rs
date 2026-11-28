@@ -711,8 +711,40 @@ mod late {
 
     /// Whether the title was found writing a page of `[from, to)` late.
     pub(super) fn written(from: usize, to: usize) -> bool {
-        let pages = PAGES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pages = PAGES.lock().unwrap_or_else(|e| e.into_inner());
+        forget(&mut pages);
         pages.as_ref().is_some_and(|p| (from / PAGE..to.div_ceil(PAGE)).any(|page| p.contains(&page)))
+    }
+
+    /// `VICTORY_CARD_STEPS_UNLEARN_S=<s>` (off without it): what was learned
+    /// is forgotten every `s` seconds, so a page the title wrote late once
+    /// (all of them were learned in one burst while the world loaded, runs
+    /// c-o-x and c-base-x, 2026-11-27) makes its fills wait only while the
+    /// title still does; one that it writes late again is learned again at the
+    /// next landing (one submission with the bytes of before, as the first
+    /// time). Logged each time with how many pages were forgotten.
+    fn forget(pages: &mut Option<std::collections::HashSet<usize>>) {
+        static PERIOD: OnceLock<Option<std::time::Duration>> = OnceLock::new();
+        let Some(period) = *PERIOD.get_or_init(|| {
+            std::env::var("VICTORY_CARD_STEPS_UNLEARN_S")
+                .ok()
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .filter(|s| *s > 0.0)
+                .map(std::time::Duration::from_secs_f64)
+        }) else {
+            return;
+        };
+        static SINCE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+        let mut since = SINCE.lock().unwrap_or_else(|e| e.into_inner());
+        let start = *since.get_or_insert_with(std::time::Instant::now);
+        if start.elapsed() < period {
+            return;
+        }
+        *since = Some(std::time::Instant::now());
+        if let Some(p) = pages.as_mut().filter(|p| !p.is_empty()) {
+            tracing::info!(pages = p.len(), "card steps: learned pages forgotten (VICTORY_CARD_STEPS_UNLEARN_S)");
+            p.clear();
+        }
     }
 
     /// The submission has landed: what the fills of `sent` (place, length,
@@ -927,6 +959,175 @@ pub(super) mod gate {
         Some((fence, value))
     }
 
+    /// `VICTORY_CARD_STEPS_GATE_REACH=1` (with the gate; off by default): a
+    /// gate opens when the card reaches it, not when the flights in the way
+    /// have landed. In front of the submission the queue signals a fence of
+    /// ours ("everything before this has run") and then waits for the gate;
+    /// a thread of ours waits for that signal, does the fills again from title
+    /// memory as it is at that moment, and opens the gate. That is the
+    /// console's moment: its card reads a constant buffer when the draw runs.
+    /// Nothing waits for a landing (copy-back, telling the title), and the
+    /// submitting thread does not wait at all; the card stands for one round
+    /// trip to a thread of ours.
+    ///
+    /// Why not the landing: with gates opened at landings (run c-hold-x,
+    /// 2026-11-27, Series X at 1440p) a gate took 48 ms from its making to its
+    /// opening (the flights in the way stood behind earlier gates), and the
+    /// title wrote 93-97 % of the places behind gates no earlier than 8 ms
+    /// after the opening (run d-watch-x): bytes of its next frame, not of the
+    /// one the card was drawing.
+    pub(in crate::host) fn reach() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| crate::switch::on("VICTORY_CARD_STEPS_GATE_REACH"))
+    }
+
+    /// [`make`] for [`reach`]: the fence the queue signals in front of the
+    /// submission, the gate's fence it then waits for, and the value of both.
+    pub(in crate::host) fn make_reach(host: &Host, fills: Vec<Fill>) -> Option<(ID3D12Fence, ID3D12Fence, u64)> {
+        let mut gates = GATES.lock().unwrap_or_else(|e| e.into_inner());
+        if gates.fence.is_none() {
+            // SAFETY: a plain creation.
+            gates.fence = unsafe { host.device.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) }.ok();
+        }
+        let gate = gates.fence.clone()?;
+        let reached = reaching::fence(host)?;
+        COUNTS[0].fetch_add(1, Ordering::Relaxed);
+        COUNTS[1].fetch_add(fills.len() as u64, Ordering::Relaxed);
+        gates.made += 1;
+        let value = gates.made;
+        reaching::give(reached.clone(), gate.clone(), value, fills);
+        Some((reached, gate, value))
+    }
+
+    /// The thread that opens gates when the card reaches them ([`reach`]).
+    pub(super) mod reaching {
+        use super::Fill;
+        use std::collections::VecDeque;
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        use std::sync::{Condvar, Mutex, OnceLock};
+        use std::time::Instant;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::Graphics::Direct3D12::{D3D12_FENCE_FLAG_NONE, ID3D12Fence};
+        use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+
+        struct Job {
+            reached: ID3D12Fence,
+            gate: ID3D12Fence,
+            value: u64,
+            fills: Vec<Fill>,
+        }
+
+        // SAFETY: D3D12 fences (free-threaded) and addresses of upload and
+        // title memory alive until the gate's lists have run.
+        unsafe impl Send for Job {}
+
+        struct Shared(Option<ID3D12Fence>);
+        // SAFETY: a D3D12 fence, free-threaded.
+        unsafe impl Send for Shared {}
+
+        static FENCE: Mutex<Shared> = Mutex::new(Shared(None));
+        static LINE: Mutex<VecDeque<Job>> = Mutex::new(VecDeque::new());
+        static MOVED: Condvar = Condvar::new();
+        /// Gates opened; µs from the card reaching them to their opening;
+        /// places whose bytes changed since the submission was prepared.
+        pub(in crate::host) static COUNTS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+        pub(super) fn fence(host: &super::Host) -> Option<ID3D12Fence> {
+            let mut f = FENCE.lock().unwrap_or_else(|e| e.into_inner());
+            if f.0.is_none() {
+                // SAFETY: a plain creation.
+                f.0 = unsafe { host.device.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) }.ok();
+            }
+            f.0.clone()
+        }
+
+        pub(super) fn give(reached: ID3D12Fence, gate: ID3D12Fence, value: u64, fills: Vec<Fill>) {
+            static STARTED: OnceLock<()> = OnceLock::new();
+            STARTED.get_or_init(|| {
+                if let Err(e) = std::thread::Builder::new().name("victory-reach".into()).spawn(serve_all) {
+                    tracing::error!(error = %e, "no thread to open gates the card reaches");
+                }
+            });
+            LINE.lock().unwrap_or_else(|e| e.into_inner()).push_back(Job { reached, gate, value, fills });
+            MOVED.notify_one();
+        }
+
+        fn serve_all() {
+            crate::cores::keep_helper_on_fast_cores("victory-reach");
+            // SAFETY: a plain auto-reset event, ours for the thread's life.
+            let event = unsafe { CreateEventW(None, false, false, None) }.unwrap_or(HANDLE::default());
+            let mut places: Vec<(usize, usize)> = Vec::new();
+            let mut which: Vec<usize> = Vec::new();
+            let mut offsets: Vec<(usize, usize)> = Vec::new();
+            let mut scratch: Vec<u8> = Vec::new();
+            loop {
+                let job = {
+                    let mut line = LINE.lock().unwrap_or_else(|e| e.into_inner());
+                    loop {
+                        match line.pop_front() {
+                            Some(j) => break j,
+                            None => line = MOVED.wait(line).unwrap_or_else(|e| e.into_inner()),
+                        }
+                    }
+                };
+                places.clear();
+                which.clear();
+                which.extend(job.fills.iter().map(|&(_, src, len)| {
+                    match places.iter().position(|&p| p == (src, len)) {
+                        Some(k) => k,
+                        None => {
+                            places.push((src, len));
+                            places.len() - 1
+                        }
+                    }
+                }));
+                // SAFETY: our fences and event.
+                unsafe {
+                    if job.reached.GetCompletedValue() < job.value {
+                        match job.reached.SetEventOnCompletion(job.value, event) {
+                            Ok(()) => {
+                                WaitForSingleObject(event, INFINITE);
+                            }
+                            Err(e) => tracing::error!(error = %e, "a gate's reaching could not be waited for: it opens now"),
+                        }
+                    }
+                }
+                let reached = Instant::now();
+                // Each place once (some 40 fills a gate read a dozen places),
+                // read into our reused scratch buffer, then written to every fill.
+                // Upload memory is write-combined: nothing reads it back.
+                scratch.clear();
+                offsets.clear();
+                for &(src, len) in &places {
+                    let start = scratch.len();
+                    scratch.resize(start + len, 0);
+                    if crate::host::read_into(src as *const u8, &mut scratch[start..start + len]) {
+                        offsets.push((start, len));
+                    } else {
+                        scratch.truncate(start);
+                        offsets.push((usize::MAX, 0));
+                    }
+                }
+                for (i, &(dst, _, len)) in job.fills.iter().enumerate() {
+                    let (start, n) = offsets[which[i]];
+                    if start == usize::MAX || n != len {
+                        continue;
+                    }
+                    // SAFETY: the fill's upload memory, alive until its lists
+                    // are reset; `len` bytes on each side.
+                    unsafe { std::ptr::copy_nonoverlapping(scratch.as_ptr().add(start), dst as *mut u8, len) };
+                }
+                // SAFETY: our fence; jobs are served in the order the gates
+                // were made, so its values only go up.
+                if let Err(e) = unsafe { job.gate.Signal(job.value) } {
+                    tracing::error!(error = %e, "a gate the card reached could not be opened");
+                }
+                COUNTS[0].fetch_add(1, Relaxed);
+                COUNTS[1].fetch_add(reached.elapsed().as_micros() as u64, Relaxed);
+            }
+        }
+    }
+
     /// A gate more, to open after the flight `after` and not before the
     /// gates made before it: its value.
     fn put(gates: &mut Gates, after: u64, fills: Vec<Fill>) -> u64 {
@@ -950,6 +1151,10 @@ pub(super) mod gate {
             COUNTS[2].fetch_add(gate.made.elapsed().as_nanos() as u64, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             watch::opened(&gate.fills);
+            if let (Some(hold), Some(fence)) = (holder::hold(), gates.fence.clone()) {
+                holder::give(fence, gate.value, gate.fills, hold);
+                continue;
+            }
             for &(dst, src, len) in &gate.fills {
                 // (As the submission's fills are done; upload memory of lists
                 // that have not run, alive until they are reset.)
@@ -960,6 +1165,149 @@ pub(super) mod gate {
                 if let Err(e) = unsafe { fence.Signal(gate.value) } {
                     tracing::error!(error = %e, "a gate in front of a submission could not be opened");
                 }
+            }
+        }
+    }
+
+    /// A gate whose flights ahead have landed, held open-to-be by a thread of
+    /// its own until the title has written its places again
+    /// (`VICTORY_CARD_STEPS_GATE_HOLD_US=<us>`, with the gate; off without it).
+    ///
+    /// Why: the title writes those places a little after it is told the
+    /// flights ahead landed ([`on`]), so a gate that fills at once fills the
+    /// bytes of before. The old wait was late enough only because preparing
+    /// the submission takes a while. Here the card stands at the gate (the
+    /// submitting thread does not): a place is taken when its bytes differ
+    /// from what was sent and two looks in a row agree (the title is not in
+    /// the middle of writing it); the gate opens when every place is taken,
+    /// or `VICTORY_CARD_STEPS_GATE_GRACE_US` (200) after the first one was,
+    /// or at the hold's end, with whatever title memory holds then.
+    pub(super) mod holder {
+        use super::Fill;
+        use std::collections::VecDeque;
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        use std::sync::{Condvar, Mutex, OnceLock};
+        use std::time::{Duration, Instant};
+        use windows::Win32::Graphics::Direct3D12::ID3D12Fence;
+
+        struct Held {
+            fence: ID3D12Fence,
+            value: u64,
+            fills: Vec<Fill>,
+            given: Instant,
+            hold: Duration,
+        }
+
+        // SAFETY: a D3D12 fence (free-threaded) and addresses of upload and
+        // title memory that stay alive until the gate's lists have run.
+        unsafe impl Send for Held {}
+
+        static LINE: Mutex<VecDeque<Held>> = Mutex::new(VecDeque::new());
+        static MOVED: Condvar = Condvar::new();
+        /// Gates held; opened with every place taken, by the grace, by the
+        /// hold's end; µs from giving to opening.
+        pub(in crate::host) static COUNTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+        fn micros(name: &str, default: Option<u64>) -> Option<u64> {
+            match std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+                Some(0) => None,
+                Some(us) => Some(us),
+                None => default,
+            }
+        }
+
+        pub(in crate::host) fn hold() -> Option<Duration> {
+            static HOLD: OnceLock<Option<Duration>> = OnceLock::new();
+            *HOLD.get_or_init(|| micros("VICTORY_CARD_STEPS_GATE_HOLD_US", None).map(Duration::from_micros))
+        }
+
+        fn grace() -> Duration {
+            static GRACE: OnceLock<Duration> = OnceLock::new();
+            *GRACE.get_or_init(|| Duration::from_micros(micros("VICTORY_CARD_STEPS_GATE_GRACE_US", Some(200)).unwrap_or(200)))
+        }
+
+        pub(in crate::host) fn give(fence: ID3D12Fence, value: u64, fills: Vec<Fill>, hold: Duration) {
+            static STARTED: OnceLock<()> = OnceLock::new();
+            STARTED.get_or_init(|| {
+                if let Err(e) = std::thread::Builder::new().name("victory-gate".into()).spawn(serve_all) {
+                    tracing::error!(error = %e, "no thread for gates: they open at once");
+                }
+            });
+            LINE.lock().unwrap_or_else(|e| e.into_inner()).push_back(Held { fence, value, fills, given: Instant::now(), hold });
+            MOVED.notify_one();
+        }
+
+        fn serve_all() {
+            crate::cores::keep_helper_on_fast_cores("victory-gate");
+            loop {
+                let held = {
+                    let mut line = LINE.lock().unwrap_or_else(|e| e.into_inner());
+                    loop {
+                        match line.pop_front() {
+                            Some(h) => break h,
+                            None => line = MOVED.wait(line).unwrap_or_else(|e| e.into_inner()),
+                        }
+                    }
+                };
+                serve(held);
+            }
+        }
+
+        fn serve(held: Held) {
+            let Held { fence, value, fills, given, hold } = held;
+            COUNTS[0].fetch_add(1, Relaxed);
+            let n = fills.len();
+            // Per place: taken; the bytes of the last look.
+            let mut taken = vec![false; n];
+            let mut last: Vec<Option<Vec<u8>>> = vec![None; n];
+            let mut first: Option<Instant> = None;
+            let mut now_bytes = Vec::new();
+            let why = loop {
+                for (i, &(dst, src, len)) in fills.iter().enumerate() {
+                    if taken[i] {
+                        continue;
+                    }
+                    now_bytes.clear();
+                    now_bytes.resize(len, 0);
+                    if !crate::host::read_into(src as *const u8, &mut now_bytes) {
+                        continue;
+                    }
+                    // SAFETY: the fill's upload memory, alive until its lists are reset.
+                    let sent = unsafe { std::slice::from_raw_parts(dst as *const u8, len) };
+                    if now_bytes[..] == *sent {
+                        last[i] = None;
+                        continue;
+                    }
+                    if last[i].as_deref() == Some(&now_bytes[..]) {
+                        taken[i] = true;
+                        first.get_or_insert_with(Instant::now);
+                    } else {
+                        last[i] = Some(now_bytes.clone());
+                    }
+                }
+                if taken.iter().all(|&t| t) {
+                    break 1;
+                }
+                let now = Instant::now();
+                if first.is_some_and(|f| now.duration_since(f) >= grace()) {
+                    break 2;
+                }
+                if now.duration_since(given) >= hold {
+                    break 3;
+                }
+                for _ in 0..64 {
+                    std::hint::spin_loop();
+                }
+            };
+            COUNTS[why].fetch_add(1, Relaxed);
+            COUNTS[4].fetch_add(given.elapsed().as_micros() as u64, Relaxed);
+            for &(dst, src, len) in &fills {
+                super::copy_mapped(dst as *mut u8, src as *const u8, len, false);
+            }
+            // SAFETY: our fence; gates are served in the order they were made,
+            // so values only go up.
+            if let Err(e) = unsafe { fence.Signal(value) } {
+                tracing::error!(error = %e, "a held gate in front of a submission could not be opened");
             }
         }
     }
@@ -1526,6 +1874,28 @@ pub(super) fn log(frames: f64) {
             g[1],
             g[2] / 1e6
         );
+        if gate::reach() {
+            let r: Vec<f64> = gate::reaching::COUNTS.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+            tracing::info!(
+                "card steps, gates opened when the card reached them (VICTORY_CARD_STEPS_GATE_REACH), per frame: {:.2} opened, \
+                 {:.3} ms from the card reaching one to its opening, {:.1} places changed since they were prepared",
+                r[0],
+                if r[0] > 0.0 { r[1] / 1e3 / r[0] } else { 0.0 },
+                r[2]
+            );
+        }
+        if gate::holder::hold().is_some() {
+            let h: Vec<f64> = gate::holder::COUNTS.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+            tracing::info!(
+                "card steps, gates held until the title wrote their places again (VICTORY_CARD_STEPS_GATE_HOLD_US), per frame: {:.2} held, \
+                 opened {:.2} with every place written, {:.2} by the grace, {:.2} at the hold's end; {:.2} ms held in all",
+                h[0],
+                h[1],
+                h[2],
+                h[3],
+                h[4] / 1e3
+            );
+        }
     }
     #[cfg(feature = "diagnostics")]
     {

@@ -3273,29 +3273,32 @@ static UNDER_SCAN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 /// the title's bytes there would reach the card a submission late.
 fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
     use std::sync::Arc;
+    thread_local! {
+        static PLACES: std::cell::RefCell<ByCopy<Option<usize>>> = std::cell::RefCell::new(ByCopy::default());
+    }
     // Per copy, the span of what is refreshed (a flush brings that much
     // up to date at most).
     let mut spans: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
-    // Where each copy is in it, if shaders may be writing it (none begins to
-    // while this runs): a frame has 20,000 refreshes of some 4,500 copies.
-    let mut places: ByCopy<Option<usize>> = ByCopy::default();
     let scanning = std::time::Instant::now();
-    for list in runs {
-        for step in &list.deferred().copies {
-            if let Step::Refresh(shadow, address, len) = step {
-                let place = places.entry(Arc::as_ptr(shadow) as usize).or_insert_with(|| {
-                    shadow.writes_pending().then(|| {
-                        spans.push((shadow.clone(), *address, *address + *len));
-                        spans.len() - 1
-                    })
-                });
-                if let Some(i) = *place {
-                    let s = &mut spans[i];
-                    (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len));
+    PLACES.with_borrow_mut(|places| {
+        places.clear();
+        for list in runs {
+            for step in &list.deferred().copies {
+                if let Step::Refresh(shadow, address, len) = step {
+                    let place = places.entry(Arc::as_ptr(shadow) as usize).or_insert_with(|| {
+                        shadow.writes_pending().then(|| {
+                            spans.push((shadow.clone(), *address, *address + *len));
+                            spans.len() - 1
+                        })
+                    });
+                    if let Some(i) = *place {
+                        let s = &mut spans[i];
+                        (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len));
+                    }
                 }
             }
         }
-    }
+    });
     if late_exact() {
         // The title's bytes are put in beside the flights' writes; a
         // settle is still due where that could not be done. At most this
@@ -5909,20 +5912,25 @@ impl Host {
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
-            let mut spans: ByCopy<(usize, usize)> = ByCopy::default();
-            for list in runs {
-                for step in &list.deferred().copies {
-                    if let Step::Refresh(shadow, address, len) = step
-                        && shadow.asked_ahead()
-                    {
-                        let span = spans
-                            .entry(std::sync::Arc::as_ptr(shadow) as usize)
-                            .or_insert((*address, *address + *len));
-                        *span = (span.0.min(*address), span.1.max(*address + *len));
+            thread_local! {
+                static ASK_SPANS: std::cell::RefCell<ByCopy<(usize, usize)>> = std::cell::RefCell::new(ByCopy::default());
+            }
+            let ranges: Vec<(usize, usize)> = ASK_SPANS.with_borrow_mut(|spans| {
+                spans.clear();
+                for list in runs {
+                    for step in &list.deferred().copies {
+                        if let Step::Refresh(shadow, address, len) = step
+                            && shadow.asked_ahead()
+                        {
+                            let span = spans
+                                .entry(std::sync::Arc::as_ptr(shadow) as usize)
+                                .or_insert((*address, *address + *len));
+                            *span = (span.0.min(*address), span.1.max(*address + *len));
+                        }
                     }
                 }
-            }
-            let ranges: Vec<(usize, usize)> = spans.into_values().collect();
+                spans.values().copied().collect()
+            });
             #[cfg(feature = "diagnostics")]
             SPLIT[8].fetch_add(split.so_far(), Ordering::Relaxed);
             stage.next("submit: asking the write watch");
@@ -6066,9 +6074,25 @@ impl Host {
             let cuts: Vec<usize> = parts.iter().filter_map(|&n| firsts.get(n).copied()).collect();
             // Fills of places the title writes after sending are done again
             // when the flights ahead have landed: the card starts then.
-            let gate = if gated.is_empty() { None } else { card_steps::gate::make(self, gated) };
+            // With `VICTORY_CARD_STEPS_GATE_REACH=1` the queue first says it
+            // has reached the gate, and a thread of ours opens it then.
+            let (gate, reached) = if gated.is_empty() {
+                (None, None)
+            } else if card_steps::gate::reach() {
+                match card_steps::gate::make_reach(self, gated) {
+                    Some((reached, fence, value)) => (Some((fence, value)), Some((reached, value))),
+                    None => (None, None),
+                }
+            } else {
+                (card_steps::gate::make(self, gated), None)
+            };
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
+                if let Some((reached, value)) = &reached
+                    && let Err(e) = self.queue.Signal(reached, *value)
+                {
+                    tracing::error!(error = %e, "the queue could not signal that it reached a gate");
+                }
                 if let Some((fence, value)) = &gate
                     && let Err(e) = self.queue.Wait(fence, *value)
                 {
@@ -8714,7 +8738,7 @@ impl Batch {
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
         }
-        let ahead = spans.len() > 1;
+        let ahead = spans.len() > 1 && !crate::watch::is_kept();
         if ahead {
             let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
             crate::watch::ask_ahead(&ranges);
@@ -8877,7 +8901,7 @@ impl Batch {
         }
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
-        let ahead = self.refreshes.len() > 1;
+        let ahead = self.refreshes.len() > 1 && !crate::watch::is_kept();
         if ahead {
             let started = std::time::Instant::now();
             let ranges: Vec<(usize, usize)> = self

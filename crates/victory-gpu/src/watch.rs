@@ -127,7 +127,13 @@ fn shards_of_pages(pages: impl IntoIterator<Item = usize>) -> u64 {
 /// holder changes them with no part's lock; held shared, a reader reads a
 /// part at a time, and who notes or needs a number that counts holds the
 /// parts it touches ([`Notes::hold`]).
-struct Notes([RwLock<Shard>; SHARDS]);
+struct Notes {
+    shards: [RwLock<Shard>; SHARDS],
+    /// Highest asking number ever noted in each shard (updated under the
+    /// shard's write lock or `&mut Notes`). Allows `all_unordered_since` to
+    /// skip clean shards without locking or touching the `BTreeMap`.
+    max_written: [std::sync::atomic::AtomicU64; SHARDS],
+}
 
 /// A part of [`Notes`].
 struct Shard {
@@ -141,28 +147,36 @@ struct Shard {
 
 impl Notes {
     const fn new() -> Notes {
-        Notes([const { RwLock::new(Shard::new()) }; SHARDS])
+        Notes {
+            shards: [const { RwLock::new(Shard::new()) }; SHARDS],
+            max_written: [const { std::sync::atomic::AtomicU64::new(0) }; SHARDS],
+        }
     }
 
     /// The part of `page`, with the journal held alone.
     fn shard_mut(&mut self, page: usize) -> &mut Shard {
-        self.0[shard_of(page)].get_mut().unwrap_or_else(|e| e.into_inner())
+        self.shards[shard_of(page)].get_mut().unwrap_or_else(|e| e.into_inner())
     }
 
     /// A part to read, the journal held shared or alone.
     fn read(&self, shard: usize) -> std::sync::RwLockReadGuard<'_, Shard> {
-        if let Ok(s) = self.0[shard].try_read() {
+        if let Ok(s) = self.shards[shard].try_read() {
             return s;
         }
         let began = std::time::Instant::now();
-        let s = self.0[shard].read().unwrap_or_else(|e| e.into_inner());
+        let s = self.shards[shard].read().unwrap_or_else(|e| e.into_inner());
         port7_waited(P7_PART_WAITS, began);
         s
     }
 
     /// See [`Shard::note`]; the journal held alone.
     fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
-        self.shard_mut(page).note(page, parts, now)
+        let shard = shard_of(page);
+        let max = self.max_written[shard].get_mut();
+        if now > *max {
+            *max = now;
+        }
+        self.shards[shard].get_mut().unwrap_or_else(|e| e.into_inner()).note(page, parts, now)
     }
 
     /// See [`Shard::parts_since`].
@@ -173,20 +187,67 @@ impl Notes {
     /// The notes of pages `[first, last)` in page order, `each` of them
     /// until it says no: whether it never did. A part at a time.
     fn each(&self, first: usize, last: usize, mut each: impl FnMut(usize, u64) -> bool) -> bool {
-        match pieces(first, last) {
-            Some(pieces) => pieces.into_iter().all(|(from, to)| {
+        if first >= last {
+            return true;
+        }
+        let (a, b) = (first >> SHARD_SHIFT, (last - 1) >> SHARD_SHIFT);
+        if b - a < 4 * SHARDS {
+            for piece in a..=b {
+                let from = first.max(piece << SHARD_SHIFT);
+                let to = last.min((piece + 1) << SHARD_SHIFT);
                 let s = self.read(shard_of(from));
-                s.written.range(from..to).all(|(&p, &w)| each(p, w))
-            }),
-            None => {
-                let mut all: Vec<(usize, u64)> = Vec::new();
-                for shard in 0..SHARDS {
-                    all.extend(self.read(shard).written.range(first..last).map(|(&p, &w)| (p, w)));
+                if !s.written.range(from..to).all(|(&p, &w)| each(p, w)) {
+                    return false;
                 }
-                all.sort_unstable();
-                all.into_iter().all(|(p, w)| each(p, w))
+            }
+            return true;
+        }
+        let mut all: Vec<(usize, u64)> = Vec::new();
+        for shard in 0..SHARDS {
+            all.extend(self.read(shard).written.range(first..last).map(|(&p, &w)| (p, w)));
+        }
+        all.sort_unstable();
+        all.into_iter().all(|(p, w)| each(p, w))
+    }
+
+    /// Like [`Notes::each`], but in arbitrary order, skipping any shard whose
+    /// latest write is `<= floor` without locking or touching its `BTreeMap`.
+    fn all_unordered_since(&self, first: usize, last: usize, floor: u64, mut each: impl FnMut(usize, u64) -> bool) -> bool {
+        if first >= last {
+            return true;
+        }
+        let (a, b) = (first >> SHARD_SHIFT, (last - 1) >> SHARD_SHIFT);
+        if b - a < SHARDS {
+            for piece in a..=b {
+                let from = first.max(piece << SHARD_SHIFT);
+                let to = last.min((piece + 1) << SHARD_SHIFT);
+                let shard = shard_of(from);
+                if self.max_written[shard].load(std::sync::atomic::Ordering::Acquire) <= floor {
+                    continue;
+                }
+                let s = self.read(shard);
+                if to - from == 1 {
+                    if let Some(&w) = s.written.get(&from)
+                        && !each(from, w)
+                    {
+                        return false;
+                    }
+                } else if !s.written.range(from..to).all(|(&p, &w)| each(p, w)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        for shard in 0..SHARDS {
+            if self.max_written[shard].load(std::sync::atomic::Ordering::Acquire) <= floor {
+                continue;
+            }
+            let s = self.read(shard);
+            if !s.written.range(first..last).all(|(&p, &w)| each(p, w)) {
+                return false;
             }
         }
+        true
     }
 
     /// The notes of pages `[first, last)` in page order. A part at a time.
@@ -203,12 +264,12 @@ impl Notes {
     /// (`write`) or reading. Taken in order: whoever waits for a part holds
     /// only lower ones, so no two holders wait for each other.
     fn hold(&self, shards: u64, write: bool) -> Held<'_> {
-        let mut held = Held { shards, read: Vec::new(), write: Vec::new() };
+        let mut held = Held { shards, read: Vec::new(), write: Vec::new(), max_written: &self.max_written };
         let mut m = shards;
         while m != 0 {
             let shard = m.trailing_zeros() as usize;
             m &= m - 1;
-            let lock = &self.0[shard];
+            let lock = &self.shards[shard];
             if write {
                 let guard = match lock.try_write() {
                     Ok(g) => g,
@@ -247,6 +308,7 @@ struct Held<'a> {
     shards: u64,
     read: Vec<std::sync::RwLockReadGuard<'a, Shard>>,
     write: Vec<std::sync::RwLockWriteGuard<'a, Shard>>,
+    max_written: &'a [std::sync::atomic::AtomicU64; SHARDS],
 }
 
 impl Held<'_> {
@@ -264,6 +326,10 @@ impl Held<'_> {
 
     /// See [`Shard::note`]; held for writing.
     fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
+        let shard = shard_of(page);
+        if now > self.max_written[shard].load(std::sync::atomic::Ordering::Relaxed) {
+            self.max_written[shard].store(now, std::sync::atomic::Ordering::Release);
+        }
         let at = self.place(page);
         self.write[at].note(page, parts, now)
     }
@@ -353,6 +419,16 @@ static JOURNAL: RwLock<Journal> = RwLock::new(Journal {
     ahead_asked: 0,
     kept: false,
 });
+
+/// Mirror of [`Journal::kept`] for lock-free fast-path checks on the
+/// submission lane (written only under [`JOURNAL`]'s write lock).
+static KEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a submission's one asking (`ask_once`) currently stands.
+#[inline]
+pub(crate) fn is_kept() -> bool {
+    KEPT.load(std::sync::atomic::Ordering::Acquire)
+}
 
 /// The page ranges of [`Journal::ahead`], by their starts, and for each the
 /// furthest end of it and those before it: whether one holds a range is
@@ -705,14 +781,14 @@ fn spread() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_SPREAD").is_some_and(|v| v == "1"))
 }
 
-/// `each(i)` for every `i` below `n`, on the threads kept for landing if
-/// [`spread`] and there are enough; what each returns, in order.
-fn spread_each<T: Send>(n: usize, each: impl Fn(usize) -> T + Sync) -> Vec<T> {
-    if !spread() || n < 4 {
+/// `each(i)` for every `i` below `n`, on the wide threads if [`spread`] and
+/// there are at least 2; what each returns, in order.
+fn spread_each<T: Send>(n: usize, each: impl Fn(usize) -> T + Send + Sync) -> Vec<T> {
+    if !spread() || n < 2 {
         return (0..n).map(each).collect();
     }
     let out: Vec<Mutex<Option<T>>> = (0..n).map(|_| Mutex::new(None)).collect();
-    crate::land::each_under(n, &|i| {
+    crate::shadow::wide_each(n, |i| {
         let v = each(i);
         *out[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(v);
     });
@@ -953,6 +1029,11 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
 
 /// [`ask_ahead`]; `held`: the caller holds everything ([`Asking::hold_all`]).
 fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
+    // The submission's one asking stands ([`ask_once`]): what it does not
+    // hold is left to `writes`. Check before scanning/sorting `ranges`.
+    if !held && is_kept() {
+        return;
+    }
     let mut pieces: Vec<(usize, usize)> = ranges
         .iter()
         // Not view memory known by its bits: the kernel would refuse the
@@ -964,14 +1045,14 @@ fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
         return;
     }
     pieces.sort_unstable();
-    // The submission's one asking stands ([`ask_once`]): what it does not
-    // hold is left to `writes`.
+    // Re-check under the journal lock in case `ask_once` started concurrently.
     if journal().kept {
         return;
     }
     let _all = (!held).then(Asking::hold_all);
     let (mut asked, mut written) = (Vec::new(), Vec::new());
     let mut runs = Vec::new();
+    let max_run = if spread() { (64 << 20) / PAGE } else { AHEAD_MAX };
     let mut i = 0;
     while i < pieces.len() {
         let first = pieces[i].0;
@@ -979,7 +1060,7 @@ fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
         let mut k = i + 1;
         while k < pieces.len()
             && pieces[k].0 <= last + AHEAD_GAP
-            && last.max(pieces[k].1) - first <= AHEAD_MAX
+            && last.max(pieces[k].1) - first <= max_run
         {
             last = last.max(pieces[k].1);
             k += 1;
@@ -1295,6 +1376,7 @@ fn ask_rest(ranges: &[(usize, usize)], held: bool) {
         let mut j = journal_mut();
         j.ahead_asked = now;
         j.kept = !ahead.is_empty();
+        KEPT.store(j.kept, std::sync::atomic::Ordering::Release);
         j.ahead.set(ahead);
         return;
     }
@@ -1305,6 +1387,7 @@ fn ask_rest(ranges: &[(usize, usize)], held: bool) {
         j.notes.note(page, parts, now);
     }
     j.kept = !ahead.is_empty();
+    KEPT.store(j.kept, std::sync::atomic::Ordering::Release);
     j.ahead.set(ahead);
 }
 
@@ -1361,14 +1444,14 @@ pub(crate) fn submission_in_test() -> std::sync::MutexGuard<'static, ()> {
 /// The submission's one asking stands no longer: its refreshes are done,
 /// or title memory was written in a way the journal was not told.
 pub(crate) fn ask_once_end() {
-    // Renderer port #7: none standing is seen shared.
-    if port_journal() && !journal().kept {
+    if !is_kept() {
         port7_count(P7_SKIPPED, 1);
         return;
     }
     let mut j = journal_mut();
     if j.kept {
         j.kept = false;
+        KEPT.store(false, std::sync::atomic::Ordering::Release);
         j.ahead.clear();
     }
 }
@@ -1377,9 +1460,7 @@ pub(crate) fn ask_once_end() {
 /// stands (the title's buffer copies, done at submission): its pages count
 /// as written after that asking, so the refreshes that follow copy them.
 pub(crate) fn wrote(at: usize, len: usize) {
-    // Renderer port #7: with no asking standing there is nothing to note,
-    // which is seen shared. (Standing, its number moves: alone, as before.)
-    if port_journal() && (len == 0 || !journal().kept) {
+    if len == 0 || !is_kept() {
         port7_count(P7_SKIPPED, 1);
         return;
     }
@@ -1580,8 +1661,21 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
     let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
         return false;
     };
-    (ranged != 0 || taken.iter().all(|&at| at != 0))
-        && j.notes.each(first, last, |page, write| write <= taken[page - first].max(ranged))
+    let floor = if ranged != 0 {
+        ranged
+    } else {
+        let mut min = u64::MAX;
+        for &at in taken {
+            if at == 0 {
+                return false;
+            }
+            if at < min {
+                min = at;
+            }
+        }
+        min
+    };
+    j.notes.all_unordered_since(first, last, floor, |page, write| write <= taken[page - first].max(ranged))
 }
 
 impl Tracked {

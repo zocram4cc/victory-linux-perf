@@ -16,7 +16,7 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -48,11 +48,13 @@ pub(crate) struct Shadow {
     /// a range holds in part cannot say so in `copied`. Locked inside
     /// `copied`'s lock.
     ranged: Mutex<[(usize, usize, u64); 2]>,
+    has_ranged: AtomicBool,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
+    has_pending: AtomicBool,
     /// With [`relay`]: how many submissions not yet copied back declared
     /// each range of `pending` ([`Flights`]). Locked inside `pending`'s
     /// lock.
@@ -715,8 +717,8 @@ pub(crate) fn stale_pages(most: usize, say: &mut dyn FnMut(&Shadow, usize, usize
 /// many.
 pub(crate) fn copy_all(copies: Vec<(usize, usize, usize)>) {
     let bytes: usize = copies.iter().map(|c| c.2).sum();
-    if bytes > 4 << 20 {
-        wide(copy_jobs(copies));
+    if bytes > 128 << 10 {
+        copy_wide_many(copies);
         return;
     }
     for (src, dst, len) in copies {
@@ -1502,7 +1504,14 @@ fn spin(there: impl Fn() -> bool) {
 
 /// How many threads are kept for [`wide`].
 fn wide_threads() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_WIDE_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6))
+            .clamp(1, 12)
+    })
 }
 
 fn workers() -> &'static Workers {
@@ -1592,28 +1601,155 @@ pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
     wide(jobs);
 }
 
+/// Zero-allocation scoped work pool for [`wide_each`].
+struct EachPool {
+    state: Mutex<EachState>,
+    more: std::sync::Condvar,
+    idle: std::sync::Condvar,
+    turn: Mutex<()>,
+    next: std::sync::atomic::AtomicUsize,
+    count: std::sync::atomic::AtomicUsize,
+    chunk: std::sync::atomic::AtomicUsize,
+    round: std::sync::atomic::AtomicU64,
+    threads: usize,
+}
+
+struct EachState {
+    work: Option<EachWork>,
+    round: u64,
+    running: usize,
+}
+
+#[derive(Clone, Copy)]
+struct EachWork(*const (dyn Fn(usize) + Sync));
+// SAFETY: `EachPool::each` keeps the closure alive until every worker has left it.
+unsafe impl Send for EachWork {}
+
+thread_local! {
+    static IN_WIDE_EACH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+impl EachPool {
+    fn new(threads: usize) -> &'static EachPool {
+        let pool: &'static EachPool = Box::leak(Box::new(EachPool {
+            state: Mutex::new(EachState { work: None, round: 0, running: 0 }),
+            more: std::sync::Condvar::new(),
+            idle: std::sync::Condvar::new(),
+            turn: Mutex::new(()),
+            next: std::sync::atomic::AtomicUsize::new(0),
+            count: std::sync::atomic::AtomicUsize::new(0),
+            chunk: std::sync::atomic::AtomicUsize::new(1),
+            round: std::sync::atomic::AtomicU64::new(0),
+            threads,
+        }));
+        for i in 0..threads {
+            let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
+                crate::cores::keep_helper_on_fast_cores("victory-wide");
+                IN_WIDE_EACH.set(true);
+                pool.help();
+            });
+        }
+        pool
+    }
+
+    fn help(&self) {
+        let mut seen = 0u64;
+        loop {
+            spin(|| self.round.load(Ordering::Acquire) != seen);
+            let work = {
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                loop {
+                    if let Some(work) = state.work
+                        && state.round != seen
+                    {
+                        seen = state.round;
+                        state.running += 1;
+                        break work;
+                    }
+                    state = self.more.wait(state).unwrap_or_else(|e| e.into_inner());
+                }
+            };
+            let _working = crate::timeline::span("a job for another thread");
+            let count = self.count.load(Ordering::Acquire);
+            let chunk = self.chunk.load(Ordering::Relaxed);
+            loop {
+                let start = self.next.fetch_add(chunk, Ordering::Relaxed);
+                if start >= count {
+                    break;
+                }
+                let end = (start + chunk).min(count);
+                for i in start..end {
+                    // SAFETY: `state.running` keeps the closure alive.
+                    unsafe { (*work.0)(i) };
+                }
+            }
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.running -= 1;
+            if state.running == 0 {
+                self.idle.notify_all();
+            }
+        }
+    }
+
+    fn run(&self, n: usize, work: &(dyn Fn(usize) + Sync)) {
+        if n < 2 || self.threads == 0 || IN_WIDE_EACH.get() {
+            for i in 0..n {
+                work(i);
+            }
+            return;
+        }
+        IN_WIDE_EACH.set(true);
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                IN_WIDE_EACH.set(false);
+            }
+        }
+        let _reset = Reset;
+        let _wide = crate::timeline::span("work spread over threads");
+        let _turn = self.turn.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: lifetime erased only until this call waits for `running == 0`.
+        let ptr = EachWork(unsafe { std::mem::transmute::<*const (dyn Fn(usize) + Sync + '_), *const (dyn Fn(usize) + Sync + 'static)>(work) });
+        let chunk = if n >= 64 { (n / ((self.threads + 1) * 8)).clamp(1, 16) } else { 1 };
+        self.next.store(0, Ordering::Relaxed);
+        self.chunk.store(chunk, Ordering::Relaxed);
+        self.count.store(n, Ordering::Release);
+        {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.round += 1;
+            state.work = Some(ptr);
+            self.round.store(state.round, Ordering::Release);
+        }
+        if n > self.threads {
+            self.more.notify_all();
+        } else {
+            (1..n).for_each(|_| self.more.notify_one());
+        }
+        loop {
+            let start = self.next.fetch_add(chunk, Ordering::Relaxed);
+            if start >= n {
+                break;
+            }
+            let end = (start + chunk).min(n);
+            for i in start..end {
+                work(i);
+            }
+        }
+        spin(|| self.state.try_lock().is_ok_and(|s| s.running == 0));
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.work = None;
+        while state.running > 0 {
+            state = self.idle.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
 /// Calls `work` with every number under `n`, on the kept threads and on
 /// this one, the next number to whichever is free: for thousands of small
 /// pieces of work, where a job each ([`wide`]) is mostly the jobs' queue.
-pub(crate) fn wide_each(n: usize, work: impl Fn(usize) + Send + Sync + 'static) {
-    let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let work = Arc::new(work);
-    let threads = (wide_threads() + 1).min(n);
-    let jobs = (0..threads)
-        .map(|_| {
-            let (next, work) = (next.clone(), work.clone());
-            Box::new(move || {
-                loop {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    if i >= n {
-                        break;
-                    }
-                    work(i);
-                }
-            }) as Job
-        })
-        .collect();
-    wide(jobs);
+pub(crate) fn wide_each(n: usize, work: impl Fn(usize) + Send + Sync) {
+    static POOL: std::sync::OnceLock<&'static EachPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| EachPool::new(wide_threads())).run(n, &work);
 }
 
 /// About this many bytes to a piece of work for [`wide`].
@@ -1631,7 +1767,27 @@ pub(crate) fn take_snapshots() {
     if snaps.is_empty() {
         return;
     }
-    wide(copy_jobs(snaps));
+    copy_wide_many(snaps);
+}
+
+/// Parallelizes `copies` (src, dst, len) in 256 KiB chunks on [`wide_each`]
+/// with no per-job heap allocations.
+fn copy_wide_many(copies: Vec<(usize, usize, usize)>) {
+    const CHUNK: usize = 64 << 10;
+    let mut parts: Vec<(usize, usize, usize)> = Vec::with_capacity(copies.len());
+    for (src, dst, len) in copies {
+        let mut at = 0;
+        while at < len {
+            let n = CHUNK.min(len - at);
+            parts.push((src + at, dst + at, n));
+            at += n;
+        }
+    }
+    wide_each(parts.len(), |i| {
+        let (src, dst, len) = parts[i];
+        // SAFETY: non-overlapping caller ranges alive until `wide_each` returns.
+        unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
+    });
 }
 
 /// `copies` (from, to, bytes) as pieces of work of about [`WIDE_JOB`]
@@ -3213,8 +3369,10 @@ impl Shadow {
             len,
             copied: Mutex::new(vec![0; pages as usize]),
             ranged: Mutex::default(),
+            has_ranged: AtomicBool::new(false),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
+            has_pending: AtomicBool::new(false),
             flights: Mutex::default(),
             before: Mutex::default(),
             merging: RwLock::default(),
@@ -3293,6 +3451,8 @@ impl Shadow {
         // lists).
         if self.card.is_some() {
             pending.push(range);
+        self.has_pending.store(true, Ordering::Release);
+            self.has_pending.store(true, Ordering::Release);
             return;
         }
         // The parts no declared range holds yet: their bytes are taken now,
@@ -3317,6 +3477,7 @@ impl Shadow {
             parts = rest;
         }
         pending.push(range);
+        self.has_pending.store(true, Ordering::Release);
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
@@ -3606,7 +3767,11 @@ impl Shadow {
         } else {
             pending.retain(|r| !ranges.contains(r));
         }
-        if !pending.is_empty() || self.card.is_some() {
+        if !pending.is_empty() {
+            return;
+        }
+        self.has_pending.store(false, Ordering::Release);
+        if self.card.is_some() {
             return;
         }
         if keeps() {
@@ -3663,13 +3828,14 @@ impl Shadow {
     /// Whether shaders of a submission not yet copied back may be writing
     /// the copy.
     pub(crate) fn writes_pending(&self) -> bool {
-        !self.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+        self.has_pending.load(Ordering::Acquire)
     }
 
     /// Whether one of those submissions may be writing in title memory
     /// `[from, to)`.
     pub(crate) fn writes_pending_in(&self, from: usize, to: usize) -> bool {
-        self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
+        self.has_pending.load(Ordering::Acquire)
+            && self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
     }
 
     /// Whether [`Shadow::update`] of `[address, address + len)` would leave
@@ -4023,7 +4189,9 @@ impl Shadow {
             return false;
         }
         // Around ranges shaders are writing the refresh asks gap by gap.
-        if self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from) {
+        if self.has_pending.load(Ordering::Acquire)
+            && self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
+        {
             return false;
         }
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
@@ -4040,6 +4208,9 @@ impl Shadow {
     /// The latest asking after which a range that holds `[from, to)` was
     /// taken whole (0: none is known). The caller holds `copied`'s lock.
     fn ranged(&self, from: usize, to: usize) -> u64 {
+        if !self.has_ranged.load(Ordering::Acquire) {
+            return 0;
+        }
         let ranged = self.ranged.lock().unwrap_or_else(|e| e.into_inner());
         ranged.iter().filter(|r| r.0 <= from && to <= r.1).map(|r| r.2).max().unwrap_or(0)
     }
@@ -4198,6 +4369,7 @@ impl Shadow {
             if to - from >= ranged[1].1 - ranged[1].0 {
                 ranged[1] = (from, to, now);
             }
+            self.has_ranged.store(true, Ordering::Release);
         }
         bytes
     }
@@ -4206,8 +4378,8 @@ impl Shadow {
     /// they are long: the big heap's copy has some 4 MB of them in each of
     /// 14 refreshes a frame, on one thread while the others had nothing.
     fn take_all(&self, runs: Vec<(usize, usize, bool)>) -> usize {
-        const LONG: usize = 1 << 20;
-        const PART: usize = 256 << 10;
+        const LONG: usize = 256 << 10;
+        const PART: usize = 64 << 10;
         let bytes = runs.iter().map(|r| r.1 - r.0).sum();
         if bytes < LONG || !crate::watch::light() {
             for (from, to, known) in runs {
@@ -4855,7 +5027,13 @@ impl Shadow {
         let Some(at) = copied.get_mut(page) else {
             return false;
         };
-        let held = *at != 0 && *at >= before && crate::watch::block_published(block);
+        // For kernel write-watched sections (`watched == 1`, Wine uffd_wp),
+        // `VICTORY_LAND_BESIDE=1` writes through a separate unwatched mapping;
+        // any concurrent or prior title write still has its kernel dirty bit
+        // set and will be noted at a higher asking number by the next `ask_once`.
+        let held = *at != 0
+            && *at >= before
+            && (crate::watch::block_published(block) || self.watched.load(Ordering::Relaxed) == 1);
         if held {
             *at = (*at).max(now);
         }
@@ -5069,7 +5247,7 @@ fn buffers() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entr
 static BUFFERS_CHANGED: AtomicU64 = AtomicU64::new(1);
 
 /// Answers a thread remembers.
-const FOUND_MOST: usize = 1024;
+const FOUND_MOST: usize = 4096;
 
 /// An ask (address, bytes), the count of changes it was answered at, and the
 /// answer.
@@ -5090,12 +5268,12 @@ fn quick_find() -> bool {
 
 fn found_at(address: u64, len: u64) -> usize {
     let h = (address ^ len.rotate_left(32)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    (h >> 54) as usize % FOUND_MOST
+    ((h >> 52) as usize) & (FOUND_MOST - 1)
 }
 
 /// What this thread remembers of an ask, if nothing changed since.
 fn found(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    let changed = BUFFERS_CHANGED.load(Ordering::SeqCst);
+    let changed = BUFFERS_CHANGED.load(Ordering::Acquire);
     let shadow = FOUND.with(|f| {
         let f = f.borrow();
         let (a, n, at, shadow) = f.get(found_at(address, len))?;
@@ -5103,8 +5281,10 @@ fn found(address: u64, len: u64) -> Option<Arc<Shadow>> {
     })?;
     // Whoever takes the map to let a copy go that nobody holds finds it held
     // now, or had counted before: then it is not handed out.
+    // On x86-64, Weak::upgrade()'s lock cmpxchg is already a full barrier.
+    #[cfg(not(target_arch = "x86_64"))]
     std::sync::atomic::fence(Ordering::SeqCst);
-    (BUFFERS_CHANGED.load(Ordering::SeqCst) == changed).then_some(shadow)
+    (BUFFERS_CHANGED.load(Ordering::Acquire) == changed).then_some(shadow)
 }
 
 /// Remembers an answer given while `changed` was the count.

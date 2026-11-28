@@ -128,6 +128,98 @@ pub extern "system" fn XMemVirtualAlloc(
     parameter.Anonymous2.Pointer = (&raw mut requirements).cast();
     // Address requirements apply to reservations at an address of our choice.
     let constrained = base.is_null();
+    // `VICTORY_SECTION_ALLOC=1|wc` (Wine): back large committed GPU heaps with
+    // a pagefile section + `MEM_WRITE_WATCH` (requires patched Wine ntdll.so
+    // supporting `UFFDIO_REGISTER_MODE_WP` on section views). Copy-back then
+    // lands through `VICTORY_LAND_BESIDE=1` without dirtying write-watch PTEs.
+    static SECTION_ALLOC: LazyLock<u8> = LazyLock::new(|| {
+        if !on_wine() {
+            return 0;
+        }
+        match std::env::var("VICTORY_SECTION_ALLOC").as_deref() {
+            Ok("1") => 1,
+            Ok("wc") => 2,
+            _ => 0,
+        }
+    });
+    let use_section = match *SECTION_ALLOC {
+        1 => true,
+        2 => (asked & 0x400) != 0,
+        _ => false,
+    };
+    if use_section
+        && constrained
+        && !placeholder
+        && (kind & MEM_COMMIT) != 0
+        && size >= 64 * MIB
+        && size.is_multiple_of(PAGE)
+        && protect == PAGE_READWRITE
+    {
+        static SECTION_HANDLES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+        // SAFETY: plain section creation + placeholder replace + write-watch arm.
+        let handle = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | SEC_COMMIT,
+                (size as u64 >> 32) as u32,
+                size as u32,
+                std::ptr::null(),
+            )
+        };
+        if !handle.is_null() {
+            let hole = unsafe {
+                VirtualAlloc2(
+                    GetCurrentProcess(),
+                    std::ptr::null(),
+                    size,
+                    MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                    PAGE_NOACCESS,
+                    &mut parameter,
+                    1,
+                )
+            };
+            let view = if !hole.is_null() {
+                unsafe {
+                    MapViewOfFile3(
+                        handle,
+                        GetCurrentProcess(),
+                        hole,
+                        0,
+                        size,
+                        MEM_REPLACE_PLACEHOLDER,
+                        PAGE_READWRITE,
+                        std::ptr::null_mut(),
+                        0,
+                    )
+                }
+            } else {
+                MEMORY_MAPPED_VIEW_ADDRESS { Value: std::ptr::null_mut() }
+            };
+            if !view.Value.is_null() {
+                let at = view.Value as usize;
+                // Arm kernel write-watch (UFFDIO_REGISTER_MODE_WP) on the title's view.
+                let watched = !unsafe { VirtualAlloc(view.Value, size, MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) }.is_null();
+                victory_gpu::title_memory_section(handle as usize, size as u64, true);
+                victory_gpu::title_memory_remapped(at, size);
+                victory_gpu::title_memory_view(at, size, handle as usize, 0);
+                victory_gpu::title_memory_allocated(at, size);
+                SECTION_HANDLES.lock().unwrap_or_else(|e| e.into_inner()).push(handle as usize);
+                tracing::info!(
+                    at = format_args!("{at:#x}"),
+                    mb = size >> 20,
+                    watched,
+                    "XMemVirtualAlloc backed by write-watched section (VICTORY_SECTION_ALLOC)"
+                );
+                note_protection(asked, kind, flags, at, size);
+                return view.Value;
+            }
+            if !hole.is_null() {
+                unsafe { VirtualFree(hole, 0, MEM_RELEASE) };
+            }
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
+        }
+    }
     if constrained {
         kind |= MEM_RESERVE;
         // The GPU side copies only the pages the title wrote since its last

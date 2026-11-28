@@ -1498,6 +1498,60 @@ pub(crate) fn forget(resource: usize) {
         // `forget` of that resource skips.
         views.free.push(i);
     }
+    FORGET_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
+/// Bumped whenever [`forget`] invalidates a table entry's generation.
+static FORGET_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+const VIEW_CACHE_SIZE: usize = 2048;
+
+struct ViewCache {
+    epoch: u64,
+    entries: Vec<Option<(u32, u32, View)>>,
+}
+
+thread_local! {
+    /// Per-thread direct-mapped cache of table entries (`kind == 0`), valid
+    /// while [`FORGET_EPOCH`] is unchanged. Avoids hammering the global
+    /// `VIEWS` RwLock across all recording threads.
+    static TLS_VIEWS: std::cell::RefCell<ViewCache> = const {
+        std::cell::RefCell::new(ViewCache { epoch: 0, entries: Vec::new() })
+    };
+    /// Per-thread cache of append-only placed-view shapes (`views.shapes`),
+    /// which are never modified or removed once inserted.
+    static TLS_SHAPES: std::cell::RefCell<Vec<Option<Shape>>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+
+fn placed_view_of(i: u32, generation: u32) -> Option<View> {
+    let payload = payload(i, generation);
+    let address = payload & ((1 << PLACED_ADDRESS_BITS) - 1);
+    let shape_id = (payload >> PLACED_ADDRESS_BITS) as usize;
+    let shape = TLS_SHAPES.with(|cache| {
+        let c = cache.borrow();
+        c.get(shape_id).copied().flatten()
+    });
+    let (unordered, resource, rest) = match shape {
+        Some(s) => s,
+        None => {
+            let s = *views_read().shapes.get(shape_id)?;
+            TLS_SHAPES.with(|cache| {
+                let mut c = cache.borrow_mut();
+                if c.len() <= shape_id {
+                    c.resize(shape_id + 1, None);
+                }
+                c[shape_id] = Some(s);
+            });
+            s
+        }
+    };
+    let mut desc = [0u32; 16];
+    desc[..10].copy_from_slice(&rest[..10]);
+    (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+    desc[12..].copy_from_slice(&rest[10..]);
+    Some(View::Placed(unordered, resource, desc))
 }
 
 /// The view the record words `i` and `generation` name: the one they hold
@@ -1505,12 +1559,46 @@ pub(crate) fn forget(resource: usize) {
 fn view_at(i: u32, generation: u32) -> Option<View> {
     match generation >> KIND_SHIFT {
         0 => {
-            let views = views_read();
-            let (view, current) = views.list.get(i as usize)?;
-            (*current == generation).then(|| view.clone())
+            let epoch = FORGET_EPOCH.load(std::sync::atomic::Ordering::Acquire);
+            let slot = (i as usize) & (VIEW_CACHE_SIZE - 1);
+            let hit = TLS_VIEWS.with(|cache| {
+                let c = cache.borrow();
+                if c.epoch == epoch
+                    && let Some(Some((ci, cg, v))) = c.entries.get(slot)
+                    && *ci == i
+                    && *cg == generation
+                {
+                    return Some(v.clone());
+                }
+                None
+            });
+            if hit.is_some() {
+                return hit;
+            }
+            let (view, read_epoch) = {
+                let views = views_read();
+                let (view, current) = views.list.get(i as usize)?;
+                if *current != generation {
+                    return None;
+                }
+                (view.clone(), FORGET_EPOCH.load(std::sync::atomic::Ordering::Acquire))
+            };
+            TLS_VIEWS.with(|cache| {
+                let mut c = cache.borrow_mut();
+                if c.epoch != read_epoch {
+                    if c.entries.is_empty() {
+                        c.entries = vec![None; VIEW_CACHE_SIZE];
+                    } else {
+                        c.entries.fill(None);
+                    }
+                    c.epoch = read_epoch;
+                }
+                c.entries[slot] = Some((i, generation, view.clone()));
+            });
+            Some(view)
         }
         CONSTANT => Some(constant_of(i, generation)),
-        PLACED => views_read().placed_of(i, generation),
+        PLACED => placed_view_of(i, generation),
         _ => None,
     }
 }

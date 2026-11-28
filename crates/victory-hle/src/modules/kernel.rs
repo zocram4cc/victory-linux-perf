@@ -434,6 +434,50 @@ pub extern "system" fn SetThreadPriority(thread: *mut c_void, priority: i32) -> 
     unsafe { windows_sys::Win32::System::Threading::SetThreadPriority(thread, priority) }
 }
 
+/// `Sleep`: when `VICTORY_SLEEP0_YIELD=1`, throttle tight `Sleep(0)` spin loops
+/// that otherwise hammer Wine's `NtDelayExecution` (`xsavec64` + `sched_yield`)
+/// and burn 65%+ of a core on a polling thread.
+pub extern "system" fn Sleep(ms: u32) {
+    #[cfg(windows)]
+    {
+        static THROTTLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if ms == 0 && *THROTTLE.get_or_init(|| std::env::var_os("VICTORY_SLEEP0_YIELD").is_some_and(|v| v == "1")) {
+            #[cfg(target_arch = "x86_64")]
+            {
+                thread_local! {
+                    static STREAK: std::cell::Cell<(u32, u64)> = const { std::cell::Cell::new((0, 0)) };
+                }
+                // SAFETY: rdtsc is always available on x86-64.
+                let now = unsafe { core::arch::x86_64::_rdtsc() };
+                let (prev, last) = STREAK.get();
+                let streak = if now.wrapping_sub(last) < 100_000 { prev.saturating_add(1) } else { 0 };
+                STREAK.set((streak, now));
+                if streak < 16 {
+                    std::hint::spin_loop();
+                    return;
+                }
+                #[link(name = "ntdll")]
+                unsafe extern "system" {
+                    fn NtDelayExecution(alertable: u8, interval: *const i64) -> i32;
+                }
+                // 50 microseconds relative wait (-500 * 100ns): negligible latency, <1% CPU.
+                let delay: i64 = -500;
+                unsafe { NtDelayExecution(0, &delay) };
+                return;
+            }
+        }
+        unsafe { windows_sys::Win32::System::Threading::Sleep(ms) };
+    }
+    #[cfg(not(windows))]
+    {
+        if ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(u64::from(ms)));
+        } else {
+            std::thread::yield_now();
+        }
+    }
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "kernel",
@@ -442,6 +486,7 @@ pub(crate) fn module() -> HleModule {
             "kernelbase.dll",
             "api-ms-win-core-libraryloader-*",
             "api-ms-win-core-processthreads-*",
+            "api-ms-win-core-synch-*",
             "api-ms-win-core-debug-*",
             "api-ms-win-core-errorhandling-*",
             "api-ms-win-crt-runtime-*",
@@ -469,6 +514,7 @@ pub(crate) fn module() -> HleModule {
             hle_export!(TerminateProcess),
             hle_export!(SetUnhandledExceptionFilter),
             hle_export!(SetThreadPriority),
+            hle_export!(Sleep),
         ],
     }
 }
