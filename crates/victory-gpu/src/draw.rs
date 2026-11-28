@@ -278,6 +278,22 @@ pub(crate) const BAKE_PIXEL_SHADERS: [&str; 7] = [
     "fcee612943c008e0",
 ];
 
+/// Whether `shader` is a program of the title's decoration bake, by hash
+/// ([`BAKE_PIXEL_SHADERS`], [`BAKE_GEOMETRY_SHADERS`]).
+fn bake_shader(shader: &crate::pipeline::Shader) -> bool {
+    let h = shader.hash.as_str();
+    BAKE_PIXEL_SHADERS.contains(&h) || BAKE_GEOMETRY_SHADERS.contains(&h)
+}
+
+/// Whether a draw with the title pipeline `pipeline` bound gets the pass of
+/// its own ahead of a bake: written-down lists (`crate::list::thin`,
+/// `VICTORY_THIN_BAKE`) translate such draws at the title's call. Known at
+/// the bind, by the programs' hashes (not the structural test of
+/// `is_bake_draw`, which needs the targets).
+pub(crate) fn bake_pipeline(pipeline: This) -> bool {
+    early_budgets().1 > 0 && crate::pipeline::shaders_any(pipeline, bake_shader)
+}
+
 /// Geometry stages shared by every ped texture compositor / decoration bake
 /// permutation (`vertex 089d6271be6650ef` fullscreen-triangle ped baker and
 /// `mesh d4111a6e6ea49d91` decoration projection mesh), catching pixel-shader
