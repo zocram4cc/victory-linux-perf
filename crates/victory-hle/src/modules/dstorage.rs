@@ -1416,6 +1416,10 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     } else {
         source
     };
+    #[cfg(feature = "diagnostics")]
+    if bc != 0 {
+        bcpack_dump(bc, &source, size);
+    }
     into_destination(request, size, |out| match tables {
         Some(tables) => bcpack::decode(bc, &source, out, tables)
             .map(|()| out.len())
@@ -1429,6 +1433,25 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         "dstorage: request done"
     );
     Ok(())
+}
+
+/// `VICTORY_BCPACK_DUMP=<folder>` (diagnostics builds): the first 400 BCPack
+/// streams of 64 KiB or more (after zlib) as `bc<bc>-<n>-<destination
+/// bytes>.bin`, to measure and check the decoder away from the game.
+#[cfg(feature = "diagnostics")]
+fn bcpack_dump(bc: u8, source: &[u8], size: usize) {
+    static DIR: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let Some(dir) = DIR.get_or_init(|| std::env::var_os("VICTORY_BCPACK_DUMP").map(Into::into)) else {
+        return;
+    };
+    if size < 64 << 10 {
+        return;
+    }
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n < 400 {
+        let _ = std::fs::write(dir.join(format!("bc{bc}-{n:04}-{size}.bin")), source);
+    }
 }
 
 /// Inflates a zlib stream into `out`, returning the bytes written. A stream
