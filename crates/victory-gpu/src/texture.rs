@@ -1558,16 +1558,17 @@ impl Staging {
         // stays mapped (see `crate::watch::title_memory_reading`; without
         // it a page went between the asking and the read in runs 71 and
         // 74).
+        let start = self.memory as usize;
         let _mapped = if no_wait() && !exact {
             // Not waited for: while the runtime remaps title memory the
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
-            let Some(mapped) = crate::watch::title_memory_reading_now() else {
+            let Some(mapped) = crate::watch::title_memory_reading_range_now(start, size) else {
                 return self.refresh_unlocked(last, size);
             };
             mapped
         } else if exact && exact_unlocked() {
-            match crate::watch::title_memory_reading_now() {
+            match crate::watch::title_memory_reading_range_now(start, size) {
                 Some(mapped) => mapped,
                 None => match self.refresh_exact_unlocked(last, size) {
                     Some(read) => {
@@ -1576,11 +1577,11 @@ impl Staging {
                         }
                         return size;
                     }
-                    None => waited(2, crate::watch::title_memory_reading),
+                    None => waited(2, || crate::watch::title_memory_reading_range(start, size)),
                 },
             }
         } else {
-            waited(2, crate::watch::title_memory_reading)
+            waited(2, || crate::watch::title_memory_reading_range(start, size))
         };
         if !committed(self.memory, size) {
             // Partly mapped: a streamed texture with only some mips' pages

@@ -3589,6 +3589,34 @@ pub fn title_memory_splitting(at: usize, len: usize) {
     }
 }
 
+// The extent a read or a change covers: `None` is all of title memory (and
+// what overflows, or is not known).
+type MappingRange = Option<(usize, usize)>;
+
+fn mapping_range(at: usize, len: usize) -> MappingRange {
+    if len == 0 {
+        return None;
+    }
+    at.checked_add(len).map(|end| (at, end))
+}
+
+fn mapping_overlaps(a: MappingRange, b: MappingRange) -> bool {
+    match (a, b) {
+        (Some((a, b)), Some((c, d))) => a < d && c < b,
+        _ => true,
+    }
+}
+
+#[derive(Default)]
+struct MappingState {
+    next: u64,
+    readers: Vec<(u64, MappingRange)>,
+    // Pending and active changes share one ordered queue (`true`: active).
+    // A new read waits behind a queued change that overlaps it, so changes
+    // are not starved.
+    writers: Vec<(u64, MappingRange, bool)>,
+}
+
 /// Held shared by a read of title memory in place, and alone by the runtime
 /// while it changes what title memory shows.
 ///
@@ -3602,11 +3630,28 @@ pub fn title_memory_splitting(at: usize, len: usize) {
 /// had asked whether the texture was all mapped and been told yes. Asking
 /// cannot help; not changing the mapping while such a read is under way
 /// does.
-static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
+static MAPPING: std::sync::Mutex<MappingState> = std::sync::Mutex::new(MappingState {
+    next: 0,
+    readers: Vec::new(),
+    writers: Vec::new(),
+});
+
+/// Rung when a read or a change of a mapping ends.
+static MAPPING_MOVED: std::sync::Condvar = std::sync::Condvar::new();
+
+fn mapping_state() -> std::sync::MutexGuard<'static, MappingState> {
+    MAPPING.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn mapping_id(state: &mut MappingState) -> u64 {
+    let id = state.next;
+    state.next = id.wrapping_add(1);
+    id
+}
 
 /// What the runtime holds while it changes what title memory shows
 /// ([`title_memory_remapping`]).
-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
+pub struct Remapping(u64);
 
 impl Drop for Remapping {
     fn drop(&mut self) {
@@ -3615,11 +3660,19 @@ impl Drop for Remapping {
             guards().changing.clear();
         }
         CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        ACTIVE.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        let mut state = mapping_state();
+        state.writers.retain(|writer| writer.0 != self.0);
+        MAPPING_MOVED.notify_all();
     }
 }
 
+/// Changes of a mapping under way now. Those of ranges that do not overlap
+/// go on side by side, so [`CHANGES`] cannot say whether one is.
+static ACTIVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// How often the runtime began or ended a change of what title memory
-/// shows: odd while one is under way.
+/// shows (whether one is under way: [`ACTIVE`]).
 static CHANGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 thread_local! {
@@ -3656,10 +3709,10 @@ pub(crate) fn again_after_change(since: u64, mut f: impl FnMut() -> bool) -> boo
 /// over (or has been going on for 2 ms): pages it took away for its moment
 /// are back. Another may have begun.
 pub(crate) fn change_over() {
-    let now = changes();
-    if now.is_multiple_of(2) {
+    if ACTIVE.load(std::sync::atomic::Ordering::SeqCst) == 0 {
         return;
     }
+    let now = changes();
     let started = std::time::Instant::now();
     while changes() == now && started.elapsed().as_millis() < 2 {
         for _ in 0..50 {
@@ -3674,7 +3727,7 @@ fn change_done() -> u64 {
     let mut started = None;
     loop {
         let now = changes();
-        if now.is_multiple_of(2) {
+        if ACTIVE.load(std::sync::atomic::Ordering::SeqCst) == 0 && changes() == now {
             return now;
         }
         tries += 1;
@@ -3752,6 +3805,16 @@ pub(crate) fn lost(what: &'static str, at: usize, len: usize) {
 /// Until this guard is dropped, reads of title memory in place stay paused
 /// ([`title_memory_reading`]). Hold it through the whole change.
 pub fn title_memory_remapping() -> Remapping {
+    remapping(None)
+}
+
+/// [`title_memory_remapping`] for a change that touches only `[at, at +
+/// len)` (all the views it cuts, whole): reads elsewhere go on.
+pub fn title_memory_remapping_range(at: usize, len: usize) -> Remapping {
+    remapping(mapping_range(at, len))
+}
+
+fn remapping(range: MappingRange) -> Remapping {
     // For the title's own threads ([`came_back`]).
     install();
     let met = MET.load(std::sync::atomic::Ordering::Relaxed);
@@ -3762,32 +3825,87 @@ pub fn title_memory_remapping() -> Remapping {
             tracing::info!(met, "accesses of title threads that waited for a change of mapping");
         }
     }
-    let changing = MAPPING.write().unwrap_or_else(|e| e.into_inner());
+    let mut state = mapping_state();
+    let id = mapping_id(&mut state);
+    state.writers.push((id, range, false));
+    loop {
+        let busy_readers = state.readers.iter().any(|&(_, other)| mapping_overlaps(range, other));
+        let busy_writers = state.writers.iter().any(|&(other_id, other, active)| {
+            other_id != id && (active || other_id < id) && mapping_overlaps(range, other)
+        });
+        if !busy_readers && !busy_writers {
+            break;
+        }
+        state = MAPPING_MOVED.wait(state).unwrap_or_else(|e| e.into_inner());
+    }
+    if let Some(writer) = state.writers.iter_mut().find(|writer| writer.0 == id) {
+        writer.2 = true;
+    }
+    drop(state);
+    ACTIVE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     CHANGING.set((true, false));
-    Remapping(changing)
+    Remapping(id)
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
-pub struct Reading(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>);
+pub struct Reading(u64);
+
+impl Drop for Reading {
+    fn drop(&mut self) {
+        let mut state = mapping_state();
+        state.readers.retain(|reader| reader.0 != self.0);
+        if !state.writers.is_empty() {
+            MAPPING_MOVED.notify_all();
+        }
+    }
+}
+
+fn mapping_read(range: MappingRange, wait: bool) -> Option<Reading> {
+    let mut state = if wait {
+        mapping_state()
+    } else {
+        match MAPPING.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        }
+    };
+    while state.writers.iter().any(|&(_, other, _)| mapping_overlaps(range, other)) {
+        if !wait {
+            return None;
+        }
+        state = MAPPING_MOVED.wait(state).unwrap_or_else(|e| e.into_inner());
+    }
+    let id = mapping_id(&mut state);
+    state.readers.push((id, range));
+    Some(Reading(id))
+}
 
 /// For reading title memory in place: until what it returns is dropped,
 /// the runtime changes no mapping, so memory found mapped stays mapped.
 /// Not to be taken twice by one thread, nor held across anything that
 /// maps title memory.
 pub fn title_memory_reading() -> Reading {
-    Reading(MAPPING.read().unwrap_or_else(|e| e.into_inner()))
+    mapping_read(None, true).expect("a waiting read always gets its turn")
 }
 
 /// [`title_memory_reading`] if it can be had at once: `None` while the
 /// runtime changes a mapping (or waits to), for a caller that has another
 /// way to read and would rather not wait.
 pub fn title_memory_reading_now() -> Option<Reading> {
-    match MAPPING.try_read() {
-        Ok(guard) => Some(Reading(guard)),
-        Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(e.into_inner())),
-        Err(std::sync::TryLockError::WouldBlock) => None,
-    }
+    mapping_read(None, false)
+}
+
+/// [`title_memory_reading`] of `[at, at + len)` only: a change of a mapping
+/// elsewhere does not wait for it, nor it for that.
+pub fn title_memory_reading_range(at: usize, len: usize) -> Reading {
+    mapping_read(mapping_range(at, len), true).expect("a waiting read always gets its turn")
+}
+
+/// [`title_memory_reading_now`] of `[at, at + len)` only.
+pub fn title_memory_reading_range_now(at: usize, len: usize) -> Option<Reading> {
+    mapping_read(mapping_range(at, len), false)
 }
 
 /// The runtime mapped title memory `[at, at + len)`: what it shows is new,
