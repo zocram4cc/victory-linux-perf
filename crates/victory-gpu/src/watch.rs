@@ -851,10 +851,23 @@ fn dirty_runs(mut at: impl Iterator<Item = usize>, step: usize) -> usize {
 /// Ranges of one submission closer than this are asked about together:
 /// walking the pages between them costs less than another kernel call (a
 /// call that resets written pages costs 30-70 microseconds whatever the
-/// range).
+/// range). `VICTORY_AHEAD_GAP_MB=<MiB>` overrides the 8 MiB default (e.g.
+/// 64–128 under Linux `PAGEMAP_SCAN`, which skips sparse/clean PMDs cheaply).
 const AHEAD_GAP: usize = (8 << 20) / PAGE;
 /// The most one asking covers (its answer needs 8 bytes per 4 KiB page).
 const AHEAD_MAX: usize = (1 << 30) / PAGE;
+
+fn ahead_gap() -> usize {
+    static GAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *GAP.get_or_init(|| {
+        std::env::var("VICTORY_AHEAD_GAP_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&mb| mb > 0)
+            .map_or(AHEAD_GAP, |mb| (mb.min(1024) << 20) / PAGE)
+    })
+}
+
 /// Asks the kernel about many ranges `(start, end)` at once, before the
 /// [`writes`] of each: ranges close together are one asking, and `writes`
 /// then answers from the journal until [`ask_ahead_done`]. The world's
@@ -886,13 +899,14 @@ fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
     let _all = (!held).then(Asking::hold_all);
     let (mut asked, mut written) = (Vec::new(), Vec::new());
     let mut runs = Vec::new();
+    let gap = ahead_gap();
     let mut i = 0;
     while i < pieces.len() {
         let first = pieces[i].0;
         let mut last = pieces[i].1;
         let mut k = i + 1;
         while k < pieces.len()
-            && pieces[k].0 <= last + AHEAD_GAP
+            && pieces[k].0 <= last + gap
             && last.max(pieces[k].1) - first <= AHEAD_MAX
         {
             last = last.max(pieces[k].1);
@@ -6374,6 +6388,44 @@ mod tests {
         assert!(last.is_some_and(|last| last > copied), "{last:?} is not after {copied}");
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn ahead_gap_switch_merges_ranges_within_it() {
+        const CHILD: &str = "VICTORY_AHEAD_GAP_CHILD";
+        const MIB: usize = 1 << 20;
+        if let Ok(askings) = std::env::var(CHILD) {
+            // SAFETY: a fresh write-watched allocation, left to the exit.
+            let p = unsafe {
+                VirtualAlloc(
+                    std::ptr::null(),
+                    64 * MIB,
+                    MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                    PAGE_READWRITE,
+                )
+            } as usize;
+            assert_ne!(p, 0);
+            ask_ahead(&[(p, p + PAGE), (p + 32 * MIB, p + 32 * MIB + PAGE)]);
+            assert_eq!(journal().ahead.ranges.len(), askings.parse::<usize>().unwrap());
+            return;
+        }
+        for (gap, askings) in [(Some("64"), 1), (None, 0)] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args(["watch::tests::ahead_gap_switch_merges_ranges_within_it", "--exact"])
+                .env(CHILD, askings.to_string())
+                .env_remove("VICTORY_AHEAD_GAP_MB");
+            if let Some(mb) = gap {
+                child.env("VICTORY_AHEAD_GAP_MB", mb);
+            }
+            let out = child.output().unwrap();
+            assert!(
+                out.status.success(),
+                "gap {gap:?}: {}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
     }
 
     /// The runtime maps a view and then tells us; a copy's refresh on another
