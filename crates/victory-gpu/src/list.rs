@@ -391,7 +391,7 @@ pub(crate) fn cut_list(this: This) -> bool {
 /// Done before the recording is, since the queue takes its lists only then.
 #[cfg(windows)]
 pub(crate) fn prefetch(this: This) {
-    if this.is_null() || !crate::shadow::prefetch_on() {
+    if this.is_null() || crate::prefetch::mode() != 1 {
         return;
     }
     // SAFETY: the title's list, which the thread that translated it has closed: nothing records
@@ -403,6 +403,26 @@ pub(crate) fn prefetch(this: This) {
     if let Some(host) = &list.host {
         host.prefetch();
     }
+}
+
+/// (`VICTORY_REFRESH_PREFETCH=2`) Recording `this` is closed: its host lists' refreshes are taken out of them, for a
+/// thread of ours to bring up to date once the recording is done ([`crate::prefetch::Job`]). Taking them out is all
+/// this does, so the thread that translates the list is done with it at once.
+#[cfg(windows)]
+pub(crate) fn prefetch_job(this: This) -> Option<std::sync::Arc<crate::prefetch::Job>> {
+    if this.is_null() || crate::prefetch::mode() != 2 {
+        return None;
+    }
+    // SAFETY: the title's list, which the thread that translated it has closed: nothing records into it now, and
+    // the queue takes it only once the recording is done.
+    let list = unsafe { &*this.cast::<List>() };
+    let parts = list
+        .earlier
+        .iter()
+        .map(|part| part.host.take_refresh_log())
+        .chain(list.host.as_ref().map(|host| host.take_refresh_log()))
+        .collect();
+    crate::prefetch::Job::new(parts)
 }
 
 /// What a queue is given for submitted lists that were cut at their waits:

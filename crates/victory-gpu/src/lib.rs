@@ -56,6 +56,8 @@ mod indirect;
 mod inplace;
 #[cfg(windows)]
 mod port;
+#[cfg(windows)]
+mod prefetch;
 /// Whether renderer port #1 is on here (`VICTORY_PORT_CONSTANTS`; off under
 /// Wine unless `VICTORY_PORT_CONSTANTS_WINE=1`), for xmem's half of it.
 #[cfg(windows)]

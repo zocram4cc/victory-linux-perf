@@ -228,6 +228,12 @@ impl<W: Work> Lane<W> {
         self.work.notify_one();
     }
 
+    /// Whether anything is being done, or is in the line: what a submission put in the line now waits behind.
+    pub(super) fn busy(&self) -> bool {
+        let state = self.lock();
+        state.running.is_some() || !state.items.is_empty()
+    }
+
     /// Waits until everything in the line that is free to run has been done
     /// (what comes in after this call may not be).
     pub(super) fn drain(&self) {
@@ -494,6 +500,8 @@ impl Work for Job {
         let Job::Lists(queue, recordings) = self else {
             return vec![self];
         };
+        // The queue takes the lists: their refreshes for a thread of ours are not waited for (`crate::prefetch`).
+        recordings.iter().for_each(|r| r.take_prefetch());
         let lists: Vec<This> = recordings.iter().map(|r| r.back()).collect();
         let jobs = jobs_of(queue as This, &lists);
         // It stood for one submission not begun.
@@ -829,6 +837,11 @@ pub(super) fn submit(this: This, lists: &[This]) {
         let recordings = crate::list::thin::submitted(lists);
         if recordings.is_empty() {
             return;
+        }
+        if crate::prefetch::mode() == 2 {
+            // What the submission waits behind, as the line is before it goes in (`crate::prefetch`).
+            let behind = LANE.busy();
+            recordings.iter().for_each(|r| r.submitted(behind));
         }
         let before = QUEUED.fetch_add(1, Relaxed);
         STATS[DEPTH].fetch_add(before, Relaxed);
@@ -1235,5 +1248,18 @@ mod tests {
         while log.lock().unwrap().len() < 6 {
             std::thread::yield_now();
         }
+    }
+
+    #[test]
+    fn a_submission_into_an_idle_line_waits_behind_nothing() {
+        let log: Log = Arc::default();
+        let idle: Lane<T> = Lane::new();
+        assert!(!idle.busy(), "an empty line has nothing for a submission to wait behind");
+        let queued: Lane<T> = Lane::new();
+        queued.push(0, [T::Run("ahead", log.clone())]);
+        assert!(queued.busy(), "a submission in the line is what the next one waits behind");
+        let running: Lane<T> = Lane::new();
+        running.lock().running = Some(0);
+        assert!(running.busy(), "a submission being done is what the next one waits behind");
     }
 }

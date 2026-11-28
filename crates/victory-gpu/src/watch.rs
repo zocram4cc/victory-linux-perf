@@ -1793,6 +1793,31 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
     ahead_answer(first, last)
 }
 
+/// (`VICTORY_REFRESH_PREFETCH=2`) An asking of `[start, end)` that the prefetch thread makes for itself: the
+/// range is held meanwhile, and what the kernel finds written is noted under a number of its own, which is
+/// returned. The standing asking and the journal's answers ahead are left as they are. `None` if the kernel
+/// refuses the range (view memory, or more than one reservation).
+pub(crate) fn ask_prefetch(start: usize, end: usize) -> Option<u64> {
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let _range = Asking::hold(first, last);
+    let pages = kernel_written(first, last)?;
+    if port_journal() {
+        return Some(note_shared(&pages));
+    }
+    let mut j = journal_mut();
+    let now = next_asking();
+    for (page, parts) in pages {
+        j.notes.note(page, parts, now);
+    }
+    Some(now)
+}
+
+/// What [`ask_prefetch`] noted for `[start, end)`: the pages written, and the asking that last found each.
+pub(crate) fn answered(start: usize, end: usize) -> Vec<(usize, u64)> {
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    journal().notes.range(first, last)
+}
+
 /// What [`asked`] answers from the journal for `[first, last)` lying in the asking standing ahead.
 fn ahead_known(j: &Journal, first: usize, last: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     j.ahead.holds(first, last).then(|| (j.ahead_asked, j.notes.range(first, last)))

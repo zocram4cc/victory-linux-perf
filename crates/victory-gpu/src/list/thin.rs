@@ -194,6 +194,9 @@ pub(crate) struct Recording {
     done: AtomicBool,
     moved: Condvar,
     abandoned: AtomicBool,
+    /// With `VICTORY_REFRESH_PREFETCH=2`: the refreshes of the list, which a thread of ours brings up to date once it
+    /// is done and submitted ([`crate::prefetch`]). The queue takes the list with them ([`Recording::take_prefetch`]).
+    prefetch: Mutex<crate::prefetch::Pending>,
 }
 
 #[derive(Default)]
@@ -217,6 +220,7 @@ impl Recording {
             done: AtomicBool::new(false),
             moved: Condvar::new(),
             abandoned: AtomicBool::new(false),
+            prefetch: Mutex::default(),
         }
     }
 
@@ -237,6 +241,19 @@ impl Recording {
         held(&self.inner).back as This
     }
 
+    /// The queue takes the list: its job stops, and nothing of it is started any more.
+    pub(crate) fn take_prefetch(&self) {
+        held(&self.prefetch).taken();
+    }
+
+    /// The recording is submitted into the line, which had `behind` anything ahead of it (`crate::prefetch`).
+    pub(crate) fn submitted(&self, behind: bool) {
+        let decided = held(&self.prefetch).submitted(behind);
+        if let Some((job, behind)) = decided {
+            crate::prefetch::submit(job, behind);
+        }
+    }
+
     /// Translates what there is.
     fn run(&self) {
         loop {
@@ -254,9 +271,11 @@ impl Recording {
             let began = std::time::Instant::now();
             let (calls, closed) = translate(back, &chunk, || self.abandoned.load(Acquire));
             if closed {
-                // Before the recording is done: the queue takes its lists then, and their refreshes are
-                // brought up to date here, ahead of their submission (`VICTORY_REFRESH_PREFETCH=1`).
+                // Before the recording is done, as the queue takes it then. Under `VICTORY_REFRESH_PREFETCH=1` the
+                // refreshes of its lists are done here; under `=2` they are taken out for a thread of ours, which
+                // does them once the recording is done and submitted (`crate::prefetch`).
                 super::prefetch(back);
+                held(&self.prefetch).closed(super::prefetch_job(back));
             }
             STATS[0].fetch_add(calls, Relaxed);
             STATS[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
@@ -271,6 +290,10 @@ impl Recording {
                 give_back(kept);
                 STATS[2].fetch_add(1, Relaxed);
                 crate::queue::line_moved();
+                let decided = held(&self.prefetch).done();
+                if let Some((job, behind)) = decided {
+                    crate::prefetch::submit(job, behind);
+                }
             }
         }
     }
@@ -278,6 +301,7 @@ impl Recording {
 
 impl Drop for Recording {
     fn drop(&mut self) {
+        self.prefetch.get_mut().unwrap_or_else(|e| e.into_inner()).dropped();
         let inner = self.inner.get_mut().unwrap_or_else(|e| e.into_inner());
         give_back(inner.chunks.drain(..).chain(std::mem::take(&mut inner.kept)).collect());
         if inner.back != 0 {

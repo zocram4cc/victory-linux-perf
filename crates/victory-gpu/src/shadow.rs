@@ -16,7 +16,7 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -59,6 +59,9 @@ pub(crate) struct Shadow {
     /// range is declared while a copy of it is being made. Taken before
     /// `pending`.
     refreshing: Mutex<()>,
+    /// With `VICTORY_REFRESH_PREFETCH=2`: how many of the Lane's refreshes and declarations of the
+    /// copy are in progress ([`LaneClaim`]). The prefetch thread starts no piece of it meanwhile.
+    lane_on: AtomicU32,
     /// With [`relay`]: how many submissions not yet copied back declared
     /// each range of `pending` ([`Flights`]). Locked inside `pending`'s
     /// lock.
@@ -1595,17 +1598,26 @@ pub(crate) fn wide_back() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_BACK").is_none_or(|v| v != "0"))
 }
 
-/// Whether the host copies of a list are brought up to date ahead of its
-/// submission, by the thread that translated it ([`Shadow::prefetch`];
-/// `VICTORY_REFRESH_PREFETCH=1`, off by default). On, [`Shadow::update`] and
+/// Whether the refreshes of host copies are brought up to date ahead of their submission
+/// (`VICTORY_REFRESH_PREFETCH`, `1` or `2`; [`crate::prefetch`]). On, [`Shadow::update`] and
 /// [`Shadow::writing`] hold their copy's `refreshing` lock.
 pub(crate) fn prefetch_on() -> bool {
     #[cfg(test)]
     if PREFETCH_IN_TEST.get() {
         return true;
     }
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::switch::on("VICTORY_REFRESH_PREFETCH"));
-    *ON
+    crate::prefetch::mode() != 0
+}
+
+/// The Lane's claim on a copy, released when it is dropped ([`Shadow::lane_claim`]).
+pub(crate) struct LaneClaim<'a>(Option<&'a AtomicU32>);
+
+impl Drop for LaneClaim<'_> {
+    fn drop(&mut self) {
+        if let Some(on) = self.0 {
+            on.fetch_sub(1, Ordering::Release);
+        }
+    }
 }
 
 thread_local! {
@@ -3490,6 +3502,7 @@ impl Shadow {
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             refreshing: Mutex::default(),
+            lane_on: AtomicU32::new(0),
             flights: Mutex::default(),
             before: Mutex::default(),
             merging: RwLock::default(),
@@ -3554,6 +3567,7 @@ impl Shadow {
         if self.place.is_some() {
             return;
         }
+        let _claim = self.lane_claim();
         let _refreshing = self.refreshing_held();
         let range = (address, address + len);
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -3977,6 +3991,7 @@ impl Shadow {
     /// (`crate::host::late`): the ranges are those of flights in the air,
     /// which are then settled before this refresh.
     pub(crate) fn stale_under_writes(&self, address: usize, len: usize) -> bool {
+        let _claim = self.lane_claim();
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
@@ -4021,6 +4036,7 @@ impl Shadow {
     /// cannot say what was written, a snapshot is missing, or `runs_left`
     /// ran out. Pages done before that stay done.
     pub(crate) fn merge_under_writes(&self, address: usize, len: usize, runs_left: &mut usize) -> bool {
+        let _claim = self.lane_claim();
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
@@ -4263,6 +4279,13 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        let _claim = self.lane_claim();
+        self.update_by(address, len, &|shadow: &Shadow, from, to| shadow.update_free(from, to))
+    }
+
+    /// [`Shadow::update`], with `free` for each stretch of `[address, address + len)` that no shader of a
+    /// flight writes.
+    fn update_by(&self, address: usize, len: usize, free: &dyn Fn(&Shadow, usize, usize) -> usize) -> usize {
         let _refreshing = self.refreshing_held();
         // In place: the card reads title memory itself.
         if self.place.is_some() {
@@ -4289,16 +4312,16 @@ impl Shadow {
             let (mut at, mut bytes) = (from, 0);
             for (a, e) in busy {
                 if a > at {
-                    bytes += self.update_free(at, a);
+                    bytes += free(self, at, a);
                 }
                 at = at.max(e);
             }
             if at < to {
-                bytes += self.update_free(at, to);
+                bytes += free(self, at, to);
             }
             return bytes;
         }
-        self.update_free(from, to)
+        free(self, from, to)
     }
 
     /// With [`prefetch_on`]: the copy's `refreshing` lock, held by the caller
@@ -4329,6 +4352,59 @@ impl Shadow {
         copied
     }
 
+    /// The Lane's claim on the copy, for its refresh or declaration of it. None on the prefetch thread
+    /// itself, and unless `VICTORY_REFRESH_PREFETCH=2`.
+    fn lane_claim(&self) -> LaneClaim<'_> {
+        if crate::prefetch::mode() != 2 || PREFETCHING.get() {
+            return LaneClaim(None);
+        }
+        self.lane_on.fetch_add(1, Ordering::AcqRel);
+        LaneClaim(Some(&self.lane_on))
+    }
+
+    /// Whether the Lane refreshes or declares writes on the copy now ([`Shadow::lane_claim`]).
+    pub(crate) fn lane_claimed(&self) -> bool {
+        self.lane_on.load(Ordering::Acquire) != 0
+    }
+
+    /// Whether the prefetch thread may bring the copy up to date: plain write-watched memory, not in place.
+    pub(crate) fn prefetchable(&self) -> bool {
+        self.place.is_none() && self.watched.load(Ordering::Relaxed) == 1
+    }
+
+    /// (`VICTORY_REFRESH_PREFETCH=2`) `[address, address + len)` brought up to date by the prefetch thread
+    /// from the pages that the write-watch asking `now` ([`crate::watch::ask_prefetch`]) found written: each
+    /// piece is copied under the copy's `refreshing` lock, and stamped `now`, as any refresh is.
+    pub(crate) fn prefetch_asked(&self, address: usize, len: usize, now: u64) -> usize {
+        let was = PREFETCHING.replace(true);
+        let copied = self.update_by(address, len, &|shadow: &Shadow, from, to| shadow.update_answered(from, to, now));
+        PREFETCHING.set(was);
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::host::PREFETCH[0].fetch_add(1, Ordering::Relaxed);
+            crate::host::PREFETCH[1].fetch_add(copied as u64, Ordering::Relaxed);
+        }
+        copied
+    }
+
+    /// [`Shadow::update_free`] of `[from, to)` from the asking `now`, which the caller holds the pieces of.
+    /// Plain write-watched memory only: view memory is left to the refreshes that guard it.
+    fn update_answered(&self, from: usize, to: usize, now: u64) -> usize {
+        if self.watched.load(Ordering::Relaxed) != 1 || crate::watch::guarded(from, to) {
+            return 0;
+        }
+        let written = crate::watch::answered(from, to);
+        let copied = self.copy_stale(from, to, now, &written);
+        self.refresh_check(from, to);
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::Checked, (to - from) as u64);
+            add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
+        }
+        copied
+    }
+
     /// Whether [`Shadow::update`] of `[address, address + len)` would copy
     /// nothing, and knows it without asking anything
     /// (`crate::watch::nothing_new`). `false` if it would have to ask.
@@ -4336,6 +4412,7 @@ impl Shadow {
         if self.place.is_some() {
             return true;
         }
+        let _claim = self.lane_claim();
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
@@ -5139,6 +5216,17 @@ impl Shadow {
     /// What is to go up to the card, taken.
     pub(crate) fn take_dirty(&self) -> Vec<(usize, usize)> {
         std::mem::take(&mut *self.card.as_ref().unwrap().dirty.lock().unwrap())
+    }
+
+    /// Tests: the Lane's claim on the copy, as a refresh of the Lane holds it.
+    pub(crate) fn claim_lane(&self) -> LaneClaim<'_> {
+        self.lane_on.fetch_add(1, Ordering::AcqRel);
+        LaneClaim(Some(&self.lane_on))
+    }
+
+    /// Tests: the copy's `refreshing` lock, as a piece of the prefetch thread in flight holds it.
+    pub(crate) fn hold_refreshing(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.refreshing.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 

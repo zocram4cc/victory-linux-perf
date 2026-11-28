@@ -2795,6 +2795,9 @@ enum Step {
 struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
+    /// (`VICTORY_REFRESH_PREFETCH=2`) The refreshes in `copies`, in order (copy, address, bytes), taken out of
+    /// the list when it is closed ([`HostList::take_refresh_log`]).
+    refresh_log: Vec<crate::prefetch::Refresh>,
     uploads: Vec<ID3D12Resource>,
     /// The bytes of `uploads` (counted in [`ALIVE`] while they are held).
     upload_bytes: u64,
@@ -7144,10 +7147,18 @@ impl HostList {
         };
         let found = coming.wait();
         let mut deferred = self.deferred();
+        if crate::prefetch::mode() == 2 {
+            deferred.refresh_log.extend(found.iter().map(|(shadow, from, to)| (shadow.clone(), *from as usize, (to - from) as usize)));
+        }
         let at = at.min(deferred.copies.len());
         deferred
             .copies
             .splice(at..at, found.into_iter().map(|(shadow, from, to)| Step::Refresh(shadow, from as usize, (to - from) as usize)));
+    }
+
+    /// The refreshes the list makes, in order, taken out of it when it is closed ([`crate::prefetch`]).
+    pub(crate) fn take_refresh_log(&self) -> Vec<crate::prefetch::Refresh> {
+        std::mem::take(&mut self.deferred().refresh_log)
     }
 
     /// Only after the list's last submission finished (every one is waited
@@ -7785,6 +7796,9 @@ impl HostList {
         let mut deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.refreshed.insert(key) {
+            if crate::prefetch::mode() == 2 {
+                deferred.refresh_log.push((shadow.clone(), address, len));
+            }
             deferred
                 .copies
                 .push(Step::Refresh(shadow.clone(), address, len));
@@ -8518,10 +8532,12 @@ fn split_line(frames: f64) {
     {
         let r: Vec<f64> = REFRESH_SPLIT.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         let p: Vec<f64> = PREFETCH.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        let q = crate::prefetch::lists(frames);
         tracing::info!(
             "refreshes on several threads per frame: {:.1} ms wall, threads' {:.1} ms asking whether a span is known to copy nothing and {:.1} ms \
              updating the others; {:.0} spans in {:.0} host copies (counted once a flush); ahead of their submissions, by the lists' threads \
-             (VICTORY_REFRESH_PREFETCH): {:.0} spans {:.2} MB; at the submissions: {:.0} spans {:.2} MB",
+             (VICTORY_REFRESH_PREFETCH): {:.0} spans {:.2} MB; at the submissions: {:.0} spans {:.2} MB; lists whose refreshes were done \
+             ahead: {:.1} prefetched, {:.1} dropped (taken before their refreshes were done), {:.1} skipped (the line was idle when they were submitted)",
             r[4] / 1e6,
             r[0] / 1e6,
             r[1] / 1e6,
@@ -8531,6 +8547,9 @@ fn split_line(frames: f64) {
             p[1] / 1e6,
             p[2],
             p[3] / 1e6,
+            q[0],
+            q[1],
+            q[2],
         );
     }
     tracing::info!(
@@ -12212,6 +12231,77 @@ mod refresh_tests {
             assert_eq!(unsafe { data.add(3 * PAGE + 9).read() }, 4, "the list's prefetch brings its first megabyte up to date");
             assert_eq!(unsafe { data.add(40 * PAGE + 9).read() }, 5, "and its last one");
         }
+    }
+
+    /// The Lane takes a list whose refreshes are being brought up to date without waiting for them: the prefetch
+    /// thread is in a piece of the copy (it holds the copy's lock) when the Lane takes the list.
+    #[test]
+    fn the_lane_takes_a_list_without_waiting_for_its_prefetch() {
+        const LEN: usize = 4 * PAGE;
+        let region = title(LEN, false);
+        // SAFETY: the test's own memory.
+        unsafe { std::ptr::write_bytes(region as *mut u8, 1, LEN) };
+        let data = memory(LEN);
+        let copy = Shadow::unbacked(region as u64, data, LEN as u64, false);
+        copy.update(region, LEN);
+        let job = crate::prefetch::job_for_test(vec![vec![(copy.clone(), region, LEN)]]);
+        let piece = copy.hold_refreshing();
+        crate::prefetch::submit(job.clone(), true);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let lane = job.clone();
+        let (took, taken) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            lane.take();
+            let _ = took.send(());
+        });
+        let returned = taken.recv_timeout(std::time::Duration::from_secs(5)).is_ok();
+        drop(piece);
+        assert!(returned, "the Lane takes the list while the prefetch thread waits for a piece of the copy");
+    }
+
+    /// The prefetch thread starts no piece of a copy the Lane is refreshing: the title's write comes in once the
+    /// Lane is off the copy.
+    #[test]
+    fn the_prefetch_starts_no_piece_of_a_copy_the_lane_is_on() {
+        const LEN: usize = 4 * PAGE;
+        let region = title(LEN, false);
+        // SAFETY: the test's own memory.
+        unsafe { std::ptr::write_bytes(region as *mut u8, 1, LEN) };
+        let data = memory(LEN);
+        let copy = Shadow::unbacked(region as u64, data, LEN as u64, false);
+        copy.update(region, LEN);
+        // SAFETY: as above.
+        unsafe { ((region + 100) as *mut u8).write_volatile(9) };
+        let claim = copy.claim_lane();
+        let job = crate::prefetch::job_for_test(vec![vec![(copy.clone(), region, LEN)]]);
+        let prefetch = std::thread::spawn(move || crate::prefetch::run(&job));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        // SAFETY: the copy's own memory.
+        let during = unsafe { data.add(100).read() };
+        drop(claim);
+        assert!(prefetch.join().unwrap(), "the prefetch completes once the Lane is off the copy");
+        // SAFETY: the copy's own memory.
+        let after = unsafe { data.add(100).read() };
+        assert_eq!((during, after), (1, 9), "no piece of the copy is started while the Lane is on it");
+    }
+
+    /// A list the queue takes before its refreshes are done is not brought up to date any further.
+    #[test]
+    fn a_list_the_queue_took_is_not_prefetched_any_further() {
+        const LEN: usize = 4 * PAGE;
+        let region = title(LEN, false);
+        // SAFETY: the test's own memory.
+        unsafe { std::ptr::write_bytes(region as *mut u8, 1, LEN) };
+        let data = memory(LEN);
+        let copy = Shadow::unbacked(region as u64, data, LEN as u64, false);
+        copy.update(region, LEN);
+        // SAFETY: as above.
+        unsafe { ((region + 100) as *mut u8).write_volatile(9) };
+        let job = crate::prefetch::job_for_test(vec![vec![(copy.clone(), region, LEN)]]);
+        job.take();
+        assert!(!crate::prefetch::run(&job), "the prefetch of a taken list is dropped, not completed");
+        // SAFETY: the copy's own memory.
+        assert_eq!(unsafe { data.add(100).read() }, 1, "and none of it is copied");
     }
 
     /// Everything at once: the title writes its memory on two threads, the
