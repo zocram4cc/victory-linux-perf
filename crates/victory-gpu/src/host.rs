@@ -10890,6 +10890,16 @@ impl Host {
         };
         let (width, height) = (desc.Width as u32, desc.Height);
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
+        if crate::ffx::framegen_on() {
+            crate::ffx::framegen_display(width, height, format.0);
+            if presenter.as_ref().is_some_and(|p| !p.framegen) && crate::ffx::framegen_ready() {
+                settle_now(WHY_SYNC);
+                tracing::info!("ffx: frame generation context made: the window's swap chain is made again as the frame generation one");
+                *presenter = None;
+            } else if !crate::ffx::framegen_ready() {
+                crate::ffx::framegen_plain_present();
+            }
+        }
         if presenter.is_none() {
             *presenter = match self.presenter(width, height, format) {
                 Ok(p) => Some(p),
@@ -10968,7 +10978,7 @@ impl Host {
             let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
             #[cfg(not(feature = "diagnostics"))]
             let read_now = false;
-            let slot = if late_free_present() && !read_now && !p.framegen {
+            let slot = if late_free_present() && !read_now {
                 let finished = FINISHED.load(Ordering::Acquire);
                 p.ahead.iter().position(|(_, flown)| *flown <= finished).or_else(|| {
                     let list = self.new_list().ok()?;
@@ -11204,7 +11214,7 @@ impl Host {
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
                 ..Default::default()
             };
-            let swap = crate::ffx::framegen_on()
+            let swap = (crate::ffx::framegen_on() && crate::ffx::framegen_ready())
                 .then(|| crate::ffx::framegen_swap_chain(hwnd, &desc, &factory, &self.queue))
                 .flatten();
             let fg = swap.is_some();

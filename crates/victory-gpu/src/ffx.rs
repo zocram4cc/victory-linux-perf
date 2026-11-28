@@ -930,13 +930,14 @@ pub(crate) fn framegen_display(width: u32, height: u32, format: i32) {
     if CONTEXT.load(Ordering::Acquire).is_null() {
         return;
     }
-    configure(api, &fg, FRAME.load(Ordering::Acquire), false);
-    let wait = header(DISPATCH_SWAP_CHAIN_WAIT_FOR_PRESENTS);
-    // SAFETY: the SDK's calls on the contexts it made.
-    unsafe {
-        (api.dispatch)(SWAP_CHAIN_CONTEXT.as_ptr(), (&raw const wait).cast());
-        (api.destroy)(CONTEXT.as_ptr(), std::ptr::null());
+    if !SWAP_CHAIN_CONTEXT.load(Ordering::Acquire).is_null() {
+        configure(api, &fg, FRAME.load(Ordering::Acquire), false);
+        let wait = header(DISPATCH_SWAP_CHAIN_WAIT_FOR_PRESENTS);
+        // SAFETY: the SDK's call on the swap chain context it made.
+        unsafe { (api.dispatch)(SWAP_CHAIN_CONTEXT.as_ptr(), (&raw const wait).cast()) };
     }
+    // SAFETY: the SDK's call on the context it made.
+    unsafe { (api.destroy)(CONTEXT.as_ptr(), std::ptr::null()) };
     CONTEXT.store(std::ptr::null_mut(), Ordering::Release);
 }
 
@@ -946,6 +947,37 @@ pub(crate) fn shown_total() -> Option<u32> {
     (!SWAP_CHAIN.load(Ordering::Acquire).is_null()).then(|| PRESENTED.load(Ordering::Acquire))
 }
 
+/// Whether the frame generation context is made and frame generation has
+/// not failed: the window's swap chain is then the frame generation one.
+pub(crate) fn framegen_ready() -> bool {
+    !FAILED.load(Ordering::Relaxed) && !CONTEXT.load(Ordering::Acquire).is_null()
+}
+
+/// Presents through the frame generation swap chain with no context, not
+/// prepared, and with the interface composed in (not interpolated).
+static NO_CONTEXT: AtomicU64 = AtomicU64::new(0);
+static NOT_PREPARED: AtomicU64 = AtomicU64::new(0);
+static NOT_INTERPOLATED: AtomicU64 = AtomicU64::new(0);
+
+/// Logs why frame generation does not run, once per reason.
+fn not_generating(why: &'static str) {
+    static REASONS: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+    let mut reasons = REASONS.lock().unwrap_or_else(|e| e.into_inner());
+    if !reasons.contains(&why) {
+        reasons.push(why);
+        tracing::warn!("ffx: frame generation not active: {why}");
+    }
+}
+
+/// A present through the plain swap chain with frame generation asked: after
+/// 600 of them without a frame generation context, says so once.
+pub(crate) fn framegen_plain_present() {
+    static PRESENTS: AtomicU64 = AtomicU64::new(0);
+    if PRESENTS.fetch_add(1, Ordering::Relaxed) == 600 {
+        tracing::warn!(failed = FAILED.load(Ordering::Relaxed), "ffx: frame generation not active: no frame generation context after 600 presents; presenting through the plain swap chain");
+    }
+}
+
 /// Records the frame generation prepare for the next present on the
 /// upscale's host list, with the upscale's inputs (in the state it left
 /// them in); the first upscale after a present only.
@@ -953,11 +985,11 @@ pub(crate) fn shown_total() -> Option<u32> {
 // motion with the image before it; pair them by the title's own frame
 // token if the interpolation shows it.
 fn framegen_prepare(api: &Api, d: &DispatchUpscale) {
-    if FAILED.load(Ordering::Relaxed)
-        || SWAP_CHAIN_CONTEXT.load(Ordering::Acquire).is_null()
-        || d.resources[DEPTH].resource.is_null()
-        || d.resources[MOTION_VECTORS].resource.is_null()
-    {
+    if FAILED.load(Ordering::Relaxed) {
+        return;
+    }
+    if d.resources[DEPTH].resource.is_null() || d.resources[MOTION_VECTORS].resource.is_null() {
+        not_generating("the upscale has no depth or motion vectors to prepare frames from");
         return;
     }
     let frame = FRAME.load(Ordering::Acquire);
@@ -966,6 +998,10 @@ fn framegen_prepare(api: &Api, d: &DispatchUpscale) {
     }
     let fg = FRAMEGEN.lock().unwrap_or_else(|e| e.into_inner());
     if CONTEXT.load(Ordering::Acquire).is_null() && !create_framegen(api, &fg) {
+        PREPARED.store(0, Ordering::Release);
+        return;
+    }
+    if SWAP_CHAIN_CONTEXT.load(Ordering::Acquire).is_null() {
         PREPARED.store(0, Ordering::Release);
         return;
     }
@@ -988,6 +1024,8 @@ fn framegen_prepare(api: &Api, d: &DispatchUpscale) {
     let r = unsafe { (api.dispatch)(CONTEXT.as_ptr(), (&raw const prepare).cast()) };
     if r != OK {
         PREPARED.store(0, Ordering::Release);
+        static REFUSED: std::sync::Once = std::sync::Once::new();
+        REFUSED.call_once(|| tracing::warn!(r, "ffx: frame generation not active: the SDK refused the frame generation prepare"));
     }
     static FIRST: std::sync::Once = std::sync::Once::new();
     FIRST.call_once(|| {
@@ -999,8 +1037,15 @@ fn framegen_prepare(api: &Api, d: &DispatchUpscale) {
 /// (no swap chain size or upscale context known) or at all (logged once,
 /// frame generation off for the run: the swap chain presents as is).
 fn create_framegen(api: &Api, fg: &Framegen) -> bool {
-    let Some(device) = host_device() else { return false };
+    let Some(device) = host_device() else {
+        not_generating("no host device for the frame generation context");
+        return false;
+    };
     if fg.display.contains(&0) || fg.max_render.contains(&0) {
+        static WAITING: std::sync::Once = std::sync::Once::new();
+        WAITING.call_once(|| {
+            tracing::warn!(display = ?fg.display, render = ?fg.max_render, "ffx: frame generation not active yet: the context waits for the window's size and the upscale's render size");
+        });
         return false;
     }
     let mut dx12 = BackendDx12 {
@@ -1096,10 +1141,17 @@ pub(crate) fn framegen_before_present(
     // SAFETY: the SDK's call on the swap chain context it made.
     unsafe { (api.configure)(SWAP_CHAIN_CONTEXT.as_ptr(), (&raw const register).cast()) };
     if CONTEXT.load(Ordering::Acquire).is_null() {
+        NO_CONTEXT.fetch_add(1, Ordering::Relaxed);
         return;
     }
     let frame = FRAME.load(Ordering::Acquire);
-    configure(api, &fg, frame, interpolate && PREPARED.load(Ordering::Acquire) == frame + 1);
+    let prepared = PREPARED.load(Ordering::Acquire) == frame + 1;
+    if !interpolate {
+        NOT_INTERPOLATED.fetch_add(1, Ordering::Relaxed);
+    } else if !prepared {
+        NOT_PREPARED.fetch_add(1, Ordering::Relaxed);
+    }
+    configure(api, &fg, frame, interpolate && prepared);
 }
 
 /// After a present through the frame generation swap chain, given the swap
@@ -1128,6 +1180,19 @@ pub(crate) fn framegen_after_present(presented: Option<u32>) {
     let presented_fps = crate::frametime::shown_fps(presented_then, presented, seconds);
     let on = !CONTEXT.load(Ordering::Acquire).is_null() && !FAILED.load(Ordering::Relaxed);
     tracing::info!(on, "ffx: frame generation: {real_fps:.1} real fps, {generated_fps:.1} generated fps, {presented_fps:.1} fps presented");
+    static WARNED: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    let mut warned = WARNED.lock().unwrap_or_else(|e| e.into_inner());
+    if generated == generated_then && warned.is_none_or(|at| at.elapsed().as_secs() >= 10) {
+        *warned = Some(std::time::Instant::now());
+        tracing::warn!(
+            context = on,
+            failed = FAILED.load(Ordering::Relaxed),
+            frames_without_context = NO_CONTEXT.swap(0, Ordering::Relaxed),
+            frames_not_prepared = NOT_PREPARED.swap(0, Ordering::Relaxed),
+            frames_interface_composed = NOT_INTERPOLATED.swap(0, Ordering::Relaxed),
+            "ffx: frame generation not active: no frame generated in the last second"
+        );
+    }
     *since = Some((std::time::Instant::now(), real, presented, generated));
 }
 
