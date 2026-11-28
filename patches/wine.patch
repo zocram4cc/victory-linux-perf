@@ -1,0 +1,205 @@
+--- a/server/process.h
++++ b/server/process.h
+@@ -22,6 +22,7 @@
+ #define __WINE_SERVER_PROCESS_H
+ 
+ #include "object.h"
++#include "wine/rbtree.h"
+ 
+ struct atom_table;
+ struct handle_table;
+@@ -79,6 +80,7 @@
+     obj_handle_t         winstation;      /* main handle to process window station */
+     obj_handle_t         desktop;         /* handle to desktop to use for new threads */
+     struct token        *token;           /* security token associated with this process */
++    struct rb_tree       view_tree;
+     struct list          views;           /* list of memory views */
+     client_ptr_t         peb;             /* PEB address in client address space */
+     struct dir_cache    *dir_cache;       /* map of client-side directory cache */
+--- a/server/file.h
++++ b/server/file.h
+@@ -179,6 +179,7 @@
+ extern struct file *get_view_file( const struct memory_view *view, unsigned int access, unsigned int sharing );
+ extern const struct pe_image_info *get_view_image_info( const struct memory_view *view, client_ptr_t *base );
+ extern int get_view_nt_name( const struct memory_view *view, struct unicode_str *name );
++extern void init_view_tree( struct process *process );
+ extern void free_mapped_views( struct process *process );
+ extern size_t get_page_size(void);
+ extern struct mapping *create_fd_mapping( struct object *root, struct unicode_str name, struct fd *fd,
+--- a/server/process.c
++++ b/server/process.c
+@@ -648,6 +648,7 @@
+     list_init( &process->asyncs );
+     list_init( &process->classes );
+     list_init( &process->views );
++    init_view_tree( process );
+ 
+     process->end_time = 0;
+ 
+--- a/server/mapping.c
++++ b/server/mapping.c
+@@ -97,6 +97,7 @@
+ /* memory view mapped in client address space */
+ struct memory_view
+ {
++    struct rb_entry node;
+     struct list     entry;           /* entry in per-process view list */
+     struct fd      *fd;              /* fd for mapped file */
+     struct ranges  *committed;       /* list of committed ranges in this mapping */
+@@ -384,47 +385,83 @@
+     return fd;
+ }
+ 
+-/* find a memory view from its base address */
++static int compare_view( const void *key, const struct rb_entry *entry )
++{
++    client_ptr_t addr = *(const client_ptr_t *)key;
++    const struct memory_view *view = RB_ENTRY_VALUE( entry, const struct memory_view, node );
++    return addr < view->base ? -1 : addr > view->base;
++}
++
++static int profile_views;
++
++void init_view_tree( struct process *process )
++{
++    rb_init( &process->view_tree, compare_view );
++    profile_views = getenv( "VICTORY_WINE_VIEW_PROFILE" ) && !strcmp( getenv( "VICTORY_WINE_VIEW_PROFILE" ), "1" );
++}
++
++static struct memory_view *query_view( struct process *process, client_ptr_t first, client_ptr_t last, int exact )
++{
++    struct rb_entry *node = process->view_tree.root;
++    struct memory_view *found = NULL;
++    static unsigned int calls, samples, differences;
++    static timeout_t tree_ticks, list_ticks;
++    int sample = profile_views && !(++calls & 31);
++    timeout_t t = sample ? monotonic_counter() : 0;
++
++    while (node)
++    {
++        struct memory_view *view = RB_ENTRY_VALUE( node, struct memory_view, node );
++        if (view->base > last) node = node->left;
++        else if (view->base + view->size <= first) node = node->right;
++        else
++        {
++            if (!exact || view->base == first) found = view;
++            break;
++        }
++    }
++    if (sample)
++    {
++        struct memory_view *view, *reference = NULL;
++        timeout_t end = monotonic_counter();
++        tree_ticks += end - t;
++        LIST_FOR_EACH_ENTRY( view, &process->views, struct memory_view, entry )
++            if (view->base <= last && view->base + view->size > first && (!exact || view->base == first))
++            {
++                reference = view;
++                break;
++            }
++        list_ticks += monotonic_counter() - end;
++        if (!!reference != !!found || (first == last && reference != found)) differences++;
++        if (++samples == 8)
++        {
++            fprintf( stderr, "view lookup: %u samples, %.2f us tree, %.2f us list, %u differences\n",
++                     samples, tree_ticks / (samples * 10.0), list_ticks / (samples * 10.0), differences );
++            samples = differences = 0;
++            tree_ticks = list_ticks = 0;
++        }
++    }
++    return found;
++}
++
+ struct memory_view *find_mapped_view( struct process *process, client_ptr_t base )
+ {
+-    struct memory_view *view;
+-
+-    LIST_FOR_EACH_ENTRY( view, &process->views, struct memory_view, entry )
+-        if (view->base == base) return view;
+-
+-    set_error( STATUS_NOT_MAPPED_VIEW );
+-    return NULL;
+-}
+-
+-/* find a memory view from any address inside it */
++    struct memory_view *view = query_view( process, base, base, 1 );
++    if (!view) set_error( STATUS_NOT_MAPPED_VIEW );
++    return view;
++}
++
+ static struct memory_view *find_mapped_addr( struct process *process, client_ptr_t addr )
+ {
+-    struct memory_view *view;
+-
+-    LIST_FOR_EACH_ENTRY( view, &process->views, struct memory_view, entry )
+-        if (addr >= view->base && addr < view->base + view->size) return view;
+-
+-    set_error( STATUS_NOT_MAPPED_VIEW );
+-    return NULL;
+-}
+-
+-/* check if an address range is valid for creating a view */
++    struct memory_view *view = query_view( process, addr, addr, 0 );
++    if (!view) set_error( STATUS_NOT_MAPPED_VIEW );
++    return view;
++}
++
+ static int is_valid_view_addr( struct process *process, client_ptr_t addr, mem_size_t size )
+ {
+-    struct memory_view *view;
+-
+-    if (!size) return 0;
+-    if (addr & (process->page_size - 1)) return 0;
+-    if (addr + size < addr) return 0;  /* overflow */
+-
+-    /* check for overlapping view */
+-    LIST_FOR_EACH_ENTRY( view, &process->views, struct memory_view, entry )
+-    {
+-        if (view->base + view->size <= addr) continue;
+-        if (view->base >= addr + size) continue;
+-        return 0;
+-    }
+-    return 1;
++    if (!size || (addr & (process->page_size - 1)) || addr + size < addr) return 0;
++    return !query_view( process, addr, addr + size - 1, 0 );
+ }
+ 
+ /* get the main exe memory view */
+@@ -447,6 +484,7 @@
+     struct process *process = thread->process;
+     struct unicode_str name;
+ 
++    rb_put( &process->view_tree, &view->base, &view->node );
+     if (view->flags & SEC_IMAGE)
+     {
+         if (is_process_init_done( process ))
+@@ -469,8 +507,9 @@
+     return 0;
+ }
+ 
+-static void free_memory_view( struct memory_view *view )
+-{
++static void free_memory_view( struct process *process, struct memory_view *view )
++{
++    rb_remove( &process->view_tree, &view->node );
+     if (view->fd) release_object( view->fd );
+     if (view->committed) release_object( view->committed );
+     if (view->shared) release_object( view->shared );
+@@ -484,7 +523,7 @@
+     struct list *ptr;
+ 
+     while ((ptr = list_head( &process->views )))
+-        free_memory_view( LIST_ENTRY( ptr, struct memory_view, entry ));
++        free_memory_view( process, LIST_ENTRY( ptr, struct memory_view, entry ));
+ }
+ 
+ /* find the shared PE mapping for a given mapping */
+@@ -1797,7 +1836,7 @@
+ 
+     if (!view) return;
+     generate_dll_event( current, DbgUnloadDllStateChange, view );
+-    free_memory_view( view );
++    free_memory_view( current->process, view );
+ }
+ 
+ /* get information about a mapped image view */

@@ -1,0 +1,15 @@
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 08b9e266..2041ac09 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -9225,9 +9225,7 @@ uint32_t d3d12_device_get_max_descriptor_heap_size(struct d3d12_device *device,
+     switch (heap_type)
+     {
+         case D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV:
+-            /* Only expose very large descriptor heaps if we have ReBAR available.
+-             * Otherwise we risk spilling to sysmem. */
+-            if (d3d12_device_use_descriptor_heap(device) && device->memory_info.has_gpu_upload_heap)
++            if (d3d12_device_use_descriptor_heap(device))
+             {
+                 VkDeviceSize useable_size =
+                     device->device_info.descriptor_heap_properties.maxResourceHeapSize -
