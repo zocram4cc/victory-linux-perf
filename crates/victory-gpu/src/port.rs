@@ -287,11 +287,79 @@ pub(crate) fn copied(dst: usize, src: usize, len: usize) {
     }
 }
 
+/// Whether the card reads the memory in place as the PC has it: up to 12
+/// pieces of 256 bytes holding something, read by the card through a buffer
+/// over the whole region (a queue and a readback of our own) and compared
+/// with the PC's bytes, read before and after (the title may write between).
+/// 28 Nov: in about half the runs every target of every frame stayed empty
+/// with this port on and never with it off; the layer's statistics were the
+/// same in both. `VICTORY_PORT_CHECK=0`: not.
+fn check() -> Option<(usize, usize, usize)> {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("VICTORY_PORT_CHECK").is_none_or(|v| v != "0"));
+    if !*ON {
+        return None;
+    }
+    struct Probe {
+        rig: crate::inplace::Rig,
+        buffer: ID3D12Resource,
+        start: u64,
+        bytes: u64,
+    }
+    // SAFETY: used under the lock only.
+    unsafe impl Send for Probe {}
+    static PROBE: Mutex<Option<Probe>> = Mutex::new(None);
+    let host = crate::host::host()?;
+    let mut probe = PROBE.lock().unwrap_or_else(|e| e.into_inner());
+    if probe.is_none() {
+        let regions = REGIONS.lock().unwrap_or_else(|e| e.into_inner());
+        let r = regions.first()?;
+        let rig = crate::inplace::Rig::new(&host.device).ok()?;
+        let buffer = crate::inplace::place(&host.device, &r.heap, 0, r.end - r.start).ok()?;
+        *probe = Some(Probe { rig, buffer, start: r.start, bytes: r.end - r.start });
+    }
+    let p = probe.as_mut()?;
+    const PIECE: usize = 256;
+    let read = |at: u64| {
+        let mut b = [0u8; PIECE];
+        // SAFETY: committed read-write pages of the title's private heap
+        // (the region stands while its heap does, and ours holds it).
+        unsafe { std::ptr::copy_nonoverlapping(at as *const u8, b.as_mut_ptr(), PIECE) };
+        b
+    };
+    let (mut same, mut differ, mut zeros) = (0, 0, 0);
+    let mut offset = 0u64;
+    while offset + PIECE as u64 <= p.bytes && same + differ < 12 {
+        let before = read(p.start + offset);
+        if before.iter().any(|&x| x != 0) {
+            let card = p.rig.fetch(&p.buffer, offset, PIECE).ok()?;
+            let after = read(p.start + offset);
+            if card[..] == before[..] || card[..] == after[..] {
+                same += 1;
+            } else {
+                differ += 1;
+                if card.iter().all(|&x| x == 0) {
+                    zeros += 1;
+                }
+            }
+        }
+        offset += 1 << 20;
+    }
+    Some((same, differ, zeros))
+}
+
 /// For the frame-rate line: what is in place, and what of ours read or
 /// wrote it on the CPU per frame.
 pub(crate) fn log(frames: f64) {
     if !on() {
         return;
+    }
+    if let Some((same, differ, zeros)) = check() {
+        if differ > 0 {
+            tracing::warn!(same, differ, zeros, "renderer port 1 check: the card reads other bytes than the PC has in the memory in place");
+        } else {
+            tracing::info!(same, "renderer port 1 check: the card reads the memory in place as the PC has it");
+        }
     }
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
     let per: Vec<f64> = STATS[9..].iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
@@ -463,15 +531,83 @@ fn open_private(device: &ID3D12Device, first: u64, bytes: u64) -> Result<Region,
     if !committed(first as usize, bytes as usize) {
         return Err((4, "pages of the private stretch are not committed".to_owned()));
     }
-    match crate::inplace::open(device, crate::inplace::From::Part(first as usize, bytes as usize)) {
-        Ok(heap) => {
-            tracing::info!(
-                start = format_args!("{first:#x}"),
-                bytes,
-                "renderer port 1: a stretch of the title's graphics memory opened as a host heap on its own private pages (Wine)"
-            );
-            Ok(Region { start: first, end: first + bytes, heap })
+    for attempt in 1..=3 {
+        let heap = match crate::inplace::open(device, crate::inplace::From::Part(first as usize, bytes as usize)) {
+            Ok(heap) => heap,
+            Err(e) => return Err((5, format!("refused by the host (private pages): {e}"))),
+        };
+        match sees_the_pages(device, &heap, first, bytes) {
+            Some(false) => {
+                tracing::warn!(
+                    start = format_args!("{first:#x}"),
+                    bytes,
+                    attempt,
+                    "renderer port 1: the card does not read the private pages the heap was opened on (marks written by the PC read back as other bytes): opened again"
+                );
+                continue;
+            }
+            seen => {
+                tracing::info!(
+                    start = format_args!("{first:#x}"),
+                    bytes,
+                    checked = seen.is_some(),
+                    "renderer port 1: a stretch of the title's graphics memory opened as a host heap on its own private pages (Wine)"
+                );
+                return Ok(Region { start: first, end: first + bytes, heap });
+            }
         }
-        Err(e) => Err((5, format!("refused by the host (private pages): {e}"))),
     }
+    tracing::warn!(
+        start = format_args!("{first:#x}"),
+        bytes,
+        "renderer port 1: the card never read the private pages: the memory is copied as without the port (slower, but drawn)"
+    );
+    Err((5, "the card does not read the private pages".to_owned()))
+}
+
+/// Whether the card reads the pages a heap was just opened on (28 Nov: in
+/// about half the runs it read zeros where the title had written, every
+/// target of every frame stayed empty, and nothing of ours noticed). Marks
+/// are written by the PC at up to 32 places still zero (fresh memory the
+/// title has not written; an atomic exchange from zero, so a write of the
+/// title's in between stays), read by the card through a buffer over the
+/// heap on a queue of our own, and set back to zero the same way. `None`:
+/// not checked (no place still zero, or no queue). `VICTORY_PORT_CHECK=0`:
+/// not checked.
+fn sees_the_pages(device: &ID3D12Device, heap: &ID3D12Heap, first: u64, bytes: u64) -> Option<bool> {
+    if std::env::var_os("VICTORY_PORT_CHECK").is_some_and(|v| v == "0") {
+        return None;
+    }
+    let mut rig = crate::inplace::Rig::new(device).ok()?;
+    let buffer = crate::inplace::place(device, heap, 0, bytes).ok()?;
+    let step = (bytes / 32).max(4096) & !7;
+    let mut marked = Vec::new();
+    let mut offset = 0u64;
+    while offset + 8 <= bytes && marked.len() < 32 {
+        // SAFETY: committed read-write private pages, 8-byte aligned.
+        let word = unsafe { &*((first + offset) as *const std::sync::atomic::AtomicU64) };
+        let mark = 0x5643_5452_594d_0000 | (offset >> 12);
+        if word.compare_exchange(0, mark, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+            marked.push((offset, mark));
+        }
+        offset += step;
+    }
+    if marked.is_empty() {
+        return None;
+    }
+    let mut seen = 0;
+    for &(offset, mark) in &marked {
+        if let Ok(b) = rig.fetch(&buffer, offset, 8)
+            && u64::from_le_bytes(b[..8].try_into().unwrap_or([0; 8])) == mark
+        {
+            seen += 1;
+        }
+    }
+    for &(offset, mark) in &marked {
+        // SAFETY: as above.
+        let word = unsafe { &*((first + offset) as *const std::sync::atomic::AtomicU64) };
+        let _ = word.compare_exchange(mark, 0, Ordering::SeqCst, Ordering::SeqCst);
+    }
+    tracing::info!(seen, marked = marked.len(), "renderer port 1: marks the card read back on the pages just opened");
+    Some(seen == marked.len())
 }

@@ -1314,7 +1314,31 @@ fn private_backing(at: usize, len: usize, first: &Slice, run: usize) -> bool {
     let fresh = (first.index..first.index + run)
         .all(|p| section.committed[p / 64].load(Ordering::Acquire) >> (p % 64) & 1 == 0);
     if !inside || !fresh {
+        if !fresh && in_whole(at, len) {
+            // Pages that hold data, mapped where the reservation is private
+            // memory of ours: no view can go there. Grand Theft Auto VI never
+            // does it (every page fresh, run after run); said, and the pages
+            // left as they are.
+            static SAID: AtomicU64 = AtomicU64::new(0);
+            if SAID.fetch_add(1, Ordering::Relaxed) < 4 {
+                tracing::error!(
+                    at = format_args!("{at:#x}"),
+                    len,
+                    "renderer port 1: pages holding data mapped into the 32-bit heap made private whole: not shown there (VICTORY_PORT_WHOLE=0 maps them as views)"
+                );
+            }
+            return true;
+        }
         return false;
+    }
+    if in_whole(at, len) {
+        // The reservation is private memory of ours already, whole; the
+        // pieces unmapped before (`release_private`) read zeros, as fresh
+        // pages do.
+        return true;
+    }
+    if whole_reservation(at, len) {
+        return true;
     }
     // SAFETY: a placeholder of the title's reservation (`unmap` just left
     // it one), replaced by committed private memory of the same bounds.
@@ -1359,6 +1383,123 @@ fn private_backing(at: usize, len: usize, first: &Slice, run: usize) -> bool {
 /// Private memory given by [`private_backing`]: base and bytes.
 static PRIVATE: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
 
+/// 32-bit reservations made private memory whole by [`whole_reservation`]:
+/// base and bytes.
+static WHOLE: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+/// `VirtualFree`: placeholders in the range joined into one.
+const MEM_COALESCE_PLACEHOLDERS: u32 = 0x1;
+
+fn in_whole(at: usize, len: usize) -> bool {
+    WHOLE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|&(r, n)| r <= at && at + len <= r + n)
+}
+
+/// The first fresh run mapped into a 32-bit graphics reservation makes the
+/// whole reservation one piece of private memory at once, and every later
+/// run mapped into it finds its pages there (`in_whole`).
+///
+/// Why (28 Nov, measured): Grand Theft Auto VI maps the five pieces of its
+/// 185 MB heap with five calls, not in address order. Made private one by
+/// one, each piece was a mapping of its own; Linux joins neighbouring
+/// anonymous mappings only while at most one side has been written. When the
+/// title had written on both sides of the last piece before it came (a race
+/// of microseconds), the heap stayed two mappings (`/proc/<pid>/maps`), and
+/// the card read zeros from all of it: marks the PC wrote read back as other
+/// bytes, every target of every frame stayed empty, and the picture was black
+/// from the start screen on, in about 7 runs of 10. With one mapping the card
+/// read the title's bytes in every run. (The huge-page helper's "57 not:
+/// Invalid argument" was the same split seen from outside: 2 MiB pieces
+/// across the two mappings.)
+///
+/// Fresh pages read zeros, so which memory holds them is not observable.
+/// Every page is written once (with its zero) right away, so the kernel
+/// gives the memory at once, in huge pages where it can. Unmapping a run
+/// inside writes zeros over it instead of giving it back (`release_private`):
+/// the next fresh run mapped there reads zeros, as it must. Pages holding
+/// data cannot be mapped into it (see `private_backing`; the title never
+/// does). If the host refuses the whole reservation, the runs are made
+/// private one by one, as before. `VICTORY_PORT_WHOLE=0`: one by one.
+fn whole_reservation(at: usize, len: usize) -> bool {
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("VICTORY_PORT_WHOLE").is_none_or(|v| v != "0"));
+    if !*ON {
+        return false;
+    }
+    let Some((base, bytes)) = LOW_RESERVATIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .copied()
+        .find(|&(r, n)| r <= at && at + len <= r + n)
+    else {
+        return false;
+    };
+    // Only before anything of it is private memory of ours.
+    if PRIVATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .range(..base + bytes)
+        .any(|(&a, &n)| a + n > base)
+    {
+        return false;
+    }
+    let replace = || {
+        // SAFETY: the title's reservation, a placeholder as a whole (the
+        // host refuses otherwise), replaced by committed private memory of
+        // the same bounds.
+        unsafe {
+            VirtualAlloc2(
+                GetCurrentProcess(),
+                base as *const c_void,
+                bytes,
+                MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            )
+        }
+    };
+    let mut made = replace();
+    if made.is_null() {
+        // Placeholders split before (by `unmap`): one again, then retry.
+        // SAFETY: placeholders of the title's reservation only; the host
+        // refuses if anything in it is not one.
+        unsafe { VirtualFree(base as *mut c_void, bytes, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) };
+        made = replace();
+    }
+    if made.is_null() {
+        static SAID: AtomicU64 = AtomicU64::new(0);
+        if SAID.fetch_add(1, Ordering::Relaxed) < 2 {
+            tracing::warn!(
+                at = format_args!("{base:#x}"),
+                bytes,
+                error = %std::io::Error::last_os_error(),
+                "renderer port 1: the 32-bit heap could not be made private whole: piece by piece (the card may read none of it)"
+            );
+        }
+        return false;
+    }
+    for page in (base..base + bytes).step_by(4096) {
+        // SAFETY: committed read-write private memory made just above.
+        unsafe { std::ptr::write_volatile(page as *mut u8, 0) };
+    }
+    PRIVATE.lock().unwrap_or_else(|e| e.into_inner()).insert(base, bytes);
+    WHOLE.lock().unwrap_or_else(|e| e.into_inner()).push((base, bytes));
+    victory_gpu::title_memory_allocated(base, bytes);
+    victory_gpu::title_memory_remapped(base, bytes);
+    victory_gpu::port_private(base, bytes);
+    tracing::info!(
+        at = format_args!("{base:#x}"),
+        bytes,
+        "renderer port 1: the 32-bit heap made private memory whole, one mapping (the card reads it only so)"
+    );
+    true
+}
+
 /// Gives back the private memory of [`private_backing`] that `[base, base +
 /// len)` touches, each allocation whole, as placeholders again.
 fn release_private(base: usize, len: usize) {
@@ -1372,7 +1513,15 @@ fn release_private(base: usize, len: usize) {
         .filter(|&(&at, &n)| at + n > base)
         .map(|(&at, &n)| (at, n))
         .collect();
+    let whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner()).clone();
     for (at, n) in gone {
+        if whole.iter().any(|&(r, _)| r == at) {
+            // Made private whole: stays; the part unmapped reads zeros again.
+            let (from, to) = (base.max(at), end.min(at + n));
+            // SAFETY: committed read-write private memory of ours.
+            unsafe { std::ptr::write_bytes(from as *mut u8, 0, to - from) };
+            continue;
+        }
         private.remove(&at);
         // SAFETY: our own private allocation, back to a placeholder.
         unsafe { VirtualFree(at as *mut c_void, n, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) };
