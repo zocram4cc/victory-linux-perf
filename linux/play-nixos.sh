@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Play clankerVI (victory-proton) on this NixOS machine: release build, your own input (no scripted
 # keys), patched Proton Wine (with UFFD_WP section write-watch + lock-free PAGEMAP_SCAN), gamescope.
-#   ./play-nixos.sh                   Series S (~34.0+ fps sustained)
+#   ./play-nixos.sh                   Series S (~36.0 fps sustained)
 #   CONSOLE=series-x ./play-nixos.sh  Series X @ 2560x1440 (~32.2+ fps)
 # Log: ~/.cache/scarlettport-autotest/play-<time>/run.log
 CONSOLE="${CONSOLE:-series-s}"
@@ -40,5 +40,6 @@ PROFILE="$PROFILE" KEYS=0 exec "$(dirname "$0")/nixos-run.sh" "play-$(date +%H%M
     VICTORY_ASK_SPREAD=1 \
     VICTORY_JOIN_BARRIERS=1 \
     VICTORY_THIN_THREADS=6 \
-    VICTORY_GUARD_HOT=500 \
+    VICTORY_GUARD_REST=500000 \
+    VICTORY_GUARD_HOT=10000 \
     VICTORY_WAIT_RESIDENT=0

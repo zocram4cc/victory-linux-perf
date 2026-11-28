@@ -1057,9 +1057,9 @@ fn with_other_views(first: usize, last: usize, pages: &mut Vec<(usize, u16)>) {
 /// call that resets written pages costs 30-70 microseconds whatever the
 /// range).
 const AHEAD_GAP: usize = (4 << 20) / PAGE;
-/// The most one asking covers (16 MiB so `spread_each` fans large ranges out
-/// across threads for lock-free `PAGEMAP_SCAN` instead of stalling one thread).
-const AHEAD_MAX: usize = (16 << 20) / PAGE;
+/// The most one asking covers (64 MiB: avoids over-splitting PAGEMAP_SCAN
+/// while still fanning huge buffers across threads).
+const AHEAD_MAX: usize = (64 << 20) / PAGE;
 /// Asks the kernel about many ranges `(start, end)` at once, before the
 /// [`writes`] of each: ranges close together are one asking, and `writes`
 /// then answers from the journal until [`ask_ahead_done`]. The world's
@@ -2930,7 +2930,7 @@ fn hot_rest() -> std::time::Duration {
     }
     static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let ms = *MS.get_or_init(|| {
-        std::env::var("VICTORY_GUARD_HOT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0).min(1000)
+        std::env::var("VICTORY_GUARD_HOT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0).min(60_000)
     });
     if ms == 0 || !port_guard() {
         return std::time::Duration::ZERO;
