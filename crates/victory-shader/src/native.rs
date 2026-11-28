@@ -672,8 +672,14 @@ fn view_heap_sgpr(code: &[u8], user_sgprs: u8, taken: &[u8]) -> Option<u8> {
                 }
             }
             Some(name) if name.starts_with("v_readlane") || name.starts_with("v_readfirstlane") || (name.starts_with("v_cmp") && inst.words.len() >= 2) => {
-                // VOP3 writes its SGPR result in bits 0-7.
-                let d = (w & 0xff) as usize;
+                // VOP3 writes its SGPR result in bits 0-7; the VOP1 form of
+                // `v_readfirstlane_b32` in bits 17-24 (bits 0-8 are its
+                // source: a v6 there "overwrote" s6 and s7).
+                let d = if inst.encoding == crate::gfx10::Encoding::Vop1 {
+                    ((w >> 17) & 0xff) as usize
+                } else {
+                    (w & 0xff) as usize
+                };
                 if d + 1 < st.len() {
                     st[d] = S::Other;
                     st[d + 1] = S::Other;
