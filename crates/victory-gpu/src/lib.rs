@@ -115,6 +115,7 @@ pub enum Precompiled {
 #[cfg(windows)]
 mod memory;
 #[cfg(windows)]
+mod resultring;
 mod shadow;
 #[cfg(windows)]
 mod tiles;

@@ -3359,6 +3359,14 @@ risk = "advanced"
 doc = ""
 
 [[flag]]
+name = "VICTORY_RESULT_RING"
+type = "switch"
+default = "1"
+off = "0"
+risk = "advanced"
+doc = "The card compare keeps its results in a ring, so the submitting thread no longer drains every flight when the area is half full. On by default, 0 restores the old rule."
+
+[[flag]]
 name = "VICTORY_RETIRE_LEAN"
 type = "text"
 default = ""
