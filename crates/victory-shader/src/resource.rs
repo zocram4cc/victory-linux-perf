@@ -518,7 +518,13 @@ impl<'a> Tracer<'a> {
     /// so far (`o`, the propagation's table).
     fn xor_terms(&self, inst: &Inst, k: usize, o: &[Option<Term>]) -> Option<[Term; 2]> {
         let name = inst.name();
-        if name != "s_xor_b32" && name != "s_xor_b64" {
+        let width = match name {
+            "s_xor_b32" => 1,
+            "s_xor_b64" => 2,
+            _ => return None,
+        };
+        // Only the destination dwords, never the trailing SCC write.
+        if k >= width {
             return None;
         }
         let Fields::Sop { src, .. } = &inst.fields else {
@@ -529,9 +535,12 @@ impl<'a> Tracer<'a> {
             match *x {
                 Operand::Scalar { code, .. } if code != NULL => o[inst.read(Reg::S(code + half))?.0 as usize],
                 Operand::Scalar { .. } => Some(Term::Const(0)),
-                Operand::Const(c) if half == 0 || name == "s_xor_b32" => inline(c).map(Term::Const),
-                Operand::Const(c) => inline(c).map(|x| Term::Const(if (x as i32) < 0 { u32::MAX } else { 0 })),
-                Operand::Literal(x) => Some(Term::Const(if half == 0 { x } else { 0 })),
+                Operand::Const(c) if name == "s_xor_b32" => inline(c).map(Term::Const),
+                // 64-bit inline integers sign-extend; float inline constants are f64 (not followed).
+                Operand::Const(c @ 128..=208) => inline(c).map(|x| Term::Const(if half == 0 { x } else if (x as i32) < 0 { u32::MAX } else { 0 })),
+                Operand::Literal(x) if name == "s_xor_b32" => Some(Term::Const(x)),
+                // Match `copy_source`: literals below 2^31 have high dword 0 either way.
+                Operand::Literal(x) if x >> 31 == 0 => Some(Term::Const(if half == 0 { x } else { 0 })),
                 _ => None,
             }
         };
@@ -1091,7 +1100,7 @@ impl<'a> Tracer<'a> {
         if let Some(pc) = self.getpc(base) {
             // A table in the code: the base is the next instruction's offset.
             let high = pc.writes.get(1).map(|w| w.1);
-            if !self.high_half(hi, high) && !high.is_some_and(|h| self.carried(hi, h)) {
+            if !self.high_half(hi, high, Some(base)) && !high.is_some_and(|h| self.carried(hi, h)) {
                 return Err("an address with an untracked high half");
             }
             // A join of paths into tables in the code is the byte in the code
@@ -1133,7 +1142,7 @@ impl<'a> Tracer<'a> {
         // shortcut: with a computed term, a high half that adds anything to the
         // base's is taken as the carry of that term (offsets below 4 GB).
         let dynamic = s.dynamic.or(extra.dynamic);
-        if !self.high_half(hi, high)
+        if !self.high_half(hi, high, Some(base))
             && !(dynamic.is_some() && high.is_some_and(|h| self.carried(hi, h)))
         {
             if std::env::var_os("VICTORY_WHY_HIGH").is_some() {
@@ -1181,8 +1190,8 @@ impl<'a> Tracer<'a> {
         })
     }
 
-    /// `hi` is `high` (0 for a table), possibly plus a carry.
-    fn high_half(&self, hi: Term, high: Option<Value>) -> bool {
+    /// `hi` is `high` (0 for a table), possibly plus the carry of a low add on `base`.
+    fn high_half(&self, hi: Term, high: Option<Value>, base: Option<Value>) -> bool {
         // A high half joined from paths that all bring one value: that value.
         let hi = match hi {
             Term::Value(v) if self.phis[v.0 as usize].is_some() => self.one_leaf(v).unwrap_or(hi),
@@ -1191,23 +1200,38 @@ impl<'a> Tracer<'a> {
         let want = high.map_or(Term::Const(0), Term::Value);
         // A table's high half that is 0 on every path, through phis and XOR
         // swaps of zeros (P.4: 461 programs).
-        if want == Term::Const(0) && self.is_zero(hi) {
+        if want == Term::Const(0) && self.is_zero(hi, base) {
             return true;
         }
         hi == want
             || matches!(hi, Term::Value(v) if self.sop2(v, &["s_addc_u32"]).is_some_and(
-                |(_, [a, b])| a == want && b == Term::Const(0) || b == want && a == Term::Const(0)
+                |(inst, [a, b])| (a == want && b == Term::Const(0) || b == want && a == Term::Const(0))
+                    && (high.is_some() || self.scc_from_base_add(inst, base))
             ))
-            || matches!(hi, Term::Value(v) if self.plus_scc(v).is_some_and(|t| t == want))
+            || matches!(hi, Term::Value(v) if self.plus_scc(v, base).is_some_and(|t| t == want))
+    }
+
+    /// Whether `inst` reads `SCC` written by an `s_add_u32` whose result sums from `base`.
+    fn scc_from_base_add(&self, inst: &Inst, base: Option<Value>) -> bool {
+        let Some(base) = base else { return false };
+        let Some(scc_def) = inst.read(Reg::Scc).and_then(|s| self.def(s)) else {
+            return false;
+        };
+        scc_def.name() == "s_add_u32"
+            && scc_def
+                .writes
+                .first()
+                .is_some_and(|w| self.sum(Term::Value(w.1)).base == Some(base))
     }
 
     /// Whether `t` is 0 whatever path the code took: a constant 0, or phis
     /// and XORs (and copies) of such, a cycle among them counting as 0 (the
     /// greatest fixed point: no path brings anything else in).
-    fn is_zero(&self, t: Term) -> bool {
+    fn is_zero(&self, t: Term, base: Option<Value>) -> bool {
         let mut seen = std::collections::BTreeSet::new();
-        let mut todo = vec![t];
-        while let Some(t) = todo.pop() {
+        // (term, may prune forward edges with `edge_reaches`, may strip one carry `plus_scc`)
+        let mut todo = vec![(t, true, true)];
+        while let Some((t, prune, allow_carry)) = todo.pop() {
             let v = match self.xor_cancelled(t) {
                 Term::Const(c) => {
                     if c != 0 {
@@ -1217,30 +1241,36 @@ impl<'a> Tracer<'a> {
                 }
                 Term::Value(v) => v,
             };
-            if !seen.insert(v) {
+            if !seen.insert((v, prune, allow_carry)) {
                 continue;
             }
             if seen.len() > 256 {
                 return false;
             }
             if let Some((b, i)) = self.phis[v.0 as usize] {
-                // Only the edges some lane that reaches the access can have
-                // come by: on the others the register may hold anything (a
-                // lane mask where the compiler reuses it, P.4).
+                // Only the forward edges some lane that reaches the access can
+                // have come by: once a back edge is crossed, atoms born inside
+                // the loop belong to an earlier iteration, so pruning stops.
                 for (j, &a) in self.p.blocks[b].phis[i].args.iter().enumerate() {
-                    if self.edge_reaches(b, j) {
-                        todo.push(self.origin(a));
+                    let back = self.p.blocks[b]
+                        .preds
+                        .get(j)
+                        .is_some_and(|&q| self.rpo[q] >= self.rpo[b]);
+                    let next_prune = prune && !back;
+                    if !next_prune || self.edge_reaches(b, j) {
+                        todo.push((self.origin(a), next_prune, allow_carry));
                     }
                 }
             } else if let Some(left) = self.xor_leaves(v) {
                 // An XOR tree: the leaves that appear an odd number of times
                 // are what it is (a swap's partner cancels out).
-                todo.extend(left);
-            } else if let Some(t) = self.plus_scc(v) {
-                // `0 + carry` of the low half's add: a table address's high
-                // half, as `high_half` takes it (heap addresses fit in 32
-                // bits).
-                todo.push(t);
+                todo.extend(left.into_iter().map(|x| (x, prune, allow_carry)));
+            } else if allow_carry
+                && let Some(t) = self.plus_scc(v, base)
+            {
+                // `0 + carry` of the low half's add on the same 32-bit `base`
+                // (at most once per path, never chained or cycled).
+                todo.push((t, prune, false));
             } else {
                 if std::env::var_os("VICTORY_WHY_HIGH").is_some() {
                     eprintln!("WHY-ZERO at access block {:?}, lanes {}", self.at.get(), self.lanes.is_some());
@@ -1283,8 +1313,8 @@ impl<'a> Tracer<'a> {
     }
 
     /// Whether some lane that reaches the access being traced can have come
-    /// into `block` by its edge `j` (true when that is not known: no access
-    /// or no lanes' paths).
+    /// into `block` by its edge `j` (true when that is not known: no access,
+    /// no lanes' paths, or a back edge).
     fn edge_reaches(&self, block: usize, j: usize) -> bool {
         let (Some(at), Some(lanes)) = (self.at.get(), self.lanes) else {
             return true;
@@ -1292,8 +1322,13 @@ impl<'a> Tracer<'a> {
         let Some(&q) = self.p.blocks[block].preds.get(j) else {
             return true;
         };
+        // A back edge carries atoms from a previous loop iteration.
+        if self.rpo[q] >= self.rpo[block] {
+            return true;
+        }
         let mut known = vec![(lanes.reach[at], true), (lanes.reach[q], true)];
-        if let LaneExit::Branch { when, taken, not_taken } = lanes.exits[q]
+        if !lanes.wide.contains(&q)
+            && let LaneExit::Branch { when, taken, not_taken } = lanes.exits[q]
             && taken != not_taken
         {
             known.push((when, taken == block));
@@ -1301,12 +1336,15 @@ impl<'a> Tracer<'a> {
         self.meet(lanes, &known)
     }
 
-    /// `x` where `v` is `s_add_u32 v, x, src_scc` (either way round): the
-    /// carry of the low half's add written out (P.4's programs build a
-    /// heap address so).
-    fn plus_scc(&self, v: Value) -> Option<Term> {
+    /// `x` where `v` is `s_add_u32 v, x, src_scc` (either way round) and `SCC`
+    /// came from an `s_add_u32` on `base` (the carry of the low half's add
+    /// written out; P.4's programs build a heap address so).
+    fn plus_scc(&self, v: Value, base: Option<Value>) -> Option<Term> {
         let inst = self.def(v)?;
         if inst.name() != "s_add_u32" || inst.writes.first()?.1 != v {
+            return None;
+        }
+        if !self.scc_from_base_add(inst, base) {
             return None;
         }
         let Fields::Sop { src, .. } = &inst.fields else {
@@ -1664,11 +1702,12 @@ impl<'a> Tracer<'a> {
         for (j, &q) in preds.iter().enumerate() {
             let n = known.len();
             known.push((lanes.reach[q], true));
-            if let LaneExit::Branch {
-                when,
-                taken,
-                not_taken,
-            } = lanes.exits[q]
+            if !lanes.wide.contains(&q)
+                && let LaneExit::Branch {
+                    when,
+                    taken,
+                    not_taken,
+                } = lanes.exits[q]
                 && taken != not_taken
             {
                 known.push((when, taken == block));
@@ -2384,11 +2423,12 @@ impl<'a> Tracer<'a> {
         for (j, &q) in preds.iter().enumerate() {
             let n = known.len();
             known.push((lanes.reach[q], true));
-            if let LaneExit::Branch {
-                when,
-                taken,
-                not_taken,
-            } = lanes.exits[q]
+            if !lanes.wide.contains(&q)
+                && let LaneExit::Branch {
+                    when,
+                    taken,
+                    not_taken,
+                } = lanes.exits[q]
                 && taken != not_taken
             {
                 known.push((when, taken == block));
@@ -2689,15 +2729,18 @@ impl<'a> Tracer<'a> {
             return None;
         }
         let half = inst.writes.iter().position(|w| w.1 == v)? as u8;
+        if half >= 2 {
+            return None;
+        }
         let Fields::Sop { src, .. } = &inst.fields else {
             return None;
         };
         let op = |o: &Operand| match *o {
             Operand::Scalar { code, .. } if code != NULL => Some(self.origin(inst.read(Reg::S(code + half))?)),
             Operand::Scalar { .. } => Some(Term::Const(0)),
-            // A 64-bit constant: its low dword, 0 (or all ones, sign) above.
-            Operand::Const(c) => inline(c).map(|k| Term::Const(if half == 0 { k } else if (k as i32) < 0 { u32::MAX } else { 0 })),
-            Operand::Literal(x) => Some(Term::Const(if half == 0 { x } else { 0 })),
+            // 64-bit inline integers sign-extend; float inline constants are f64 (not followed).
+            Operand::Const(c @ 128..=208) => inline(c).map(|k| Term::Const(if half == 0 { k } else if (k as i32) < 0 { u32::MAX } else { 0 })),
+            Operand::Literal(x) if x >> 31 == 0 => Some(Term::Const(if half == 0 { x } else { 0 })),
             _ => None,
         };
         Some([op(src.first()?)?, op(src.get(1)?)?])
@@ -4683,5 +4726,84 @@ pub(crate) mod tests {
         assert_eq!(table_offset(&r, other), 0x20);
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
+    }
+
+    #[test]
+    fn high_half_and_xor_proofs_reject_unsound_cases() {
+        let layout = [param(Table, 0, 1), param(Constants, 1, 1)];
+        let check = |words: &[u32], wide: &[usize]| {
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let p = crate::ir::build(&code, false, 256).unwrap();
+            let wset: std::collections::HashSet<usize> = wide.iter().copied().collect();
+            let st = crate::structure::structure_wide(&p, &wset).unwrap();
+            track(&p, &layout, HwStage::Cs, Some(&st))
+        };
+
+        // R1a: back edge carries high half = 1, exit block has !C while back edge has C.
+        const R1A: &[u32] = &[
+            0xBE840300, 0xBE850380, 0xBE820380, 0xBE870305,
+            0xBE850381, 0x80028102, 0xBF0A8202, 0xBF85FFFB,
+            0xBE850307, 0xF4080202, 0xFA000000, 0xBF810000,
+        ];
+        assert!(check(R1A, &[]).is_err(), "back edge carrying 1 must be rejected");
+
+        // R1b: forward edge inside loop (s5=1) reached by walking across a back edge.
+        const R1B: &[u32] = &[
+            0xBE840300, 0xBE850380, 0xBE820380, 0xBE870305,
+            0x80028102, 0xBF0A8202, 0xBF840002, 0xBE850381,
+            0xBF820001, 0xBE850380, 0xBF85FFF8, 0xBE850307,
+            0xF4080202, 0xFA000000, 0xBF810000,
+        ];
+        assert!(check(R1B, &[]).is_err(), "forward edge behind back edge must be rejected");
+
+        // R2: wide branch at block 0 where wave goes together; lane with !C still enters join (s5=1).
+        const R2: &[u32] = &[
+            0xBE840300, 0xBE850381, 0x7D840080, 0xBE823C6A,
+            0xBF890001, 0xBE850380, 0xBEFE0302, 0x8A7E6A7E,
+            0xBF880002, 0xF4080202, 0xFA000000, 0xBF810000,
+        ];
+        assert!(check(R2, &[0]).is_err(), "wide branch must not prune edge in edge_reaches");
+        assert!(check(R2, &[]).is_ok(), "non-wide per-lane branch still prunes unread edge");
+
+        // R3a: plus_scc must reject unrelated SCC = 1 (s_cmp_eq_u32 s0, s0; s_add_u32 s5, 0, src_scc).
+        const R3A: &[u32] = &[
+            0xBE840300, 0xBF060000, 0x8005FD80, 0xF4080202,
+            0xFA000000, 0xBF810000,
+        ];
+        assert!(check(R3A, &[]).is_err(), "unrelated SCC in plus_scc must be rejected");
+
+        // R3b: plus_scc cycle in a loop (s5 = phi(0, s5 + src_scc)).
+        const R3B: &[u32] = &[
+            0xBE840300, 0xBE850380, 0xBE820380, 0xBF060000,
+            0x8005FD05, 0x80028102, 0xBF0A8402, 0xBF85FFFB,
+            0xF4080202, 0xFA000000, 0xBF810000,
+        ];
+        assert!(check(R3B, &[]).is_err(), "plus_scc cycle must be rejected");
+
+        // Positive: legitimate low-half add on the same base + 0 + carry still passes.
+        const POS_PLUS_SCC: &[u32] = &[
+            0x80040100, 0x8005FD80, 0xF4080202, 0xFA000000,
+            0xBF810000,
+        ];
+        assert!(check(POS_PLUS_SCC, &[]).is_ok(), "legitimate base-add carry must still pass");
+
+        // R4a: s_xor_b64 s[4:5], 0, 1.0 -> high half is 0x3FF00000 on GFX10, not 0.
+        const R4A: &[u32] = &[
+            0x8984F280, 0xBE840300, 0xF4080202, 0xFA000000,
+            0xBF810000,
+        ];
+        assert!(check(R4A, &[]).is_err(), "s_xor_b64 with inline float constant must not fold as 0");
+
+        // R4b: xor_copy must not overwrite origin of Reg::Scc for s_xor_b32 s2, s0, 0.
+        {
+            let code: Vec<u8> = [0x8902_8000u32, S_ENDPGM]
+                .iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect();
+            let p = crate::ir::build(&code, false, 256).unwrap();
+            let t = Tracer::new(&p, &layout, HwStage::Cs, None).unwrap();
+            let scc = p.blocks[0].insts[0].write(Reg::Scc).unwrap();
+            assert_eq!(t.origin(scc), Term::Value(scc), "SCC must keep its own origin");
+        }
     }
 }

@@ -4633,6 +4633,7 @@ impl<'a> Lower<'a> {
             Atom::Opaque(v)
                 if (assume_dead_joins() || self.stale.contains(&v))
                     && matches!(self.vals.get(&v), Some(Val::Missing(w)) if DEAD_DESCRIPTOR_WORDS.contains(w))
+                    && (!self.x.native.wave64 || self.stale_pair_high(v))
                     && !std::env::var_os("VICTORY_DEAD_DESCRIPTOR_JOINS").is_some_and(|x| x == "0") =>
             {
                 Ok(self.s.m.bool(false))
@@ -6116,6 +6117,34 @@ impl<'a> Lower<'a> {
         self.s.op(qb, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &[faults, place, iu, mark, iu, iu, iu, mask, align]);
     }
 
+    /// In wave64, `Atom::Opaque(v)` stands for a 64-bit pair `(v, hi)` read as
+    /// a lane mask; treating it as `false` for all 64 lanes is only sound when
+    /// every non-descriptor 64-bit reader's high dword is also a dead descriptor
+    /// dword.
+    fn stale_pair_high(&self, lo: Value) -> bool {
+        let mut any = false;
+        for (bi, block) in self.x.p.blocks.iter().enumerate() {
+            for (ii, inst) in block.insts.iter().enumerate() {
+                for &(reg, val) in &inst.reads {
+                    if val != lo || self.is_pure_descriptor_use(inst, (bi, ii), reg) {
+                        continue;
+                    }
+                    let Reg::S(c) = reg else { return false };
+                    let Some(hi) = inst.read(Reg::S(c + 1)) else {
+                        continue;
+                    };
+                    any = true;
+                    let dead_hi = (assume_dead_joins() || self.stale.contains(&hi))
+                        && matches!(self.vals.get(&hi), Some(Val::Missing(w)) if DEAD_DESCRIPTOR_WORDS.contains(w));
+                    if !dead_hi {
+                        return false;
+                    }
+                }
+            }
+        }
+        any
+    }
+
     /// Whether `v` is only ever used as a descriptor: followed through
     /// copies (`s_mov_b32`/`s_mov_b64`, among them the moves `ir::unspill`
     /// makes of spill saves and restores) and joins, every use is an SGPR
@@ -6135,57 +6164,85 @@ impl<'a> Lower<'a> {
             if seen.len() > 512 {
                 return false;
             }
-            for block in &p.blocks {
+            for (bi, block) in p.blocks.iter().enumerate() {
                 for ph in &block.phis {
                     if ph.args.contains(&x) {
                         todo.push(ph.value);
                     }
                 }
-                for i in &block.insts {
-                    let Some(&(reg, _)) = i.reads.iter().find(|r| r.1 == x) else { continue };
-                    let name = i.name();
-                    if matches!(name, "s_mov_b32" | "s_mov_b64") {
-                        // The copy's dword that reads `x`.
-                        let k = match (&i.fields, reg) {
-                            (Fields::Sop { src, .. }, Reg::S(c)) => match src.first() {
-                                Some(Operand::Scalar { code, .. }) if c >= *code => usize::from(c - code),
+                for (ii, i) in block.insts.iter().enumerate() {
+                    for &(reg, _) in i.reads.iter().filter(|r| r.1 == x) {
+                        let name = i.name();
+                        if matches!(name, "s_mov_b32" | "s_mov_b64") {
+                            // The copy's dword that reads `x`.
+                            let k = match (&i.fields, reg) {
+                                (Fields::Sop { src, .. }, Reg::S(c)) => match src.first() {
+                                    Some(Operand::Scalar { code, .. }) if *code != NULL && c >= *code => {
+                                        usize::from(c - code)
+                                    }
+                                    _ => return false,
+                                },
                                 _ => return false,
-                            },
-                            _ => return false,
-                        };
-                        match i.writes.get(k) {
-                            Some(&(_, w)) => todo.push(w),
-                            None => return false,
+                            };
+                            match i.writes.get(k) {
+                                Some(&(_, w)) => todo.push(w),
+                                None => return false,
+                            }
+                            continue;
                         }
-                        continue;
+                        // Only the resource and sampler operands (never `soffset`,
+                        // stored `data`, or `image_bvh` `BvhNodes::Memory` addresses).
+                        if self.is_pure_descriptor_use(i, (bi, ii), reg) {
+                            continue;
+                        }
+                        return false;
                     }
-                    // Only the resource and sampler operands (not `soffset`, a
-                    // number).
-                    let within = |op: &Operand| match (*op, reg) {
-                        (Operand::Scalar { code, dwords }, Reg::S(c)) => c >= code && c < code + dwords,
-                        _ => false,
-                    };
-                    let descriptor = match &i.fields {
-                        Fields::Smem { base, .. } if name.starts_with("s_buffer_") => within(base),
-                        Fields::Buffer { rsrc, .. } => within(rsrc),
-                        Fields::Image { rsrc, sampler, .. } => within(rsrc) || sampler.as_ref().is_some_and(within),
-                        _ => false,
-                    };
-                    if descriptor {
-                        continue;
-                    }
-                    return false;
                 }
             }
         }
         true
     }
 
+    /// Whether `reg` is read by `i` at `site` solely as a host descriptor
+    /// operand (not also as `soffset`, `s_buffer_store` data, or a numeric
+    /// `BvhNodes::Memory` base address).
+    fn is_pure_descriptor_use(&self, i: &Inst, site: Site, reg: Reg) -> bool {
+        let name = i.name();
+        let within = |op: &Operand| match (*op, reg) {
+            (Operand::Scalar { code, dwords }, Reg::S(c)) => c >= code && c < code + dwords,
+            _ => false,
+        };
+        match &i.fields {
+            Fields::Smem { base, soffset, data, .. } if name.starts_with("s_buffer_") => {
+                within(base)
+                    && !within(soffset)
+                    && !(name.contains("_store_") && data.as_ref().is_some_and(within))
+            }
+            Fields::Buffer { rsrc, soffset, .. } => within(rsrc) && !within(soffset),
+            Fields::Image { rsrc, sampler, .. } => {
+                let bvh_mem = name.starts_with("image_bvh")
+                    && !self
+                        .x
+                        .res
+                        .bvh
+                        .iter()
+                        .any(|&(s, n)| s == site && matches!(n, crate::resource::BvhNodes::Resource));
+                !bvh_mem && (within(rsrc) || sampler.as_ref().is_some_and(within))
+            }
+            _ => false,
+        }
+    }
+
     /// Whether no lane that reads `v` (a join in block `b`) can have come into
     /// `b` from its predecessor `q`: what that edge brings is never read, so
     /// any value is right there. False where that is not proven (a read
-    /// in another join, no lanes' paths).
+    /// in another join, a loop back edge, or a wide branch).
     fn edge_unread(&self, v: Value, b: usize, q: usize) -> bool {
+        // A back edge carries atoms from a previous iteration of loop `b`,
+        // which cannot be met against the next iteration's `reach[r]`.
+        if self.rpo[q] >= self.rpo[b] {
+            return false;
+        }
         let p = self.x.p;
         let st = self.x.st;
         let mut readers = Vec::new();
@@ -6201,7 +6258,8 @@ impl<'a> Lower<'a> {
             return true;
         }
         let mut edge = vec![(st.reach[q], true)];
-        if let LaneExit::Branch { when, taken, not_taken } = st.exits[q]
+        if !st.wide.contains(&q)
+            && let LaneExit::Branch { when, taken, not_taken } = st.exits[q]
             && taken != not_taken
         {
             edge.push((when, taken == b));
@@ -7486,6 +7544,7 @@ impl<'a> Lower<'a> {
         // ([`Self::compare_only`]), never assumed.
         // `VICTORY_VIEW_IDENTITY=0` leaves them without value, as before.
         let identity_on = !std::env::var_os("VICTORY_VIEW_IDENTITY").is_some_and(|v| v == "0");
+        let view_heap_site = self.is_view_heap_load(site);
         let mut identity: Option<Option<V>> = None;
         for k in 0..count {
             let rel = k.wrapping_sub(u32::from(first));
@@ -7493,11 +7552,13 @@ impl<'a> Lower<'a> {
                 Some(&(_, x)) => self.write(inst, Reg::S(code + k as u8), x, None),
                 None => {
                     if let Some(v) = inst.write(Reg::S(code + k as u8)) {
-                        if identity_on && rel < 2 && self.compare_only(v) {
+                        if identity_on && view_heap_site && rel < 2 && self.compare_only(v, rel) {
                             let id = *identity.get_or_insert_with(|| self.heap_index(site, first, false).ok());
                             if let Some(id) = id {
-                                let x = if rel == 0 { id } else { self.s.m.i32(0) };
-                                self.write(inst, Reg::S(code + k as u8), x, None);
+                                // Emit `id` (the view's heap slot) for both rel 0 and rel 1 so
+                                // standalone d1 comparisons distinguish distinct views rather
+                                // than comparing `0 == 0`.
+                                self.write(inst, Reg::S(code + k as u8), id, None);
                                 continue;
                             }
                         }
@@ -7515,11 +7576,32 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// Whether `v`, a descriptor's dword 0 or 1, is only used as a
-    /// descriptor or compared for equality with another descriptor's dword
-    /// 0 or 1 ([`Self::ident_dword`]): followed through copies, joins and
+    /// Whether the scalar load at `site` reads from the view heap (a `Table`,
+    /// `ResourceHeap`, or `MEMORY_LOADED` address — never `CODE`, `Descriptor`,
+    /// `SamplerHeap`, or a `lane_copied` load).
+    fn is_view_heap_load(&self, site: Site) -> bool {
+        if self.x.res.lane_copied.contains(&site) {
+            return false;
+        }
+        let Some(a) = self.scalar.get(&site).copied() else {
+            return false;
+        };
+        if a.param == crate::resource::MEMORY {
+            return a.offset == crate::resource::MEMORY_LOADED;
+        }
+        matches!(
+            self.x.native.layout.get(a.param).map(|p| p.root),
+            Some(RootType::Table | RootType::ResourceHeap)
+        )
+    }
+
+    /// Whether `v`, a descriptor's dword `rel` (`0` or `1`), is only used as a
+    /// descriptor or compared for equality with other view-heap descriptors'
+    /// same dword `rel` ([`Self::ident_dword`]) that also receive the same
+    /// heap-slot identity representation: followed through plain copies,
+    /// unguarded plain `v_mov_b32`, joins of identity dwords, and
     /// `v_readfirstlane_b32`.
-    fn compare_only(&self, v: Value) -> bool {
+    fn compare_only(&self, v: Value, rel: u32) -> bool {
         let p = self.x.p;
         let mut todo = vec![v];
         let mut seen = std::collections::BTreeSet::new();
@@ -7530,71 +7612,136 @@ impl<'a> Lower<'a> {
             if seen.len() > 512 {
                 return false;
             }
-            for block in &p.blocks {
+            for (bi, block) in p.blocks.iter().enumerate() {
                 for ph in &block.phis {
                     if ph.args.contains(&x) {
+                        // Reject mixed phis: every incoming edge of the join must
+                        // also be a matching identity dword `rel`.
+                        let mut leaves = Vec::new();
+                        if !ph
+                            .args
+                            .iter()
+                            .all(|&a| a == x || self.ident_dword(a, rel, &mut Vec::new(), &mut leaves))
+                        {
+                            return false;
+                        }
+                        todo.extend(leaves);
                         todo.push(ph.value);
                     }
                 }
-                for i in &block.insts {
-                    let Some(&(reg, _)) = i.reads.iter().find(|r| r.1 == x) else { continue };
-                    let name = i.name();
-                    match name {
-                        "s_mov_b32" | "s_mov_b64" | "v_mov_b32" | "v_readfirstlane_b32" => {
-                            let k = match (&i.fields, reg) {
-                                (Fields::Sop { src, .. }, Reg::S(c)) => match src.first() {
-                                    Some(Operand::Scalar { code, .. }) if c >= *code => usize::from(c - code),
+                for (ii, i) in block.insts.iter().enumerate() {
+                    for &(reg, _) in i.reads.iter().filter(|r| r.1 == x) {
+                        let name = i.name();
+                        match name {
+                            "s_mov_b32" | "s_mov_b64" => {
+                                let k = match (&i.fields, reg) {
+                                    (Fields::Sop { src, .. }, Reg::S(c)) => match src.first() {
+                                        Some(Operand::Scalar { code, .. }) if *code != NULL && c >= *code => {
+                                            usize::from(c - code)
+                                        }
+                                        _ => return false,
+                                    },
                                     _ => return false,
-                                },
-                                _ => 0,
-                            };
-                            match i.writes.get(k) {
-                                Some(&(_, w)) => todo.push(w),
-                                None => return false,
+                                };
+                                match i.writes.get(k) {
+                                    Some(&(_, w)) => todo.push(w),
+                                    None => return false,
+                                }
+                                continue;
                             }
-                            continue;
+                            "v_mov_b32" => {
+                                let Fields::Valu(f) = &i.fields else {
+                                    return false;
+                                };
+                                if f.abs != 0 || f.neg != 0 || f.sdwa.is_some() || f.dpp.is_some() {
+                                    return false;
+                                }
+                                // `x` must be `src[0]` (or kept in disabled lanes only if `src[0]`
+                                // is also an identity dword); and if guarded, the old dst VGPR
+                                // must also be an identity dword.
+                                let src0 = match f.src.first() {
+                                    Some(&Operand::Scalar { code, .. }) if code != NULL => i.read(Reg::S(code)),
+                                    Some(&Operand::Vector { reg, .. }) => i.read(Reg::V(reg)),
+                                    _ => return false,
+                                };
+                                let Some(src0) = src0 else { return false };
+                                let mut leaves = Vec::new();
+                                if src0 != x && !self.ident_dword(src0, rel, &mut Vec::new(), &mut leaves) {
+                                    return false;
+                                }
+                                if self.x.st.guards[bi][ii].is_some()
+                                    && let Some(Operand::Vector { reg: dreg, .. }) = f.dst
+                                    && let Some(old) = i.read(Reg::V(dreg))
+                                    && old != x
+                                    && !self.ident_dword(old, rel, &mut Vec::new(), &mut leaves)
+                                {
+                                    return false;
+                                }
+                                todo.extend(leaves);
+                                match i.writes.first() {
+                                    Some(&(_, w)) => todo.push(w),
+                                    None => return false,
+                                }
+                                continue;
+                            }
+                            "v_readfirstlane_b32" => {
+                                let Fields::Valu(f) = &i.fields else {
+                                    return false;
+                                };
+                                if f.abs != 0 || f.neg != 0 || f.sdwa.is_some() || f.dpp.is_some() {
+                                    return false;
+                                }
+                                match i.writes.first() {
+                                    Some(&(_, w)) => todo.push(w),
+                                    None => return false,
+                                }
+                                continue;
+                            }
+                            _ => {}
                         }
-                        _ => {}
-                    }
-                    let equality = (name.starts_with("s_cmp_eq_") || name.starts_with("s_cmp_lg_")
-                        || name.starts_with("v_cmp_eq_") || name.starts_with("v_cmp_ne_")
-                        || name.starts_with("v_cmpx_eq_") || name.starts_with("v_cmpx_ne_"))
-                        && (name.contains("_u32") || name.contains("_i32"));
-                    if equality {
-                        // Both sides descriptors' dwords 0-1.
-                        let ok = i.reads.iter().filter(|r| !matches!(r.0, Reg::S(c) if c == EXEC || c == EXEC + 1))
-                            .all(|r| r.1 == x || self.ident_dword(r.1, &mut Vec::new()));
-                        if ok && i.reads.iter().filter(|r| !matches!(r.0, Reg::S(c) if c == EXEC || c == EXEC + 1)).count() == 2 {
-                            continue;
-                        }
-                        if std::env::var_os("VICTORY_WHY_IDENTITY").is_some() {
-                            eprintln!("WHY-IDENTITY compared at {:#x} {name} with a non-descriptor", i.machine.offset);
-                        }
-                        return false;
-                    }
-                    let within = |op: &Operand| match (*op, reg) {
-                        (Operand::Scalar { code, dwords }, Reg::S(c)) => c >= code && c < code + dwords,
-                        _ => false,
-                    };
-                    let descriptor = match &i.fields {
-                        Fields::Smem { base, .. } if name.starts_with("s_buffer_") => within(base),
-                        Fields::Buffer { rsrc, .. } => within(rsrc),
-                        Fields::Image { rsrc, sampler, .. } => within(rsrc) || sampler.as_ref().is_some_and(within),
-                        _ => false,
-                    };
-                    if !descriptor {
-                        if std::env::var_os("VICTORY_WHY_IDENTITY").is_some() {
-                            let k = match &i.fields {
-                                Fields::Sop { src, .. } => src.iter().find_map(|o| match *o {
-                                    Operand::Literal(x) => Some(format!("{x:#x}")),
-                                    Operand::Const(c) => crate::resource::inline(c).map(|x| format!("{x:#x}")),
-                                    _ => None,
-                                }).unwrap_or_default(),
-                                _ => String::new(),
+                        let equality = (name.starts_with("s_cmp_eq_") || name.starts_with("s_cmp_lg_")
+                            || name.starts_with("v_cmp_eq_") || name.starts_with("v_cmp_ne_")
+                            || name.starts_with("v_cmpx_eq_") || name.starts_with("v_cmpx_ne_"))
+                            && (name.contains("_u32") || name.contains("_i32"))
+                            && match &i.fields {
+                                Fields::Valu(f) => f.sdwa.is_none() && f.dpp.is_none(),
+                                _ => true,
                             };
-                            eprintln!("WHY-IDENTITY used by {:#x} {name} {k}", i.machine.offset);
+                        if equality {
+                            // Both sides must be matching view-heap descriptors' dword `rel`,
+                            // and every partner leaf must also stay compare-only (so neither
+                            // side gets a different representation such as `view_address`).
+                            let mut leaves = Vec::new();
+                            let non_exec = || {
+                                i.reads
+                                    .iter()
+                                    .filter(|r| !matches!(r.0, Reg::S(c) if c == EXEC || c == EXEC + 1))
+                            };
+                            let ok = non_exec()
+                                .all(|r| r.1 == x || self.ident_dword(r.1, rel, &mut Vec::new(), &mut leaves));
+                            if ok && non_exec().count() == 2 {
+                                todo.extend(leaves);
+                                continue;
+                            }
+                            if std::env::var_os("VICTORY_WHY_IDENTITY").is_some() {
+                                eprintln!("WHY-IDENTITY compared at {:#x} {name} with a non-descriptor", i.machine.offset);
+                            }
+                            return false;
                         }
-                        return false;
+                        if !self.is_pure_descriptor_use(i, (bi, ii), reg) {
+                            if std::env::var_os("VICTORY_WHY_IDENTITY").is_some() {
+                                let k = match &i.fields {
+                                    Fields::Sop { src, .. } => src.iter().find_map(|o| match *o {
+                                        Operand::Literal(x) => Some(format!("{x:#x}")),
+                                        Operand::Const(c) => crate::resource::inline(c).map(|x| format!("{x:#x}")),
+                                        _ => None,
+                                    }).unwrap_or_default(),
+                                    _ => String::new(),
+                                };
+                                eprintln!("WHY-IDENTITY used by {:#x} {name} {k}", i.machine.offset);
+                            }
+                            return false;
+                        }
                     }
                 }
             }
@@ -7602,10 +7749,17 @@ impl<'a> Lower<'a> {
         true
     }
 
-    /// Whether `v` comes, through copies, joins and `v_readfirstlane_b32`,
-    /// only from dwords 0-1 of scalar descriptor loads the program traces
-    /// (`scalar`).
-    fn ident_dword(&self, v: Value, seen: &mut Vec<Value>) -> bool {
+    /// Whether `v` comes, through plain copies, unguarded (or identity-preserving)
+    /// `v_mov_b32`, joins and `v_readfirstlane_b32`, only from dword `rel` (`0` or `1`)
+    /// of view-heap resource descriptor loads that receive the heap-slot identity
+    /// in `descriptor_data` (appending those leaf values to `leaves`).
+    fn ident_dword(
+        &self,
+        v: Value,
+        rel: u32,
+        seen: &mut Vec<Value>,
+        leaves: &mut Vec<Value>,
+    ) -> bool {
         if seen.contains(&v) {
             return true;
         }
@@ -7614,7 +7768,10 @@ impl<'a> Lower<'a> {
         }
         seen.push(v);
         if let Some(&(b, i)) = self.phi_at.get(&v) {
-            return self.x.p.blocks[b].phis[i].args.iter().all(|&a| self.ident_dword(a, seen));
+            return self.x.p.blocks[b].phis[i]
+                .args
+                .iter()
+                .all(|&a| self.ident_dword(a, rel, seen, leaves));
         }
         let Some(&b) = self.def_block.get(&v) else { return false };
         let p = self.x.p;
@@ -7623,17 +7780,144 @@ impl<'a> Lower<'a> {
         };
         let k = inst.writes.iter().position(|w| w.1 == v).unwrap_or(0);
         match inst.name() {
-            "s_mov_b32" | "s_mov_b64" | "v_mov_b32" | "v_readfirstlane_b32" => {
+            "s_mov_b32" | "s_mov_b64" => {
                 let src = match &inst.fields {
                     Fields::Sop { src, .. } => match src.first() {
-                        Some(Operand::Scalar { code, .. }) => inst.read(Reg::S(code + k as u8)),
+                        Some(Operand::Scalar { code, .. }) if *code != NULL => {
+                            inst.read(Reg::S(code + k as u8))
+                        }
                         _ => None,
                     },
-                    _ => inst.reads.first().map(|r| r.1),
+                    _ => None,
                 };
-                src.is_some_and(|s| self.ident_dword(s, seen))
+                src.is_some_and(|s| self.ident_dword(s, rel, seen, leaves))
             }
-            name if name.starts_with("s_load_dwordx") => k < 2 && self.scalar.contains_key(&(b, n)),
+            "v_mov_b32" => {
+                let Fields::Valu(f) = &inst.fields else {
+                    return false;
+                };
+                if f.abs != 0 || f.neg != 0 || f.sdwa.is_some() || f.dpp.is_some() {
+                    return false;
+                }
+                let src = match f.src.first() {
+                    Some(&Operand::Scalar { code, .. }) if code != NULL => inst.read(Reg::S(code)),
+                    Some(&Operand::Vector { reg, .. }) => inst.read(Reg::V(reg)),
+                    _ => None,
+                };
+                let Some(src) = src else { return false };
+                if !self.ident_dword(src, rel, seen, leaves) {
+                    return false;
+                }
+                // Disabled lanes keep the destination VGPR's old value: when the
+                // move is guarded, that old value must also be a matching identity dword.
+                if self.x.st.guards[b][n].is_some() {
+                    let Some(Operand::Vector { reg: dreg, .. }) = f.dst else {
+                        return false;
+                    };
+                    let Some(old) = inst.read(Reg::V(dreg)) else {
+                        return false;
+                    };
+                    if !self.ident_dword(old, rel, seen, leaves) {
+                        return false;
+                    }
+                }
+                true
+            }
+            "v_readfirstlane_b32" => {
+                let Fields::Valu(f) = &inst.fields else {
+                    return false;
+                };
+                if f.abs != 0 || f.neg != 0 || f.sdwa.is_some() || f.dpp.is_some() {
+                    return false;
+                }
+                let Some(&Operand::Vector { reg, .. }) = f.src.first() else {
+                    return false;
+                };
+                inst.read(Reg::V(reg))
+                    .is_some_and(|s| self.ident_dword(s, rel, seen, leaves))
+            }
+            name if name.starts_with("s_load_dwordx") => {
+                let site = (b, n);
+                if !self.is_view_heap_load(site) {
+                    return false;
+                }
+                // Find the resource descriptor use (or a twin load from the same address),
+                // matching `descriptor_data`.
+                let x = self.x;
+                let uses = |of: Site| {
+                    x.res
+                        .descriptors
+                        .iter()
+                        .filter(|d| d.role == Role::Resource)
+                        .filter_map(move |d| {
+                            d.source.leaves().into_iter().find_map(|l| match *l {
+                                Source::Loaded { load, first } if load == of => Some((d.site, first)),
+                                _ => None,
+                            })
+                        })
+                };
+                let by_scalar_load = |u: &(Site, u8)| {
+                    matches!(x.p.blocks[u.0.0].insts[u.0.1].fields, Fields::Smem { .. })
+                };
+                let use_of = |of: Site| uses(of).find(|u| !by_scalar_load(u)).or_else(|| uses(of).next());
+                let address = self.scalar.get(&site).copied();
+                let twin = || {
+                    let a = address?;
+                    let same = |s: Site| x.p.blocks[s.0].insts[s.1].name() == inst.name();
+                    x.res
+                        .scalar
+                        .iter()
+                        .filter(|(s, other)| *s != site && *other == a && same(*s))
+                        .find_map(|(s, _)| use_of(*s))
+                };
+                let Some((at, first)) = use_of(site).or_else(twin) else {
+                    return false;
+                };
+                if k != usize::from(first) + rel as usize {
+                    return false;
+                }
+                let src = Source::Loaded { load: site, first };
+                let used = self.used_kind(&src);
+                let ui = &x.p.blocks[at.0].insts[at.1];
+                let un = ui.name();
+                let is_image = matches!(ui.fields, Fields::Image { .. }) && !un.starts_with("image_bvh");
+                if !is_image {
+                    // Constant buffers never get identity values (they fail in `descriptor_data`).
+                    if used.is_some_and(|u| u.kind == ResourceType::Cbv)
+                        || (matches!(ui.fields, Fields::Smem { .. })
+                            && !used.is_some_and(|u| u.kind == ResourceType::Srv))
+                    {
+                        return false;
+                    }
+                    // If `descriptor_data` replaces d0/d1 with `view_address`, this load
+                    // carries a real console address rather than a heap-slot identity.
+                    if first == 0
+                        && let Fields::Smem { data: Some(Operand::Scalar { code, .. }), .. } = inst.fields
+                        && (0..2u8).any(|j| inst.write(Reg::S(code + j)).is_some_and(|w| self.computed_with(w, 6)))
+                    {
+                        return false;
+                    }
+                }
+                if rel == 1 {
+                    // Images put `(width - 1) << 30` in d1; buffers with metadata stride or
+                    // `Table`/`ResourceHeap` slot strides put `stride << 16` in d1.
+                    if is_image {
+                        return false;
+                    }
+                    let stride = used.map_or(0, |u| u.stride);
+                    if stride > 1 && stride < (1 << 14) {
+                        return false;
+                    }
+                    let has_slot_stride = address
+                        .and_then(|a| x.native.layout.get(a.param))
+                        .is_some_and(|rp| matches!(rp.root, RootType::ResourceHeap | RootType::Table));
+                    if has_slot_stride {
+                        return false;
+                    }
+                }
+                leaves.push(v);
+                true
+            }
             _ => false,
         }
     }
@@ -14680,5 +14964,251 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn dead_descriptor_and_identity_proofs_reject_unsound_cases() {
+        let lower_wide = |words: &[u32],
+                          layout: Vec<RootParam>,
+                          used: Vec<UsedResource>,
+                          wave64: bool,
+                          wide: &[usize]|
+         -> Result<Lowered, crate::ShaderError> {
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let sgprs: u32 = layout.iter().map(|p| p.sgprs).sum();
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64,
+                vgprs: 256,
+                layout,
+                used,
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 1 << 15 | sgprs.max(2) << 1,
+                    threads: [64, 1, 1],
+                }),
+                code,
+            };
+            let p = ir::build(&native.code, wave64, 256).unwrap();
+            let wset: std::collections::HashSet<usize> = wide.iter().copied().collect();
+            let st = structure::structure_wide(&p, &wset).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+            let io = io::raise(&p, &native).unwrap();
+            lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+            })
+        };
+
+        let tex_and_uav = || {
+            let layout = vec![root(RootType::Table, 0, 0), root(RootType::Constants, 1, 1)];
+            let used = vec![
+                UsedResource {
+                    kind: ResourceType::Srv,
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 8,
+                    user_data: 0,
+                    slot: 0,
+                },
+                UsedResource {
+                    kind: ResourceType::Uav,
+                    root: RootType::Table,
+                    table_offset_dwords: 16,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 4,
+                    user_data: 0,
+                    slot: 0,
+                },
+            ];
+            (layout, used)
+        };
+
+        let buf_and_uav = || {
+            let layout = vec![root(RootType::Table, 0, 0), root(RootType::Constants, 1, 1)];
+            let used = vec![
+                UsedResource {
+                    kind: ResourceType::Srv,
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 4,
+                    dwords: 4,
+                    user_data: 0,
+                    slot: 0,
+                },
+                UsedResource {
+                    kind: ResourceType::Uav,
+                    root: RootType::Table,
+                    table_offset_dwords: 16,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 4,
+                    user_data: 0,
+                    slot: 0,
+                },
+            ];
+            (layout, used)
+        };
+
+        // L1a: edge_unread must reject a live loop back edge carrying a stale descriptor dword.
+        const L1A: &[u32] = &[
+            0xBE820300, 0xBE830380, 0xF40C0201, 0xFA000000,
+            0xF4080401, 0xFA000040, 0xF0000108, 0x00020200,
+            0xBE840380, 0xBE850380, 0x80058105, 0xBF0A8205,
+            0xBF840002, 0xBE840308, 0xBF82FFFB, 0x7E060204,
+            0xE0701000, 0x80040300, 0xBF810000,
+        ];
+        let (l, u) = tex_and_uav();
+        assert!(lower_wide(L1A, l, u, false, &[]).is_err(), "L1a back edge must be rejected");
+
+        // L1b: edge_unread must reject wide branch, while still accepting per-lane branch.
+        const L1B: &[u32] = &[
+            0xBE820300, 0xBE830380, 0xF40C0201, 0xFA000000,
+            0xF4080401, 0xFA000040, 0xF0000108, 0x00020200,
+            0xBE840308, 0x7D840080, 0xBE863C6A, 0xBF890001,
+            0xBE840380, 0xBEFE0306, 0x8A7E6A7E, 0xBF880003,
+            0x7E060204, 0xE0701000, 0x80040300, 0xBF810000,
+        ];
+        let (l, u) = tex_and_uav();
+        assert!(lower_wide(L1B, l, u, false, &[0]).is_err(), "L1b wide branch must be rejected");
+        let (l, u) = tex_and_uav();
+        assert!(lower_wide(L1B, l, u, false, &[]).is_ok(), "non-wide per-lane edge_unread still passes");
+
+        // L2a: descriptor_only must reject soffset aliasing rsrc.
+        const L2A: &[u32] = &[
+            0xBE820300, 0xBE830380, 0xF4080201, 0xFA000000,
+            0xF4080401, 0xFA000040, 0xBF068001, 0xBF850005,
+            0xBE840308, 0xBE850309, 0xBE86030A, 0xBE87030B,
+            0xBF820002, 0xF4080101, 0xFA000040, 0xE0301000,
+            0x04010100, 0xE0701000, 0x80040100, 0xBF810000,
+        ];
+        let (l, u) = buf_and_uav();
+        assert!(lower_wide(L2A, l, u, false, &[]).is_err(), "L2a soffset alias must be rejected");
+
+        // L2b: descriptor_only must reject image_bvh BvhNodes::Memory base address.
+        const L2B: &[u32] = &[
+            0xBE820300, 0xBE830380, 0xF40C0201, 0xFA000000,
+            0xF4080401, 0xFA000040, 0xF0000108, 0x00020200,
+            0xBF068001, 0xBF850002, 0xBE840308, 0xBF820001,
+            0xBE840380, 0xBE8503FF, 0x80000000, 0xBE860380,
+            0xBE8703FF, 0x81000000, 0xF1989F01, 0x00010C00,
+            0xE0701000, 0x80040C00, 0xBF810000,
+        ];
+        let (l, u) = tex_and_uav();
+        assert!(lower_wide(L2B, l, u, false, &[]).is_err(), "L2b BvhNodes::Memory must be rejected");
+
+        // L3a: compare_only + ident_dword must reject s_load_dwordx2 from CODE table.
+        const L3A: &[u32] = &[
+            0xBE820300, 0xBE830380, 0xF40C0201, 0xFA000000,
+            0xF4080401, 0xFA000040, 0xF0000108, 0x00020200,
+            0xBE941F00, 0xF404058A, 0xFA000020, 0xBF061608,
+            0x85188081, 0x7E060218, 0xE0701000, 0x80040300,
+            0xBF810000, 0x00000000, 0x00000000,
+        ];
+        let (l, u) = tex_and_uav();
+        assert!(lower_wide(L3A, l, u, false, &[]).is_err(), "L3a CODE load must be rejected");
+
+        // L3b: compare_only + ident_dword must reject guarded v_mov_b32 with non-descriptor old VGPR.
+        const L3B: &[u32] = &[
+            0xBE820300, 0xBE830380, 0xF40C0201, 0xFA000000,
+            0xF4080401, 0xFA000040, 0xF0000108, 0x00020200,
+            0x7E080280, 0x7D840080, 0xBE943C6A, 0x7E080208,
+            0xBEFE0314, 0x7D840808, 0x02060280, 0xE0701000,
+            0x80040300, 0xBF810000,
+        ];
+        let (l, u) = tex_and_uav();
+        assert!(lower_wide(L3B, l, u, false, &[]).is_err(), "L3b guarded v_mov_b32 must be rejected");
+
+        // L3c: compare_only + ident_dword must reject v_mov_b32_sdwa.
+        const L3C: &[u32] = &[
+            0xBE820300, 0xBE830380, 0xF40C0201, 0xFA000000,
+            0xF4080401, 0xFA000040, 0xF0000108, 0x00020200,
+            0x7E0802F9, 0x00850608, 0x7D840808, 0x02060280,
+            0xE0701000, 0x80040300, 0xBF810000,
+        ];
+        let (l, u) = tex_and_uav();
+        assert!(lower_wide(L3C, l, u, false, &[]).is_err(), "L3c SDWA v_mov must be rejected");
+
+        // L3d: compare_only must reject comparing d0 (heap_index) with d1 ((width-1)<<30).
+        const L3D: &[u32] = &[
+            0xBE820300, 0xBE830380, 0xF40C0201, 0xFA000000,
+            0xF4080401, 0xFA000040, 0xF0000108, 0x00020200,
+            0xBF060908, 0x85188081, 0x7E060218, 0xE0701000,
+            0x80040300, 0xBF810000,
+        ];
+        let (l, u) = tex_and_uav();
+        assert!(lower_wide(L3D, l, u, false, &[]).is_err(), "L3d d0 vs d1 must be rejected");
+
+        // L3e: compare_only must reject soffset aliasing rsrc.
+        const L3E: &[u32] = &[
+            0xBE820300, 0xBE830380, 0x8F148501, 0xF4080101,
+            0x28000000, 0xF4080401, 0xFA000040, 0xE0301000,
+            0x04010100, 0xE0701000, 0x80040100, 0xBF810000,
+        ];
+        let (l, u) = buf_and_uav();
+        assert!(lower_wide(L3E, l, u, false, &[]).is_err(), "L3e soffset alias must be rejected");
+
+        // L3f: compare_only must reject comparing heap_index (s4) with view_address (s8).
+        const L3F: &[u32] = &[
+            0xBE820300, 0xBE830380, 0xF4080101, 0xFA000000,
+            0xF4080201, 0xFA000000, 0xF4080401, 0xFA000040,
+            0xE0301000, 0x80010100, 0xE0301000, 0x80020200,
+            0x80148408, 0xBF060804, 0x85188014, 0x7E060218,
+            0xE0701000, 0x80040300, 0xBF810000,
+        ];
+        let (l, u) = buf_and_uav();
+        assert!(lower_wide(L3F, l, u, false, &[]).is_err(), "L3f heap_index vs view_address must be rejected");
+
+        // L3g: compare_only must reject SamplerHeap loads (whose d1 used to become 0 == 0).
+        const L3G: &[u32] = &[
+            0xBE820300, 0xBE830380, 0xBE940301, 0xBE950380,
+            0xF408010A, 0xFA000000, 0xF408020A, 0xFA000020,
+            0xF4080401, 0xFA000040, 0xE0301000, 0x80010100,
+            0xE0301000, 0x80020200, 0xBF060905, 0x85188081,
+            0x7E060218, 0xE0701000, 0x80040300, 0xBF810000,
+        ];
+        let layout_3g = vec![root(RootType::Table, 0, 0), root(RootType::SamplerHeap, 1, 0xFF)];
+        let used_3g = vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 16,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        assert!(lower_wide(L3G, layout_3g, used_3g, false, &[]).is_err(), "L3g SamplerHeap d1 must be rejected");
+
+        // Positive: comparing d0 of two view-heap image descriptors still passes.
+        const POS_COMPARE: &[u32] = &[
+            0xBE820300, 0xBE830380, 0xF40C0201, 0xFA000000,
+            0xF40C0501, 0xFA000020, 0xF4080401, 0xFA000040,
+            0xF0000108, 0x00020200, 0xF0000108, 0x00050300,
+            0xBF061408, 0x851C8081, 0x7E08021C, 0xE0701000,
+            0x80040400, 0xBF810000,
+        ];
+        let (l, u) = tex_and_uav();
+        assert!(lower_wide(POS_COMPARE, l, u, false, &[]).is_ok(), "valid image d0 compare must pass");
+
+        // L4: atom() wave64 half-stale Atom::Opaque must reject live high half (s9 = -1).
+        const L4: &[u32] = &[
+            0xBE820300, 0xBE830380, 0xF40C0201, 0xFA000000,
+            0xF4080401, 0xFA000040, 0xF0000108, 0x00020200,
+            0xBE8903C1, 0x87FE087E, 0x7E060281, 0xE0701000,
+            0x80040300, 0xBF810000,
+        ];
+        let (l, u) = tex_and_uav();
+        assert!(lower_wide(L4, l, u, true, &[]).is_err(), "L4 wave64 half-stale mask must be rejected");
     }
 }
