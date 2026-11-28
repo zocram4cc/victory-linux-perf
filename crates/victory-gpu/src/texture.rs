@@ -926,16 +926,6 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         staging.expected.store(there, Relaxed);
     }
     record_upload(list, resource, &copy, &staging, &staging.buffer, staging.base, prefill);
-    // When the list is submitted, its copy takes what the staging buffer
-    // holds by then: noted before the check below, which sets `dirty`
-    // again if it detiles (the next list then uploads once more).
-    {
-        let staging = staging.clone();
-        list.defer_host(move || {
-            staging.uploaded.store(true, Relaxed);
-            staging.dirty.store(false, Relaxed);
-        });
-    }
     // A host copy that took the place of one with fewer levels: the slots
     // that show that one are made again once this upload has run.
     if staging.first == staging.level0 && copy.grown.swap(false, Relaxed) {
@@ -952,12 +942,23 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     let on_demand = if staging.on_demand { crate::resource::host_tiled(resource) } else { None };
     let Some(on_demand) = on_demand else {
         // Once per submission however many of its lists sample the texture.
-        list.defer_texture(staging);
+        list.defer_texture(staging.clone());
+        // When the list is submitted, its copy takes what the staging buffer
+        // holds by then: noted after the check above, whose detiling set
+        // `dirty` for contents this very copy carries (noted before it, the
+        // next list uploaded the same bytes once more). A later list of the
+        // submission that detiles again sets `dirty` after this.
+        list.defer_host(move || staging.sent());
         // Then what the list's copy puts in the host copy is known.
         list.defer_host(move || noted.note_held());
         return;
     };
     list.defer_texture_ready(staging.clone());
+    // Noted after the check, as above.
+    {
+        let staging = staging.clone();
+        list.defer_host(move || staging.sent());
+    }
     list.defer_host(move || {
         let waiting = on_demand.uploaded(staging.detiled.load(Relaxed), staging.memory as u64);
         staging.waiting.store(if waiting { crate::host::moment().max(1) } else { 0 }, Relaxed);
@@ -1343,6 +1344,16 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
 }
 
 impl Staging {
+    /// A copy of the staging buffer as it is now goes to the host texture
+    /// with the submission being prepared. Under the lock of the check: one
+    /// that detiles right now is done, and its contents are in the copy.
+    fn sent(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let _checked = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        self.uploaded.store(true, Relaxed);
+        self.dirty.store(false, Relaxed);
+    }
+
     /// Levels on demand: what says, beside the mapping, which levels of
     /// the texture are the title's now. First the lowest level a live view
     /// of the texture shows (0 without a view that says): the title's own
