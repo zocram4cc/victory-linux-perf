@@ -32,3 +32,7 @@ Read first: [STATUS.md](STATUS.md) (setup, how to play, every tool), [CHECKPOINT
 - Belobug's texture uploads in the submission prelude (`5d6bd84`) for the load-time flicker.
 - The author's next fixes (known_holes under Wine, PORT_DESCRIPTORS with port 1, COPY_COMPARE on BAR): `git fetch kroeeee`, merge, checkpoint, measure.
 - The world-entry load varies run to run (20-30 s of flicker and black patches in some runs, clean in others).
+
+## Reference material (28 Nov)
+
+The user has legitimate access to the console SDK and keeps it locally. Rule: **reference only**. Never copy its code, headers, internal names or documentation text into this repository, PRs or anything public. Findings are written in our own words, as observations about how the console behaves, and our own code implements them. Nothing from the SDK is committed.
