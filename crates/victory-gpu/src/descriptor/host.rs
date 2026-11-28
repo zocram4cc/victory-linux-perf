@@ -1016,23 +1016,24 @@ pub(crate) fn guard_due_same(index: u32) {
 }
 
 /// A slot of a texture picked by index was uploaded with `bytes`: counted
-/// if a guard write made it due ([`GUARD_WRITES`] 6 and 7).
-/// Returns whether it was.
-pub(crate) fn guard_due_uploaded(index: u32, bytes: u64) -> bool {
+/// if a guard write made it due ([`GUARD_WRITES`] 6 and 7) or the write
+/// watch's sweep did ([`WATCH_SWEEP`] 6 and 7). Returns which:
+/// `"guard"` or `"sweep"` (the repair line's `mechanism`).
+pub(crate) fn guard_due_uploaded(index: u32, bytes: u64) -> Option<&'static str> {
     use std::sync::atomic::Ordering::Relaxed;
     if !guard_writes() && !watch_textures() {
-        return false;
+        return None;
     }
     watch_uploaded(index);
     let source = GUARD_DUE.lock().unwrap_or_else(|e| e.into_inner()).uploaded(index);
-    let counts = match source {
-        Some(GUARD) => &GUARD_WRITES[6..8],
-        Some(_) => &WATCH_SWEEP[6..8],
-        None => return false,
+    let (counts, mechanism) = match source {
+        Some(GUARD) => (&GUARD_WRITES[6..8], "guard"),
+        Some(_) => (&WATCH_SWEEP[6..8], "sweep"),
+        None => return None,
     };
     counts[0].fetch_add(1, Relaxed);
     counts[1].fetch_add(bytes, Relaxed);
-    true
+    Some(mechanism)
 }
 
 /// Diagnostics: the first 16 bytes of level 0 of each title texture at its
@@ -1075,23 +1076,26 @@ pub(crate) fn first_upload_seen(resource: crate::object::This) {
     first.entry(at).or_insert((crate::frame::current(), bytes));
 }
 
-/// Diagnostics: a texture picked by index was uploaded, `again` if a guard
-/// or write-watch write made it due. Then a line, once for each slot (of
+/// Diagnostics: a texture picked by index was uploaded, `again` naming what
+/// made it due if anything did: a guard write (`"guard"`), the write
+/// watch's sweep (`"sweep"`) or a look of the pass's recheck that found it
+/// changed (`"recheck"`). Then a line, once for each slot and mechanism (of
 /// textures more than one texel high; at most 4,096 lines): the slot, the
 /// texture's shape, the frames since its memory's first upload, and the
 /// first 16 bytes of its level 0 then and now (data that is no texture,
 /// such as compressed bytes or 16-bit numbers, shows there).
 #[cfg(feature = "diagnostics")]
-pub(crate) fn guard_upload_seen(index: u32, resource: crate::object::This, frame: u64, again: bool) {
+pub(crate) fn guard_upload_seen(index: u32, resource: crate::object::This, frame: u64, again: Option<&'static str>) {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-    static LOGGED: std::sync::LazyLock<Mutex<std::collections::HashSet<u32>>> = std::sync::LazyLock::new(Mutex::default);
+    static LOGGED: std::sync::LazyLock<Mutex<std::collections::HashSet<(u32, &'static str)>>> =
+        std::sync::LazyLock::new(Mutex::default);
     static LINES: AtomicU64 = AtomicU64::new(0);
-    if !again {
+    let Some(mechanism) = again else {
         first_upload_seen(resource);
         return;
-    }
+    };
     let (w, h, levels, format) = crate::resource::texture_shape(resource).unwrap_or_default();
-    if h <= 1 || LINES.load(Relaxed) >= 4096 || !LOGGED.lock().unwrap_or_else(|e| e.into_inner()).insert(index) {
+    if h <= 1 || LINES.load(Relaxed) >= 4096 || !LOGGED.lock().unwrap_or_else(|e| e.into_inner()).insert((index, mechanism)) {
         return;
     }
     let Some((at, now)) = level0_bytes(resource) else {
@@ -1111,8 +1115,9 @@ pub(crate) fn guard_upload_seen(index: u32, resource: crate::object::This, frame
         frames_since_first_upload = before.map_or(-1, |(f, _)| frame.saturating_sub(f) as i64),
         level0_first_bytes_then = before.map_or_else(|| "unknown".to_string(), |(_, b)| hex(&b)),
         level0_first_bytes_now = hex(&now),
+        mechanism,
         memory = if crate::inplace::shown_bytes(at as usize, 1).is_some_and(|n| n > 0) { "view" } else { "write watch" },
-        "a texture picked by index uploaded again after a write the guards or the write watch saw"
+        "a texture picked by index uploaded again after a write the guards or the write watch saw, or a change the recheck found"
     );
 }
 

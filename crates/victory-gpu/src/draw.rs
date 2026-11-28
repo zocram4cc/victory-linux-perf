@@ -1179,7 +1179,55 @@ const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
 /// changes it found are real; what tells of them cheaply is still to be made.
 fn recheck_forever() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_RECHECK_FOREVER").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_RECHECK_FOREVER").is_some_and(|v| v == "1")) || tex_recheck()
+}
+
+/// `VICTORY_TEX_RECHECK=1` (off unless set): the looks at uploaded textures
+/// picked by index read all of the texture ([`full_recheck`]) and go on
+/// every 400 frames for as long as the slot lives ([`recheck_forever`]),
+/// reading at most `VICTORY_TEX_RECHECK_MB` (64) MB a frame
+/// ([`recheck_at_most`]). Prior art: another fork's `texrecheck.rs` does
+/// this on a thread of its own with a list of its own; here it is our
+/// schedule and our queue, as the two switches above already had it, with
+/// that tree's budget. Not taken from it: the thread (the looks stay in
+/// the pass, so a frame's looks cost the pass up to the budget) and its
+/// back-off for textures changed at every look.
+fn tex_recheck() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_TEX_RECHECK").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Bytes of whole-texture looks one frame reads: [`RECHECK_AT_MOST`], or
+/// with [`tex_recheck`] `VICTORY_TEX_RECHECK_MB` (64) MB.
+fn recheck_at_most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        if !tex_recheck() {
+            return RECHECK_AT_MOST;
+        }
+        std::env::var("VICTORY_TEX_RECHECK_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(64).max(1) << 20
+    })
+}
+
+/// Lines a run gives to textures found changed after their upload
+/// (`VICTORY_RECHECK_LINES`, 4096; it was 200 and then one in a thousand).
+fn recheck_lines() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| std::env::var("VICTORY_RECHECK_LINES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4096))
+}
+
+/// The shape of the texture a slot's view shows, for the log: width,
+/// height, format (DXGI number), levels.
+fn view_shape(view: &View) -> Option<(u64, u32, u32, u16)> {
+    match view {
+        View::Placed(_, r, _) if r[0] != 1 => {
+            Some((u64::from(r[4]) | u64::from(r[5]) << 32, r[6], r[8], (r[7] >> 16) as u16))
+        }
+        View::Shader(r, _) => {
+            crate::resource::texture_shape(*r as This).map(|(w, h, levels, format)| (w, h, format, levels))
+        }
+        _ => None,
+    }
 }
 
 /// Bytes of whole-texture looks one frame reads ([`full_recheck`]): such a
@@ -1190,7 +1238,8 @@ const RECHECK_AT_MOST: u64 = 32 << 20;
 /// Whole-texture looks at uploaded textures since the start, the bytes they
 /// read, and looks left for a later frame because the frame's bytes were
 /// spent (`VICTORY_TEXTURE_FULL_RECHECK`).
-pub(crate) static HEAP_TEXTURES_FULL_RECHECK: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Then the nanoseconds whole looks took (reading and hashing).
+pub(crate) static HEAP_TEXTURES_FULL_RECHECK: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// Whether a look at an uploaded texture reads all of its title memory, not
 /// three 16 KiB windows of it (`VICTORY_TEXTURE_FULL_RECHECK=1`; off by
@@ -1205,7 +1254,7 @@ pub(crate) static HEAP_TEXTURES_FULL_RECHECK: [AtomicU64; 3] = [const { AtomicU6
 /// [`RECHECK_AT_MOST`] a frame (the look that crosses the line is finished).
 fn full_recheck() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_FULL_RECHECK").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_FULL_RECHECK").is_some_and(|v| v == "1")) || tex_recheck()
 }
 
 /// A fingerprint of all of the title memory `[at, at + len)`, never 0: of
@@ -3842,12 +3891,15 @@ impl State {
             // (all their blocks are shown at other addresses too), and each
             // was shown four frames late, over and over.
             let mut again_in = RECHECK_FRAMES[0];
+            // A look found it changed: its upload below is the recheck's
+            // repair (the repair line's `mechanism`).
+            let mut rechecked = false;
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
                 // A whole look reads all of the texture: this frame's bytes
                 // bound how many; the slots over it stay due for a later
                 // pass, which reads them once the next frame has begun.
                 if full_recheck() {
-                    if RECHECK_SPENT.load(Ordering::Relaxed) >= RECHECK_AT_MOST {
+                    if RECHECK_SPENT.load(Ordering::Relaxed) >= recheck_at_most() {
                         HEAP_TEXTURES_FULL_RECHECK[2].fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
@@ -3855,7 +3907,12 @@ impl State {
                     HEAP_TEXTURES_FULL_RECHECK[0].fetch_add(1, Ordering::Relaxed);
                     HEAP_TEXTURES_FULL_RECHECK[1].fetch_add(len, Ordering::Relaxed);
                 }
-                if recheck_fingerprint(at, len) == print {
+                let began = full_recheck().then(std::time::Instant::now);
+                let now_print = recheck_fingerprint(at, len);
+                if let Some(began) = began {
+                    HEAP_TEXTURES_FULL_RECHECK[3].fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                }
+                if now_print == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {
                         Some(wait) => {
@@ -3879,23 +3936,31 @@ impl State {
                 if recheck_soon() {
                     again_in = 1;
                 }
+                rechecked = true;
                 let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
-                if n < 200 || n.is_multiple_of(1000) {
+                if n < recheck_lines() {
                     // Whether its pages are the title's at other addresses
                     // too: what is written there is told of there alone.
                     let elsewhere = crate::inplace::shown_elsewhere(at as usize & !0xffff, (at + len) as usize);
-                    let first = heap.handle(index).and_then(crate::descriptor::view).map_or(0, |view| match view {
-                        View::Placed(false, _, desc) => crate::resource::first_mip(&desc),
+                    let view = heap.handle(index).and_then(crate::descriptor::view);
+                    let first = view.as_ref().map_or(0, |view| match view {
+                        View::Placed(false, _, desc) => crate::resource::first_mip(desc),
                         _ => 0,
                     });
+                    let (width, height, format, levels) = view.as_ref().and_then(view_shape).unwrap_or_default();
                     tracing::warn!(
                         first_level = first,
                         blocks_shown_elsewhere = elsewhere.len(),
                         slot = index,
                         address = format_args!("{at:#x}"),
                         bytes = len,
+                        width,
+                        height,
+                        format,
+                        levels,
                         frames_after_upload = frame.saturating_sub(uploaded),
-                        looks,
+                        look = u32::from(looks) + 1,
+                        whole = full_recheck(),
                         changed = n + 1,
                         "a texture picked by index changed after its upload with nothing to tell of it: uploaded again"
                     );
@@ -4194,7 +4259,7 @@ impl State {
                 return false;
             }
             let (bytes, whole) = crate::texture::staged(resource, there.is_none()).unwrap_or((0, true));
-            let _again = crate::descriptor::host::guard_due_uploaded(index, bytes);
+            let _again = crate::descriptor::host::guard_due_uploaded(index, bytes).or(rechecked.then_some("recheck"));
             #[cfg(feature = "diagnostics")]
             crate::descriptor::host::guard_upload_seen(index, resource, frame, _again);
             // Not all of it there: looked at again next frame, and from
@@ -6692,6 +6757,19 @@ mod tests {
         placed[..10].copy_from_slice(&depth);
         assert!(!stencil_plane(&View::Placed(false, [0; 14], placed)));
         assert!(!stencil_plane(&View::Unordered(1, 0, Some(stencil))));
+    }
+
+    /// A placed texture's shape for the recheck's log comes from its
+    /// resource description in D3D12_RESOURCE_DESC's words: Width a UINT64
+    /// at words 4-5, Height word 6, DepthOrArraySize and MipLevels the low
+    /// and high halves of word 7, Format word 8; a placed buffer has none.
+    #[test]
+    fn a_placed_texture_names_its_shape() {
+        let mut r = [0u32; 14];
+        (r[0], r[4], r[6], r[7], r[8]) = (3, 512, 512, 10 << 16 | 1, 78);
+        assert_eq!(super::view_shape(&crate::descriptor::View::Placed(false, r, [0; 16])), Some((512, 512, 78, 10)));
+        r[0] = 1;
+        assert_eq!(super::view_shape(&crate::descriptor::View::Placed(false, r, [0; 16])), None);
     }
 
     #[test]

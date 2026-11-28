@@ -9747,14 +9747,22 @@ impl Meter {
             {
                 let [unchanged, changed] =
                     [0, 1].map(|i| crate::draw::HEAP_TEXTURES_RECHECKED[i].load(Ordering::Relaxed));
-                let [full, bytes, left] =
-                    [0, 1, 2].map(|i| crate::draw::HEAP_TEXTURES_FULL_RECHECK[i].load(Ordering::Relaxed));
+                let [full, bytes, left, ns] =
+                    [0, 1, 2, 3].map(|i| crate::draw::HEAP_TEXTURES_FULL_RECHECK[i].load(Ordering::Relaxed));
+                // Per frame since the line before: MB the whole looks read
+                // and the ms they took in the pass.
+                static BEFORE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+                let d_bytes = bytes.saturating_sub(BEFORE[0].swap(bytes, Ordering::Relaxed));
+                let d_ns = ns.saturating_sub(BEFORE[1].swap(ns, Ordering::Relaxed));
                 tracing::info!(
                     "textures picked by index looked at again after their upload, since the start: {unchanged} looks found \
                      the memory as it was, {changed} found it changed (uploaded again; five looks, then none, unless \
-                     VICTORY_HEAP_RECHECK_FOREVER=1); {full} whole looks read {} MB ({left} left for a later frame; three \
-                     windows unless VICTORY_TEXTURE_FULL_RECHECK=1)",
-                    bytes >> 20
+                     VICTORY_HEAP_RECHECK_FOREVER=1 or VICTORY_TEX_RECHECK=1); {full} whole looks read {} MB ({left} left \
+                     for a later frame; three windows unless VICTORY_TEXTURE_FULL_RECHECK=1 or VICTORY_TEX_RECHECK=1); \
+                     since the line before, whole looks read {:.1} MB a frame in {:.2} ms a frame of the pass",
+                    bytes >> 20,
+                    d_bytes as f64 / frames / 1e6,
+                    d_ns as f64 / frames / 1e6,
                 );
             }
             if crate::descriptor::host::guard_writes() {
