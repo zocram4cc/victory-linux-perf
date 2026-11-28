@@ -4749,6 +4749,8 @@ impl Shadow {
         put_changed(start + at, &was, title)
     }
 
+    pub(crate) fn mapped_on_card(&self) -> bool { self.mapped }
+
     /// Only used at the completed tail of the relay under the submit lock.
     /// No later flight shares the snapshot and copy_back_done returns it to
     /// the pool before another submit can begin (relay excludes keeps).
@@ -4767,12 +4769,18 @@ impl Shadow {
         let owner = self.clone();
         let title = self.start as usize + at;
         if !crate::watch::lazy_back::eligible(self.id(), title) { return false; }
-        if !crate::watch::lazy_back::arm(title, baseline, move |own| {
-            // SAFETY: owner retains the mapping. The next submit drains the
-            // page before new preparation or GPU work can write the source.
-            unsafe { std::ptr::copy_nonoverlapping(owner.data.add(at), own, PAGE) };
-            Ok(())
-        }) { return false; }
+        let armed = if self.mapped {
+            crate::host::lazy_readback::ready() && crate::watch::lazy_back::arm_gpu(
+                title, |bytes| bytes == baseline, crate::host::lazy_readback::Page::Live(owner, at))
+        } else {
+            crate::watch::lazy_back::arm(title, baseline, move |own| {
+                // SAFETY: owner retains this CPU-visible mapping through the
+                // next submit, which captures its bytes before reusing it.
+                unsafe { std::ptr::copy_nonoverlapping(owner.data.add(at), own, PAGE) };
+                Ok(())
+            })
+        };
+        if !armed { return false; }
         crate::watch::wrote(title, PAGE);
         true
     }
@@ -5995,6 +6003,25 @@ pub(crate) fn verify_lazy_card_readback(at: usize) {
         assert_eq!(held.read_volatile(), 0x11, "GPU source still outstanding");
         assert_eq!((at as *const u8).read_volatile(), 0xbd);
         assert_eq!(held.add(PAGE - 1).read_volatile(), 0xbd);
+    }
+    // A GPU-mapped source has no CPU mirror. Use a second mapped D3D12
+    // resource so the same test works on devices without GPU_UPLOAD.
+    let (resource, live) = host.shared_buffer(PAGE as u64).unwrap();
+    unsafe { std::ptr::write_bytes(live, 0x47, PAGE); }
+    let mapped = build_loose_shadow(at as u64, PAGE as u64, LooseBacking::Mapped { buffer: resource, data: live });
+    let _scope = crate::watch::lazy_back::completed_landing(std::iter::once((mapped.id(), at, at + PAGE)));
+    let side = crate::inplace::beside(at, PAGE).unwrap() as *const u8;
+    assert!(mapped.defer_mapped_page(0, &vec![0xbd; PAGE]));
+    crate::watch::lazy_back::retire_sources();
+    unsafe { std::ptr::write_bytes(live, 0x75, PAGE); }
+    // A fresh completed GPU result supersedes even when the old baseline
+    // is different; continuous protection proves the title has not written.
+    assert!(mapped.defer_mapped_page(0, &vec![0x47; PAGE]));
+    unsafe { assert_eq!(side.read_volatile(), 0xbd, "neither version landed in title RAM"); }
+    crate::watch::lazy_back::retire_sources();
+    unsafe {
+        std::ptr::write_bytes(live, 0xa1, PAGE);
+        assert_eq!((at as *const u8).read_volatile(), 0x75, "fault reads the latest immutable GPU version");
     }
 }
 

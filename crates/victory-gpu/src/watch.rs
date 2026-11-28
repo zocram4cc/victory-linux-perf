@@ -5230,6 +5230,21 @@ mod tests {
         fails.store(false, std::sync::atomic::Ordering::Release);
         drop(title_memory_remapping());
         assert!(writable(at));
+        // A separately published alias must see the newest physical bytes,
+        // even if this registration is outside a batched remapping scope.
+        let baseline = vec![0x52; PAGE];
+        assert!(lazy_back::arm(at, &baseline, |dest| {
+            unsafe { std::ptr::write_bytes(dest, 0x31, PAGE) };
+            Ok(())
+        }));
+        use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
+        let alias = unsafe { MapViewOfFile(section as _, FILE_MAP_WRITE, 0, 0, bytes) };
+        assert!(!alias.Value.is_null());
+        crate::inplace::title_memory_view(alias.Value as usize, bytes, section, 0);
+        assert!(writable(at));
+        assert_eq!(unsafe { alias.Value.cast::<u8>().read_volatile() }, 0x31);
+        title_memory_remapped(alias.Value as usize, bytes);
+        unsafe { UnmapViewOfFile(alias); }
         crate::shadow::verify_lazy_card_readback(at);
         crate::inplace::title_memory_section_gone(section);
         drop_views(section, &[at], bytes);

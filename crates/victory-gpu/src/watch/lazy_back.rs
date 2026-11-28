@@ -2,7 +2,7 @@
 //! Next submit saves any still-live source before the GPU can reuse its storage.
 //! Only a full, singly mapped section page with an identical CPU baseline can
 //! take the whole GPU page without a three-way merge. All other cases stay eager.
-use super::{BLOCK, Bits, GUARDS, mapping_hold_now, open};
+use super::{BLOCK, Bits, GUARDS, mapping_hold_now, open_given};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
@@ -56,13 +56,17 @@ pub(crate) fn can_defer() -> bool {
 // Fetches touch only host-owned backing and the permanently mapped side view.
 // Never take a submission, mapping or watch lock inside a fetch.
 type Fetch = Box<dyn Fn(*mut u8) -> Result<(), ()> + Send>;
+use crate::host::lazy_readback::{self, Page};
+
 enum Source {
+    Gpu(Page),
     Live(Fetch),
     // Next submit can reuse the GPU source. Keep its completed version here
     // until a consumer actually touches title memory.
     Saved(Vec<u8>),
 }
 struct Entry {
+    owner: Option<u64>,
     own: usize,
     source: Source,
     copied: bool,
@@ -107,6 +111,12 @@ impl Pages {
         };
         if !entry.copied {
             match &entry.source {
+                Source::Gpu(page) => {
+                    // SAFETY: the sole title view is inaccessible until the fetch completes.
+                    let dest =
+                        unsafe { std::slice::from_raw_parts_mut(entry.own as *mut u8, BLOCK) };
+                    lazy_readback::fetch(std::slice::from_ref(page), dest)?;
+                }
                 Source::Live(fetch) => fetch(entry.own as *mut u8)?,
                 Source::Saved(bytes) => {
                     // SAFETY: our stable alias spans the guarded title page.
@@ -152,6 +162,41 @@ pub(crate) fn retire_sources() {
         return;
     }
     let mut pages = PAGES.lock().unwrap_or_else(|e| e.into_inner());
+    // Snapshot GPU-mapped pages on the device. Device-local copies with a
+    // separate CPU reference need that reference coherent before preparation.
+    // Return the latter in batches and keep title memory guarded.
+    let mut card = Vec::new();
+    let mut mapped = Vec::new();
+    for (&at, entry) in &pages.entries {
+        if !entry.copied
+            && let Source::Gpu(page @ Page::Live(..)) = &entry.source
+        {
+            if page.needs_cpu_reference() {
+                card.push((at, page.clone()));
+            } else {
+                mapped.push((at, page.clone()));
+            }
+        }
+    }
+    for chunk in mapped.chunks(lazy_readback::BATCH) {
+        let inputs: Vec<_> = chunk.iter().map(|(_, p)| p.clone()).collect();
+        if let Some(buffer) = required(lazy_readback::snapshot(&inputs)) {
+            for (i, (at, _)) in chunk.iter().enumerate() {
+                pages.entries.get_mut(at).unwrap().source =
+                    Source::Gpu(Page::Snapshot(buffer.clone(), i * BLOCK));
+            }
+        } else {
+            card.extend_from_slice(chunk);
+        }
+    }
+    for chunk in card.chunks(lazy_readback::BATCH) {
+        let inputs: Vec<_> = chunk.iter().map(|(_, p)| p.clone()).collect();
+        let mut bytes = vec![0; chunk.len() * BLOCK];
+        required(lazy_readback::fetch(&inputs, &mut bytes));
+        for ((at, _), saved) in chunk.iter().zip(bytes.chunks_exact(BLOCK)) {
+            pages.entries.get_mut(at).unwrap().source = Source::Saved(saved.to_vec());
+        }
+    }
     for entry in pages.entries.values_mut() {
         if !entry.copied
             && let Source::Live(fetch) = &entry.source
@@ -187,6 +232,15 @@ pub(crate) fn try_materialize(at: usize, len: usize) -> Result<bool, ()> {
 
 pub(crate) fn materialize(at: usize, len: usize) -> bool {
     required(try_materialize(at, len))
+}
+
+pub(crate) fn was_guarded(at: usize, len: usize) -> bool {
+    TOUCHED.any(
+        at / BLOCK,
+        at.saturating_add(len)
+            .div_ceil(BLOCK)
+            .min(Bits::PIECES * Bits::WORDS * 64),
+    )
 }
 
 pub(crate) fn fault(at: usize, write: bool) -> Result<bool, ()> {
@@ -234,6 +288,14 @@ impl Drop for PhysicalWrite {
     }
 }
 
+pub(crate) fn publishing_view(section: usize, offset: u64, len: usize) -> Option<PhysicalWrite> {
+    // Existing views, including any beyond the normal watch's alias cap.
+    // Pair this pin with the final single-view check under PAGES in arm_source.
+    required(physical_write(|| {
+        crate::inplace::views_of_section_all(section, offset, len)
+    }))
+}
+
 pub fn pending_io(at: usize, len: usize) {
     if enabled() && len != 0 {
         let sections = crate::inplace::sections_in(at, len);
@@ -257,7 +319,16 @@ pub(crate) fn arm(
     baseline: &[u8],
     fetch: impl Fn(*mut u8) -> Result<(), ()> + Send + 'static,
 ) -> bool {
-    if !at.is_multiple_of(BLOCK) || baseline.len() != BLOCK || !super::ensure_handler() {
+    baseline.len() == BLOCK
+        && arm_source(at, |title| title == baseline, Source::Live(Box::new(fetch)))
+}
+
+pub(crate) fn arm_gpu(at: usize, matches: impl FnOnce(&[u8]) -> bool, page: Page) -> bool {
+    arm_source(at, matches, Source::Gpu(page))
+}
+
+fn arm_source(at: usize, matches: impl FnOnce(&[u8]) -> bool, source: Source) -> bool {
+    if !at.is_multiple_of(BLOCK) || !super::ensure_handler() {
         return false;
     }
     // An outstanding read through a private alias may still be using it.
@@ -270,7 +341,7 @@ pub(crate) fn arm(
     if crate::inplace::pages_of(at) != [at] {
         return false;
     }
-    let Some(own) = crate::inplace::beside(at, BLOCK) else {
+    let Some(own) = crate::inplace::beside_for_pager(at, BLOCK) else {
         return false;
     };
     let Ok(guards) = GUARDS.try_write() else {
@@ -279,10 +350,10 @@ pub(crate) fn arm(
     if guards.left_alone(at / BLOCK) {
         return false;
     }
-    open(&guards, at, at + BLOCK);
     let mut pages = PAGES.lock().unwrap_or_else(|e| e.into_inner());
     const MAX_PENDING_BYTES: usize = 64 << 20;
-    if pages.entries.len() >= MAX_PENDING_BYTES / BLOCK
+    if crate::inplace::pages_of(at) != [at]
+        || (!pages.entries.contains_key(&at) && pages.entries.len() >= MAX_PENDING_BYTES / BLOCK)
         || pages.pending_sections.contains(&section)
         || pages.physical_writers != 0
         || pages
@@ -292,8 +363,25 @@ pub(crate) fn arm(
     {
         return false;
     }
+    let owner = match &source {
+        Source::Gpu(Page::Live(shadow, _)) => Some(shadow.id()),
+        _ => None,
+    };
+    if let Some(entry) = pages.entries.get_mut(&at)
+        && owner.is_some()
+        && owner == entry.owner
+        && own == entry.own
+        && !entry.copied
+    {
+        // The guard has covered the only title VA continuously since the
+        // proof. A newer full-page result from the same GPU buffer supersedes
+        // the older version, including a saved device-local snapshot.
+        entry.source = source;
+        return true;
+    }
     // Overlapping shadows are landed in submission order.
     required(pages.finish(at));
+    open_given(&guards, at, at + BLOCK, None);
     // SAFETY: query the entire page before changing its protection. A mixed
     // page cannot be restored using VirtualProtect's single old protection.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
@@ -316,7 +404,7 @@ pub(crate) fn arm(
     let protection = Protection(at, old);
     // SAFETY: all title access is stopped, the permanent alias is committed.
     if old != PAGE_READWRITE
-        || unsafe { std::slice::from_raw_parts(own as *const u8, BLOCK) } != baseline
+        || !matches(unsafe { std::slice::from_raw_parts(own as *const u8, BLOCK) })
     {
         drop(protection);
         ACTIVE.store(!pages.entries.is_empty(), Ordering::Release);
@@ -325,8 +413,9 @@ pub(crate) fn arm(
     pages.entries.insert(
         at,
         Entry {
+            owner,
             own,
-            source: Source::Live(Box::new(fetch)),
+            source,
             copied: false,
         },
     );

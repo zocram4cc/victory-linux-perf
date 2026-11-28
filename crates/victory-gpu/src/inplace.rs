@@ -337,6 +337,7 @@ pub fn title_memory_section_gone(section: usize) {
 /// The runtime mapped `[at, at + len)` as a view of `section` from
 /// `offset` on. Call after [`crate::title_memory_remapped`] of the range.
 pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
+    let _lazy = crate::watch::lazy_back::publishing_view(section, offset, len);
     {
         let mut v = views_mut();
         v.views.insert(at, (len, section, offset));
@@ -450,13 +451,24 @@ pub(crate) fn views_of_section(section: usize, offset: u64, len: usize) -> Vec<(
     if len == 0 {
         return Vec::new();
     }
-    let v = views();
+    section_views(&views(), section, offset, len, Some(crate::watch::MANY_VIEWS))
+}
+
+/// Includes heavily aliased pages when every view must be accounted for.
+pub(crate) fn views_of_section_all(section: usize, offset: u64, len: usize) -> Vec<(usize, usize)> {
+    section_views(&views(), section, offset, len, None)
+}
+
+fn section_views(v: &Views, section: usize, offset: u64, len: usize, limit: Option<usize>) -> Vec<(usize, usize)> {
+    if len == 0 {
+        return Vec::new();
+    }
     let end = offset.saturating_add(len as u64);
     let mut pages: Vec<usize> = Vec::new();
     let mut at = offset - offset % K64 as u64;
     while at < end {
         if let Some(shown) = v.pages.get(&(section, at))
-            && shown.len() <= crate::watch::MANY_VIEWS
+            && limit.is_none_or(|limit| shown.len() <= limit)
         {
             pages.extend(shown.iter().copied());
         }
@@ -611,6 +623,12 @@ fn stretch_in(views: &BTreeMap<usize, (usize, usize, u64)>, at: usize, len: usiz
 /// the same pages at `at`.
 pub(crate) fn beside(at: usize, len: usize) -> Option<usize> {
     crate::watch::lazy_back::materialize(at, len);
+    beside_for_pager(at, len)
+}
+
+/// Looks up the permanent view while the pager exclusively holds MAPPING.
+/// Its caller is responsible for any still-deferred contents.
+pub(crate) fn beside_for_pager(at: usize, len: usize) -> Option<usize> {
     let known = {
         let v = views();
         let Cover::Run(section, offset) = cover_in(&v.views, at, len) else {
@@ -1353,6 +1371,20 @@ pub(crate) fn tick() {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn uncapped_section_views_include_every_alias() {
+        let section = usize::MAX;
+        let aliases: Vec<usize> = (0..=crate::watch::MANY_VIEWS)
+            .map(|i| 0x6000_0000_0000 + i * 2 * K64)
+            .collect();
+        views_mut().pages.insert((section, 0), aliases.clone());
+        let capped = views_of_section(section, 0, K64);
+        let all = views_of_section_all(section, 0, K64);
+        views_mut().pages.remove(&(section, 0));
+        assert!(capped.is_empty());
+        assert_eq!(all, aliases.into_iter().map(|at| (at, K64)).collect::<Vec<_>>());
+    }
 
     /// Views as the runtime tells them: a range inside one view, or over
     /// views that continue each other in one section, is one run; over

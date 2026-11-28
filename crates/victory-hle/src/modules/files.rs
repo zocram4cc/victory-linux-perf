@@ -37,6 +37,8 @@ macro_rules! host {
 }
 pub(crate) use host;
 
+mod lazy_io;
+
 /// Mounted drives: upper-case letter and host root (UTF-16, no trailing
 /// separator, no NUL).
 static DRIVES: Mutex<Vec<(u16, Vec<u16>)>> = Mutex::new(Vec::new());
@@ -576,7 +578,12 @@ pub extern "system" fn ReadFile(
     read: *mut u32,
     overlapped: *mut c_void,
 ) -> i32 {
-    let Some(writing) = victory_gpu::try_kernel_writing(buffer as usize, len as usize) else {
+    let mapping = (!overlapped.is_null() && victory_gpu::lazy_readback_enabled())
+        .then(victory_gpu::title_memory_reading);
+    let pins = lazy_io::metadata(read, overlapped).and_then(|metadata| {
+        Some((metadata, lazy_io::prepare(buffer as usize, len as usize)?))
+    });
+    let Some(writing) = pins else {
         // The destination could not be prepared. Avoid dereferencing an
         // invalid title pointer when reporting a zero-byte transfer.
         if !read.is_null() {
@@ -585,6 +592,7 @@ pub extern "system" fn ReadFile(
             let write = host!("ntdll.dll", "NtWriteVirtualMemory": NtWrite);
             write(unsafe { GetCurrentProcess() }, read.cast(), &0, size_of::<u32>(), std::ptr::null_mut());
         }
+        drop(mapping);
         unsafe { windows_sys::Win32::Foundation::SetLastError(windows_sys::Win32::Foundation::ERROR_NOACCESS) };
         return 0;
     };
@@ -599,6 +607,10 @@ pub extern "system" fn ReadFile(
     // refresh that guards its blocks before it does will not see it.
     if done == 0 && error == windows_sys::Win32::Foundation::ERROR_IO_PENDING {
         victory_gpu::lazy_pending_io(buffer as usize, len as usize);
+        if !overlapped.is_null() {
+            victory_gpu::lazy_pending_io(overlapped as usize, size_of::<windows_sys::Win32::System::IO::OVERLAPPED>());
+        }
+        if !read.is_null() { victory_gpu::lazy_pending_io(read as usize, size_of::<u32>()); }
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::info!(len, "ReadFile: a read of the title's goes on after the call"));
     }
@@ -610,6 +622,7 @@ pub extern "system" fn ReadFile(
         }
     }
     drop(writing);
+    drop(mapping);
     // SAFETY: as above.
     unsafe { windows_sys::Win32::Foundation::SetLastError(error) };
     done
@@ -623,7 +636,10 @@ pub extern "system" fn ReadFile(
 /// own writes. Returns the items read, as the CRT does; the bytes of a
 /// partial last item are copied too, as the CRT leaves them.
 pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File) -> usize {
-    let _writing = victory_gpu::kernel_writing(buffer as usize, size.saturating_mul(count));
+    let Some(_writing) = lazy_io::prepare(buffer as usize, size.saturating_mul(count)) else {
+        lazy_io::mark_stream_error(stream);
+        return 0;
+    };
     host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize)(
         buffer, size, count, stream,
     )
@@ -760,7 +776,7 @@ extern "C" fn fiopen(path: *const c_char, mode: i32, protection: i32) -> File {
 }
 
 pub(crate) fn module() -> HleModule {
-    HleModule {
+    let mut module = HleModule {
         name: "files",
         dlls: &[
             "kernel32.dll",
@@ -814,7 +830,9 @@ pub(crate) fn module() -> HleModule {
                 address: fiopen_wide as *const () as usize,
             },
         ],
-    }
+    };
+    if victory_gpu::lazy_readback_enabled() { lazy_io::extend(&mut module); }
+    module
 }
 
 #[cfg(test)]
