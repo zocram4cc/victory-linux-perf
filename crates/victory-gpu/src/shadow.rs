@@ -5030,13 +5030,7 @@ impl Shadow {
         let Some(at) = copied.get_mut(page) else {
             return false;
         };
-        // For kernel write-watched sections (`watched == 1`, Wine uffd_wp),
-        // `VICTORY_LAND_BESIDE=1` writes through a separate unwatched mapping;
-        // any concurrent or prior title write still has its kernel dirty bit
-        // set and will be noted at a higher asking number by the next `ask_once`.
-        let held = *at != 0
-            && *at >= before
-            && (crate::watch::block_published(block) || self.watched.load(Ordering::Relaxed) == 1);
+        let held = *at != 0 && *at >= before && crate::watch::block_published(block);
         if held {
             *at = (*at).max(now);
         }
