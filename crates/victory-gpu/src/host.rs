@@ -3221,6 +3221,7 @@ struct Line {
     in_hand: Vec<(usize, crate::queue::Written, usize)>,
     /// With [`card_steps`]: what the flights being landed write.
     landing: Vec<card_steps::Writer>,
+    spare: Vec<Late>,
 }
 
 // SAFETY: D3D12 objects (free-threaded) and host lists nothing records
@@ -3237,12 +3238,22 @@ static LINE: Mutex<Line> = Mutex::new(Line {
     landed: Vec::new(),
     in_hand: Vec::new(),
     landing: Vec::new(),
+    spare: Vec::new(),
 });
 /// Told when a flight joins [`LINE`] or it is poked.
 static LINE_MOVED: std::sync::Condvar = std::sync::Condvar::new();
 
 fn line() -> std::sync::MutexGuard<'static, Line> {
     LINE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn take_items(line: &mut Line) -> Vec<Late> {
+    std::mem::replace(&mut line.line, std::mem::take(&mut line.spare))
+}
+
+fn give_back(line: &mut Line, mut items: Vec<Late>) {
+    items.clear();
+    line.spare = items;
 }
 
 /// Why flights were settled ([`LATE_STATS`]' places from 2 on).
@@ -6054,7 +6065,7 @@ impl Host {
         let _settling = crate::timeline::span("settling flights");
         let mut counted = false;
         loop {
-            let items = {
+            let mut items = {
                 let mut line = line();
                 if line.line.is_empty() {
                     line.settling = false;
@@ -6063,7 +6074,7 @@ impl Host {
                 line.settling = true;
                 line.written.clear();
                 line.lists = 0;
-                std::mem::take(&mut line.line)
+                take_items(&mut line)
             };
             let flights = items.iter().filter(|i| matches!(i, Late::Run(_))).count();
             if !counted {
@@ -6145,7 +6156,7 @@ impl Host {
             // In the order given: what tells the title the card is done.
             let mut last = 0;
             let mut landed = Vec::new();
-            for item in items {
+            for item in items.drain(..) {
                 match item {
                     Late::Run(mut flight) => {
                         last = flight.number;
@@ -6169,7 +6180,9 @@ impl Host {
                 FINISHED.store(last, Ordering::Release);
                 bury(last);
             }
-            line().landed.extend(landed);
+            let mut line = line();
+            line.landed.extend(landed);
+            give_back(&mut line, items);
         }
         if counted {
             self.log_messages();
@@ -6523,7 +6536,10 @@ impl Host {
             for list in runs {
                 texture_back_ranges.extend(list.deferred().texture_backs.iter().map(crate::texback::Back::range));
             }
-            let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
+            let mut writes = Vec::new();
+            for list in runs {
+                writes.extend_from_slice(&list.deferred().writes);
+            }
             tally(&SUBMISSION_US, &TOTAL_SUBMISSION_US, 0, (prepared - started).saturating_sub(settled).as_micros() as u64, Ordering::Relaxed);
             submitting(0, 0);
             #[cfg(feature = "diagnostics")]
@@ -8720,11 +8736,14 @@ fn front_spans(steps: impl Iterator<Item = Touch>, split: bool) -> Vec<(usize, u
 /// The copies' ranges as spans `(copy, from, to)`, each copy's in order, the
 /// empty ones left out.
 fn flat_spans(spans: Vec<(usize, Vec<(usize, usize)>)>) -> Vec<(usize, usize, usize)> {
-    spans
-        .into_iter()
-        .flat_map(|(copy, ranges)| ranges.into_iter().map(move |(from, to)| (copy, from, to)))
-        .filter(|s| s.1 < s.2)
-        .collect()
+    let mut flat = Vec::with_capacity(spans.iter().map(|s| s.1.len()).sum::<usize>());
+    flat.extend(
+        spans
+            .into_iter()
+            .flat_map(|(copy, ranges)| ranges.into_iter().map(move |(from, to)| (copy, from, to)))
+            .filter(|s| s.1 < s.2),
+    );
+    flat
 }
 
 /// Steps of a submission's lists from which [`Batch::refresh_front`] makes
@@ -8748,9 +8767,10 @@ struct ListFront {
 /// A list's steps as [`front_spans`] takes them, folded per copy
 /// ([`ListFront`]).
 fn list_front(steps: &[Step], textures: bool) -> ListFront {
-    let mut shadows: Vec<(usize, std::sync::Arc<crate::shadow::Shadow>)> = Vec::new();
+    let refreshes = steps.iter().filter(|step| matches!(step, Step::Refresh(..))).count();
+    let mut shadows: Vec<(usize, std::sync::Arc<crate::shadow::Shadow>)> = Vec::with_capacity(refreshes);
     let mut staged: Vec<std::sync::Arc<crate::texture::Staging>> = Vec::new();
-    let mut refreshed: ByCopy<()> = ByCopy::default();
+    let mut refreshed: ByCopy<()> = ByCopy::with_capacity_and_hasher(refreshes, Default::default());
     let touches = steps.iter().filter_map(|step| match step {
         Step::Refresh(shadow, from, len) => {
             let key = std::sync::Arc::as_ptr(shadow) as usize;
@@ -8802,15 +8822,14 @@ fn fold_touches(touches: impl Iterator<Item = Touch>, split: bool) -> Vec<(usize
             None => c.2 = true,
         }
     }
-    copies
-        .into_iter()
-        .flat_map(|(key, ranges, written)| {
-            ranges
-                .into_iter()
-                .map(move |(from, to)| (key, from, to, false))
-                .chain(written.then_some((key, usize::MAX, 0, true)))
-        })
-        .collect()
+    let mut out = Vec::with_capacity(copies.iter().map(|c| c.1.len() + usize::from(c.2)).sum::<usize>());
+    out.extend(copies.into_iter().flat_map(|(key, ranges, written)| {
+        ranges
+            .into_iter()
+            .map(move |(from, to)| (key, from, to, false))
+            .chain(written.then_some((key, usize::MAX, 0, true)))
+    }));
+    out
 }
 
 /// [`front_spans`] of the lists whose parts are `lists` ([`fold_touches`]), a
@@ -8846,7 +8865,7 @@ fn join_keys<'a>(lists: impl Iterator<Item = &'a [(usize, usize, usize, bool)]>,
 
 /// [`join_keys`] of the lists' parts, with their copies.
 fn join_fronts(fronts: &[ListFront], parts: &[usize]) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
-    let mut shadows: ByCopy<std::sync::Arc<crate::shadow::Shadow>> = ByCopy::default();
+    let mut shadows: ByCopy<std::sync::Arc<crate::shadow::Shadow>> = ByCopy::with_capacity_and_hasher(fronts.iter().map(|f| f.shadows.len()).sum::<usize>(), Default::default());
     for front in fronts {
         for (key, shadow) in &front.shadows {
             shadows.entry(*key).or_insert_with(|| shadow.clone());
@@ -8919,6 +8938,36 @@ mod front_tests {
         let steps = || [Refresh(1, 0, 10), Refresh(1, 1 << 20, (1 << 20) + 10), Refresh(2, 0, 5), Write(2), Refresh(2, 9, 99), Part, Refresh(1, 30, 40)].into_iter();
         assert_eq!(front_spans(steps(), false), [(1, 0, (1 << 20) + 10), (2, 0, 5)]);
         assert_eq!(front_spans(steps(), true), [(1, 0, 40), (1, 1 << 20, (1 << 20) + 10), (2, 0, 5)]);
+    }
+}
+
+#[cfg(test)]
+mod line_tests {
+    use super::{Late, Line, give_back, take_items};
+
+    #[test]
+    fn a_settles_items_come_back_empty() {
+        let mut line = Line {
+            line: Vec::new(),
+            written: Vec::new(),
+            lists: 0,
+            target: 0,
+            settling: false,
+            poke: false,
+            landed: Vec::new(),
+            in_hand: Vec::new(),
+            landing: Vec::new(),
+            spare: Vec::new(),
+        };
+        line.line.push(Late::Signal(1, 1));
+        line.line.push(Late::Signal(2, 2));
+        let items = take_items(&mut line);
+        assert!(line.line.is_empty());
+        give_back(&mut line, items);
+        line.line.push(Late::Signal(3, 3));
+        let next = take_items(&mut line);
+        assert_eq!(next.len(), 1);
+        assert!(line.line.is_empty(), "the buffer given back still holds the last settle's items");
     }
 }
 
@@ -9229,6 +9278,7 @@ impl Batch {
             drop(lists);
             planning.next("refreshes in front: the spans");
             let fronts: Vec<ListFront> = fronts.iter().map(|m| m.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default()).collect();
+            due.reserve(fronts.iter().map(|f| f.textures.len()).sum::<usize>());
             for front in &fronts {
                 for staging in &front.textures {
                     if self.texture_due(staging) {
@@ -9241,7 +9291,7 @@ impl Batch {
             return;
         }
         let mut copies: ByCopy<std::sync::Arc<crate::shadow::Shadow>> = ByCopy::default();
-        let mut touches = Vec::new();
+        let mut touches = Vec::with_capacity(steps + runs.len());
         for (n, list) in runs.iter().enumerate() {
             if parts.contains(&n) {
                 touches.push(Touch::Part);
@@ -9315,7 +9365,9 @@ impl Batch {
         }
         let ahead = spans.len() > 1;
         if ahead {
-            let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).flat_map(|r| r.1.iter().copied()).collect();
+            let asked = spans.iter().filter(|r| r.0.asked_ahead());
+            let mut ranges = Vec::with_capacity(asked.clone().map(|r| r.1.len()).sum::<usize>());
+            ranges.extend(asked.flat_map(|r| r.1.iter().copied()));
             crate::watch::ask_ahead(&ranges);
         }
         #[cfg(feature = "diagnostics")]
@@ -9348,7 +9400,8 @@ impl Batch {
         }
         // The time counted is the time it took, not the threads' sum.
         let took = started.elapsed().as_micros() as u64;
-        let summed = [0, 2].map(|i| PREPARING[i].load(Ordering::Relaxed)).iter().zip(before).map(|(now, was)| now.saturating_sub(was)).collect::<Vec<_>>();
+        let now = [0, 2].map(|i| PREPARING[i].load(Ordering::Relaxed));
+        let summed = std::array::from_fn::<_, 2, _>(|k| now[k].saturating_sub(before[k]));
         untally_preparing(2, summed[1], Ordering::Relaxed);
         untally_preparing(0, summed[0], Ordering::Relaxed);
         tally(&PREPARING, &TOTAL_PREPARING, 0, took, Ordering::Relaxed);
@@ -9616,7 +9669,7 @@ fn front_join(ranges: &mut Vec<(usize, usize)>, from: usize, to: usize, split: b
 /// ranges in a row), grouped by copy again: [`Batch::refresh_spans`] refreshes one
 /// copy's ranges one after the other, on one thread.
 fn group_spans(spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> {
-    let mut grouped: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
+    let mut grouped: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::with_capacity(spans.len());
     for (shadow, from, to) in spans {
         match grouped.last_mut() {
             Some((last, ranges)) if std::sync::Arc::ptr_eq(last, &shadow) => ranges.push((from, to)),

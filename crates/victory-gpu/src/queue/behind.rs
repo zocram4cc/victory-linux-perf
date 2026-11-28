@@ -877,16 +877,15 @@ fn jobs_of(this: This, lists: &[This]) -> Vec<Job> {
             super::queue(this).kind
         )
     });
-    let mut jobs: Vec<Job> = Vec::new();
-    if first > 0 {
-        let (taken, order) = crate::list::detach(&lists[..first]);
+    let head = (first > 0).then(|| crate::list::detach(&lists[..first]));
+    let parts = if first < lists.len() { crate::list::detach_parts(&lists[first..]) } else { Vec::new() };
+    let mut jobs: Vec<Job> = Vec::with_capacity(usize::from(head.is_some()) + parts.iter().map(|p| p.0.len() + 1).sum::<usize>());
+    if let Some((taken, order)) = head {
         jobs.push(Job::Run(queue, taken, order));
     }
-    if first < lists.len() {
-        for (waits, taken, order) in crate::list::detach_parts(&lists[first..]) {
-            jobs.extend(waits.into_iter().map(Job::Value));
-            jobs.push(Job::Run(queue, taken, order));
-        }
+    for (waits, taken, order) in parts {
+        jobs.extend(waits.into_iter().map(Job::Value));
+        jobs.push(Job::Run(queue, taken, order));
     }
     jobs
 }
