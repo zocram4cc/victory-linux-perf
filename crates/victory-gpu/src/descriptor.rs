@@ -1499,7 +1499,6 @@ pub(crate) fn forget(resource: usize) {
         views.free.push(i);
     }
     FORGET_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
-    host::invalidate_list_views();
 }
 
 /// Bumped whenever [`forget`] invalidates a table entry's generation.
