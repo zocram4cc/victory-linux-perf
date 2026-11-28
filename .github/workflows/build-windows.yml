@@ -1,0 +1,39 @@
+
+name: Build VIctory RDNA2 Windows
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Download source
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.98.1
+          rustup default 1.98.1
+          rustup target add x86_64-pc-windows-msvc
+
+      - name: Build VIctory
+        shell: pwsh
+        run: |
+          cargo build --locked --profile diag -p victory --features diagnostics
+
+      - name: Upload EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: VIctory-RDNA2-Relay2-Windows
+          path: |
+            target/diag/victory.exe
+            target/diag/*.dll
+            scripts/
+          if-no-files-found: error
