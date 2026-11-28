@@ -994,6 +994,7 @@ fn create() -> windows::core::Result<Host> {
             crate::tdr::log();
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        log_adapters(&device);
         // Before anything is made with it (`VICTORY_RECORD`).
         #[cfg(feature = "diagnostics")]
         crate::replay::record::from_env(&device);
@@ -1083,6 +1084,54 @@ impl Host {
         let adapter = self.adapter.as_ref();
         // SAFETY: a plain query.
         adapter.map_or(0, |a| unsafe { a.CheckInterfaceSupport(&IDXGIDevice::IID) }.unwrap_or(0))
+    }
+}
+
+/// At start: the graphics adapter the host device is on as DXGI names it
+/// (vendor and device ids, description, flags), every adapter DXGI lists,
+/// and what `crate::indirect::amd` makes of the device: under Proton the
+/// layer below may hide an NVIDIA card's vendor (a sibling Linux fork's
+/// launcher sets `DXVK_CONFIG="dxgi.hideNvidiaGpu = False"` for it), and
+/// paths here and in the runtime pick by vendor. Also whether
+/// `DXVK_CONFIG` and `PROTON_ENABLE_NVAPI` are set. Log only.
+fn log_adapters(device: &ID3D12Device) {
+    let name = |d: &DXGI_ADAPTER_DESC1| {
+        let end = d.Description.iter().position(|&c| c == 0).unwrap_or(d.Description.len());
+        String::from_utf16_lossy(&d.Description[..end])
+    };
+    // SAFETY: plain DXGI queries.
+    unsafe {
+        let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) else {
+            tracing::warn!("graphics adapter: no DXGI factory to ask");
+            return;
+        };
+        match factory.EnumAdapterByLuid::<IDXGIAdapter1>(device.GetAdapterLuid()).and_then(|a| a.GetDesc1()) {
+            Ok(d) => tracing::info!(
+                vendor = format_args!("{:#06x}", d.VendorId),
+                device = format_args!("{:#06x}", d.DeviceId),
+                description = %name(&d),
+                flags = format_args!("{:#x}", d.Flags),
+                video_memory_mb = d.DedicatedVideoMemory >> 20,
+                amd = crate::indirect::amd(device),
+                dxvk_config = std::env::var("DXVK_CONFIG").ok().as_deref().unwrap_or("(unset)"),
+                proton_enable_nvapi = std::env::var("PROTON_ENABLE_NVAPI").ok().as_deref().unwrap_or("(unset)"),
+                "graphics adapter of the host device, as DXGI names it (vendor 0x10de NVIDIA, 0x1002 AMD)"
+            ),
+            Err(e) => tracing::warn!(error = %e, "graphics adapter of the host device: not found by its LUID"),
+        }
+        for i in 0..8 {
+            let Ok(adapter) = factory.EnumAdapters1(i) else { break };
+            if let Ok(d) = adapter.GetDesc1() {
+                tracing::info!(
+                    index = i,
+                    vendor = format_args!("{:#06x}", d.VendorId),
+                    device = format_args!("{:#06x}", d.DeviceId),
+                    description = %name(&d),
+                    flags = format_args!("{:#x}", d.Flags),
+                    "graphics adapter DXGI lists"
+                );
+            }
+        }
     }
 }
 
