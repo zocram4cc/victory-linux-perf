@@ -953,7 +953,7 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
         for &g in guards.iter().flatten() {
             t.guarded += 1;
             let support = s.bools.support(g);
-            t.opaque += usize::from(support.iter().any(|a| matches!(a, Atom::Opaque(_))));
+            t.opaque += usize::from(support.iter().any(|a| matches!(a, Atom::Opaque(_, _))));
         }
     }
     for exit in &s.exits {
