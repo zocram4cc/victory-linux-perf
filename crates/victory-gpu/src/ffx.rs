@@ -940,6 +940,12 @@ pub(crate) fn framegen_display(width: u32, height: u32, format: i32) {
     CONTEXT.store(std::ptr::null_mut(), Ordering::Release);
 }
 
+/// The swap chain's presents since it was made, generated frames included:
+/// `None` without frame generation's swap chain.
+pub(crate) fn shown_total() -> Option<u32> {
+    (!SWAP_CHAIN.load(Ordering::Acquire).is_null()).then(|| PRESENTED.load(Ordering::Acquire))
+}
+
 /// Records the frame generation prepare for the next present on the
 /// upscale's host list, with the upscale's inputs (in the state it left
 /// them in); the first upscale after a present only.
@@ -1119,7 +1125,7 @@ pub(crate) fn framegen_after_present(presented: Option<u32>) {
     }
     let real_fps = (real - real_then) as f64 / seconds;
     let generated_fps = (generated - generated_then) as f64 / seconds;
-    let presented_fps = f64::from(presented.wrapping_sub(presented_then)) / seconds;
+    let presented_fps = crate::frametime::shown_fps(presented_then, presented, seconds);
     let on = !CONTEXT.load(Ordering::Acquire).is_null() && !FAILED.load(Ordering::Relaxed);
     tracing::info!(on, "ffx: frame generation: {real_fps:.1} real fps, {generated_fps:.1} generated fps, {presented_fps:.1} fps presented");
     *since = Some((std::time::Instant::now(), real, presented, generated));

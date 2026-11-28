@@ -10265,6 +10265,8 @@ struct Meter {
     logged: std::time::Instant,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
+    /// The swap chain's presents at the last summary ([`crate::ffx::shown_total`]); `None` without frame generation.
+    shown: Option<u32>,
 }
 
 impl Meter {
@@ -10279,6 +10281,7 @@ impl Meter {
             drawn: crate::draw::drawn(),
             logged: now,
             caption: None,
+            shown: crate::ffx::shown_total(),
         }
     }
 
@@ -10326,6 +10329,12 @@ impl Meter {
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
+        let shown_now = crate::ffx::shown_total();
+        let shown_fps = match (self.shown, shown_now) {
+            (Some(then), Some(now)) => Some(crate::frametime::shown_fps(then, now, elapsed.as_secs_f64())),
+            _ => None,
+        };
+        self.shown = shown_now;
         // `VICTORY_FRAMETIME_DUMP`: the worst and mean frame of this interval,
         // measured at each present, are taken here, where the interval ends;
         // the rest of its row is made with the counters, by the meter's thread.
@@ -10539,17 +10548,19 @@ impl Meter {
                 ram_mb,
                 cpu_pct,
                 remaps,
+                shown_fps: shown_fps.unwrap_or(fps),
             };
             crate::frametime::record(&row);
             // On-screen figures (`VICTORY_DEBUG_HUD=1`): the same row the dump
             // writes (the HUD has a thread of its own: this only hands it the text).
+            let rate = crate::frametime::rate_text(row.fps, shown_fps);
             crate::debug_hud::update(HWND(hud_window as *mut _), || {
                 format!(
-                    "{fps:.1} FPS   {ms:.1} ms/frame   {draws:.0} draws/frame\n\
+                    "{rate}   {ms:.1} ms/frame   {draws:.0} draws/frame\n\
                      CPU prep {cpu:.1} ms   heap {heap:.1} ms   GPU wait {gpu:.1} ms\n\
                      copies {copies:.1} ms   textures {textures:.1} ms   copy-back {back:.1} ms\n\
                      dropped {dropped:.0}/frame   indirect dropped {indirect:.0}/frame",
-                    fps = row.fps,
+                    rate = rate,
                     ms = row.ms,
                     draws = row.draws,
                     cpu = row.cpu_prepare_ms,
@@ -10776,7 +10787,11 @@ impl Meter {
             self.caption = Some(buffer);
         }
         let Some(caption) = &self.caption else { return };
-        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        let rate = match shown_fps {
+            Some(shown) => format!("{fps:.0} fps real / {shown:.0} shown"),
+            None => format!("{fps:.0} fps"),
+        };
+        let text = format!(" | VIctory {rate} {ms:.1} ms/frame {draws:.0} draws/frame");
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,

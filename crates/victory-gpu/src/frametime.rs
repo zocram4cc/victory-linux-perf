@@ -100,7 +100,7 @@ texture_refresh_ms,card_passes,card_compares,card_sent_mb,card_ranges,\
 card_pieces,card_fetched,card_fetched_mb,card_waits,card_wait_ms,\
 twins_into_depth,twins_into_colour,depth_planes,ram_mb,cpu_pct,map_n,map_ms,map_mb,\
 unmap_n,unmap_ms,unmap_mb,split_n,split_ms,alias_n,alias_ms,alias_mb,lock_wait_ms,\
-lock_hold_ms\n";
+lock_hold_ms,shown_fps\n";
 
 /// The `#` block a dump starts with: the machine and the switches, so a file
 /// from another PC can be compared and reproduced. `pandas.read_csv(...,
@@ -324,6 +324,21 @@ pub(crate) fn take_interval() -> (f64, f64, u64) {
     (max, avg, count)
 }
 
+/// Presents counted between two readings of the swap chain's count (`u32`,
+/// wrapping), over `seconds`: the shown rate.
+pub(crate) fn shown_fps(then: u32, now: u32, seconds: f64) -> f64 {
+    f64::from(now.wrapping_sub(then)) / seconds
+}
+
+/// The frame rate line: the real rate, and the shown one with frame
+/// generation on (`24.6 FPS real / 49.2 shown`).
+pub(crate) fn rate_text(fps: f64, shown: Option<f64>) -> String {
+    match shown {
+        Some(shown) => format!("{fps:.1} FPS real / {shown:.1} shown"),
+        None => format!("{fps:.1} FPS"),
+    }
+}
+
 /// One summary interval's figures: times per frame in ms, sizes per frame in
 /// MB, counts per frame.
 #[derive(Default)]
@@ -368,6 +383,9 @@ pub(crate) struct Row {
     pub cpu_pct: f64,
     /// Title memory remaps per frame (zero without `VICTORY_REMAP_STATS=1`).
     pub remaps: crate::remap::Frame,
+    /// Presents a second, generated ones included ([`crate::ffx::shown_total`]);
+    /// the same as `fps` without frame generation.
+    pub shown_fps: f64,
 }
 
 /// The header line: the column names (the line after the `#` block).
@@ -389,7 +407,7 @@ fn write_row(out: &mut impl Write, t_ms: u128, r: &Row) -> std::io::Result<()> {
          {card_waits:.3},{card_wait_ms:.3},{twins_into_depth:.3},{twins_into_colour:.3},\
          {depth_planes:.3},{ram_mb:.3},{cpu_pct:.3},{map_n:.3},{map_ms:.3},{map_mb:.3},\
          {unmap_n:.3},{unmap_ms:.3},{unmap_mb:.3},{split_n:.3},{split_ms:.3},{alias_n:.3},\
-         {alias_ms:.3},{alias_mb:.3},{lock_wait_ms:.3},{lock_hold_ms:.3}",
+         {alias_ms:.3},{alias_mb:.3},{lock_wait_ms:.3},{lock_hold_ms:.3},{shown_fps:.3}",
         frame = r.frame,
         frames = r.frames,
         fps = r.fps,
@@ -439,6 +457,7 @@ fn write_row(out: &mut impl Write, t_ms: u128, r: &Row) -> std::io::Result<()> {
         alias_mb = r.remaps.alias.mb,
         lock_wait_ms = r.remaps.lock_wait.ms,
         lock_hold_ms = r.remaps.lock_hold.ms,
+        shown_fps = r.shown_fps,
     )
 }
 
@@ -468,24 +487,37 @@ mod tests {
         card_pieces,card_fetched,card_fetched_mb,card_waits,card_wait_ms,\
         twins_into_depth,twins_into_colour,depth_planes,ram_mb,cpu_pct,map_n,map_ms,map_mb,\
         unmap_n,unmap_ms,unmap_mb,split_n,split_ms,alias_n,alias_ms,alias_mb,lock_wait_ms,\
-        lock_hold_ms";
+        lock_hold_ms,shown_fps";
 
     #[test]
     fn header_then_row_carry_the_columns() {
         let mut out = Vec::new();
         write_header(&mut out).unwrap();
-        let row = Row { fps: 60.0, draws: 3.0, ..Row::default() };
+        let row = Row { fps: 24.6, shown_fps: 49.2, draws: 3.0, ..Row::default() };
         write_row(&mut out, 1_700_000_000_000, &row).unwrap();
         let text = String::from_utf8(out).unwrap();
         let mut lines = text.lines();
         assert_eq!(lines.next(), Some(COLUMNS));
         let names: Vec<&str> = COLUMNS.split(',').collect();
-        assert_eq!(names.len(), 50);
+        assert_eq!(names.len(), 51);
         let values: Vec<&str> = lines.next().unwrap_or_default().split(',').collect();
         assert_eq!(values.len(), names.len(), "one value per column: {values:?}");
         let at = |name: &str| values[names.iter().position(|n| *n == name).unwrap()];
         assert_eq!(at("t_ms"), "1700000000000");
-        assert_eq!(at("fps"), "60.000");
+        assert_eq!(at("fps"), "24.600");
         assert_eq!(at("draws"), "3.000");
+        assert_eq!(at("shown_fps"), "49.200");
+    }
+
+    #[test]
+    fn shown_fps_counts_every_present_across_the_wrap() {
+        assert_eq!(shown_fps(u32::MAX - 1, 3, 1.0), 5.0);
+        assert_eq!(shown_fps(10, 70, 2.0), 30.0);
+    }
+
+    #[test]
+    fn rate_text_names_real_and_shown_frames() {
+        assert_eq!(rate_text(24.6, Some(49.2)), "24.6 FPS real / 49.2 shown");
+        assert_eq!(rate_text(24.6, None), "24.6 FPS");
     }
 }

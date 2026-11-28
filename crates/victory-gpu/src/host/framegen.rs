@@ -75,3 +75,17 @@ pub(super) fn record_ui(
         list.ResourceBarrier(&after);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT};
+
+    #[test]
+    fn a_plane_is_copied_only_onto_a_back_buffer_of_its_format_and_size() {
+        let rgba = DXGI_FORMAT_R8G8B8A8_UNORM;
+        assert!(copyable((rgba, 1920, 1080), (rgba, 1920, 1080)));
+        assert!(!copyable((DXGI_FORMAT_R16G16B16A16_FLOAT, 1920, 1080), (rgba, 1920, 1080)));
+        assert!(!copyable((rgba, 1280, 720), (rgba, 1920, 1080)));
+    }
+}
