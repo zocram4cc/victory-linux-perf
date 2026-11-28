@@ -2337,15 +2337,34 @@ pub(crate) fn let_go_idle() {
 /// The card's `used` bytes of `budget` as the texture rules see them: with
 /// textures first (`crate::shadow::textures_first`) less the card memory
 /// windows hold, which move to the PC's memory before a texture goes, until
-/// the card is over 95 % of its budget (then they count again, and textures
-/// go as before). Without it, `used`.
+/// the card is over [`textures_first_ceiling`] of its budget (then they count
+/// again, and textures go as before). Without it, `used`.
 #[cfg(windows)]
 fn textures_first_used(budget: u64, used: u64) -> u64 {
-    if crate::shadow::textures_first() && used <= budget / 100 * 95 {
+    if crate::shadow::textures_first() && used <= budget / 100 * textures_first_ceiling() {
         used.saturating_sub(crate::shadow::windows_on_card_bytes())
     } else {
         used
     }
+}
+
+/// `VICTORY_TEXTURES_FIRST_CEILING`: the percent of the card's budget up to
+/// which textures first leaves the windows out of the count (85; 60-97). At
+/// 95, with the room check counting the same way (v2.3), the card sat near
+/// its budget and every session on a 16 GB PC ended within 10-20 minutes
+/// with the device removed or a list that could not close for want of
+/// memory (five of five on 28 Nov 2026; none in 13 runs before).
+#[cfg(windows)]
+fn textures_first_ceiling() -> u64 {
+    static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PERCENT.get_or_init(|| {
+        let percent = std::env::var("VICTORY_TEXTURES_FIRST_CEILING")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(85, |p| p.clamp(60, 97));
+        tracing::info!(percent, "textures first: windows left out of the card's count up to this share of its budget (VICTORY_TEXTURES_FIRST_CEILING)");
+        percent
+    })
 }
 
 /// Counts of [`slot_evict`]: textures let go though slots showed them,
