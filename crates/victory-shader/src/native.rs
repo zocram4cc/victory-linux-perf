@@ -497,7 +497,18 @@ fn view_heap_sgpr(code: &[u8], user_sgprs: u8) -> Option<u8> {
     // first SGPR: a buffer instruction that takes one as its resource
     // shows that heap is the view heap (samplers are not buffers' resources).
     let mut pending: Vec<(usize, u8)> = Vec::new();
-    let insts = crate::gfx10::decode(code).ok()?;
+    let insts = match crate::gfx10::decode(code) {
+        Ok(i) => i,
+        Err(e) => {
+            if std::env::var_os("VICTORY_WHY_HEAP").is_some() {
+                eprintln!("WHY-HEAP the code does not decode: {e}");
+            }
+            return None;
+        }
+    };
+    if std::env::var_os("VICTORY_WHY_HEAP").is_some() {
+        eprintln!("WHY-HEAP {} instructions, last at {:#x}", insts.len(), insts.last().map_or(0, |i| i.offset));
+    }
     let mut st = [S::Other; 106];
     for (i, s) in st.iter_mut().enumerate().take(usize::from(user_sgprs)) {
         *s = S::User(i as u8);
@@ -567,6 +578,10 @@ fn view_heap_sgpr(code: &[u8], user_sgprs: u8) -> Option<u8> {
             Some("s_load_dwordx4" | "s_load_dwordx8") if inst.words.len() >= 2 => {
                 let base = ((w & 0x3f) * 2) as usize;
                 let soffset = (inst.words[1] >> 25) as usize;
+                if std::env::var_os("VICTORY_WHY_HEAP").is_some() && base + 1 < st.len() {
+                    let d = |x: S| match x { S::User(u) => format!("user{u}"), S::Plus(u) => format!("plus{u}"), S::Zero => "zero".into(), S::Times32 => "x32".into(), S::Other => "other".into() };
+                    eprintln!("WHY-HEAP load at {:#x} base s{base} = {} / {}", inst.offset, d(st[base]), d(st[base + 1]));
+                }
                 // A heap address computed by an add (a waterfall loop's: the
                 // first lane's byte offset added to the heap's base).
                 if base + 1 < st.len()
@@ -594,7 +609,13 @@ fn view_heap_sgpr(code: &[u8], user_sgprs: u8) -> Option<u8> {
                     *s = S::Other;
                 }
             }
-            Some(name) if name.starts_with("s_") && !name.starts_with("s_waitcnt") && !name.starts_with("s_clause") => {
+            // SOPP (branches, waits, `s_nop`) and SOPC (compares) have no
+            // destination: their bits 16-22 are the opcode, not an SGPR
+            // (taking them so lost s10 at every `s_cbranch` of opcode 10).
+            Some(name)
+                if name.starts_with("s_")
+                    && matches!(inst.encoding, crate::gfx10::Encoding::Sop1 | crate::gfx10::Encoding::Sop2 | crate::gfx10::Encoding::Sopk | crate::gfx10::Encoding::Smem) =>
+            {
                 // Another scalar instruction: whatever it writes is no
                 // longer what was tracked (SOP1/SOP2/SOPK keep sdst there).
                 if sdst < st.len() && !name.starts_with("s_cmp") && !name.starts_with("s_buffer") && !name.starts_with("s_load") {
@@ -733,6 +754,9 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
     // descriptor dwords (`e[20]`) could cover it (family 0x33cb3490: half of
     // Jason's house culled, `docs/royale/p4-house-bug.md`).
     let view_heap = view_heap_sgpr(code, user_sgprs);
+    if std::env::var_os("VICTORY_WHY_HEAP").is_some() {
+        eprintln!("WHY-HEAP user SGPRs {user_sgprs}, view heap from the code {view_heap:?}, layout {:?}", layout.iter().map(|p| (p.root, p.user_data, p.sgprs)).collect::<Vec<_>>());
+    }
     if let Some(x) = view_heap
         && !layout.iter().any(|p| matches!(p.root, RootType::Table | RootType::Descriptor) && p.user_data == x)
     {
