@@ -202,58 +202,66 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     let short = |&(a, b): &(usize, usize)| short(a, b - a);
     let mut at = 0u64;
     let mut copies = Vec::with_capacity(dirty.len());
-    for (_, ranges) in dirty {
+    let mut total_move_bytes = 0u64;
+    let mut total_move_runs = 0u64;
+    let mut total_words = 0u64;
+    // Collect relative offsets in one pass over `dirty`, then apply `memory.data`.
+    let mut rel_parts: Vec<(usize, u64, usize)> = Vec::new();
+    let mut rel_work: Vec<(usize, &[(usize, usize)], u64)> = Vec::new();
+    const CHUNK: usize = 64 << 10;
+    for (shadow, ranges) in dirty {
+        let from = shadow.card_data() as usize;
         let mut runs = Vec::new();
-        for &(a, b) in ranges.iter().filter(|r| !short(r)) {
-            runs.push((a, at, b - a));
-            at += ((b - a) as u64).next_multiple_of(16);
+        let mut copy_words = 0usize;
+        let pairs_start = {
+            for &(a, b) in ranges {
+                let len = b - a;
+                if short(&(a, b)) {
+                    copy_words += len / 4;
+                } else {
+                    runs.push((a, at, len));
+                    total_move_bytes += len as u64;
+                    total_move_runs += 1;
+                    let mut off = 0;
+                    while off < len {
+                        let n = CHUNK.min(len - off);
+                        rel_parts.push((from + a + off, at + off as u64, n));
+                        off += n;
+                    }
+                    at += (len as u64).next_multiple_of(16);
+                }
+            }
+            at
+        };
+        if copy_words > 0 {
+            let mut to_off = pairs_start;
+            for chunk in ranges.chunks(RUNS_AT_A_TIME) {
+                let w: usize = chunk.iter().filter(|r| short(r)).map(|r| (r.1 - r.0) / 4).sum();
+                if w > 0 {
+                    rel_work.push((from, chunk, to_off));
+                    to_off += (w * 8) as u64;
+                }
+            }
+            total_words += copy_words as u64;
+            at += (copy_words as u64 * 8).next_multiple_of(16);
         }
-        let words: usize = ranges.iter().filter(|r| short(r)).map(|r| (r.1 - r.0) / 4).sum();
-        copies.push(Copy { runs, pairs: (at, words as u32) });
-        at += (words as u64 * 8).next_multiple_of(16);
+        copies.push(Copy { runs, pairs: (pairs_start, copy_words as u32) });
     }
     if at == 0 {
         return None;
     }
     let memory = memory(host, at)?;
-    let mut moves: Vec<(usize, usize, usize)> = Vec::new();
-    let mut work: Vec<(usize, &[(usize, usize)], usize)> = Vec::new();
-    for ((shadow, ranges), copy) in dirty.iter().zip(&copies) {
-        let from = shadow.card_data() as usize;
-        moves.extend(copy.runs.iter().map(|&(a, to, n)| (from + a, memory.data + to as usize, n)));
-        // (80,000 runs of some words a frame: in pieces of work.)
-        let mut to = memory.data + copy.pairs.0 as usize;
-        for ranges in ranges.chunks(RUNS_AT_A_TIME) {
-            let words: usize = ranges.iter().filter(|r| short(r)).map(|r| (r.1 - r.0) / 4).sum();
-            if words > 0 {
-                work.push((from, ranges, to));
-                to += words * 8;
-            }
-        }
-    }
-    STATS[0].fetch_add(moves.iter().map(|m| m.2 as u64).sum(), Ordering::Relaxed);
-    STATS[1].fetch_add(moves.len() as u64, Ordering::Relaxed);
-    STATS[2].fetch_add(copies.iter().map(|c| u64::from(c.pairs.1)).sum(), Ordering::Relaxed);
-    // Chunk large moves into 64 KiB pieces and execute BOTH short-run pair
-    // packing and bulk moves in a single `wide_each` fan-out (one barrier
-    // instead of two).
-    const CHUNK: usize = 64 << 10;
-    let mut parts: Vec<(usize, usize, usize)> = Vec::with_capacity(moves.len());
-    for (src, dst, len) in moves {
-        let mut off = 0;
-        while off < len {
-            let n = CHUNK.min(len - off);
-            parts.push((src + off, dst + off, n));
-            off += n;
-        }
-    }
-    let n_work = work.len();
-    let total = n_work + parts.len();
+    STATS[0].fetch_add(total_move_bytes, Ordering::Relaxed);
+    STATS[1].fetch_add(total_move_runs, Ordering::Relaxed);
+    STATS[2].fetch_add(total_words, Ordering::Relaxed);
+    let base = memory.data;
+    let n_work = rel_work.len();
+    let total = n_work + rel_parts.len();
     if total > 0 {
         crate::shadow::wide_each(total, |i| {
             if i < n_work {
-                let (from, ranges, to) = work[i];
-                let mut to = to as *mut [u32; 2];
+                let (from, ranges, to_off) = rel_work[i];
+                let mut to = (base + to_off as usize) as *mut [u32; 2];
                 for &(a, b) in ranges.iter().filter(|r| short(r)) {
                     for offset in (a..b).step_by(4) {
                         // SAFETY: inside the copy's mapping and inside `memory`.
@@ -265,9 +273,9 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
                     }
                 }
             } else {
-                let (src, dst, len) = parts[i - n_work];
+                let (src, dst_off, len) = rel_parts[i - n_work];
                 // SAFETY: non-overlapping ranges alive until `wide_each` returns.
-                unsafe { copy_wc(src as *const u8, dst as *mut u8, len) };
+                unsafe { copy_wc(src as *const u8, (base + dst_off as usize) as *mut u8, len) };
             }
         });
     }
