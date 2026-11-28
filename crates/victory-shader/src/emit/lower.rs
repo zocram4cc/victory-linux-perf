@@ -9814,10 +9814,24 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if let Some(rest) = name.strip_prefix("v_cmp_").or(name.strip_prefix("v_cmpx_")) {
-            let r = if v.dpp.is_some() {
-                Err("a compare with DPP")
-            } else {
-                self.compare(inst, rest)
+            // With DPP: src0 read from the lane DPP names (the same `dpp` as
+            // every other DPP VALU op, through `src0`); only where every lane
+            // writes its bit (no row or bank mask leaving lanes out).
+            if v.dpp.is_some() && std::env::var_os("VICTORY_WHY_DPP").is_some() {
+                eprintln!("WHY-DPP compare at {:#x} {} words {:08x?} dpp {:?}", inst.machine.offset, inst.name(), inst.machine.words, v.dpp);
+            }
+            let r = match v.dpp {
+                Some(d) => match self.dpp(inst, d) {
+                    Ok((x, None)) => {
+                        self.src0 = Some(x);
+                        let r = self.compare(inst, rest);
+                        self.src0 = None;
+                        r
+                    }
+                    Ok((_, Some(_))) => Err("a compare with DPP"),
+                    Err(why) => Err(why),
+                },
+                None => self.compare(inst, rest),
             };
             if let Err(why) = r {
                 for &(_, w) in &inst.writes {

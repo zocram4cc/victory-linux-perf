@@ -203,6 +203,18 @@ TextureCube cubet : register(t8, space2);
 /// Compute shaders, each `cs`, dispatched as 2×2 groups of 8×8 threads
 /// over a 16×16 texture and a 256-dword buffer.
 const CS_CASES: &[(&str, &str)] = &[
+    // A compare against a quad neighbour's value: the console compiler can
+    // fold the lane read into the compare as DPP (P.4: `v_cmp_* … dpp`).
+    (
+        "compare with a quad neighbour",
+        r#"CS {
+            uint n = d.y * 16 + d.x;
+            float f = asfloat(raw.Load(4 * (n & 31)) & 0x3fffffff) + float(n) * 0.5;
+            float qd = QuadReadAcrossDiagonal(f);
+            float qx = QuadReadAcrossX(f);
+            outb.Store(4 * n, (qd > f ? 1u : 0u) | (qx < f ? 2u : 0u));
+        }"#,
+    ),
     // An LDS counter bumped by 1 in some lanes, the old value kept: the
     // console compiler makes it `ds_append` (P.4: family 0x1cd48770).
     (
