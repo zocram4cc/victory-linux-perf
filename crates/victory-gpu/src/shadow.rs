@@ -177,6 +177,9 @@ pub(crate) struct Shadow {
     /// [`hold_mode`] 2: the pieces (title address / 64 KiB) bytes are held in,
     /// and the frame the first of them was held.
     held_pieces: Mutex<std::collections::HashMap<usize, u64>>,
+    /// Mode 2 of [`dword_mode`]: the frame a refresh last found title bytes
+    /// over a lately landed piece of it, plus one (0: never).
+    title_over_landed: AtomicU64,
 }
 
 /// Whether the title's bytes that a refresh finds changed in a 64 KiB piece
@@ -1259,10 +1262,6 @@ fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
     merge_piece_won(now, held, title, false).0
 }
 
-/// [`merge_piece`]; with `wins` ([`card_wins`]) every byte is the card's,
-/// and the second is how many bytes of the title's (where title memory held
-/// another value than the CPU's side and the card did not change it) took
-/// the card's value.
 /// Whether what shaders wrote lands a dword at a time (`VICTORY_LAND_DWORDS=0`:
 /// a byte at a time, as before): a dword of a copy in the card's memory that
 /// the card changed in any byte goes into title memory, and into the CPU's
@@ -1285,11 +1284,34 @@ fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
 ///
 /// Cost: a pass over each landed stretch a word at a time (as a compare),
 /// nothing read again.
-fn land_dwords() -> bool {
-    crate::toggled!("VICTORY_LAND_DWORDS")
+/// `VICTORY_LAND_DWORDS`: 1 (as above, for every copy; the default),
+/// 0 (off: byte by byte, as before), 2 (gated: only in a copy where a refresh
+/// found title-changed bytes in a piece a landing wrote lately, within
+/// [`DWORD_GATE_FRAMES`] frames). Elsewhere title memory holds what the CPU's
+/// side holds under the card's untouched bytes, and a byte merge mixes
+/// nothing. A run in a heavy scene put mode 1 at 51 ms a frame (83.5 MB of
+/// landed stretches looked at and 3 million dwords widened a frame).
+fn dword_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_LAND_DWORDS").as_deref() {
+        Ok("0") => 0,
+        Ok("2") => 2,
+        _ => 1,
+    })
 }
 
-/// For [`land_dwords`], ahead of a byte merge of `now` (the card's bytes)
+/// Mode 2 of [`dword_mode`]: frames after the last refresh that found title
+/// bytes over a lately landed piece of a copy during which its landings are
+/// widened.
+const DWORD_GATE_FRAMES: u64 = 4;
+
+/// Whether a copy whose refresh last found title bytes over a lately landed
+/// piece at frame `found` (plus one; 0 never) is widened at frame `now`.
+fn dword_gate_open(found: u64, now: u64) -> bool {
+    found.checked_sub(1).is_some_and(|f| now.saturating_sub(f) <= DWORD_GATE_FRAMES)
+}
+
+/// For [`dword_mode`], ahead of a byte merge of `now` (the card's bytes)
 /// into `held` (the CPU's side) from title address `addr` on: each dword (by
 /// title address) that the card changed in some bytes but not all has its
 /// other bytes made to differ in `held` (the card's, inverted), so that the
@@ -1360,7 +1382,7 @@ fn widen_to_dwords(addr: usize, now: &[u8], held: &mut [u8], title: Option<&[u8]
     (widened, mixed)
 }
 
-/// Since the last frame-rate line, of [`land_dwords`]: widenings, bytes looked
+/// Since the last frame-rate line, of [`dword_mode`]: widenings, bytes looked
 /// at, dwords widened, nanoseconds spent.
 static DWORD_PATH: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
@@ -1375,12 +1397,13 @@ fn widen_timed(addr: usize, now: &[u8], held: &mut [u8], title: Option<&[u8]>) -
     out
 }
 
-/// For the frame-rate line, over `frames` frames: what [`land_dwords`] cost.
+/// For the frame-rate line, over `frames` frames: what [`dword_mode`] cost.
 pub(crate) fn dword_path_line(frames: f64) -> Option<String> {
     let [n, bytes, widened, ns] = [0, 1, 2, 3].map(|i| DWORD_PATH[i].swap(0, Ordering::Relaxed) as f64 / frames.max(1.0));
     (n > 0.0).then(|| {
         format!(
-            "dword landing per frame: {n:.0} stretches, {:.1} MB looked at, {widened:.0} dwords widened, {:.2} ms",
+            "dword landing per frame (VICTORY_LAND_DWORDS={}): {n:.0} stretches, {:.1} MB looked at, {widened:.0} dwords widened, {:.2} ms",
+            dword_mode(),
             bytes / 1e6,
             ns / 1e6
         )
@@ -1395,6 +1418,10 @@ fn dword_bounds(addr: usize, first: usize, last: usize, n: usize) -> (usize, usi
     (lo.max(addr) - addr, (hi - addr).min(n - 1))
 }
 
+/// [`merge_piece`]; with `wins` ([`card_wins`]) every byte is the card's,
+/// and the second is how many bytes of the title's (where title memory held
+/// another value than the CPU's side and the card did not change it) took
+/// the card's value.
 fn merge_piece_won(now: &[u8], held: &mut [u8], title: &mut [u8], wins: bool) -> (bool, u64) {
     let mut differs = 0u8;
     let mut won = 0u64;
@@ -2492,7 +2519,7 @@ pub(crate) mod resent {
         /// greatest, not a sum).
         pub(crate) idle: u64,
         pub(crate) longest: u64,
-        /// [`super::land_dwords`]: dwords the card changed in part, landed
+        /// [`super::dword_mode`]: dwords the card changed in part, landed
         /// whole (a byte merge would have kept the title's other bytes).
         pub(crate) dwords: u64,
     }
@@ -3608,6 +3635,13 @@ mod landing_tests {
     }
 
     #[test]
+    fn the_gate_opens_for_frames_after_title_bytes_over_landed_pieces() {
+        assert!(!super::dword_gate_open(0, 10), "never seen");
+        assert!(super::dword_gate_open(11, 10), "seen this frame");
+        assert!(super::dword_gate_open(11, 14) && !super::dword_gate_open(11, 15));
+    }
+
+    #[test]
     fn a_stretch_widens_to_whole_dwords_inside_itself() {
         assert_eq!(super::dword_bounds(0x1000, 5, 9, 64), (4, 11));
         assert_eq!(super::dword_bounds(0x1001, 0, 0, 64), (0, 2), "not before the stretch");
@@ -4052,6 +4086,7 @@ impl Shadow {
             landed_pieces: Mutex::default(),
             held_back: Mutex::default(),
             held_pieces: Mutex::default(),
+            title_over_landed: AtomicU64::new(0),
         }
     }
 
@@ -5142,7 +5177,7 @@ impl Shadow {
         to - from
     }
 
-    /// [`land_dwords`] ahead of a landing's merge of `parts` (offsets from
+    /// [`dword_mode`] ahead of a landing's merge of `parts` (offsets from
     /// `lo` in the copy) of a piece the card's bytes of which are at `now`
     /// ([`widen_to_dwords`]). Returns the dwords widened: those the card
     /// changed in part (title memory is not read for the count here).
@@ -5201,7 +5236,7 @@ impl Shadow {
     /// [`hold_back`]: a landing looks at offsets `[from, to)`, in pieces the
     /// compare found the card changed.
     fn note_landed_pieces(&self, from: usize, to: usize) {
-        if !hold_back() || from >= to {
+        if !(hold_back() || dword_mode() == 2) || from >= to {
             return;
         }
         let start = self.start as usize;
@@ -5317,6 +5352,15 @@ impl Shadow {
             sent += runs.iter().map(|r| r.1 as u64).sum::<u64>();
         }
         sent
+    }
+
+    /// Whether its landings are widened to dwords now ([`dword_mode`]).
+    fn widens(&self) -> bool {
+        match dword_mode() {
+            1 => true,
+            2 => dword_gate_open(self.title_over_landed.load(Ordering::Relaxed), crate::frame::current()),
+            _ => false,
+        }
     }
 
     /// Whether title bytes are held back ([`hold_back`]).
@@ -5437,13 +5481,17 @@ impl Shadow {
                 // (A piece a landing put shaders' bytes into lately: the
                 // title's bytes wait for the next submission that declares
                 // writes there, [`hold_back`]. `at` lies in one piece.)
-                let held_now = hold
-                    && !whole
+                let over_landed = !whole
                     && !runs.is_empty()
+                    && (hold || dword_mode() == 2)
                     && landed_lately(
                         self.landed_pieces.lock().unwrap_or_else(|e| e.into_inner()).get(&(at / PAGE)).copied(),
                         crate::frame::current(),
                     );
+                if over_landed && dword_mode() == 2 {
+                    self.title_over_landed.store(crate::frame::current() + 1, Ordering::Relaxed);
+                }
+                let held_now = hold && over_landed;
                 if held_now {
                     if hold_mode() == 2 || cfg!(test) {
                         self.held_pieces.lock().unwrap_or_else(|e| e.into_inner()).entry(at / PAGE).or_insert(crate::frame::current());
@@ -5751,7 +5799,7 @@ impl Shadow {
             return 0;
         };
         let last = last_difference(gpu, old).unwrap_or(first);
-        let dwords = land_dwords();
+        let dwords = self.widens();
         let (first, last) = if dwords { dword_bounds(start + at, first, last, gpu.len()) } else { (first, last) };
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, old) = (&gpu[first..=last], &mut old[first..=last]);
@@ -5837,7 +5885,7 @@ impl Shadow {
             return 0;
         };
         let last = last_difference(gpu, held).unwrap_or(first);
-        let dwords = land_dwords();
+        let dwords = self.widens();
         let (first, last) = if dwords { dword_bounds(start + at, first, last, gpu.len()) } else { (first, last) };
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, held) = (&gpu[first..=last], &mut held[first..=last]);
@@ -5970,7 +6018,7 @@ impl Shadow {
             }
             let near: Vec<(usize, usize)> = skip.iter().copied().filter(|&(a, b)| a < hi && b > lo).collect();
             let parts: Vec<(usize, usize)> = outside(lo, hi, near).into_iter().map(|(a, b)| (a - lo, b - lo)).collect();
-            if land_dwords() && !card_wins() {
+            if self.widens() && !card_wins() {
                 // SAFETY: as below; `now` stays as it is during the call.
                 let mixed = unsafe { self.widen_parts(lo, now as *const u8, &parts) };
                 if mixed > 0 {
