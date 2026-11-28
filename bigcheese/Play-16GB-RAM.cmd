@@ -105,6 +105,17 @@ rem in the PC are capped at 96 MB (768 before); 24 spare snapshot buffers.
 if not defined VICTORY_RESIDENCY set "VICTORY_RESIDENCY=1"
 if not defined VICTORY_WINDOW_BUDGET_MB set "VICTORY_WINDOW_BUDGET_MB=96"
 if not defined VICTORY_SNAPSHOT_POOL set "VICTORY_SNAPSHOT_POOL=24"
+rem Fewer freezes on 16 GB (overnight run n3-E-ram against n1-A-now: frames
+rem 35% faster at the same scene size, worst tenth 136 ms against 353):
+rem copies of game memory that spilled into the PC's RAM move back to the card
+rem when it has room; game memory the card can read where it is is not copied
+rem (up to 1.5 GB); fewer helper threads, so the game's own threads get the CPU.
+if not defined VICTORY_WINDOW_PROMOTE set "VICTORY_WINDOW_PROMOTE=1"
+if not defined VICTORY_INPLACE set "VICTORY_INPLACE=1"
+if not defined VICTORY_INPLACE_MB set "VICTORY_INPLACE_MB=1536"
+if not defined VICTORY_THIN_THREADS set "VICTORY_THIN_THREADS=4"
+if not defined VICTORY_UNDER_THREADS set "VICTORY_UNDER_THREADS=3"
+if not defined VICTORY_LAND_THREADS set "VICTORY_LAND_THREADS=3"
 
 rem --- victory-amd's installer settings (eikkapine) ---
 if not defined VICTORY_LOG set "VICTORY_LOG=info"
