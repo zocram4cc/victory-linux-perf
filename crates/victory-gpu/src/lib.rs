@@ -102,7 +102,8 @@ mod shadow;
 mod tiles;
 pub mod signature;
 mod switch;
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 mod ab;
 #[cfg(windows)]
 mod tdr;

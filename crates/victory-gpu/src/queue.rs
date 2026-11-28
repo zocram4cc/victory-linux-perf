@@ -1029,6 +1029,8 @@ extern "system" fn present(
         called.end();
         #[cfg(feature = "diagnostics")]
         frame_ends();
+        #[cfg(all(windows, not(feature = "diagnostics")))]
+        crate::ab::presented(|_, _, _| {});
         return S_OK;
     }
     #[cfg(windows)]
@@ -1073,6 +1075,8 @@ extern "system" fn present(
     called.end();
     #[cfg(all(windows, feature = "diagnostics"))]
     frame_ends();
+    #[cfg(all(windows, not(feature = "diagnostics")))]
+    crate::ab::presented(|_, _, _| {});
     S_OK
 }
 
