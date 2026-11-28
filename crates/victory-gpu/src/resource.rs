@@ -1312,6 +1312,9 @@ type Made = (std::sync::Arc<HostTexture>, Option<std::sync::Arc<Twin>>);
 /// copy is the card's.
 #[cfg(windows)]
 struct Hosted {
+    /// Last host-list epoch that prepared this ordinary texture SRV
+    /// (`thin_read`).
+    read_epoch: std::sync::atomic::AtomicU64,
     /// The host copy (and twin) once made. Taken out again only by
     /// [`let_go_idle`] and when the title releases the resource.
     made: std::sync::Mutex<Option<Made>>,
@@ -1319,7 +1322,7 @@ struct Hosted {
     state: u32,
     clear: Option<[u32; 5]>,
     /// When the host copy was last asked for (`crate::host::moment`),
-    /// written under `made`'s lock.
+    /// refreshed while the lookup or its list holds the copy.
     used: std::sync::atomic::AtomicU64,
     /// Zero before allocation, then the deadline of the one recovery
     /// attempt, or `u64::MAX` if the host refused permanently.
@@ -1344,6 +1347,18 @@ struct Hosted {
     /// its memory: 1 + the change count of its memory's bucket
     /// ([`TARGET_CHANGES`]) when it was found; 0 while none is kept.
     no_target: std::sync::atomic::AtomicU32,
+}
+
+#[cfg(windows)]
+impl Hosted {
+    /// Stamps the host copy as asked for now (`used`).
+    fn touch(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let now = crate::host::moment();
+        if self.used.load(Relaxed) != now {
+            self.used.store(now, Relaxed);
+        }
+    }
 }
 
 /// Whether a texture the title places in memory is read, kept and uploaded
@@ -1948,10 +1963,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         // are made before the next submission runs.
         crate::descriptor::texture_made(this as usize);
     }
-    let now = crate::host::moment();
-    if r.host.used.load(Relaxed) != now {
-        r.host.used.store(now, Relaxed);
-    }
+    r.host.touch();
     made.clone()
 }
 
@@ -2891,6 +2903,9 @@ pub(crate) fn is_resource(this: This) -> bool {
         && usize::from_ne_bytes(table) == RESOURCE_FUNCTIONS.0.as_ptr() as usize
 }
 
+#[cfg(windows)]
+pub(crate) mod thin_read;
+
 /// A title texture's host copy, shared, for a list to hold.
 #[cfg(windows)]
 pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
@@ -3244,6 +3259,7 @@ fn hand_out_resource(
         backing,
         #[cfg(windows)]
         host: Hosted {
+            read_epoch: Default::default(),
             made: std::sync::Mutex::new(None),
             state,
             // SAFETY: the title passes a whole clear value (the format,
