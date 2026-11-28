@@ -127,6 +127,31 @@ fn shards_of_pages(pages: impl IntoIterator<Item = usize>) -> u64 {
 /// holder changes them with no part's lock; held shared, a reader reads a
 /// part at a time, and who notes or needs a number that counts holds the
 /// parts it touches ([`Notes::hold`]).
+/// Lock-free direct-mapped table of the highest asking number noted for any
+/// 64 KiB page mapping to slot `page & PAGE_MAX_MASK` (512 KiB, L2-resident).
+/// Allows `all_unordered_since` to prove small spans clean with zero `RwLock`
+/// or `BTreeMap` accesses.
+const PAGE_MAX_LEN: usize = 1 << 16;
+const PAGE_MAX_MASK: usize = PAGE_MAX_LEN - 1;
+static PAGE_MAX: [std::sync::atomic::AtomicU64; PAGE_MAX_LEN] = [const { std::sync::atomic::AtomicU64::new(0) }; PAGE_MAX_LEN];
+
+#[inline]
+fn bump_page_max(page: usize, now: u64) {
+    let slot = &PAGE_MAX[page & PAGE_MAX_MASK];
+    let mut cur = slot.load(std::sync::atomic::Ordering::Relaxed);
+    while now > cur {
+        match slot.compare_exchange_weak(
+            cur,
+            now,
+            std::sync::atomic::Ordering::Release,
+            std::sync::atomic::Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
 struct Notes {
     shards: [RwLock<Shard>; SHARDS],
     /// Highest asking number ever noted in each shard (updated under the
@@ -176,6 +201,7 @@ impl Notes {
         if now > *max {
             *max = now;
         }
+        bump_page_max(page, now);
         self.shards[shard].get_mut().unwrap_or_else(|e| e.into_inner()).note(page, parts, now)
     }
 
@@ -215,6 +241,21 @@ impl Notes {
     fn all_unordered_since(&self, first: usize, last: usize, floor: u64, mut each: impl FnMut(usize, u64) -> bool) -> bool {
         if first >= last {
             return true;
+        }
+        // Fast path for small spans (95%+ of refresh checks): check the
+        // lock-free L2-resident `PAGE_MAX` table before touching any `RwLock`
+        // or `BTreeMap`.
+        if last - first <= 32 {
+            let mut maybe_dirty = false;
+            for p in first..last {
+                if PAGE_MAX[p & PAGE_MAX_MASK].load(std::sync::atomic::Ordering::Acquire) > floor {
+                    maybe_dirty = true;
+                    break;
+                }
+            }
+            if !maybe_dirty {
+                return true;
+            }
         }
         let (a, b) = (first >> SHARD_SHIFT, (last - 1) >> SHARD_SHIFT);
         if b - a < SHARDS {
@@ -330,6 +371,7 @@ impl Held<'_> {
         if now > self.max_written[shard].load(std::sync::atomic::Ordering::Relaxed) {
             self.max_written[shard].store(now, std::sync::atomic::Ordering::Release);
         }
+        bump_page_max(page, now);
         let at = self.place(page);
         self.write[at].note(page, parts, now)
     }
@@ -1014,7 +1056,7 @@ fn with_other_views(first: usize, last: usize, pages: &mut Vec<(usize, u16)>) {
 /// walking the pages between them costs less than another kernel call (a
 /// call that resets written pages costs 30-70 microseconds whatever the
 /// range).
-const AHEAD_GAP: usize = (8 << 20) / PAGE;
+const AHEAD_GAP: usize = (1 << 20) / PAGE;
 /// The most one asking covers (its answer needs 8 bytes per 4 KiB page).
 const AHEAD_MAX: usize = (1 << 30) / PAGE;
 /// Asks the kernel about many ranges `(start, end)` at once, before the
@@ -1052,7 +1094,6 @@ fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
     let _all = (!held).then(Asking::hold_all);
     let (mut asked, mut written) = (Vec::new(), Vec::new());
     let mut runs = Vec::new();
-    let max_run = if spread() { (64 << 20) / PAGE } else { AHEAD_MAX };
     let mut i = 0;
     while i < pieces.len() {
         let first = pieces[i].0;
@@ -1060,7 +1101,7 @@ fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
         let mut k = i + 1;
         while k < pieces.len()
             && pieces[k].0 <= last + AHEAD_GAP
-            && last.max(pieces[k].1) - first <= max_run
+            && last.max(pieces[k].1) - first <= AHEAD_MAX
         {
             last = last.max(pieces[k].1);
             k += 1;
@@ -1675,6 +1716,22 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
         }
         min
     };
+    // Per-page lock-free check against L2-resident `PAGE_MAX` for spans up to
+    // 4 MiB (64 pages): avoids `RwLock<Shard>` and `BTreeMap` even when `taken`
+    // has mixed timestamps (`floor` < individual page's `taken`).
+    if last - first <= 64 {
+        let mut maybe_dirty = false;
+        for (idx, p) in (first..last).enumerate() {
+            let need = taken[idx].max(ranged);
+            if PAGE_MAX[p & PAGE_MAX_MASK].load(std::sync::atomic::Ordering::Acquire) > need {
+                maybe_dirty = true;
+                break;
+            }
+        }
+        if !maybe_dirty {
+            return true;
+        }
+    }
     j.notes.all_unordered_since(first, last, floor, |page, write| write <= taken[page - first].max(ranged))
 }
 

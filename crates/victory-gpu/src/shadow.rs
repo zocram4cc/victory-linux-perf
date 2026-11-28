@@ -1644,6 +1644,9 @@ impl EachPool {
         }));
         for i in 0..threads {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
+                use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL};
+                // SAFETY: current thread handle, matching `victory-submit` priority.
+                unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) };
                 crate::cores::keep_helper_on_fast_cores("victory-wide");
                 IN_WIDE_EACH.set(true);
                 pool.help();

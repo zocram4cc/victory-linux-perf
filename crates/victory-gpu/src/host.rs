@@ -8285,65 +8285,75 @@ fn list_front(steps: &[Step], textures: bool) -> ListFront {
 /// Touches of one list, per copy in the order of their first touch: the span
 /// of its refreshes before its first write, and whether it is written.
 fn fold_touches(touches: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize, bool)> {
-    let mut at: ByCopy<usize> = ByCopy::default();
-    let mut copies: Vec<(usize, usize, usize, bool)> = Vec::new();
-    let mut last = usize::MAX;
-    for touch in touches {
-        let (key, range) = match touch {
-            Touch::Refresh(key, from, to) => (key, Some((from, to))),
-            Touch::Write(key) => (key, None),
-            _ => continue,
-        };
-        // (Most come several times on end.)
-        let i = if copies.get(last).is_some_and(|c| c.0 == key) {
-            last
-        } else {
-            *at.entry(key).or_insert_with(|| {
-                copies.push((key, usize::MAX, 0, false));
-                copies.len() - 1
-            })
-        };
-        last = i;
-        let c = &mut copies[i];
-        match range {
-            Some((from, to)) if !c.3 => (c.1, c.2) = (c.1.min(from), c.2.max(to)),
-            Some(_) => {}
-            None => c.3 = true,
-        }
+    thread_local! {
+        static AT: std::cell::RefCell<ByCopy<usize>> = std::cell::RefCell::new(ByCopy::default());
     }
-    copies
+    AT.with_borrow_mut(|at| {
+        at.clear();
+        let mut copies: Vec<(usize, usize, usize, bool)> = Vec::new();
+        let mut last = usize::MAX;
+        for touch in touches {
+            let (key, range) = match touch {
+                Touch::Refresh(key, from, to) => (key, Some((from, to))),
+                Touch::Write(key) => (key, None),
+                _ => continue,
+            };
+            // (Most come several times on end.)
+            let i = if copies.get(last).is_some_and(|c| c.0 == key) {
+                last
+            } else {
+                *at.entry(key).or_insert_with(|| {
+                    copies.push((key, usize::MAX, 0, false));
+                    copies.len() - 1
+                })
+            };
+            last = i;
+            let c = &mut copies[i];
+            match range {
+                Some((from, to)) if !c.3 => (c.1, c.2) = (c.1.min(from), c.2.max(to)),
+                Some(_) => {}
+                None => c.3 = true,
+            }
+        }
+        copies
+    })
 }
 
 /// [`front_spans`] of the lists whose parts are `lists` ([`fold_touches`]), a
 /// new part of the submission beginning at each of `parts`: the same spans,
 /// in the same order (`front_tests`).
 fn join_keys<'a>(lists: impl Iterator<Item = &'a [(usize, usize, usize, bool)]>, parts: &[usize]) -> Vec<(usize, usize, usize)> {
-    let mut at: ByCopy<usize> = ByCopy::default();
-    let mut spans: Vec<(usize, usize, usize)> = Vec::new();
-    let mut given: Vec<u32> = Vec::new();
-    let mut part = 1;
-    for (n, copies) in lists.enumerate() {
-        if parts.contains(&n) {
-            part += 1;
-        }
-        for &(key, from, to, written) in copies {
-            let i = *at.entry(key).or_insert_with(|| {
-                spans.push((key, usize::MAX, 0));
-                given.push(0);
-                spans.len() - 1
-            });
-            // What the list refreshes before it writes the copy counts unless
-            // an earlier list of this part gave the copy to shaders.
-            if given[i] != part && from < to {
-                (spans[i].1, spans[i].2) = (spans[i].1.min(from), spans[i].2.max(to));
-            }
-            if written {
-                given[i] = part;
-            }
-        }
+    thread_local! {
+        static AT: std::cell::RefCell<ByCopy<usize>> = std::cell::RefCell::new(ByCopy::default());
     }
-    spans.retain(|s| s.1 < s.2);
-    spans
+    AT.with_borrow_mut(|at| {
+        at.clear();
+        let mut spans: Vec<(usize, usize, usize)> = Vec::new();
+        let mut given: Vec<u32> = Vec::new();
+        let mut part = 1;
+        for (n, copies) in lists.enumerate() {
+            if parts.contains(&n) {
+                part += 1;
+            }
+            for &(key, from, to, written) in copies {
+                let i = *at.entry(key).or_insert_with(|| {
+                    spans.push((key, usize::MAX, 0));
+                    given.push(0);
+                    spans.len() - 1
+                });
+                // What the list refreshes before it writes the copy counts unless
+                // an earlier list of this part gave the copy to shaders.
+                if given[i] != part && from < to {
+                    (spans[i].1, spans[i].2) = (spans[i].1.min(from), spans[i].2.max(to));
+                }
+                if written {
+                    given[i] = part;
+                }
+            }
+        }
+        spans.retain(|s| s.1 < s.2);
+        spans
+    })
 }
 
 /// [`join_keys`] of the lists' parts, with their copies.
