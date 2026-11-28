@@ -1240,7 +1240,10 @@ const BATCHES: u32 = 8;
 
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
-    allocator: ID3D12CommandAllocator,
+    /// Its command allocator and when it was made (`now_ms`): with
+    /// [`allocator_trim`] a reset now and then takes a new one, and the old one,
+    /// which keeps the most memory its list ever recorded into it, goes.
+    allocator: Mutex<(ID3D12CommandAllocator, u64)>,
     pub(crate) list: ID3D12GraphicsCommandList,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
@@ -1259,7 +1262,10 @@ pub(crate) struct HostList {
     twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
     /// The list that runs those transitions just before this one, made
     /// when the list first has such transitions ([`lazy_prelude`]).
-    prelude: OnceLock<Option<Prelude>>,
+    prelude: OnceLock<Option<(Mutex<(ID3D12CommandAllocator, u64)>, ID3D12GraphicsCommandList)>>,
+    /// With [`prelude_pool`]: the preludes of the pool this recording's
+    /// submissions ran, given back at the list's reset.
+    pooled_preludes: Mutex<Vec<Prelude>>,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: std::sync::Arc<Mutex<std::collections::BTreeSet<String>>>,
     /// What its indirect executions ran, for the report of a removed device.
@@ -1268,7 +1274,7 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted, and after
     /// it what the clamp notes about mesh records. In memory the CPU maps.
-    budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    budget: OnceLock<Option<Budget>>,
     /// The same words in the card's own memory ([`card_budget`]), which the
     /// clamp uses instead when there is one: zeroed in the list before its
     /// first clamp, its notes copied to `budget` when the list closes.
@@ -1314,6 +1320,303 @@ type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
 fn lazy_prelude() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_LAZY_PRELUDE").is_none_or(|v| v != "0"))
+}
+
+/// Whether host command allocators are taken anew now and then
+/// (`VICTORY_ALLOCATOR_TRIM=1`; off by default). A D3D12 command allocator never
+/// gives back the memory of the most its list ever recorded into it: a list that
+/// once took a loading frame's commands keeps that for the run, and the host lists
+/// and preludes of a run held gigabytes of private memory beside the card's own.
+/// With the switch a list's reset (and a prelude's, before it records again: the
+/// only moments its allocator holds nothing that runs) takes a new allocator when
+/// the one it has is `VICTORY_ALLOCATOR_TRIM_S` seconds old (30), and the old one
+/// goes behind the submissions still running ([`retire`]).
+pub(crate) fn allocator_trim() -> Option<u64> {
+    static S: OnceLock<Option<u64>> = OnceLock::new();
+    *S.get_or_init(|| {
+        std::env::var_os("VICTORY_ALLOCATOR_TRIM").is_some_and(|v| v == "1").then(|| {
+            std::env::var("VICTORY_ALLOCATOR_TRIM_S")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(30u64)
+                .clamp(5, 3600)
+        })
+    })
+}
+
+/// Since the start: host list allocators and prelude allocators taken
+/// anew ([`allocator_trim`]).
+pub(crate) static ALLOCATOR_TRIMS: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// With [`allocator_trim`]: `slot` (an allocator and when it was made)
+/// takes a new allocator if its own is old enough; the old one is retired. Whether
+/// it did (the new one needs no reset). To be called only where the allocator's
+/// last commands have run.
+fn allocator_refresh(
+    slot: &mut (ID3D12CommandAllocator, u64),
+    count: &std::sync::atomic::AtomicU64,
+) -> bool {
+    let Some(secs) = allocator_trim() else {
+        return false;
+    };
+    let now = now_ms();
+    if !trim_due(now, slot.1, secs) {
+        return false;
+    }
+    let Some(host) = host() else {
+        return false;
+    };
+    // SAFETY: plain object creation.
+    let made: windows::core::Result<ID3D12CommandAllocator> =
+        unsafe { host.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT) };
+    match made {
+        Ok(fresh) => {
+            let old = std::mem::replace(slot, (fresh, now));
+            retire(old.0);
+            count.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+        Err(_) => {
+            // No new one now: the old one serves on, and is asked again later.
+            slot.1 = now;
+            false
+        }
+    }
+}
+
+/// Whether an allocator made at `made` (ms) is `secs` old at `now`.
+fn trim_due(now: u64, made: u64, secs: u64) -> bool {
+    now.saturating_sub(made) >= secs * 1000
+}
+
+/// Whether host lists' preludes come from one shared pool
+/// (`VICTORY_PRELUDE_POOL=1`; off unless set). A prelude runs in one
+/// submission only: the transitions and twin copies its list needs before
+/// it, recorded again at each submission of the list. Each host list keeps
+/// a prelude of its own (an allocator and a list) for as long as it lives,
+/// and an allocator with a list that recorded anything costs most of a
+/// megabyte of private memory however little it holds (the origin's
+/// figures, Windows drivers). With the switch a submission's prelude is
+/// taken from the pool when it is recorded and held by its list
+/// ([`HostList::pooled_preludes`]) until the list's [`HostList::reset`],
+/// which comes only once the list's last submission has run, and so the
+/// prelude that ran just before it; there it goes back. Idle ones past
+/// [`PRELUDE_POOL_IDLE`] are let go.
+pub(crate) fn prelude_pool() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PRELUDE_POOL").is_some_and(|v| v == "1"))
+}
+
+/// The most idle preludes the pool keeps.
+const PRELUDE_POOL_IDLE: usize = 64;
+
+/// Idle preludes of the pool: their last submission has run.
+static PRELUDE_POOL: Mutex<Vec<Prelude>> = Mutex::new(Vec::new());
+
+/// Preludes of the pool alive (idle or held by a list), and made so far.
+pub(crate) static PRELUDE_POOL_STATS: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// An idle prelude of the pool, or a new one; whether it is new (its
+/// allocator then needs no reset).
+fn take_prelude() -> Option<(Prelude, bool)> {
+    if let Some(prelude) = PRELUDE_POOL.lock().unwrap_or_else(|e| e.into_inner()).pop() {
+        return Some((prelude, false));
+    }
+    let prelude = host()?.make_prelude()?;
+    PRELUDE_POOL_STATS[0].fetch_add(1, Ordering::Relaxed);
+    PRELUDE_POOL_STATS[1].fetch_add(1, Ordering::Relaxed);
+    Some((prelude, true))
+}
+
+/// Gives back `preludes`, whose submissions have run; past
+/// [`PRELUDE_POOL_IDLE`] idle ones they go.
+fn give_preludes(preludes: Vec<Prelude>) {
+    if preludes.is_empty() {
+        return;
+    }
+    let gone = keep_most(&mut PRELUDE_POOL.lock().unwrap_or_else(|e| e.into_inner()), preludes, PRELUDE_POOL_IDLE);
+    PRELUDE_POOL_STATS[0].fetch_sub(gone.len() as u64, Ordering::Relaxed);
+    // Let go outside the lock.
+    drop(gone);
+}
+
+/// Adds `more` to `pool` and takes out what is past `most`, to be let go.
+fn keep_most<T>(pool: &mut Vec<T>, more: Vec<T>, most: usize) -> Vec<T> {
+    pool.extend(more);
+    let keep = pool.len().min(most);
+    pool.split_off(keep)
+}
+
+/// Whether a host list's indirect-work budget is a 256-byte slot of a
+/// shared buffer (`VICTORY_BUDGET_PACK=1`; off by default). A budget is 256 bytes
+/// that shaders write through its address; each list made a shared buffer of its
+/// own for it, and a committed buffer takes 64 KiB however few of its bytes are
+/// used. With the switch a budget is a slot of a 64 KiB buffer of [`BUDGET_SLABS`],
+/// given back behind the submissions running when its list goes ([`retire`]).
+fn budget_pack() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BUDGET_PACK").is_some_and(|v| v == "1"))
+}
+
+const BUDGET_SLOT: u64 = 256;
+const BUDGET_SLAB: u64 = 64 << 10;
+
+/// The free slots of a new slab `at`, (slab, offset), in the order they are
+/// popped from the back: the slab's first slot first.
+fn slab_slots(at: usize) -> impl Iterator<Item = (usize, u64)> {
+    (0..BUDGET_SLAB / BUDGET_SLOT).rev().map(move |k| (at, k * BUDGET_SLOT))
+}
+
+/// The budgets' buffers (buffer, mapping, GPU address) and the free slots (buffer,
+/// offset).
+static BUDGET_SLABS: Mutex<(Vec<(ID3D12Resource, usize, u64)>, Vec<(usize, u64)>)> =
+    Mutex::new((Vec::new(), Vec::new()));
+
+/// Indirect-work budgets since the start: buffers of their own made, slabs
+/// made ([`budget_pack`]), and slots of slabs in use now.
+pub(crate) static BUDGETS: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// A host list's indirect-work budget: a buffer of its own, or a slot of a shared
+/// one.
+enum Budget {
+    Own(ID3D12Resource, usize, u64),
+    Packed(BudgetSlot),
+}
+
+/// A slot of [`BUDGET_SLABS`]: given back when dropped, behind the submissions
+/// running then.
+struct BudgetSlot {
+    slab: usize,
+    offset: u64,
+    /// The slab itself, so the words' buffer is reachable without the lock.
+    buffer: ID3D12Resource,
+    data: usize,
+    gpu: u64,
+}
+
+/// Gives a slot back when dropped ([`retire`] drops it once the submissions running
+/// at the list's end have finished).
+struct BudgetFree(usize, u64);
+
+impl Drop for BudgetFree {
+    fn drop(&mut self) {
+        BUDGETS[2].fetch_sub(1, Ordering::Relaxed);
+        BUDGET_SLABS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .1
+            .push((self.0, self.1));
+    }
+}
+
+impl Drop for BudgetSlot {
+    fn drop(&mut self) {
+        retire(BudgetFree(self.slab, self.offset));
+    }
+}
+
+impl Budget {
+    fn new() -> Option<Budget> {
+        if !budget_pack() {
+            let (buffer, data) = host()?.shared_buffer(BUDGET_SLOT)?;
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            BUDGETS[0].fetch_add(1, Ordering::Relaxed);
+            return Some(Budget::Own(buffer, data as usize, gpu));
+        }
+        let mut slabs = BUDGET_SLABS.lock().unwrap_or_else(|e| e.into_inner());
+        if slabs.1.is_empty() {
+            let (buffer, data) = host()?.shared_buffer(BUDGET_SLAB)?;
+            name(&buffer, || "indirect budgets".into());
+            BUDGETS[1].fetch_add(1, Ordering::Relaxed);
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            let at = slabs.0.len();
+            slabs.0.push((buffer, data as usize, gpu));
+            slabs.1.extend(slab_slots(at));
+        }
+        let (slab, offset) = slabs.1.pop()?;
+        BUDGETS[2].fetch_add(1, Ordering::Relaxed);
+        let (buffer, data, gpu) = &slabs.0[slab];
+        let (data, gpu) = (data + offset as usize, gpu + offset);
+        // A slot given back holds its last list's words: zeroed, as a new buffer is.
+        // SAFETY: the slot's 256 mapped bytes, ours alone now (its last list's
+        // submissions ran).
+        unsafe { std::ptr::write_bytes(data as *mut u8, 0, BUDGET_SLOT as usize) };
+        Some(Budget::Packed(BudgetSlot {
+            slab,
+            offset,
+            buffer: buffer.clone(),
+            data,
+            gpu,
+        }))
+    }
+
+    /// The buffer its words live in, and where in it (a packed slot's offset).
+    fn place(&self) -> (&ID3D12Resource, u64) {
+        match self {
+            Budget::Own(buffer, _, _) => (buffer, 0),
+            Budget::Packed(slot) => (&slot.buffer, slot.offset),
+        }
+    }
+
+    fn data(&self) -> usize {
+        match self {
+            Budget::Own(_, data, _) => *data,
+            Budget::Packed(slot) => slot.data,
+        }
+    }
+
+    fn gpu(&self) -> u64 {
+        match self {
+            Budget::Own(_, _, gpu) => *gpu,
+            Budget::Packed(slot) => slot.gpu,
+        }
+    }
+}
+
+#[cfg(test)]
+mod memory_trim_tests {
+    use super::*;
+
+    /// An allocator is taken anew once it is the trim's seconds old, not
+    /// before; a clock that went back trims nothing.
+    #[test]
+    fn allocators_are_trimmed_once_old_enough() {
+        assert!(!trim_due(29_999, 0, 30));
+        assert!(trim_due(30_000, 0, 30));
+        assert!(trim_due(90_000, 50_000, 30));
+        assert!(!trim_due(10, 1_000, 30));
+    }
+
+    /// The pool keeps at most its idle count; what is past it is let go,
+    /// the newest given back first.
+    #[test]
+    fn the_prelude_pool_keeps_its_most() {
+        let mut pool = vec![1, 2];
+        assert!(keep_most(&mut pool, vec![3], 4).is_empty());
+        assert_eq!(keep_most(&mut pool, vec![4, 5, 6], 4), vec![5, 6]);
+        assert_eq!(pool, vec![1, 2, 3, 4]);
+        assert_eq!(keep_most(&mut pool, Vec::new(), 1), vec![2, 3, 4]);
+    }
+
+    /// A 64 KiB slab holds 256 budgets of 256 bytes, each inside the slab,
+    /// none twice, taken from its start.
+    #[test]
+    fn budget_slots_tile_their_slab() {
+        let mut slots: Vec<(usize, u64)> = slab_slots(3).collect();
+        assert_eq!(slots.len(), 256);
+        assert_eq!(slots.pop(), Some((3, 0)));
+        assert_eq!(slots.pop(), Some((3, 256)));
+        let mut offsets: Vec<u64> = slab_slots(0).map(|s| s.1).collect();
+        offsets.sort_unstable();
+        offsets.dedup();
+        assert_eq!(offsets.len(), 256);
+        assert!(offsets.iter().all(|&o| o % 256 == 0 && o + BUDGET_SLOT <= BUDGET_SLAB));
+    }
 }
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
@@ -4362,7 +4665,7 @@ impl Host {
     }
 
     /// An allocator and a closed list for a prelude.
-    fn make_prelude(&self) -> Option<Prelude> {
+    pub(crate) fn make_prelude(&self) -> Option<Prelude> {
         // SAFETY: plain object creation.
         let made: windows::core::Result<Prelude> = unsafe {
             (|| {
@@ -4399,7 +4702,7 @@ impl Host {
             )?;
             let prelude = OnceLock::new();
             if !lazy_prelude() {
-                let _ = prelude.set(self.make_prelude());
+                let _ = prelude.set(self.make_prelude().map(|(a, l)| (Mutex::new((a, now_ms())), l)));
             }
             #[cfg(feature = "diagnostics")]
             let notes = std::sync::Arc::<Mutex<Vec<Note>>>::default();
@@ -4425,13 +4728,14 @@ impl Host {
                 );
             }
             Ok(HostList {
-                allocator,
+                allocator: Mutex::new((allocator, now_ms())),
                 list,
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
                 prelude,
+                pooled_preludes: Mutex::default(),
                 pipelines,
                 #[cfg(feature = "diagnostics")]
                 indirects,
@@ -6793,12 +7097,16 @@ impl HostList {
                 give_chunks(std::mem::take(&mut scratch.chunks));
             }
         }
-        // SAFETY: the list is not executing.
+        // The preludes of the pool its submissions ran have run too.
+        give_preludes(std::mem::take(&mut *self.pooled_preludes.lock().unwrap_or_else(|e| e.into_inner())));
+        let mut allocator = self.allocator.lock().unwrap_or_else(|e| e.into_inner());
+        let fresh = allocator_refresh(&mut allocator, &ALLOCATOR_TRIMS[0]);
+        // SAFETY: the list is not executing; a fresh allocator is new and empty.
         let reset = unsafe {
-            self.allocator
-                .Reset()
-                .and_then(|()| self.list.Reset(&self.allocator, None))
+            (if fresh { Ok(()) } else { allocator.0.Reset() })
+                .and_then(|()| self.list.Reset(&allocator.0, None))
         };
+        drop(allocator);
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
@@ -7182,31 +7490,57 @@ impl HostList {
         if barriers.is_empty() && syncs.is_empty() {
             return None;
         }
+        // SAFETY (for both kinds of prelude below): the allocator's last list
+        // has run (a pooled one came back at a list's reset, which follows
+        // that list's last submission; a list's own one ran in the list's
+        // last submission, and a list is not sent again before that has
+        // run); the textures are live.
+        let record = |allocator: &ID3D12CommandAllocator,
+                      list: &ID3D12GraphicsCommandList,
+                      fresh: bool|
+         -> windows::core::Result<()> {
+            unsafe {
+                (if fresh { Ok(()) } else { allocator.Reset() }).and_then(|()| {
+                    list.Reset(allocator, None)?;
+                    if !to_copy.is_empty() {
+                        list.ResourceBarrier(&to_copy);
+                    }
+                    for (depth, twin, colour) in &syncs {
+                        record_twin_copy(list, &depth.texture, twin, *colour);
+                    }
+                    if !barriers.is_empty() {
+                        list.ResourceBarrier(&barriers);
+                    }
+                    list.Close()
+                })
+            }
+        };
+        // With `VICTORY_PRELUDE_POOL=1`: a prelude of the shared pool, held
+        // by this list until its reset ([`prelude_pool`]).
+        if prelude_pool() {
+            let Some(((allocator, list), made)) = take_prelude() else {
+                fail(format_args!("no host list for a state prelude (VICTORY_PRELUDE_POOL=1)"));
+            };
+            if let Err(e) = record(&allocator, &list, made) {
+                fail(format_args!("a host state prelude did not record ({e})"));
+            }
+            let out = list.cast().ok();
+            self.pooled_preludes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((allocator, list));
+            return out;
+        }
         let Some((allocator, list)) = self
             .prelude
-            .get_or_init(|| host().and_then(|h| h.make_prelude()))
+            .get_or_init(|| host().and_then(|h| h.make_prelude()).map(|(a, l)| (Mutex::new((a, now_ms())), l)))
             .as_ref()
         else {
             fail(format_args!("no host list for a state prelude"));
         };
-        // SAFETY: the prelude is not executing (every submission is waited
-        // for); the textures are live.
-        let recorded = unsafe {
-            allocator.Reset().and_then(|()| {
-                list.Reset(allocator, None)?;
-                if !to_copy.is_empty() {
-                    list.ResourceBarrier(&to_copy);
-                }
-                for (depth, twin, colour) in &syncs {
-                    record_twin_copy(list, &depth.texture, twin, *colour);
-                }
-                if !barriers.is_empty() {
-                    list.ResourceBarrier(&barriers);
-                }
-                list.Close()
-            })
-        };
-        if let Err(e) = recorded {
+        let mut allocator = allocator.lock().unwrap_or_else(|e| e.into_inner());
+        let fresh = allocator_refresh(&mut allocator, &ALLOCATOR_TRIMS[1]);
+        if let Err(e) = record(&allocator.0, list, fresh) {
             fail(format_args!("a host state prelude did not record ({e})"));
         }
         list.cast().ok()
@@ -7499,18 +7833,13 @@ impl HostList {
     /// The host address of the list's indirect-work budget, zeroed at each
     /// submission of the list from the first use after a reset on.
     pub(crate) fn budget(&self) -> Option<u64> {
-        let (buffer, data) = self
-            .budget
-            .get_or_init(|| {
-                let (b, d) = host()?.shared_buffer(256)?;
-                Some((b, d as usize))
-            })
-            .as_ref()?;
+        let budget = self.budget.get_or_init(Budget::new).as_ref()?;
+        let (data, gpu) = (budget.data(), budget.gpu());
         let card = self.card_budget.get_or_init(|| self.make_card_budget()).as_ref();
         let mut deferred = self.deferred();
         if !deferred.budget_zeroed {
             deferred.budget_zeroed = true;
-            let at = *data;
+            let at = data;
             // SAFETY: the list's own mapped words, written before it runs.
             // The words after the budget hold what the clamp noted about the
             // list's last run (mesh dispatches: the largest group count
@@ -7535,8 +7864,11 @@ impl HostList {
                 self.zero_card_budget(card);
             }
         }
-        // SAFETY: a live buffer.
-        Some(unsafe { card.unwrap_or(buffer).GetGPUVirtualAddress() })
+        Some(match card {
+            // SAFETY: a live buffer.
+            Some(card) => unsafe { card.GetGPUVirtualAddress() },
+            None => gpu,
+        })
     }
 
     /// The budget's words in the card's own memory ([`card_budget`]), if
@@ -7588,11 +7920,11 @@ impl HostList {
         if !self.deferred().budget_zeroed {
             return;
         }
-        let (Some(Some(card)), Some(Some((mapped, _)))) =
-            (self.card_budget.get(), self.budget.get())
+        let (Some(Some(card)), Some(Some(budget))) = (self.card_budget.get(), self.budget.get())
         else {
             return;
         };
+        let (mapped, at) = budget.place();
         // SAFETY: an open list; both buffers are the list's own. The
         // mapped one is promoted from common to the copy destination.
         unsafe {
@@ -7601,7 +7933,7 @@ impl HostList {
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);
-            self.list.CopyBufferRegion(mapped, 4, card, 4, 16);
+            self.list.CopyBufferRegion(mapped, at + 4, card, 4, 16);
             self.list.ResourceBarrier(&[transition(
                 card,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,

@@ -904,7 +904,10 @@ fn log_memory() {
          keeps them); entries of views no resource releases held by the cap: {}, freed by it \
          so far: {} (VICTORY_OWNERLESS_VIEWS, unset: all kept); host lists: {} \
          made by the host, {} preludes made for them, private bytes grew {:.0} MB while \
-         lists were made; twins of depth textures: {:.0} MB; host copies of \
+         lists were made; allocators taken anew (VICTORY_ALLOCATOR_TRIM): {} of lists, {} \
+         of preludes; pooled preludes (VICTORY_PRELUDE_POOL): {} alive, {} made; indirect \
+         budgets: {} buffers of their own, {} slabs of 256 (VICTORY_BUDGET_PACK) with {} \
+         slots in use; twins of depth textures: {:.0} MB; host copies of \
          placed textures whose title memory is not mapped any more (estimate): {:.0} MB, of \
          them still shown by a descriptor slot {:.0} MB; the pipeline library's mapped file \
          let go from memory so far: {:.0} MB; our own blocks of 32 MB and more, in MB: {}",
@@ -920,6 +923,13 @@ fn log_memory() {
         lists[0],
         lists[1],
         lists[2] as i64 as f64 / (1 << 20) as f64,
+        crate::host::ALLOCATOR_TRIMS[0].load(Relaxed),
+        crate::host::ALLOCATOR_TRIMS[1].load(Relaxed),
+        crate::host::PRELUDE_POOL_STATS[0].load(Relaxed),
+        crate::host::PRELUDE_POOL_STATS[1].load(Relaxed),
+        crate::host::BUDGETS[0].load(Relaxed),
+        crate::host::BUDGETS[1].load(Relaxed),
+        crate::host::BUDGETS[2].load(Relaxed),
         mb(census[7]),
         mb(census[8]),
         mb(census[9]),
