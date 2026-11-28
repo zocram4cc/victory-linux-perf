@@ -116,7 +116,9 @@ struct List {
     newer: [u32; 256],
     /// Ours, after the console layout: memory handed out by
     /// [`allocate_upload`], kept until the list is reset; the host list the
-    /// calls record into (decision 0007), and the draw state the title set.
+    /// calls record into (decision 0007; with [`lazy`] a list of ours has
+    /// one only from the reset that begins a recording to its submission),
+    /// and the draw state the title set.
     uploads: std::sync::Mutex<Vec<Upload>>,
     #[cfg(windows)]
     host: Option<crate::host::HostList>,
@@ -264,23 +266,121 @@ fn pools() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_POOL").is_none_or(|v| v != "0"))
 }
 
+/// A host list that has run and was kept ([`recycle`]), the last one kept
+/// first: reset, so open for recording.
+#[cfg(windows)]
+fn idle_list() -> Option<crate::host::HostList> {
+    let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+    let Idle(list, bytes) = idle.0.pop()?;
+    idle.1 -= bytes;
+    Some(list)
+}
+
 /// A host list open for recording: one that has run, as a title's list is
 /// after its reset, or a new one.
 #[cfg(windows)]
 fn fresh_list() -> Option<crate::host::HostList> {
-    let idle = {
-        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        let taken = idle.0.pop();
-        if let Some(Idle(_, bytes)) = &taken {
-            idle.1 -= bytes;
-        }
-        taken
-    };
-    match idle {
-        Some(Idle(list, _)) => Some(list),
-        None => crate::host::host().and_then(|h| h.new_list().ok()),
-    }
+    idle_list().or_else(|| crate::host::host().and_then(|h| h.new_list().ok()))
 }
+
+/// Whether the lists of ours that [`thin`] translates the title's calls into
+/// hold a host list only while they record (`VICTORY_LIST_LAZY=1`, with
+/// `VICTORY_THIN=1`; off by default). Without it a submission leaves such a
+/// list a new host list, closed, for its next recording ([`detach`]), and
+/// the title's list keeps the recording, and with it that list, until the
+/// title resets it again: about 630-690 host lists were held so in drives,
+/// each with about 1.07-1.43 MB of the driver's write-combined memory and
+/// 1.16 MB of private memory. And a list of ours made new came with a host
+/// list made new, however many were idle. With it a submission takes the
+/// host list and leaves none, a list of ours is made without one, and the
+/// reset that begins a recording takes one, an idle one first
+/// ([`host_for_recording`]). A title's own list (without `VICTORY_THIN`)
+/// keeps its host list as before.
+#[cfg(windows)]
+fn lazy() -> bool {
+    *LAZY.get_or_init(|| {
+        let asked = std::env::var_os("VICTORY_LIST_LAZY").is_some_and(|v| v == "1");
+        let on = asked && thin::on();
+        if on {
+            tracing::info!("lists of ours hold a host list only while they record (VICTORY_LIST_LAZY=1)");
+        } else if asked {
+            tracing::warn!("VICTORY_LIST_LAZY=1 needs VICTORY_THIN=1: host lists are held as before");
+        }
+        on
+    })
+}
+
+/// [`lazy`], once it was asked.
+#[cfg(windows)]
+static LAZY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// With [`lazy`], since the start: host lists taken at a reset by a list of
+/// ours that had none; of them, those made new (none was idle); and resets
+/// that found none to take ([`host_for_recording`]).
+#[cfg(windows)]
+static TAKEN: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// For the housekeeping line: [`TAKEN`], and whether [`lazy`] is on (not
+/// until it was first asked: the line does not ask, which would start the
+/// threads of `VICTORY_THIN` from the sweep).
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+#[cfg(windows)]
+pub(crate) fn taken_at_reset() -> ([u64; 3], bool) {
+    let taken = std::array::from_fn(|i| TAKEN[i].load(std::sync::atomic::Ordering::Relaxed));
+    (taken, LAZY.get() == Some(&true))
+}
+
+/// With [`lazy`], at the reset that begins a recording of a list of ours
+/// that has no host list: the one it records onto, an idle one, or one made
+/// new if none is idle. It is closed first, as a submission left one before:
+/// the reset goes on to reset its allocator, which a list still open on it
+/// does not allow, and both kinds are open (an idle one was reset when it was
+/// kept, and a list is made open). None if there is none to take (counted,
+/// and warned of once): the recording then draws nothing, as a list for
+/// which no host list could be made at all (its bottom-of-pipe writes are
+/// done at once, and a submission runs nothing of it).
+#[cfg(windows)]
+fn host_for_recording() -> Option<crate::host::HostList> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (host, made) = match idle_list() {
+        Some(list) => (list, false),
+        None => match crate::host::host().map(|h| h.new_list()) {
+            Some(Ok(list)) => (list, true),
+            failed => {
+                TAKEN[2].fetch_add(1, Relaxed);
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    let error = match failed {
+                        Some(Err(e)) => e.to_string(),
+                        _ => "no host GPU".to_string(),
+                    };
+                    tracing::warn!(%error, "no host list for a recording of a list of ours (VICTORY_LIST_LAZY=1): it draws nothing");
+                });
+                return None;
+            }
+        },
+    };
+    host.close();
+    TAKEN[0].fetch_add(1, Relaxed);
+    TAKEN[1].fetch_add(u64::from(made), Relaxed);
+    Some(host)
+}
+
+/// The host list of a submitted list, taken from it. The list is left a new
+/// one, closed: its next call is a reset, which wants it closed; with `lazy`
+/// none, and that reset takes one ([`host_for_recording`]). None if it had
+/// none, or if no new one could be had (it keeps its own then, which does
+/// not run).
+#[cfg(windows)]
+fn take_host(list: &mut List, lazy: bool) -> Option<crate::host::HostList> {
+    if lazy {
+        return list.host.take();
+    }
+    let fresh = fresh_list()?;
+    fresh.close();
+    list.host.replace(fresh)
+}
+
 
 /// The host sides of lists whose submission has run (submissions are
 /// waited for; `ran` names the ones it ran, by their place in `lists`):
@@ -388,12 +488,12 @@ pub(crate) fn cut_list(this: This) -> bool {
 pub(crate) type Parts = Vec<(Vec<ValueWait>, Vec<Detached>, Vec<usize>)>;
 
 /// Takes the host sides of the submitted `lists`, part by part ([`cut`]),
-/// and leaves each list a new, closed host list for its next reset, as
-/// [`detach`] does. What comes back is in the order the queue runs it: a
-/// new entry starts at every part that has waits; host lists without
-/// waits join the entry before them. The list's upload memory and draw
-/// state (its dynamic descriptor slots) go with its last part, which runs
-/// last.
+/// and leaves each list a new, closed host list for its next reset (with
+/// [`lazy`] none), as [`detach`] does. What comes back is in the order the
+/// queue runs it: a new entry starts at every part that has waits; host
+/// lists without waits join the entry before them. The list's upload
+/// memory and draw state (its dynamic descriptor slots) go with its last
+/// part, which runs last.
 /// shortcut: a list the submission names a second time runs again only if
 /// it has one part and that part is in the entry being filled; otherwise
 /// the second naming is dropped (logged once).
@@ -403,6 +503,7 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
     // The lists taken: where its one host list is (entry, place), or none
     // for a list of several parts.
     let mut seen: Vec<(This, Option<(usize, usize)>)> = Vec::new();
+    let lazy = lazy();
     for &this in lists {
         if this.is_null() {
             continue;
@@ -419,16 +520,10 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             }
             continue;
         }
-        let Some(fresh) = fresh_list() else {
-            continue;
-        };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
-        let Some(host) = list.host.replace(fresh) else {
+        let Some(host) = take_host(list, lazy) else {
             continue;
         };
         let earlier = std::mem::take(&mut list.earlier);
@@ -478,11 +573,13 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
 
 /// Takes the host sides of submitted lists (each once, however often the
 /// submission names it) and leaves each list a new, closed host list for
-/// its next reset: what was taken, and which of them run in what order.
+/// its next reset (with [`lazy`] none): what was taken, and which of them
+/// run in what order.
 #[cfg(windows)]
 pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
     let mut taken: Vec<(This, Detached)> = Vec::new();
     let mut order = Vec::new();
+    let lazy = lazy();
     for &this in lists {
         if this.is_null() {
             continue;
@@ -491,17 +588,11 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             order.push(i);
             continue;
         }
-        let Some(fresh) = fresh_list() else {
-            continue;
-        };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
         let list = this.cast_mut().cast::<List>();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let (host, uploads, state) = unsafe {
-            let Some(host) = (*list).host.replace(fresh) else {
+            let Some(host) = take_host(&mut *list, lazy) else {
                 continue;
             };
             let uploads =
@@ -591,17 +682,21 @@ fn new_list(
     tracing::debug!(kind, "command list");
     #[cfg(windows)]
     if thin::on() {
-        let mut list = boxed(kind, pipeline, true);
+        let mut list = boxed(kind, pipeline, true, false);
         list.thin.begin(kind, pipeline);
         return object::hand_out(LIST, list, iid, &LIST_IIDS, out);
     }
-    object::hand_out(LIST, boxed(kind, pipeline, false), iid, &LIST_IIDS, out)
+    // (Made open, as in D3D12: the title records into it without a reset.)
+    object::hand_out(LIST, boxed(kind, pipeline, false, true), iid, &LIST_IIDS, out)
 }
 
-/// A list; with `thin` one whose calls are written down (it has no host list).
-fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
+/// A list; with `thin` one whose calls are written down, and with `with_host`
+/// one that records onto a host list from the start (a list whose calls are
+/// written down has none; a list of ours that [`thin`] translates into is
+/// made without one with [`lazy`], and takes one at its first reset).
+fn boxed(kind: u32, pipeline: This, thin: bool, with_host: bool) -> Box<List> {
     #[cfg(not(windows))]
-    let _ = thin;
+    let _ = (thin, with_host);
     let list = Box::new(List {
         object: match (crate::device::newer(), thin) {
             (true, false) => Object::new(&NEWER_LIST_FUNCTIONS),
@@ -622,7 +717,7 @@ fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
         newer: [0; 256],
         uploads: Default::default(),
         #[cfg(windows)]
-        host: crate::host::host().filter(|_| !thin).and_then(|h| match h.new_list() {
+        host: crate::host::host().filter(|_| with_host).and_then(|h| match h.new_list() {
             Ok(list) => Some(list),
             Err(e) => {
                 tracing::warn!(error = %e, "no host command list");
@@ -700,6 +795,12 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
         list.earlier.clear();
         list.gate.clear();
+        // A list of ours gave its host list away with its last submission
+        // ([`lazy`]): it takes one for this recording, closed, which is
+        // reset below as any other.
+        if list.host.is_none() && lazy() {
+            list.host = host_for_recording();
+        }
     }
     #[cfg(windows)]
     with_state(this, |host, state| {
@@ -2443,6 +2544,84 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    /// A list of ours as the test holds it.
+    #[cfg(windows)]
+    fn ours<'a>(this: This) -> &'a mut List {
+        // SAFETY: a list the test made and has not let go of; nothing else
+        // has it.
+        unsafe { &mut *this.cast_mut().cast::<List>() }
+    }
+
+    /// With `VICTORY_LIST_LAZY=1` a list of ours is made without a host list
+    /// and has none to run; the reset that begins a recording takes one,
+    /// closed, and resets it (an allocator is not reset under a list open on
+    /// it, which would end the run); a submission takes it and leaves none.
+    /// Without the switch (as the queues submit here: the switch is not set)
+    /// a submission leaves a new one, closed, which the next reset resets; a
+    /// list that had none is given one, and nothing of it runs.
+    #[cfg(windows)]
+    #[test]
+    fn a_list_of_ours_holds_a_host_list_only_while_it_records() {
+        if crate::host::host().is_none() {
+            eprintln!("skipping the host lists of lists of ours: no D3D12 device");
+            return;
+        }
+        let null = std::ptr::null();
+        let allocator: This = std::ptr::NonNull::<u64>::dangling().as_ptr().cast_const().cast();
+        let this: This = Box::into_raw(boxed(0, null, false, false)).cast_const().cast();
+        assert!(ours(this).host.is_none(), "made without one");
+        assert_eq!(close(this), S_OK);
+        assert!(take_host(ours(this), true).is_none(), "nothing to run");
+        let ([taken, made, none], _) = taken_at_reset();
+        // Two recordings, each on a host list taken at its reset.
+        let mut ran = Vec::new();
+        for _ in 0..2 {
+            ours(this).host = host_for_recording();
+            assert!(ours(this).host.is_some());
+            assert_eq!(reset(this, allocator, null), S_OK);
+            assert!(ours(this).host.as_ref().is_some_and(|h| h.untouched()));
+            assert_eq!(close(this), S_OK);
+            ran.push(take_host(ours(this), true).expect("the recording's host list"));
+            assert!(ours(this).host.is_none(), "none left behind");
+        }
+        let ([taken_now, made_now, none_now], _) = taken_at_reset();
+        assert_eq!((taken_now - taken, none_now - none), (2, 0));
+        assert!(made_now - made <= 2);
+        // Without the switch: a new one, closed, is left for the next reset.
+        ours(this).host = host_for_recording();
+        assert_eq!(reset(this, allocator, null), S_OK);
+        assert_eq!(close(this), S_OK);
+        let (submitted, runs) = detach(&[this, this]);
+        assert_eq!((submitted.len(), runs.as_slice()), (1, &[0, 0][..]), "taken once, run twice");
+        assert!(ours(this).host.is_some(), "a new one left");
+        assert_eq!(reset(this, allocator, null), S_OK);
+        assert_eq!(close(this), S_OK);
+        let parts = detach_parts(&[this]);
+        assert_eq!(parts.len(), 1);
+        assert!(ours(this).host.is_some(), "a new one left");
+        assert_eq!(reset(this, allocator, null), S_OK);
+        assert_eq!(close(this), S_OK);
+        // A list that had none is given one; nothing of it is taken to run.
+        let other: This = Box::into_raw(boxed(0, null, false, false)).cast_const().cast();
+        assert!(take_host(ours(other), false).is_none());
+        assert!(ours(other).host.is_some());
+        // The host lists that ran are kept for others, reset, as a queue's are.
+        let order: Vec<usize> = (0..ran.len()).collect();
+        let ran: Vec<Detached> = ran
+            .into_iter()
+            .map(|host| Detached { host, _uploads: Vec::new(), _state: Default::default() })
+            .collect();
+        recycle(ran, &order);
+        recycle(submitted, &[0]);
+        for (_, part, order) in parts {
+            recycle(part, &order);
+        }
+        for list in [this, other] {
+            // SAFETY: made above with `Box::into_raw`, and let go of once.
+            drop(unsafe { Box::from_raw(list.cast_mut().cast::<List>()) });
+        }
     }
 
     /// An offset near `u64::MAX` must not overflow and write outside the

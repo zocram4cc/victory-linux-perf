@@ -2216,7 +2216,12 @@ pub(crate) fn let_go_idle() {
         Some([budget, used, ..]) if keep => {
             let used = used.saturating_sub(crate::pool::texture_room())
                 + crate::shadow::card_room_kept()
-                + targets_room_kept();
+                + targets_room_kept()
+                // With `VICTORY_WINDOWS_BAR_PCT` (from LibsMQG/hle-d3d12-amd)
+                // the windows that would lie in card memory if there were
+                // room count as in use: the rule lets the longest idle copies
+                // go to make it.
+                + crate::shadow::windows_wanting_card(budget);
             crate::host::vram_keep(budget, used)
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),

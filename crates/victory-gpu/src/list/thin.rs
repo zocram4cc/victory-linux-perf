@@ -164,7 +164,8 @@ static WORDS: Mutex<Vec<Vec<u64>>> = Mutex::new(Vec::new());
 /// Recordings with words to translate.
 static READY: Mutex<VecDeque<Arc<Recording>>> = Mutex::new(VecDeque::new());
 static WORK: Condvar = Condvar::new();
-/// Lists of ours nobody uses, closed.
+/// Lists of ours nobody uses, closed (with `VICTORY_LIST_LAZY=1` most have
+/// no host list).
 static BACKS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 /// Since the last line of the log: streams handed over; calls translated and
 /// the microseconds that took (all threads), recordings translated, and
@@ -362,14 +363,17 @@ fn give_back(streams: Vec<Vec<u64>>) {
     }
 }
 
-/// A list of ours, closed.
+/// A list of ours, closed. With `VICTORY_LIST_LAZY=1` one made new has no
+/// host list (nor has one whose last recording was submitted): the reset
+/// its stream begins with takes one, an idle one first ([`super::lazy`]).
 fn back_list(kind: u32) -> This {
     if let Some(back) = held(&BACKS).pop() {
         // SAFETY: a list of ours nobody uses.
         unsafe { (*(back as *mut List)).kind = kind };
         return back as This;
     }
-    let list: This = Box::into_raw(super::boxed(kind, std::ptr::null(), false)).cast_const().cast();
+    let list: This =
+        Box::into_raw(super::boxed(kind, std::ptr::null(), false, !super::lazy())).cast_const().cast();
     super::close(list);
     list
 }

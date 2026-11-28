@@ -940,6 +940,20 @@ fn log_memory() {
         "memory, placed textures: {} of them were asked for again with other filler words in their description          (one resource and host copy each since the filler left the key; VICTORY_PLACED_FILLER=1 keeps it)",
         crate::resource::placed_filler_twins()
     );
+    // Host lists taken by lists of ours at the reset that begins a recording
+    // (`VICTORY_LIST_LAZY`, from LibsMQG/hle-d3d12-amd): all, made new, none
+    // to take.
+    #[cfg(windows)]
+    {
+        let (taken, lazy) = crate::list::taken_at_reset();
+        tracing::info!(
+            "memory, host lists: {} taken at a reset (made new {}, none to take {}) (VICTORY_LIST_LAZY={})",
+            taken[0],
+            taken[1],
+            taken[2],
+            u8::from(lazy)
+        );
+    }
     // What the line above leaves open: what is alive of the buffers "made
     // so far", what the windows hold and what holds them, and what our own
     // code has allocated.

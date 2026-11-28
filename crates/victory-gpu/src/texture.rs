@@ -433,14 +433,17 @@ thread_local! {
 }
 
 /// Calls `f` with `size` bytes of this thread's read buffer (their
-/// contents are whatever the last texture left).
+/// contents are whatever the last texture left). The buffer does not
+/// shrink: it keeps the bytes of the biggest texture the thread ever read,
+/// unless `VICTORY_SHRINK_KEPT=1` gives it back after a use over 8 MiB
+/// (`crate::kept`).
 fn with_read<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
     READ.with(|read| {
         let mut read = read.borrow_mut();
-        if read.len() < size {
-            read.resize(size, 0);
-        }
-        f(&mut read[..size])
+        crate::kept::grow(&mut read, size);
+        let out = f(&mut read[..size]);
+        crate::kept::after_use(&mut read);
+        out
     })
 }
 

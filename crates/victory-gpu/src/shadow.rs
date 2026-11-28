@@ -584,18 +584,69 @@ fn window_mapped_most() -> u64 {
 /// Bytes alive of windows in card memory the CPU maps.
 static WINDOW_MAPPED_BYTES: AtomicU64 = AtomicU64::new(0);
 
-/// A buffer for a window of `size` bytes in card memory the CPU maps, if it is
-/// to be there ([`window_mapped_most`]).
-fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+/// (From LibsMQG/hle-d3d12-amd) The share of the card's budget windows in
+/// card memory may take, in percent (`VICTORY_WINDOWS_BAR_PCT`, 1 to 50; not
+/// set, none: windows go there under the windows' line, as before). Set, his
+/// rule holds on a card with a budget of 10 GiB or more: windows go there up
+/// to that share (and [`window_mapped_most`]) while the card is under 92 % of
+/// its budget, and the room rule counts the windows that would lie there if
+/// there were room as in use ([`windows_wanting_card`]), so it lets the
+/// longest idle texture copies go to make that room, where before the copies
+/// filled the card and new windows went to the PC's memory. On his PC (24 GB
+/// card, 28 %): PC memory held for the card 7.7-10.2 -> 4.0-5.3 GB driving.
+fn window_mapped_pct() -> Option<u64> {
+    static PCT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *PCT.get_or_init(|| {
+        std::env::var("VICTORY_WINDOWS_BAR_PCT").ok().and_then(|v| v.trim().parse::<u64>().ok()).map(|p| p.clamp(1, 50))
+    })
+}
+
+/// The most bytes of windows in card memory, and the card's use under which
+/// a new one may go there, on a card with `budget` bytes: with
+/// [`window_mapped_pct`] (and a budget of 10 GiB or more) that share of the
+/// budget and 92 %; otherwise [`window_mapped_most`] and the windows' line.
+fn window_mapped_limits(budget: u64) -> (u64, u64) {
     let most = window_mapped_most();
+    match window_mapped_pct() {
+        Some(pct) if budget >= 10 << 30 => (most.min(budget / 100 * pct), budget / 100 * 92),
+        _ => (most, window_card_line(budget, window_card_percent())),
+    }
+}
+
+/// For the room rule (`crate::resource::let_go_idle`, once a second): with
+/// [`window_mapped_pct`], the bytes of windows that would lie in card memory
+/// if there were room, up to its share (those alive less those there now).
+/// The rule counts them as in use, so it lets the longest idle texture copies
+/// go to make that room: copies idle the longest are seldom made again, and
+/// windows are used every frame. 0 without it.
+pub(crate) fn windows_wanting_card(budget: u64) -> u64 {
+    if window_mapped_most() == 0 || window_mapped_pct().is_none() || budget < 10 << 30 {
+        return 0;
+    }
+    let (cap, _) = window_mapped_limits(budget);
+    let on = WINDOW_MAPPED_BYTES.load(Ordering::Relaxed);
+    let alive: u64 = {
+        let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+        let mut seen = std::collections::HashSet::new();
+        loose.values().filter(|s| seen.insert(Arc::as_ptr(s) as usize)).map(|s| s.len).sum()
+    };
+    cap.min(alive).saturating_sub(on)
+}
+
+/// A buffer for a window of `size` bytes in card memory the CPU maps, if it is
+/// to be there ([`window_mapped_most`], [`window_mapped_limits`]).
+fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+    let mut most = window_mapped_most();
     if most == 0 {
         return None;
     }
     let host = host()?;
-    if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > window_card_line(budget, window_card_percent())
-    {
-        return None;
+    if let Some([budget, used, ..]) = host.video_memory() {
+        let (cap, line) = window_mapped_limits(budget);
+        if used + size > line {
+            return None;
+        }
+        most = cap;
     }
     if WINDOW_MAPPED_BYTES.fetch_add(size, Ordering::Relaxed) + size > most {
         WINDOW_MAPPED_BYTES.fetch_sub(size, Ordering::Relaxed);
@@ -657,10 +708,11 @@ fn note_promote_room(video: Option<[u64; 4]>) {
     if !window_promote() {
         return;
     }
-    let most = window_mapped_most();
-    let room = most > 0
-        && WINDOW_MAPPED_BYTES.load(Ordering::Relaxed) + WINDOW <= most
-        && video.is_some_and(|[budget, used, ..]| used + PROMOTE_MARGIN < window_card_line(budget, window_card_percent()));
+    let room = window_mapped_most() > 0
+        && video.is_some_and(|[budget, used, ..]| {
+            let (most, line) = window_mapped_limits(budget);
+            WINDOW_MAPPED_BYTES.load(Ordering::Relaxed) + WINDOW <= most && used + PROMOTE_MARGIN < line
+        });
     PROMOTE_ROOM.store(room, Ordering::Relaxed);
 }
 
