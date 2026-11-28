@@ -225,10 +225,11 @@ fn early_tables() -> bool {
     crate::toggled!("VICTORY_EARLY_TABLES")
 }
 
-/// A host list that has run and waits to be used again, and the bytes of
-/// upload memory it keeps.
+/// A host list that has run and waits to be used again, the bytes of
+/// upload memory it keeps, and whether it was closed after its reset
+/// (`crate::host::off_line`).
 #[cfg(windows)]
-struct Idle(crate::host::HostList, u64);
+struct Idle(crate::host::HostList, u64, bool);
 
 // SAFETY: D3D12 objects are free-threaded, and an idle list is touched by
 // nobody until it is taken out again.
@@ -262,22 +263,44 @@ fn pools() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_POOL").is_none_or(|v| v != "0"))
 }
 
-/// A host list open for recording: one that has run, as a title's list is
-/// after its reset, or a new one.
+/// A host list that has run, as a title's list is after its reset, or a new
+/// one (open), and whether it is closed.
 #[cfg(windows)]
-fn fresh_list() -> Option<crate::host::HostList> {
+fn idle_list() -> Option<(crate::host::HostList, bool)> {
     let idle = {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         let taken = idle.0.pop();
-        if let Some(Idle(_, bytes)) = &taken {
+        if let Some(Idle(_, bytes, _)) = &taken {
             idle.1 -= bytes;
         }
         taken
     };
     match idle {
-        Some(Idle(list, _)) => Some(list),
-        None => crate::host::host().and_then(|h| h.new_list().ok()),
+        Some(Idle(list, _, closed)) => Some((list, closed)),
+        None => crate::host::host().and_then(|h| h.new_list().ok()).map(|list| (list, false)),
     }
+}
+
+/// A host list open for recording ([`idle_list`]; one closed after its
+/// reset is reset again).
+#[cfg(windows)]
+fn fresh_list() -> Option<crate::host::HostList> {
+    let (list, closed) = idle_list()?;
+    if closed {
+        list.reset();
+    }
+    Some(list)
+}
+
+/// A host list for a title's list that was submitted: closed, for the
+/// title's next call on it is a reset ([`idle_list`]).
+#[cfg(windows)]
+fn closed_list() -> Option<crate::host::HostList> {
+    let (list, closed) = idle_list()?;
+    if !closed {
+        list.close();
+    }
+    Some(list)
 }
 
 /// The host sides of lists whose submission has run (submissions are
@@ -297,12 +320,17 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
             continue;
         }
         // As the title's reset does: what the list kept for its commands
-        // goes, its allocators stay.
+        // goes, its allocators stay. Closed here, not on the line's thread
+        // when it is taken ([`closed_list`]).
         host.reset();
+        let closed = crate::host::off_line();
+        if closed {
+            host.close();
+        }
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
-            idle.0.push(Idle(host, bytes));
+            idle.0.push(Idle(host, bytes, closed));
             idle.1 += bytes;
         }
     }
@@ -417,12 +445,11 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             }
             continue;
         }
-        let Some(fresh) = fresh_list() else {
+        // The title's next call on its list is a reset, which wants it
+        // closed.
+        let Some(fresh) = closed_list() else {
             continue;
         };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
@@ -489,12 +516,11 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             order.push(i);
             continue;
         }
-        let Some(fresh) = fresh_list() else {
+        // The title's next call on its list is a reset, which wants it
+        // closed.
+        let Some(fresh) = closed_list() else {
             continue;
         };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
         let list = this.cast_mut().cast::<List>();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
