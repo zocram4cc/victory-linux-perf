@@ -1,4 +1,4 @@
-# VIctory UM
+# VIctory xmem
 
 [VIctory](https://github.com/Marvisak/VIctory) on Linux with an AMD card.
 A patched RADV maps the title's memory straight into the GPU, the way the
