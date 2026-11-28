@@ -67,6 +67,10 @@ pub(crate) struct Shader {
     /// Its part in the light probe (`crate::lightprobe`).
     #[cfg(windows)]
     pub(crate) probe: Option<crate::lightprobe::Role>,
+    /// Whether it is one of the programs that only make the structure
+    /// builder's input geometry ([`bvh_input`]).
+    #[cfg(windows)]
+    pub(crate) bvh_input: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -113,9 +117,12 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .or_insert_with(|| {
             KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            let hash = full.to_hex()[..16].to_owned();
             Arc::new(Shader {
                 stage,
-                hash: full.to_hex()[..16].to_owned(),
+                #[cfg(windows)]
+                bvh_input: stage == "compute" && bvh_input(&hash),
+                hash,
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
@@ -299,6 +306,80 @@ fn of_builder(shaders: &[Arc<Shader>]) -> bool {
     c.part(FourCC::DXIL)
         .and_then(|part| victory_shader::native_programs(part.data).ok())
         .is_some_and(|programs| programs.iter().any(victory_shader::spill::is_spilled))
+}
+
+/// The title's compute programs that skin, deform or unpack geometry for
+/// the ray-tracing structures only, by container hash (41 programs; ported
+/// from ZigZagBoi1/ScarlettPort #399): what they write is read by the
+/// structure builder's stages and by nothing else a frame runs.
+#[cfg(windows)]
+const BVH_INPUTS: [&str; 41] = [
+    "023439f44041b689",
+    "1a77e876755eff12",
+    "207bf7d2f14a87e6",
+    "2cb480030989538a",
+    "3cf39f4495b908d0",
+    "409e2cddc90b6d0d",
+    "4518151afe8c6c09",
+    "60b09004fef7f2f1",
+    "64fe9fa3cb71d57f",
+    "6b39336022e5e663",
+    "71ab19b0a4669299",
+    "75bd00da58a1615c",
+    "77edaab306206e9a",
+    "81dc252c4d183e30",
+    "822e62ded676ef45",
+    "827b309e779552d7",
+    "82a2ad6d07417d36",
+    "878933b499cfa14d",
+    "8f9eb68d0c6dd5cf",
+    "904e7a51e3fab26c",
+    "90a0692af4320129",
+    "952fd529dd779b27",
+    "96d1ef386a0ddcfb",
+    "9db486cee396e315",
+    "9ffcaff533995118",
+    "a567b9ef845fb680",
+    "aff8936db59182b7",
+    "b5a672a450b321e2",
+    "b8e420aac4197681",
+    "c7213dc64c67638b",
+    "c7aef9c89f12051f",
+    "c968414adaaeb93d",
+    "ca2c77616107b128",
+    "cb90a66c7fe122aa",
+    "cd34b8dd52ee5c0c",
+    "ced45910ad577dcb",
+    "d28b4922384831fe",
+    "d3022ba8427bc72c",
+    "dd24ff46af3ae6ee",
+    "e06a21f3cea46973",
+    "f16876929fa64f9f",
+];
+
+#[cfg(windows)]
+fn bvh_input(hash: &str) -> bool {
+    BVH_INPUTS.contains(&hash)
+}
+
+/// `VICTORY_BVH_INPUT_SKIP`: a dispatch of a [`bvh_input`] program is
+/// dropped while the structure builder does not run (it is off unless
+/// `VICTORY_BVH_BUILDER=1`): its output would only be read by the builder.
+/// On by default, `0` turns it off.
+#[cfg(windows)]
+pub(crate) fn bvh_input_skipped(this: This) -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_INPUT_SKIP").is_none_or(|v| v != "0"));
+    #[cfg(feature = "diagnostics")]
+    let on = crate::ab::pick("VICTORY_BVH_INPUT_SKIP").unwrap_or(on);
+    if !on || this.is_null() {
+        return false;
+    }
+    static BUILDER_ALLOWED: OnceLock<bool> = OnceLock::new();
+    if *BUILDER_ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+        return false;
+    }
+    pipeline(this).shaders.iter().any(|s| s.bvh_input)
 }
 
 /// `VICTORY_BVH_QUARANTINE=1`: what the structure builder's stages store

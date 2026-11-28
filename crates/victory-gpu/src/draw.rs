@@ -1113,6 +1113,28 @@ fn dropped(pipeline: usize) {
 /// Dispatches run on the host so far.
 static DISPATCHED: AtomicU64 = AtomicU64::new(0);
 
+/// Dispatches dropped by `VICTORY_BVH_INPUT_SKIP`.
+static BVH_INPUT_SKIPPED: AtomicU64 = AtomicU64::new(0);
+
+/// At a present: every 256th, how many dispatches a frame
+/// `VICTORY_BVH_INPUT_SKIP` dropped since, if any.
+pub(crate) fn bvh_input_report() {
+    static FRAMES: AtomicU64 = AtomicU64::new(0);
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    if !(FRAMES.fetch_add(1, Ordering::Relaxed) + 1).is_multiple_of(256) {
+        return;
+    }
+    let now = BVH_INPUT_SKIPPED.load(Ordering::Relaxed);
+    let n = now - LAST.swap(now, Ordering::Relaxed);
+    if n > 0 {
+        tracing::info!(
+            target: "victory_gpu::host",
+            "VICTORY_BVH_INPUT_SKIP: {:.1} dispatches a frame of the structure builder's input programs dropped (the builder is off)",
+            n as f64 / 256.0
+        );
+    }
+}
+
 pub(crate) fn dispatched() -> u64 {
     DISPATCHED.load(Ordering::Relaxed)
 }
@@ -3203,6 +3225,10 @@ impl State {
                 crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
                 self.list_dropped_roots([x, y, z]);
             }
+            return;
+        }
+        if crate::pipeline::bvh_input_skipped(self.pipeline as This) {
+            BVH_INPUT_SKIPPED.fetch_add(1, Ordering::Relaxed);
             return;
         }
         let Some(p) = crate::pipeline::host_dispatch_pipeline(self.pipeline as This) else {
