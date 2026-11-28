@@ -16,6 +16,8 @@
 //! `present` (swap chain).
 
 #[cfg(windows)]
+mod alloc_retry;
+#[cfg(windows)]
 mod ambient;
 #[cfg(windows)]
 mod lightprobe;

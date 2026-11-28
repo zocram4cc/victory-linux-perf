@@ -49,7 +49,9 @@ static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 pub(crate) fn room(memory: Option<[u64; 4]>) {
     let residency_on = crate::residency::on();
     let tune_32 = crate::residency::is_32gb_host();
-    if !residency_on && !tune_32 {
+    // (With the commit watch a PC of more than 32 GiB short of commit takes
+    // the path below too, `crate::residency::commit_watch`.)
+    if !residency_on && !tune_32 && !crate::residency::trim_needed() && !crate::residency::tight_ram() {
         SPARES.store(spares_for(memory, crate::host::keep_freed(), false, false, false), Ordering::Relaxed);
         return;
     }

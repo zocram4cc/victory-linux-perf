@@ -3541,7 +3541,11 @@ static WINDOW_BAND: std::sync::Mutex<crate::host::RamBand> =
 /// again. Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
     const IDLE_FRAMES: u64 = 4;
-    let budget = window_budget();
+    // A PC of more than 32 GiB has no budget but while short of commit
+    // (`crate::residency::commit_watch`).
+    let budget = window_budget().or_else(|| {
+        (crate::residency::trim_needed() && std::env::var_os("VICTORY_WINDOW_BUDGET_MB").is_none()).then_some(768 << 20)
+    });
     let mut idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
     let mut keep = u64::MAX;
     if let Some(bytes) = budget
@@ -6303,7 +6307,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
 /// tight RAM; `"0"` disables).
 fn shadow_budget_bytes() -> Option<u64> {
     static MB: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    let base = (*MB.get_or_init(|| match std::env::var("VICTORY_SHADOW_BUDGET_MB") {
+    let base = match *MB.get_or_init(|| match std::env::var("VICTORY_SHADOW_BUDGET_MB") {
         Ok(v) => v
             .trim()
             .parse::<u64>()
@@ -6311,7 +6315,12 @@ fn shadow_budget_bytes() -> Option<u64> {
             .filter(|&v| v > 0)
             .map(|v| v.saturating_mul(1 << 20)),
         Err(_) => crate::residency::is_32gb_host().then_some(1536 << 20),
-    }))?;
+    }) {
+        Some(base) => base,
+        // A PC of more than 32 GiB short of commit (`crate::residency::commit_watch`).
+        None if crate::residency::tight_ram() && std::env::var_os("VICTORY_SHADOW_BUDGET_MB").is_none() => 1024 << 20,
+        None => return None,
+    };
     if crate::residency::tight_ram() {
         Some(base.min(1024 << 20))
     } else {

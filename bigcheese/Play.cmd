@@ -219,6 +219,10 @@ rem that a crash shows only its own report.
 set "crashlog=%VICTORY_DATA_DIR%\7952987A\crashes.log"
 set "crashsize=0"
 if exist "%crashlog%" for %%A in ("%crashlog%") do set "crashsize=%%~zA"
+rem The PC's memory for programs is its RAM plus the page file. With the page
+rem file off or small the game can end with "memory allocation of ... bytes
+rem failed" even with 48 GB of RAM: say so before it starts.
+powershell -NoProfile -Command "try { $c = Get-CimInstance Win32_ComputerSystem; if (-not $c.AutomaticManagedPagefile) { $s = @(Get-CimInstance Win32_PageFileSetting); $auto = @($s | Where-Object { $_.MaximumSize -eq 0 }).Count; $max = ($s | Measure-Object MaximumSize -Sum).Sum; if ($s.Count -eq 0 -or ($auto -eq 0 -and $max -lt 16384)) { ''; ('Warning: the page file is ' + $(if ($s.Count -eq 0) { 'off' } else { 'at most ' + $max + ' MB' }) + '. The game can then run out of memory and close'); 'with: memory allocation of ... bytes failed. Set it to System managed size:'; 'Start, type: View advanced system settings, Performance Settings, Advanced,'; 'Virtual memory Change, tick Automatically manage, OK, then restart the PC.'; '' } } } catch {}"
 echo Starting the game (%VICTORY_CONSOLE%). Keep this window open; closing it quits the game.
 echo F3: FPS and VRAM. F7: frame generation off and on.
 "%runner%" run "%VICTORY_GAME_DIR%\%exe_name%" --console %VICTORY_CONSOLE% --execute
@@ -226,6 +230,11 @@ set "code=%errorlevel%"
 if not "%code%"=="0" (
   echo.
   echo The game ended with code %code%. The lines above may say why.
+  if "%code%"=="-1073740791" (
+    echo If a line above says: memory allocation of ... bytes failed, Windows ran
+    echo out of memory for programs ^(RAM plus page file^). Close other programs and
+    echo set the page file to System managed size, then restart the PC.
+  )
   if exist "%crashlog%" powershell -NoProfile -Command "$b = [IO.File]::ReadAllBytes($env:crashlog); $s = [int64]$env:crashsize; if ($b.Length -gt $s) { ''; 'Crash report (from ' + $env:crashlog + '):'; ([Text.Encoding]::UTF8.GetString($b, $s, $b.Length - $s) -split [char]10 | Select-Object -First 60) -join [char]10 }"
   echo.
   echo Asking for help? Send a screenshot of this window, with the crash report

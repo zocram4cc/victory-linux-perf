@@ -448,7 +448,10 @@ struct Counting;
 unsafe impl std::alloc::GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
         // SAFETY: the caller's contract, passed on.
-        let at = unsafe { std::alloc::System.alloc(layout) };
+        let mut at = unsafe { std::alloc::System.alloc(layout) };
+        if at.is_null() {
+            at = crate::alloc_retry::retry(|| unsafe { std::alloc::System.alloc(layout) });
+        }
         if !at.is_null() {
             own(layout.size(), true);
             big(at, layout.size(), true);
@@ -458,7 +461,10 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
 
     unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
         // SAFETY: the caller's contract, passed on.
-        let at = unsafe { std::alloc::System.alloc_zeroed(layout) };
+        let mut at = unsafe { std::alloc::System.alloc_zeroed(layout) };
+        if at.is_null() {
+            at = crate::alloc_retry::retry(|| unsafe { std::alloc::System.alloc_zeroed(layout) });
+        }
         if !at.is_null() {
             own(layout.size(), true);
             big(at, layout.size(), true);
@@ -475,7 +481,10 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
 
     unsafe fn realloc(&self, at: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
         // SAFETY: the caller's contract, passed on.
-        let moved = unsafe { std::alloc::System.realloc(at, layout, size) };
+        let mut moved = unsafe { std::alloc::System.realloc(at, layout, size) };
+        if moved.is_null() {
+            moved = crate::alloc_retry::retry(|| unsafe { std::alloc::System.realloc(at, layout, size) });
+        }
         if !moved.is_null() {
             own(layout.size(), false);
             own(size, true);

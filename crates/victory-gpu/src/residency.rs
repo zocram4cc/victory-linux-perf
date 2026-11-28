@@ -184,15 +184,62 @@ fn next_pressure(was: bool, physical: u64, commit: u64) -> bool {
     }
 }
 
+/// `VICTORY_COMMIT_WATCH=0`: PCs of more than 32 GiB watch nothing (as
+/// before). On by default: there too the trim and tight watermarks follow the
+/// commit left (RAM plus page file), not the free RAM. A 48 GB PC ended with
+/// "memory allocation of 3076541 bytes failed" (28 Nov 2026): nothing of ours
+/// was let go early there, since the watermarks ran on 32 GiB PCs only.
+pub(crate) fn commit_watch() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COMMIT_WATCH").is_none_or(|v| v != "0"))
+}
+
+/// Allocations of ours the system refused, each retried
+/// ([`crate::alloc_retry`]); and how many the sweep has seen.
+pub(crate) static ALLOCATIONS_REFUSED: AtomicU64 = AtomicU64::new(0);
+static REFUSALS_SEEN: AtomicU64 = AtomicU64::new(0);
+
 /// Called by the once-per-second submission sweep. A failed sample keeps the last good state.
 pub(crate) fn refresh() {
     let tune_32 = is_32gb_host();
-    if !on() && !tune_32 {
+    let watch = !tune_32 && commit_watch();
+    if !on() && !tune_32 && !watch {
         return;
     }
     let Some(status) = memory_status() else { return };
     let (physical, commit) = (status.ullAvailPhys, status.ullAvailPageFile);
-    if tune_32 {
+    let refused = ALLOCATIONS_REFUSED.load(Ordering::Relaxed);
+    let newly_refused = refused != REFUSALS_SEEN.swap(refused, Ordering::Relaxed);
+    if newly_refused {
+        tracing::warn!(
+            refused,
+            available_commit_mib = commit >> 20,
+            commit_limit_mib = status.ullTotalPageFile >> 20,
+            physical_free_mib = physical >> 20,
+            "the PC refused memory to us (its RAM and page file are full): waited for it and let go of what we keep spare"
+        );
+    }
+    if watch {
+        // The free RAM is left out: with plenty of it the commit can still run out.
+        let trim = next_trim(trim_needed(), u64::MAX, commit) || newly_refused;
+        let tight = next_tight(tight_ram(), u64::MAX, commit) || newly_refused;
+        if trim != trim_needed() || tight != tight_ram() {
+            tracing::info!(
+                trim,
+                tight,
+                available_commit_mib = commit >> 20,
+                commit_limit_mib = status.ullTotalPageFile >> 20,
+                "commit watch (VICTORY_COMMIT_WATCH): the commit left crossed a watermark; spare memory of ours kept short while it is low"
+            );
+        }
+        TRIM_NEEDED.store(trim, Ordering::Relaxed);
+        TIGHT_RAM.store(tight, Ordering::Relaxed);
+    }
+    if tune_32 && newly_refused {
+        TRIM_NEEDED.store(true, Ordering::Relaxed);
+        TIGHT_RAM.store(true, Ordering::Relaxed);
+    }
+    if tune_32 && !newly_refused {
         let was_trim = trim_needed();
         let trim = next_trim(was_trim, physical, commit);
         if trim != was_trim {

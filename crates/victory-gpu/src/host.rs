@@ -461,7 +461,10 @@ pub(crate) fn ram_idle_ms(avail_phys: Option<u64>) -> u64 {
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),
     };
-    ram_idle_for(effective, keep_freed() && !crate::residency::limited_host_ram())
+    ram_idle_for(
+        effective,
+        keep_freed() && !crate::residency::limited_host_ram() && !crate::residency::trim_needed(),
+    )
 }
 
 fn ram_idle_for(avail_phys: Option<u64>, keep: bool) -> u64 {

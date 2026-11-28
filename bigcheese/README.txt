@@ -57,6 +57,13 @@ working 1.0.2.1 one (names and sizes only; it changes nothing) and names any
 that are missing or the wrong size. If the files are fine, try
 Play-No-FG.cmd: Play-16GB-RAM.cmd with frame generation off for the run.
 
+"memory allocation of ... bytes failed" (exit code -1073740791) means Windows
+ran out of memory for programs: RAM plus the page file, so it happens with
+48 GB of RAM too when the page file is off or small. Set the page file to
+"System managed size" (the launchers warn at the start when it is not) and
+close other programs. Since v2.3.1 the game also waits up to 4 seconds for
+memory and lets go of what it keeps spare before giving up.
+
 
 What you need
 -------------
