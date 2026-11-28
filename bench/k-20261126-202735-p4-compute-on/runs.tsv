@@ -1,0 +1,2 @@
+run	result	entry_s	lines	fps	ms	prep	copies	gpu	back	write_watch	dropped	log
+1	ok	59	5	41.5	24	19	13	0	2	1.6	1340	/home/archie/Games/victory-data/perfiles/kroeeee/logs/run-20261126-202735.txt

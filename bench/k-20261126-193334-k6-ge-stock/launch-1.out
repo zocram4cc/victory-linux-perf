@@ -1,0 +1,6 @@
+log: /home/archie/Games/victory-data/perfiles/kroeeee/logs/run-20261126-193334.txt (release build)
+ProtonFixes[2004502] WARN: Skipping fix execution. Execution conditions are not satisfied.
+Proton: Upgrading prefix from None to 11.0-100 with GE-Proton11-14 (/home/archie/Games/victory-data/perfiles/kroeeee/prefix-ge/)
+ProtonFixes[2004502] WARN: Skipping upscaler setup. Execution conditions are not satisfied.
+ProtonFixes[2004502] WARN: Skipping fix execution. Execution conditions are not satisfied.
+ntsync: up and running.

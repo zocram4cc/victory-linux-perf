@@ -1,0 +1,6 @@
+01:47 p4-hunt-r1-s3 (63 programs, bench/p4-hunt/a.txt at that step): the user: looks ugly (not grey)
+  detail: wrong during the first view of the house (outside): artifacts and low fps; fine once the view cuts to Jason. So something in this set misbehaves in the outdoor view (screenshots taken after the cut may not show it).
+01:48 p4-hunt-r1-s4 (32 programs): the user: half the house missing, flickering
+01:56 p4-hunt-r2-all (508 programs: all candidates minus round 1's culprit): the user: flicker in the intro before the loading screen, half the house missing
+02:02 p4-entry-plain run 2 (NO native programs): the user: half the house missing and flicker. So that symptom is pre-existing (streaming), not P.4; run 1 of the same looked normal.
+03:08 plain run (P.4 off, translator steps 1-5, all normal shaders from the cache): the user: at sunset, looking at the houses fps drops and the picture breaks (white noise on foliage, Jason's arms black once); looking at the sea fps and picture fine. Same as the known dense-area behaviour (K.7/P.4), not a regression (no shader failed to translate before or now).

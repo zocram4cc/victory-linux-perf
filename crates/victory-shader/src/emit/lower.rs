@@ -6514,6 +6514,34 @@ impl<'a> Lower<'a> {
                     self.set(scc, Val::Bit(s));
                     Ok(())
                 }
+                "s_bitreplicate_b64_b32" => {
+                    // Each bit of S0 twice: bits 2i and 2i+1 of the result
+                    // are bit i (the bits spread apart, then doubled).
+                    let a = half(self, 0, 0)?;
+                    self.s.flags |= flags::INT64;
+                    let i64t = self.s.m.int(64);
+                    let mut x = self.s.m.cast(c, Cast::ZExt, a, i64t);
+                    for (shift, mask) in [
+                        (16u64, 0x0000_FFFF_0000_FFFFu64),
+                        (8, 0x00FF_00FF_00FF_00FF),
+                        (4, 0x0F0F_0F0F_0F0F_0F0F),
+                        (2, 0x3333_3333_3333_3333),
+                        (1, 0x5555_5555_5555_5555),
+                    ] {
+                        let k = self.s.m.int_const(i64t, shift as i64);
+                        let m = self.s.m.int_const(i64t, mask as i64);
+                        let t = self.s.m.bin(c, Bin::Shl, x, k);
+                        let t = self.s.m.bin(c, Bin::Or, x, t);
+                        x = self.s.m.bin(c, Bin::And, t, m);
+                    }
+                    let one = self.s.m.int_const(i64t, 1);
+                    let t = self.s.m.bin(c, Bin::Shl, x, one);
+                    let x = self.s.m.bin(c, Bin::Or, x, t);
+                    let (l, h) = self.split64(x);
+                    self.set(lo, Val::I32(l));
+                    self.set(hi, Val::I32(h));
+                    Ok(())
+                }
                 "s_flbit_i32_b64" => {
                     // The first set bit from the top of 64 (DXIL's first bit
                     // high counts from the top too), -1 for none.
@@ -6830,6 +6858,23 @@ impl<'a> Lower<'a> {
                     let nb = self.s.m.bin(c, Bin::Xor, bit, ones);
                     (self.s.m.bin(c, Bin::And, old, nb), None)
                 }
+            }
+            "s_sext_i32_i16" => {
+                let a = src32(self, 0)?;
+                let k16 = self.s.m.i32(16);
+                let x = self.s.m.bin(c, Bin::Shl, a, k16);
+                (self.s.m.bin(c, Bin::AShr, x, k16), None)
+            }
+            "s_absdiff_i32" => {
+                // |S0 - S1| (wrapping); SCC: the result is not 0.
+                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                let d = self.s.m.bin(c, Bin::Sub, a, b);
+                let z = self.s.m.i32(0);
+                let neg = self.s.m.bin(c, Bin::Sub, z, d);
+                let below = self.s.m.cmp(c, pred::SLT, d, z);
+                let r = self.s.m.select(c, below, neg, d);
+                let nonzero = self.s.m.cmp(c, pred::NE, r, z);
+                (r, Some(nonzero))
             }
             "s_bfm_b32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
