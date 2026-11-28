@@ -946,6 +946,173 @@ impl Layout {
     }
 }
 
+/// One contiguous run of a [`CopyTable`]: the same on every row of the
+/// subresource. `tiled` is relative to the row's [`CopyRow::tiled`] (before
+/// the row's XOR), `linear` to its [`CopyRow::linear`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableRun {
+    pub tiled: u64,
+    pub linear: u32,
+    pub len: u32,
+}
+
+/// One row (of one depth slice) of a [`CopyTable`]: run `r` copies
+/// `tiled + (r.tiled ^ xor)` to `linear + r.linear`, `r.len` bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CopyRow {
+    pub tiled: u64,
+    pub xor: u32,
+    pub linear: u64,
+}
+
+/// [`Layout::detile`] of one subresource as data instead of a copy: the
+/// contiguous runs it copies, for another copier (a compute shader) to do
+/// the same copy. Runs repeat on every row, so the table holds them once
+/// and the rows once: `runs.len() + rows.len()` entries, not their product.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyTable {
+    pub runs: Vec<TableRun>,
+    pub rows: Vec<CopyRow>,
+    /// Bytes of tiled memory the detile requires, as [`Layout::detile`]
+    /// requires them ([`Layout::bytes_from`] of the mip).
+    pub tiled_bytes: u64,
+    /// Bytes of linear memory the rows reach (the last row's end).
+    pub linear_bytes: u64,
+}
+
+impl CopyTable {
+    /// Runs plus rows: what a copier is handed.
+    pub fn entries(&self) -> usize {
+        self.runs.len() + self.rows.len()
+    }
+
+    /// Bytes the table copies.
+    pub fn copied_bytes(&self) -> u64 {
+        let row: u64 = self.runs.iter().map(|r| u64::from(r.len)).sum();
+        row * self.rows.len() as u64
+    }
+
+    /// Whether every source address, destination address and length the
+    /// table makes is a multiple of `to` (a power of two): checked on the
+    /// parts, so a `true` holds for every row and run combined.
+    pub fn aligned(&self, to: u64) -> bool {
+        debug_assert!(to.is_power_of_two());
+        let mask = to - 1;
+        self.runs
+            .iter()
+            .all(|r| (r.tiled | u64::from(r.linear) | u64::from(r.len)) & mask == 0)
+            && self
+                .rows
+                .iter()
+                .all(|r| (r.tiled | u64::from(r.xor) | r.linear) & mask == 0)
+    }
+
+    /// The copy the table describes, on the CPU, with every run checked
+    /// against both buffers: what a shader given the table must do.
+    pub fn apply(&self, tiled: &[u8], linear: &mut [u8]) -> Result<(), Error> {
+        if (tiled.len() as u64) < self.tiled_bytes || (linear.len() as u64) < self.linear_bytes {
+            return Err(Error::TooSmall);
+        }
+        for row in &self.rows {
+            for run in &self.runs {
+                let from = row
+                    .tiled
+                    .checked_add(run.tiled ^ u64::from(row.xor))
+                    .and_then(|at| usize::try_from(at).ok())
+                    .ok_or(Error::TooSmall)?;
+                let to = row
+                    .linear
+                    .checked_add(u64::from(run.linear))
+                    .and_then(|at| usize::try_from(at).ok())
+                    .ok_or(Error::TooSmall)?;
+                let n = run.len as usize;
+                let src = tiled.get(from..from.checked_add(n).ok_or(Error::TooSmall)?).ok_or(Error::TooSmall)?;
+                let dst = linear.get_mut(to..to.checked_add(n).ok_or(Error::TooSmall)?).ok_or(Error::TooSmall)?;
+                dst.copy_from_slice(src);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Layout {
+    /// The runs [`Layout::detile`] of mip `mip` of array slice `slice` (3D:
+    /// every depth slice, `slice` 0) copies into rows `row_pitch` bytes
+    /// apart and depth slices `depth_pitch` apart, as a [`CopyTable`]. The
+    /// same checks as the detile, and the same runs in the same order: for
+    /// a D3D12 upload pass the footprint's `RowPitch` (and `RowPitch` times
+    /// its rows) and add the footprint's offset to every linear address.
+    pub fn copy_table(&self, mip: u32, slice: u32, row_pitch: usize, depth_pitch: usize) -> Result<CopyTable, Error> {
+        let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
+        let depth = m.depth;
+        if m.width == 0 || m.height == 0 || depth == 0 {
+            return Err(Error::Invalid);
+        }
+        let first = if self.desc.dimension == Dimension::Tex3d {
+            if slice != 0 {
+                return Err(Error::Invalid);
+            }
+            0
+        } else {
+            slice
+        };
+        if first >= self.slices {
+            return Err(Error::Invalid);
+        }
+        if !self.addressable() {
+            return Err(Error::Unsupported);
+        }
+        let n = self.desc.element_bytes as usize;
+        let bytes = m.width as usize * n;
+        let slice_bytes = (m.height as usize - 1)
+            .checked_mul(row_pitch)
+            .and_then(|offset| offset.checked_add(bytes))
+            .ok_or(Error::TooSmall)?;
+        if row_pitch < bytes || bytes > u32::MAX as usize || (depth > 1 && depth_pitch < slice_bytes) {
+            return Err(Error::TooSmall);
+        }
+        let need = (depth as usize - 1)
+            .checked_mul(depth_pitch)
+            .and_then(|offset| offset.checked_add(slice_bytes))
+            .ok_or(Error::TooSmall)?;
+        let run = |tiled: u64, linear: usize, len: usize| TableRun {
+            tiled,
+            linear: linear as u32,
+            len: len as u32,
+        };
+        let mut runs = Vec::new();
+        let mut rows = Vec::with_capacity(depth as usize * m.height as usize);
+        let linear_row = |z: u32, y: u32| (z as usize * depth_pitch + y as usize * row_pitch) as u64;
+        if self.desc.swizzle == Swizzle::LINEAR {
+            runs.push(run(0, 0, bytes));
+            for z in 0..depth {
+                let (s, _) = self.split(first + z);
+                let base = u64::from(s) * self.slice_size + m.offset;
+                for y in 0..m.height {
+                    let tiled = base + u64::from(y) * u64::from(m.pitch) * n as u64;
+                    rows.push(CopyRow { tiled, xor: 0, linear: linear_row(z, y) });
+                }
+            }
+        } else {
+            runs.extend(TilePlan::new(self, m, false).runs.into_iter()
+                .map(|(tiled, at, len)| run(tiled as u64, at, len)));
+            for z in 0..depth {
+                let (s, inner) = self.split(first + z);
+                let base = u64::from(s) * self.slice_size + m.offset;
+                for y in 0..m.height {
+                    rows.push(CopyRow { tiled: base + self.row(m, y, inner), xor: 0, linear: linear_row(z, y) });
+                }
+            }
+        }
+        Ok(CopyTable {
+            runs,
+            rows,
+            tiled_bytes: self.bytes_from(mip),
+            linear_bytes: need as u64,
+        })
+    }
+}
+
 fn copy_run<const DETILE: bool>(
     src: &[u8],
     dst: &mut [u8],
@@ -2594,5 +2761,158 @@ mod tests {
                 scalar_ms / opt_ms,
             );
         }
+    }
+    /// Every layout family the copies handle: linear, the plain tiled
+    /// modes at every element size, block compression, arrays, thin and
+    /// thick 3D. The host rejects XOR layouts before uploading.
+    fn copy_table_cases() -> Vec<Layout> {
+        let mut out = Vec::new();
+        for swizzle in [
+            Swizzle::LINEAR,
+            Swizzle::SW_256B_S,
+            Swizzle::SW_256B_D,
+            Swizzle::SW_4KB_S,
+            Swizzle::SW_4KB_D,
+            Swizzle::SW_64KB_S,
+            Swizzle::SW_64KB_D,
+        ] {
+            for n in [1, 2, 4, 8, 16] {
+                out.push(Layout::new(&Desc { depth: 2, ..desc(73, 39, 7, n, swizzle) }).unwrap());
+                out.push(Layout::new(&desc(256, 128, 9, n, swizzle)).unwrap());
+            }
+            out.push(Layout::new(&Desc { block: 4, ..desc(1000, 700, 10, 16, swizzle) }).unwrap());
+            out.push(Layout::new(&Desc { block: 4, ..desc(109, 71, 6, 8, swizzle) }).unwrap());
+        }
+        out.push(Layout::new(&Desc { dimension: Dimension::Tex3d, depth: 16, ..desc(64, 32, 7, 4, Swizzle::SW_4KB_S) }).unwrap());
+        out.push(Layout::new(&Desc { dimension: Dimension::Tex3d, depth: 9, ..desc(40, 24, 5, 8, Swizzle::SW_64KB_S) }).unwrap());
+        out
+    }
+
+    /// The table, applied, writes exactly what the detile writes, byte for
+    /// byte and padding included, with odd and with 256-byte row pitches.
+    #[test]
+    fn copy_tables_detile_as_the_walk_does() {
+        let mut checked = 0;
+        for l in copy_table_cases() {
+            let tiled: Vec<u8> = (0..l.size).map(|i| (i.wrapping_mul(0x9e37_79b9) >> 24) as u8).collect();
+            let n = l.desc.element_bytes as usize;
+            let slices = if l.desc.dimension == Dimension::Tex3d { 1 } else { l.slices };
+            for slice in 0..slices {
+                for mip in 0..l.desc.mips {
+                    let m = l.mips[mip as usize];
+                    let bytes = m.width as usize * n;
+                    for pitch in [bytes + 3, bytes.next_multiple_of(256)] {
+                        let plane = pitch * m.height as usize + 5;
+                        let len = (m.depth as usize - 1) * plane + (m.height as usize - 1) * pitch + bytes;
+                        let mut walked = vec![0xcc; len];
+                        let mut tabled = walked.clone();
+                        l.detile(&tiled, mip, slice, &mut walked, pitch, plane).unwrap();
+                        let table = l.copy_table(mip, slice, pitch, plane).unwrap();
+                        assert_eq!(table.linear_bytes as usize, len);
+                        assert_eq!(table.copied_bytes(), (bytes * m.height as usize * m.depth as usize) as u64);
+                        table.apply(&tiled, &mut tabled).unwrap();
+                        assert!(walked == tabled, "{:?} mip {mip} slice {slice} pitch {pitch}", l.desc);
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 1000, "{checked}");
+    }
+
+    /// The table refuses what the detile refuses, and a buffer too small
+    /// for it is refused, not overrun.
+    #[test]
+    fn copy_tables_check_as_the_walk_does() {
+        let l = Layout::new(&Desc { block: 4, ..desc(256, 256, 7, 16, Swizzle::SW_64KB_S) }).unwrap();
+        assert_eq!(l.copy_table(7, 0, 4096, 0), Err(Error::Invalid));
+        assert_eq!(l.copy_table(0, 1, 4096, 0), Err(Error::Invalid));
+        assert_eq!(l.copy_table(0, 0, 64 * 16 - 1, 0), Err(Error::TooSmall));
+        let table = l.copy_table(0, 0, 1024, 0).unwrap();
+        let tiled = vec![0u8; table.tiled_bytes as usize];
+        let mut linear = vec![0u8; table.linear_bytes as usize];
+        assert_eq!(table.apply(&tiled[..tiled.len() - 1], &mut linear), Err(Error::TooSmall));
+        let short = linear.len() - 1;
+        assert_eq!(table.apply(&tiled, &mut linear[..short]), Err(Error::TooSmall));
+        assert_eq!(table.apply(&tiled, &mut linear), Ok(()));
+        let r = Layout::new(&desc(64, 64, 1, 4, Swizzle::SW_64KB_R_X)).unwrap();
+        assert_eq!(r.copy_table(0, 0, 256, 0), Err(Error::Unsupported));
+        let deep = Layout::new(&Desc { dimension: Dimension::Tex3d, depth: 4, ..desc(16, 16, 1, 4, Swizzle::SW_4KB_S) }).unwrap();
+        assert_eq!(deep.copy_table(0, 1, 64, 1024), Err(Error::Invalid));
+        assert_eq!(deep.copy_table(0, 0, 64, usize::MAX), Err(Error::TooSmall));
+    }
+
+    /// 4-byte alignment: what a shader copying 32-bit words needs. Every
+    /// element of 4 bytes or more, block compression included, is aligned at
+    /// any 256-byte pitch; 1- and 2-byte elements in tiled modes are not.
+    #[test]
+    fn copy_table_alignment() {
+        for l in copy_table_cases() {
+            let n = l.desc.element_bytes as usize;
+            for mip in 0..l.desc.mips {
+                let m = l.mips[mip as usize];
+                let pitch = (m.width as usize * n).next_multiple_of(256);
+                let table = l.copy_table(mip, 0, pitch, pitch * m.height as usize).unwrap();
+                if n >= 4 {
+                    assert!(table.aligned(4), "{:?} mip {mip}", l.desc);
+                }
+                if !table.aligned(4) {
+                    // Then some address or length really is unaligned.
+                    let odd = table.runs.iter().any(|r| (r.tiled | u64::from(r.linear) | u64::from(r.len)) & 3 != 0)
+                        || table.rows.iter().any(|r| (r.tiled | u64::from(r.xor) | r.linear) & 3 != 0);
+                    assert!(odd);
+                }
+            }
+        }
+        // R8 in a 64 KiB `S` block: x0-x3 are address bits 0-3, so a wide
+        // mip's runs are 16 bytes; its 2-texel mip and an odd width are not.
+        let r8 = Layout::new(&desc(256, 256, 9, 1, Swizzle::SW_64KB_S)).unwrap();
+        assert!(r8.copy_table(0, 0, 256, 65536).unwrap().aligned(4));
+        assert!(!r8.copy_table(7, 0, 256, 512).unwrap().aligned(4));
+        let odd = Layout::new(&desc(73, 39, 1, 1, Swizzle::SW_64KB_S)).unwrap();
+        assert!(!odd.copy_table(0, 0, 256, 256 * 39).unwrap().aligned(4));
+    }
+
+    /// The tables' sizes for the textures that matter (BC7, 1K-4K, full
+    /// chains), printed with `--nocapture`: a few thousand entries at most,
+    /// against megabytes of texels.
+    #[test]
+    fn copy_table_sizes() {
+        for (w, swizzle) in [
+            (1024, Swizzle::SW_64KB_S),
+            (2048, Swizzle::SW_64KB_S),
+            (4096, Swizzle::SW_64KB_S),
+            (4096, Swizzle::SW_64KB_D),
+            (4096, Swizzle::SW_4KB_S),
+        ] {
+            let mips = 32 - u32::leading_zeros(w);
+            let d = Desc { block: 4, ..desc(w, w, mips, 16, swizzle) };
+            let l = Layout::new(&d).unwrap();
+            let (mut entries, mut runs0, mut rows0, mut longest) = (0, 0, 0, 0);
+            for mip in 0..mips {
+                let m = l.mips[mip as usize];
+                let pitch = (m.width as usize * 16).next_multiple_of(256);
+                let t = l.copy_table(mip, 0, pitch, pitch * m.height as usize).unwrap();
+                assert!(t.aligned(4));
+                if mip == 0 {
+                    (runs0, rows0) = (t.runs.len(), t.rows.len());
+                }
+                longest = longest.max(t.runs.iter().map(|r| r.len).max().unwrap_or(0));
+                entries += t.entries();
+            }
+            // Runs and rows of the top mip are its width and height in
+            // blocks at most.
+            assert!(runs0 <= (w / 4) as usize && rows0 == (w / 4) as usize);
+            println!(
+                "BC7 {w}x{w} {swizzle:?}: {mips} mips, {entries} entries in all (mip 0: {runs0} runs + {rows0} rows), \
+                 longest run {longest} bytes, {} MiB of texels",
+                l.size >> 20
+            );
+        }
+    }
+    #[test]
+    fn copy_tables_reject_overlapping_depth_slices() {
+        let deep = Layout::new(&Desc { dimension: Dimension::Tex3d, depth: 4, ..desc(16, 16, 1, 4, Swizzle::SW_4KB_S) }).unwrap();
+        assert_eq!(deep.copy_table(0, 0, 64, 1023), Err(Error::TooSmall));
     }
 }

@@ -1591,6 +1591,12 @@ fn create() -> windows::core::Result<Host> {
 }
 
 impl Host {
+    /// The last value of the queue's fence the card has reached.
+    pub(crate) fn completed(&self) -> u64 {
+        // SAFETY: this fence belongs to the live host queue.
+        unsafe { self.fence.GetCompletedValue() }
+    }
+
     /// The driver's version, as the system counts it (0: not known).
     pub(crate) fn driver(&self) -> i64 {
         let adapter = self.adapter.as_ref();
@@ -3774,6 +3780,7 @@ enum Step {
     /// A sparse upload consumes the staging buffer's held-mip mask in the
     /// next step. Complete this refresh before that metadata is read.
     TextureReady(std::sync::Arc<crate::texture::Staging>),
+    GpuTexture(std::sync::Arc<crate::texture::Staging>, std::sync::Arc<crate::detile::Upload>),
     /// Reads a CPU-written linear movie plane into a per-list upload buffer.
     Plane((usize, usize), Box<dyn Fn() + Send>),
     /// A title buffer copy that the list does on the card ([`place`]): what
@@ -4699,7 +4706,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         return Some(WHY_READ);
                     }
                 }
-                Step::Texture(staging) | Step::TextureReady(staging) => {
+                Step::Texture(staging) | Step::TextureReady(staging) | Step::GpuTexture(staging, _) => {
                     let (at, len) = staging.memory();
                     if touches(written, at, at + len) {
                         if count {
@@ -7952,6 +7959,20 @@ impl Host {
         batch.fill();
         stage.next("submit: the last refreshes");
         batch.flush(None);
+        // The GPU detile's dispatches (`crate::detile`), in front of the lists that read them.
+        if crate::detile::on()
+            && let Some(pre) = crate::detile::pre_list()
+        {
+            lists.insert(0, Some(pre));
+            #[cfg(feature = "diagnostics")]
+            {
+                marks.iter_mut().for_each(|m| m.0 += 1);
+                marks.insert(0, (0, crate::copystat::Timed::Other));
+            }
+            for first in firsts.iter_mut().skip(1) {
+                *first += 1;
+            }
+        }
         crate::watch::ask_once_end();
         #[cfg(feature = "diagnostics")]
         split.part(2);
@@ -8049,6 +8070,9 @@ impl Host {
                 }
                 self.queue.Signal(&self.fence, *submitted)
             };
+            if crate::detile::on() {
+                crate::detile::sent(*submitted);
+            }
             awake::sent(&self.device);
             #[cfg(feature = "diagnostics")]
             crate::timeline::sent(sending, *submitted, stamp);
@@ -8167,6 +8191,9 @@ impl Host {
             }
         }
         mark_frame_preparations(runs);
+        if crate::detile::on() {
+            crate::detile::sent(*submitted);
+        }
         let _ = &firsts;
         let fence = *submitted;
         FINISHED.store(this_submission, Ordering::Release);
@@ -9816,6 +9843,10 @@ impl HostList {
         self.deferred().copies.push(Step::TextureReady(staging));
     }
 
+    pub(crate) fn defer_gpu_texture(&self, staging: std::sync::Arc<crate::texture::Staging>, upload: std::sync::Arc<crate::detile::Upload>) {
+        self.deferred().copies.push(Step::GpuTexture(staging, upload));
+    }
+
     /// A copy source owned exclusively by this list until reset after its
     /// last execution. A different list can prepare its movie plane concurrently.
     pub(crate) fn plane_upload(
@@ -9961,6 +9992,11 @@ impl HostList {
                         add(C::GpuWrites, 1);
                         add(C::SnapshotUs, snapshot.elapsed().as_micros() as u64);
                     }
+                    continue;
+                }
+                Step::GpuTexture(staging, upload) => {
+                    batch.texture_due(staging);
+                    staging.gpu_fill(upload);
                     continue;
                 }
                 Step::Texture(staging) => {

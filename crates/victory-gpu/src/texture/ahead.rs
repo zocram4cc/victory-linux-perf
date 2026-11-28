@@ -122,11 +122,15 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
         return turned_down();
     }
     super::PICKING.set(Some(there));
-    let staging = super::staging(resource, &copy, first);
-    super::PICKING.set(None);
-    let Some(staging) = staging.filter(|s| {
+    let staging = super::staging(resource, &copy, first).filter(|s| {
+        // The independent copy queue needs a mapped upload, even when the
+        // direct queue detiles on the GPU. Apply the speculative residency
+        // check while PICKING still describes this request.
         !s.on_demand && s.first == s.level0 && !s.uploaded.load(Relaxed) && s.once.load(Relaxed)
-    }) else {
+            && s.ensure_cpu(|bytes| super::cpu_staging(crate::host::host()?, bytes, || format!("ahead staging of {resource:?}")))
+    });
+    super::PICKING.set(None);
+    let Some(staging) = staging else {
         copy.ahead.store(LISTED, Relaxed);
         return turned_down();
     };
@@ -288,6 +292,8 @@ impl Job {
     unsafe fn record(&self, list: &ID3D12GraphicsCommandList) {
         let (s, texture) = (&self.staging, &self.copy.texture);
         crate::launcher_stats::TEXTURE_UPLOAD_BYTES.fetch_add(s.bytes, Relaxed);
+        // Jobs are accepted only with a CPU buffer, held until the copy fence.
+        let cpu = s.cpu.get().expect("copy-queue job holds CPU staging");
         for (i, footprint) in s.footprints.iter().enumerate() {
             let to = D3D12_TEXTURE_COPY_LOCATION {
                 // SAFETY: a borrowed pointer the location never releases.
@@ -297,10 +303,10 @@ impl Job {
             };
             let from = D3D12_TEXTURE_COPY_LOCATION {
                 // SAFETY: as above.
-                pResource: unsafe { std::mem::transmute_copy(&s.buffer) },
+                pResource: unsafe { std::mem::transmute_copy(&cpu.buffer) },
                 Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
                 Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: s.base + footprint.Offset, ..*footprint },
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: cpu.base + footprint.Offset, ..*footprint },
                 },
             };
             // SAFETY: the caller's.

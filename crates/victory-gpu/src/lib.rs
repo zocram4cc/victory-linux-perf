@@ -41,6 +41,8 @@ mod faultbook;
 #[cfg(windows)]
 mod cores;
 pub mod descriptor;
+#[cfg(windows)]
+mod detile;
 pub mod device;
 #[cfg(windows)]
 mod launcher_stats;
