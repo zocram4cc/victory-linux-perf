@@ -27,8 +27,14 @@ Which launcher?
   Play-16GB-RAM.cmd  the 16 GB tweaks: the game sees a Series S (about 7.6 GB
                      for the game instead of 13.5), more buffers in the card's
                      memory (the card window line at 90%), smaller upload and
-                     streaming memory. Needed on 16 GB of RAM.
-  Play.cmd           victory-amd's normal settings: Series X, default memory
+                     streaming memory. Needed on 16 GB of RAM. Sized for a
+                     16 GB graphics card.
+  Play-16GB-RAM-8GB-VRAM.cmd
+                     Play-16GB-RAM.cmd with the card's memory sized for an
+                     8 GB graphics card (2 GB of game buffers on the card
+                     instead of 6, 1 GB of buffer copies instead of 4). A
+                     first guess, not yet measured on an 8 GB card.
+  Play.cmd          victory-amd's normal settings: Series X, default memory
                      budgets, the card window line at 80%.
   Play-No-FG.cmd     Play-16GB-RAM.cmd with frame generation off, for a
                      game that crashes at the start or a card it fails on.

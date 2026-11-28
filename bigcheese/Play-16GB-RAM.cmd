@@ -85,6 +85,8 @@ rem this file to use it anyway.
 if not defined VICTORY_CONSOLE set "VICTORY_CONSOLE=series-s"
 
 rem --- 16 GB of RAM (measured on cool_fox, which shares this memory code) ---
+rem The card's memory below is sized for a 16 GB graphics card. With an 8 GB
+rem card use Play-16GB-RAM-8GB-VRAM.cmd: it sets smaller sizes, then runs this.
 rem Buffers the CPU fills go in the card's memory (needs Resizable BAR / Smart
 rem Access Memory on) instead of the PC's memory; at 1024 the game ran out of
 rem memory in the prologue, at 6144 it ran 15 minutes without a crash.
