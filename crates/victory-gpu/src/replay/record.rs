@@ -140,8 +140,14 @@ pub fn sheets_from(var: impl Fn(&str) -> Option<String>) -> Option<super::trigge
     })
 }
 
-/// The automatic trigger's defaults: see [`sheets_from`].
-pub const SHEETS_JUMP: f32 = 1.0;
+/// The automatic trigger's defaults: see [`sheets_from`]. A draw's
+/// largest jump over 2.0, calibrated by replay against the decoding lane's
+/// census of spike vertices: 49 of 56 draws with spikes in corridor3, 16 of
+/// 16 in multi2/capture-1, 60 of 64 in multi3/capture-3, the giant sheets of
+/// multi3/capture-4 (20 of 34 draws, and 12 of lists the census does not
+/// cover); no draw in multi3/capture-1 (cafe, close characters up to 1.7) or
+/// in multi1/capture-2 (largest 0.9).
+pub const SHEETS_JUMP: f32 = 2.0;
 pub const SHEETS_MIN: u32 = 1;
 
 fn parse_at(text: &str) -> At {
