@@ -251,6 +251,28 @@ pub(crate) fn not_resident() -> D3D12_HEAP_FLAGS {
     if wait_resident() { D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT } else { D3D12_HEAP_FLAG_NONE }
 }
 
+/// Whether the short-lived buffers of [`Host::upload_buffer`],
+/// [`Host::shared_buffer`] and [`Host::uav_buffer`] wait for [`resident`] /
+/// [`mapped`] as other new memory does (`VICTORY_BUFFER_NO_WAIT=1`: they are
+/// made resident and not waited for; off by default; in-run A/B-able). They are
+/// named only by lists recorded after they are made, and those wait for the
+/// system's mapping on submission; the page faults [`wait_resident`] guards
+/// against were descriptor slots of textures read by lists sent before. In
+/// run sc-tl1 the waits were ~4 ms a frame of the list threads and the
+/// submitting thread, one at a time behind [`mapped`]'s lock.
+/// After eikkapine/victory-amd 2b88c2e80 (`VICTORY_BUFFER_WAIT`).
+fn buffer_wait() -> bool {
+    static BIT: std::sync::LazyLock<Option<u32>> = std::sync::LazyLock::new(|| crate::ab::bit("VICTORY_BUFFER_NO_WAIT"));
+    static NO: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("VICTORY_BUFFER_NO_WAIT").is_some_and(|v| v == "1"));
+    !BIT.map_or(*NO, crate::ab::on)
+}
+
+/// The flags of such a buffer: as other new memory if it is waited for, else
+/// resident from the start.
+fn buffer_flags(wait: bool) -> D3D12_HEAP_FLAGS {
+    if wait { not_resident() } else { D3D12_HEAP_FLAG_NONE }
+}
+
 /// A queue of its own that new memory is waited for with ([`mapped`]).
 struct Aside {
     queue: ID3D12CommandQueue,
@@ -10161,12 +10183,13 @@ impl Host {
         };
         let mut buffer: Option<ID3D12Resource> = None;
         let mut data = std::ptr::null_mut();
+        let wait = buffer_wait();
         // SAFETY: plain creation and mapping of an upload buffer.
         let made = unsafe {
             self.device
                 .CreateCommittedResource(
                     &heap,
-                    not_resident(),
+                    buffer_flags(wait),
                     &desc,
                     D3D12_RESOURCE_STATE_GENERIC_READ,
                     None,
@@ -10174,7 +10197,9 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
+                    if wait {
+                        resident(&self.device, b)?;
+                    }
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -11357,12 +11382,13 @@ impl Host {
         };
         let mut buffer: Option<ID3D12Resource> = None;
         let mut data = std::ptr::null_mut();
+        let wait = buffer_wait();
         // SAFETY: plain creation and mapping of a CPU-visible buffer.
         let made = unsafe {
             self.device
                 .CreateCommittedResource(
                     &heap,
-                    not_resident(),
+                    buffer_flags(wait),
                     &desc,
                     D3D12_RESOURCE_STATE_COMMON,
                     None,
@@ -11370,8 +11396,10 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
-                    mapped(&self.device)?;
+                    if wait {
+                        resident(&self.device, b)?;
+                        mapped(&self.device)?;
+                    }
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -11497,11 +11525,12 @@ impl Host {
             ..Default::default()
         };
         let mut buffer: Option<ID3D12Resource> = None;
+        let wait = buffer_wait();
         // SAFETY: plain creation of a device-local buffer.
         let made = unsafe {
             self.device.CreateCommittedResource(
                 &heap,
-                not_resident(),
+                buffer_flags(wait),
                 &desc,
                 D3D12_RESOURCE_STATE_COMMON,
                 None,
@@ -11512,7 +11541,11 @@ impl Host {
         if let Some(b) = &buffer {
             crate::book::made(b, || "an unordered access buffer".into());
         }
-        let made = made.and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident(&self.device, b))).and_then(|()| mapped(&self.device));
+        let made = if wait {
+            made.and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident(&self.device, b))).and_then(|()| mapped(&self.device))
+        } else {
+            made
+        };
         match made {
             Ok(()) => buffer,
             Err(e) => {
