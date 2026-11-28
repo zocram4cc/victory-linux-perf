@@ -220,11 +220,23 @@ rem card (13.7-14.3 real fps against 9.4 waiting; VICTORY_FRAMEGEN_AHEAD=0: wait
 if not defined VICTORY_FRAMEGEN_AHEAD set "VICTORY_FRAMEGEN_AHEAD=1"
 
 
-rem victory-amd's list of the pipelines the game needs first (faster first
-rem loading), put in the cache once.
-if exist "%~dp0early-pipelines.txt" if not exist "%VICTORY_CACHE_DIR%\pipelines\early-pipelines.txt" (
+rem The list of the pipelines the game needs first (faster first loading):
+rem put in the cache, and added to the cache's own list whenever a new zip
+rem brings a changed one (the game keeps each pipeline once).
+set "early=%VICTORY_CACHE_DIR%\pipelines\early-pipelines.txt"
+set "shipped=%VICTORY_CACHE_DIR%\pipelines\early-pipelines-shipped.txt"
+if exist "%~dp0early-pipelines.txt" (
   if not exist "%VICTORY_CACHE_DIR%\pipelines" mkdir "%VICTORY_CACHE_DIR%\pipelines"
-  copy /y "%~dp0early-pipelines.txt" "%VICTORY_CACHE_DIR%\pipelines\early-pipelines.txt" >nul
+  fc /b "%~dp0early-pipelines.txt" "%shipped%" >nul 2>&1 || (
+    if exist "%early%" (
+      >"%early%.nl" echo.
+      copy /b "%early%"+"%early%.nl"+"%~dp0early-pipelines.txt" "%early%.new" >nul && move /y "%early%.new" "%early%" >nul
+      del "%early%.nl" 2>nul
+    ) else (
+      copy /y "%~dp0early-pipelines.txt" "%early%" >nul
+    )
+    copy /y "%~dp0early-pipelines.txt" "%shipped%" >nul
+  )
 )
 
 rem ---------------------------------------------------------------- shaders, once
