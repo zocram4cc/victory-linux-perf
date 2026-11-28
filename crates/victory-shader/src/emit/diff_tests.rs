@@ -578,6 +578,91 @@ const CS_CASES: &[(&str, &str)] = &[
             outb.Store2(8 * n, uint2(uint(q >> 7) ^ z, uint(w >> (n & 15))));
         }"#,
     ),
+    // Wave-wide boolean tests stored as data without `v_mbcnt`: SCC of a mask
+    // operation read via `s_cselect_b32` and `s_not_b64`.
+    (
+        "wave any and all as data",
+        r#"CS {
+            uint n = d.y * 16 + d.x;
+            uint x = raw.Load(4 * (n & 31));
+            bool a = (x & 3) == 1;
+            bool b = (d.x + d.y) < 32;
+            uint r0 = WaveActiveAnyTrue(a) ? 11 : 22;
+            uint r1 = WaveActiveAllTrue(b) ? 33 : 44;
+            uint r2 = WaveActiveAllTrue(!a) ? 55 : 66;
+            uint r3 = WaveActiveAllEqual(g.x) ? 77 : 88;
+            outb.Store4(16 * n, uint4(r0, r1, r2, r3));
+        }"#,
+    ),
+    // Lane masks carried across divergent branches and reconvergence, then
+    // read as ballots and bit counts.
+    (
+        "lane mask across branches",
+        r#"CS {
+            uint n = d.y * 16 + d.x;
+            uint x = raw.Load(4 * (n & 31));
+            bool c = false;
+            [branch] if ((i & 3) != 0) {
+                c = (x & 1) != 0;
+            } else {
+                c = (x & 2) != 0;
+            }
+            uint4 bal = WaveActiveBallot(c);
+            uint cnt = WaveActiveCountBits(c);
+            uint pre = WavePrefixCountBits(c);
+            outb.Store4(16 * n, uint4(bal.x, bal.y, cnt, pre));
+        }"#,
+    ),
+    // Negated and combined lane masks inside and outside divergent branches
+    // (exercises scalar bitwise mask reconstruction and `s_bcnt0`/`s_ff0`).
+    (
+        "negated and combined lane masks",
+        r#"CS {
+            uint n = d.y * 16 + d.x;
+            uint x = raw.Load(4 * (n & 31));
+            bool a = (x & 1) != 0;
+            uint4 ba = WaveActiveBallot(a);
+            uint4 nba = ~ba;
+            uint r0 = countbits(nba.x) + countbits(nba.y);
+            uint r1 = firstbitlow(nba.x);
+            uint r2 = 0, r3 = 0;
+            [branch] if ((i & 1) == 0) {
+                bool b = (x & 4) != 0;
+                uint4 bb = WaveActiveBallot(b);
+                uint4 diff = ba & ~bb;
+                r2 = countbits(diff.x) + countbits(diff.y);
+                r3 = firstbitlow(diff.x | diff.y);
+            }
+            outb.Store4(16 * n, uint4(r0, r1, r2, r3));
+        }"#,
+    ),
+    // Whole-wave reductions with hoisted non-inline identities (+inf, -inf,
+    // INT_MAX, INT_MIN) and bit/prefix ops inside a divergent branch.
+    (
+        "wave min and max of floats and ints",
+        r#"CS {
+            uint n = d.y * 16 + d.x;
+            float f = float(int(n) - 120) * k.x + float(i & 7) * 0.25;
+            int si = int(n * 17) - 2000;
+            uint ui = (n * 2654435761u) ^ asuint(k.y);
+            float fmin = 0, fmax = 0;
+            int imin = 0, imax = 0;
+            uint umin = 0, umax = 0, bor = 0, band = 0, bxor = 0, psum = 0;
+            [branch] if ((i & 3) != 3) {
+                fmin = WaveActiveMin(f);
+                fmax = WaveActiveMax(f);
+                imin = WaveActiveMin(si);
+                imax = WaveActiveMax(si);
+                umin = WaveActiveMin(ui);
+                umax = WaveActiveMax(ui);
+                bor = WaveActiveBitOr(ui & 0xFFFF);
+                band = WaveActiveBitAnd(ui | 0xFF00);
+                bxor = WaveActiveBitXor(ui & 0xFF);
+                psum = WavePrefixSum(i & 7);
+            }
+            outb.Store4(16 * n, uint4(asuint(fmin) ^ asuint(fmax), uint(imin ^ imax), umin ^ umax, bor ^ band ^ bxor ^ psum));
+        }"#,
+    ),
 ];
 
 const MS_COMMON: &str = r#"

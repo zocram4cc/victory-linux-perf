@@ -1592,10 +1592,11 @@ mod tests {
         emit(&c, &native, &p, &st, &io, &res).map(|_| ())
     }
 
-    /// The high dword of a wave64 mask rewritten alone (`s_mov_b32 vcc_hi`
-    /// or `exec_hi`): lanes 32-63 took the mask the low dword was first
-    /// written with (the compare's, EXEC's on entry). Now the store refuses;
-    /// without the write it translates.
+    /// The high dword of a wave64 mask rewritten alone (`s_mov_b32 vcc_hi, 0`
+    /// or `s_mov_b32 exec_hi, 0`): lanes 32-63 are cleared rather than inheriting
+    /// the low dword's compare/EXEC bit. With wave64 split-half tracking, compute
+    /// shaders translate this exactly with `WaveSize(64)` and `Atom::Constant(0xFFFF_FFFF)`
+    /// (`lane < 32`); rewriting the high dword with an unlowerable scalar still refuses.
     #[test]
     fn a_mask_whose_high_dword_is_rewritten_is_refused() {
         // v_cmp_eq_u32 vcc, 0, v0; v_mov_b32 v2, 11; v_cndmask_b32 v1, 0, v2, vcc
@@ -1607,14 +1608,21 @@ mod tests {
         for body in [&select[..], &carry, &mov] {
             stores_v1(body).unwrap();
         }
-        // s_mov_b32 vcc_hi, 0 after the compare.
+        // s_mov_b32 vcc_hi, 0 / s_mov_b32 exec_hi, 0: now tracked exactly as
+        // `low_half & Atom::Constant(0x0000_0000_FFFF_FFFF)` (never bare `Atom::Lane`),
+        // translating cleanly with console lanes.
         let select_hi = [0x7D84_0080, 0xBEEB_0380, 0x7E04_028B, 0x0202_0480];
         let carry_hi = [0x7D84_0080, 0xBEEB_0380, 0x7E04_028B, 0x5002_0480];
-        // s_mov_b32 exec_hi, 0; v_mov_b32 v1, 7, then the same after
-        // s_mov_b64 s[2:3], exec.
         let exec_hi = [0xBEFF_0380, 0x7E02_0287];
         let exec_hi_saved = [0xBE82_047E, 0xBEFF_0380, 0x7E02_0287];
         for body in [&select_hi[..], &carry_hi, &exec_hi, &exec_hi_saved] {
+            stores_v1(body).unwrap();
+        }
+        // Rewriting vcc_hi / exec_hi with an untracked uninitialized SGPR (s20)
+        // still cannot inherit the compare's high half and must refuse.
+        let select_hi_bad = [0x7D84_0080, 0xBEEB_0314, 0x7E04_028B, 0x0202_0480];
+        let exec_hi_bad = [0xBEFF_0314, 0x7E02_0287];
+        for body in [&select_hi_bad[..], &exec_hi_bad] {
             assert!(stores_v1(body).is_err(), "{body:x?}");
         }
     }

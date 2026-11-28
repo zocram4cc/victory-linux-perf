@@ -41,7 +41,7 @@ impl Op {
         Some(match name {
             // the low dword of a 64-bit sum (`v_add_co_ci_u32` carries into
             // the high one) is the 32-bit sum of the low dwords
-            "v_add_nc_u32" | "v_add_co_u32" => Op::AddU,
+            "v_add_nc_u32" | "v_add_nc_i32" | "v_add_co_u32" => Op::AddU,
             "v_add_f32" => Op::AddF,
             "v_add_f16" => Op::AddH,
             "v_min_u32" => Op::MinU,
@@ -53,6 +53,35 @@ impl Op {
             "v_or_b32" => Op::Or,
             "v_and_b32" => Op::And,
             "v_xor_b32" => Op::Xor,
+            _ => return None,
+        })
+    }
+
+    fn of3(name: &str) -> Option<Op> {
+        Some(match name {
+            "v_add3_u32" => Op::AddU,
+            "v_or3_b32" => Op::Or,
+            "v_xor3_b32" => Op::Xor,
+            "v_min3_u32" => Op::MinU,
+            "v_max3_u32" => Op::MaxU,
+            "v_min3_i32" => Op::MinI,
+            "v_max3_i32" => Op::MaxI,
+            "v_min3_f32" => Op::MinF,
+            "v_max3_f32" => Op::MaxF,
+            _ => return None,
+        })
+    }
+
+    fn of_sop(name: &str) -> Option<Op> {
+        Some(match name {
+            "s_add_u32" | "s_add_i32" => Op::AddU,
+            "s_min_u32" => Op::MinU,
+            "s_max_u32" => Op::MaxU,
+            "s_min_i32" => Op::MinI,
+            "s_max_i32" => Op::MaxI,
+            "s_or_b32" => Op::Or,
+            "s_and_b32" => Op::And,
+            "s_xor_b32" => Op::Xor,
             _ => return None,
         })
     }
@@ -153,14 +182,22 @@ pub(crate) struct Section {
 pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
     let insts = &p.blocks[block].insts;
     let wave: u32 = if p.wave64 { 64 } else { 32 };
+    let mut pre_consts: Option<HashMap<Value, u32>> = None;
     let mut out = HashMap::new();
     let mut i = 0;
     while i < insts.len() {
         let inst = &insts[i];
-        // EXEC becomes every lane: `s_or_saveexec -1` or `s_nand_saveexec 0`.
+        // EXEC becomes every lane: `s_or_saveexec -1`, `s_orn2_saveexec -1`,
+        // `s_nand_saveexec 0`, or `s_orn1_saveexec 0`.
         let all = match inst.name() {
-            "s_or_saveexec_b64" | "s_or_saveexec_b32" => Some(Operand::Const(193)),
-            "s_nand_saveexec_b64" | "s_nand_saveexec_b32" => Some(Operand::Const(128)),
+            "s_or_saveexec_b64"
+            | "s_or_saveexec_b32"
+            | "s_orn2_saveexec_b64"
+            | "s_orn2_saveexec_b32" => Some(Operand::Const(193)),
+            "s_nand_saveexec_b64"
+            | "s_nand_saveexec_b32"
+            | "s_orn1_saveexec_b64"
+            | "s_orn1_saveexec_b32" => Some(Operand::Const(128)),
             _ => None,
         };
         let start = all.is_some_and(
@@ -184,7 +221,8 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
         let Some(end) = end else {
             break;
         };
-        let (vec, uni) = simulate(&insts[i + 1..end], wave, saved);
+        let consts = pre_consts.get_or_insert_with(|| collect_scalar_consts(p));
+        let (vec, uni) = simulate(&insts[i + 1..end], wave, saved, consts);
         let mut reads = HashMap::new();
         for later in insts[end + 1..].iter().filter(|i| i.name() == "v_readlane_b32") {
             if let Fields::Valu(v) = &later.fields
@@ -192,7 +230,7 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
                     (v.dst, &v.src[..])
                 && let Some(left) = later.read(Reg::V(*reg)).and_then(|x| vec.get(&x))
                 && let Some(w) = later.write(Reg::S(code))
-                && let Some(l) = lane_number(lane)
+                && let Some(l) = lane_number_in(later, lane, &uni, consts)
                 && let Some(&sym) = left.get(l as usize)
                 // (a lane's own value stays a lane read)
                 && !matches!(sym, Sym::Own(_))
@@ -204,6 +242,75 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
         let shapes = shapes(vec, uni, wave);
         out.insert(i, Section { end, shapes, reads });
         i = end + 1;
+    }
+    out
+}
+
+/// Scalar 32-bit constants built before a section (e.g. hoisted `+inf`, `-inf`,
+/// `INT_MAX`, `INT_MIN` for `v_cndmask_b32` or nibble tables for `v_permlane`).
+fn collect_scalar_consts(p: &Program) -> HashMap<Value, u32> {
+    let mut defs: HashMap<Value, &Inst> = HashMap::new();
+    for block in &p.blocks {
+        for inst in &block.insts {
+            if matches!(inst.fields, Fields::Sop { .. })
+                && matches!(
+                    inst.name(),
+                    "s_mov_b32" | "s_movk_i32" | "s_brev_b32" | "s_not_b32"
+                )
+            {
+                for &(r, w) in &inst.writes {
+                    if matches!(r, Reg::S(_)) {
+                        defs.insert(w, inst);
+                    }
+                }
+            }
+        }
+    }
+    fn resolve(
+        v: Value,
+        defs: &HashMap<Value, &Inst>,
+        cache: &mut HashMap<Value, Option<u32>>,
+        depth: usize,
+    ) -> Option<u32> {
+        if let Some(&r) = cache.get(&v) {
+            return r;
+        }
+        if depth > 8 {
+            return None;
+        }
+        let inst = *defs.get(&v)?;
+        let Fields::Sop { src, imm, .. } = &inst.fields else {
+            return None;
+        };
+        let res = match inst.name() {
+            "s_movk_i32" => Some(i32::from((*imm)? as i16) as u32),
+            name @ ("s_mov_b32" | "s_brev_b32" | "s_not_b32") => {
+                let raw = match *src.first()? {
+                    Operand::Scalar { code: NULL, .. } => Some(0),
+                    Operand::Scalar { code, .. } => inst
+                        .read(Reg::S(code))
+                        .and_then(|u| resolve(u, defs, cache, depth + 1)),
+                    Operand::Const(c) => crate::resource::inline(c),
+                    Operand::Literal(x) => Some(x),
+                    _ => None,
+                }?;
+                Some(match name {
+                    "s_brev_b32" => raw.reverse_bits(),
+                    "s_not_b32" => !raw,
+                    _ => raw,
+                })
+            }
+            _ => None,
+        };
+        cache.insert(v, res);
+        res
+    }
+    let mut cache = HashMap::new();
+    let mut out = HashMap::new();
+    for &v in defs.keys() {
+        if let Some(k) = resolve(v, &defs, &mut cache, 0) {
+            out.insert(v, k);
+        }
     }
     out
 }
@@ -289,11 +396,26 @@ fn combine(op: Op, a: Sym, b: Sym) -> Sym {
     }
 }
 
-/// The lane a `v_readlane_b32` names.
-fn lane_number(op: &Operand) -> Option<u32> {
+/// The lane a `v_readlane_b32` / `v_writelane_b32` names (inline, literal, or
+/// constant scalar).
+fn lane_number_in(
+    inst: &Inst,
+    op: &Operand,
+    uni: &HashMap<Value, Sym>,
+    pre_consts: &HashMap<Value, u32>,
+) -> Option<u32> {
     match *op {
         Operand::Const(c) => crate::resource::inline(c),
         Operand::Literal(x) => Some(x),
+        Operand::Scalar { code: NULL, .. } => Some(0),
+        Operand::Scalar { code, .. } => {
+            let v = inst.read(Reg::S(code))?;
+            match uni.get(&v).copied() {
+                Some(Sym::K(k)) => Some(k),
+                Some(_) => None,
+                None => pre_consts.get(&v).copied(),
+            }
+        }
         _ => None,
     }
 }
@@ -301,7 +423,12 @@ fn lane_number(op: &Operand) -> Option<u32> {
 /// The lanes' values of the VGPRs the section writes, and its scalars.
 type Left = (HashMap<Value, Vec<Sym>>, HashMap<Value, Sym>);
 
-fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Left {
+fn simulate(
+    insts: &[Inst],
+    wave: u32,
+    saved: Value,
+    pre_consts: &HashMap<Value, u32>,
+) -> Left {
     let all = if wave == 64 {
         u64::MAX
     } else {
@@ -310,63 +437,130 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Left {
     let mut exec = all;
     let mut vec: HashMap<Value, Vec<Sym>> = HashMap::new();
     let mut uni: HashMap<Value, Sym> = HashMap::new();
-    // Masks the section derives from the saved EXEC (`s_and` with it).
+    // Masks the section derives from the saved EXEC (`s_and` / `s_mov` of it).
     let mut masked = vec![saved];
+    let scalar_sym = |inst: &Inst, op: &Operand, uni: &HashMap<Value, Sym>| -> Sym {
+        match *op {
+            Operand::Scalar { code: NULL, .. } => Sym::K(0),
+            Operand::Scalar { code, .. } => match inst.read(Reg::S(code)) {
+                Some(x) => uni
+                    .get(&x)
+                    .copied()
+                    .or_else(|| pre_consts.get(&x).copied().map(Sym::K))
+                    .unwrap_or(Sym::Uni(x)),
+                None => Sym::Unknown,
+            },
+            Operand::Const(c) => crate::resource::inline(c).map_or(Sym::Unknown, Sym::K),
+            Operand::Literal(x) => Sym::K(x),
+            _ => Sym::Unknown,
+        }
+    };
     for inst in insts {
         let name = inst.name();
         if inst.write(Reg::S(EXEC)).is_some() {
-            // Constant lane sets (prefix sums); anything else ends what
-            // the simulation can follow.
-            let lo = name
-                .starts_with("s_mov_b")
-                .then(|| constant(inst))
-                .flatten();
-            let Some(k) = lo else {
+            // Constant lane sets (prefix sums, or `s_or_b64 exec, exec, -1`);
+            // anything else ends what the simulation can follow.
+            let next = update_exec(inst, exec, false, all);
+            let Some(new_exec) = next else {
                 return (vec, uni);
             };
-            exec = (if name == "s_mov_b64" {
-                k
-            } else {
-                (exec & !0xFFFF_FFFF) | (k & 0xFFFF_FFFF)
-            }) & all;
+            exec = new_exec;
             continue;
         }
         if inst.write(Reg::S(EXEC + 1)).is_some() {
-            let Some(k) = name
-                .starts_with("s_mov_b")
-                .then(|| constant(inst))
-                .flatten()
-            else {
+            let Some(new_exec) = update_exec(inst, exec, true, all) else {
                 return (vec, uni);
             };
-            exec = ((exec & 0xFFFF_FFFF) | ((k & 0xFFFF_FFFF) << 32)) & all;
+            exec = new_exec;
             continue;
         }
-        if let Fields::Sop { dst, src, .. } = &inst.fields {
-            if name.starts_with("s_and_b")
+        if let Fields::Sop { dst, src, imm } = &inst.fields {
+            if (name.starts_with("s_and_b") || matches!(name, "s_mov_b64" | "s_mov_b32"))
                 && src.iter().any(|o| matches!(*o, Operand::Scalar { code, .. } if inst.read(Reg::S(code)).is_some_and(|v| masked.contains(&v))))
                 && let Some(&(_, w)) = inst.writes.iter().find(|w| matches!(w.0, Reg::S(_)))
             {
                 masked.push(w);
             }
-            if name == "s_mov_b32"
-                && let (Some(Operand::Scalar { code: dc, .. }), Some(s0)) = (dst, src.first())
+            if let Some(Operand::Scalar { code: dc, .. }) = dst
                 && *dc != NULL
                 && let Some(w) = inst.write(Reg::S(*dc))
             {
-                let sym = match *s0 {
-                    Operand::Scalar { code, .. } if code != NULL => inst
-                        .read(Reg::S(code))
-                        .map_or(Sym::Unknown, |x| uni.get(&x).copied().unwrap_or(Sym::Uni(x))),
-                    Operand::Const(c) => crate::resource::inline(c).map_or(Sym::Unknown, Sym::K),
-                    Operand::Literal(x) => Sym::K(x),
-                    _ => Sym::Unknown,
+                let sym = match name {
+                    "s_mov_b32" => src.first().map_or(Sym::Unknown, |s0| scalar_sym(inst, s0, &uni)),
+                    "s_movk_i32" => imm.map_or(Sym::Unknown, |k| Sym::K(i32::from(k as i16) as u32)),
+                    "s_brev_b32" => match src.first().map(|s0| scalar_sym(inst, s0, &uni)) {
+                        Some(Sym::K(k)) => Sym::K(k.reverse_bits()),
+                        _ => Sym::Unknown,
+                    },
+                    "s_not_b32" => match src.first().map(|s0| scalar_sym(inst, s0, &uni)) {
+                        Some(Sym::K(k)) => Sym::K(!k),
+                        _ => Sym::Unknown,
+                    },
+                    _ => match (Op::of_sop(name), src.first(), src.get(1)) {
+                        (Some(op), Some(s0), Some(s1)) => {
+                            let a = scalar_sym(inst, s0, &uni);
+                            let b = scalar_sym(inst, s1, &uni);
+                            combine(op, a, b)
+                        }
+                        _ => Sym::Unknown,
+                    },
                 };
                 uni.insert(w, sym);
             }
             for &(_, w) in &inst.writes {
                 uni.entry(w).or_insert(Sym::Unknown);
             }
+            continue;
+        }
+        if let Fields::Ds {
+            dst: Some(Operand::Vector { reg: dreg, .. }),
+            addr: Some(Operand::Vector { reg: sreg, .. }),
+            offset0,
+            offset1,
+            ..
+        } = &inst.fields
+            && name == "ds_swizzle_b32"
+        {
+            let Some(dst) = inst.write(Reg::V(*dreg)) else {
+                continue;
+            };
+            let src_lanes = match inst.read(Reg::V(*sreg)) {
+                Some(x) => vec
+                    .get(&x)
+                    .cloned()
+                    .unwrap_or_else(|| vec![Sym::Own(x); wave as usize]),
+                None => vec![Sym::Unknown; wave as usize],
+            };
+            let old = match inst.read(Reg::V(*dreg)) {
+                Some(x) => vec
+                    .get(&x)
+                    .cloned()
+                    .unwrap_or_else(|| vec![Sym::Own(x); wave as usize]),
+                None => vec![Sym::Unknown; wave as usize],
+            };
+            let off = u32::from(*offset0) | u32::from(*offset1) << 8;
+            let merged = (0..wave)
+                .map(|l| {
+                    if exec >> l & 1 == 0 {
+                        return old[l as usize];
+                    }
+                    let src_l = if off & 0x8000 != 0 {
+                        let pick = (off >> (2 * (l & 3))) & 3;
+                        (l & !3) | pick
+                    } else {
+                        let and = (off & 0x1F) | !0x1F;
+                        let or = (off >> 5) & 0x1F;
+                        let xor = (off >> 10) & 0x1F;
+                        ((l & and) | or) ^ xor
+                    };
+                    if src_l < wave && (exec >> src_l) & 1 != 0 {
+                        src_lanes[src_l as usize]
+                    } else {
+                        Sym::K(0)
+                    }
+                })
+                .collect();
+            vec.insert(dst, merged);
             continue;
         }
         let Fields::Valu(v) = &inst.fields else {
@@ -388,13 +582,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Left {
                         .unwrap_or_else(|| (0..wave).map(|_| Sym::Own(x)).collect()),
                     None => one(Sym::Unknown),
                 },
-                Operand::Scalar { code, .. } if code != NULL => match inst.read(Reg::S(code)) {
-                    Some(x) => one(uni.get(&x).copied().unwrap_or(Sym::Uni(x))),
-                    None => one(Sym::Unknown),
-                },
-                Operand::Const(c) => one(crate::resource::inline(c).map_or(Sym::Unknown, Sym::K)),
-                Operand::Literal(x) => one(Sym::K(x)),
-                _ => one(Sym::Unknown),
+                _ => one(scalar_sym(inst, op, uni)),
             }
         };
         let modifiers = v.abs != 0 || v.neg != 0 || v.clamp || v.omod != 0 || v.sdwa.is_some();
@@ -404,7 +592,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Left {
             else {
                 continue;
             };
-            let l = lane_number(lane);
+            let l = lane_number_in(inst, lane, &uni, pre_consts);
             let x = lanes(src, &vec, &uni);
             if let Some(w) = inst.write(Reg::S(code)) {
                 let s = l
@@ -412,6 +600,48 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Left {
                     .unwrap_or(Sym::Unknown);
                 uni.insert(w, s);
             }
+            continue;
+        }
+        if name == "v_readfirstlane_b32" {
+            let (Some(Operand::Scalar { code, .. }), Some(src)) = (v.dst, v.src.first()) else {
+                continue;
+            };
+            let x = lanes(src, &vec, &uni);
+            if let Some(w) = inst.write(Reg::S(code)) {
+                let s = if exec != 0 {
+                    x.get(exec.trailing_zeros() as usize)
+                        .copied()
+                        .unwrap_or(Sym::Unknown)
+                } else {
+                    Sym::Unknown
+                };
+                uni.insert(w, s);
+            }
+            continue;
+        }
+        if name == "v_writelane_b32"
+            && !modifiers
+            && v.dpp.is_none()
+            && let Some(Operand::Vector { reg: dreg, .. }) = v.dst
+            && let Some(dst) = inst.write(Reg::V(dreg))
+        {
+            let mut merged = lanes(
+                &Operand::Vector {
+                    reg: dreg,
+                    dwords: 1,
+                },
+                &vec,
+                &uni,
+            );
+            if let (Some(src0), Some(lane_op)) = (v.src.first(), v.src.get(1))
+                && let Some(l) = lane_number_in(inst, lane_op, &uni, pre_consts)
+            {
+                let target = (l & (wave - 1)) as usize;
+                merged[target] = scalar_sym(inst, src0, &uni);
+            } else {
+                merged.fill(Sym::Unknown);
+            }
+            vec.insert(dst, merged);
             continue;
         }
         if name == "v_add_f64"
@@ -560,16 +790,31 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Left {
         let mut writes = exec;
         let fetched: Option<Vec<Sym>> = match (v.dpp, &src0) {
             (Some(d), Some(s)) => {
-                if exec != all {
-                    vec.insert(dst, vec![Sym::Unknown; wave as usize]);
-                    continue;
-                }
                 let mut f = Vec::with_capacity(wave as usize);
                 let mut ok = true;
+                let (fi, bound_ctrl, is_row) = match d {
+                    Dpp::Row {
+                        fi, bound_ctrl, ..
+                    } => (fi, bound_ctrl, true),
+                    Dpp::Lanes { fi, .. } => (fi, false, false),
+                };
                 for l in 0..wave {
                     match dpp_lane(d, l) {
                         Some((src, zero, on)) if src < wave => {
-                            f.push(if zero { Sym::K(0) } else { s[src as usize] });
+                            if zero {
+                                f.push(Sym::K(0));
+                            } else if (exec >> src) & 1 == 0 && !fi {
+                                if is_row && bound_ctrl {
+                                    f.push(Sym::K(0));
+                                } else if is_row {
+                                    f.push(Sym::Unknown);
+                                    writes &= !(1u64 << l);
+                                } else {
+                                    ok = false;
+                                }
+                            } else {
+                                f.push(s[src as usize]);
+                            }
                             if !on {
                                 writes &= !(1u64 << l);
                             }
@@ -601,7 +846,9 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Left {
                 let b = src(1).unwrap_or_default();
                 (0..wave as usize)
                     .map(|l| match (a[l], b.get(l).copied(), mask) {
-                        (Sym::K(ident), Some(Sym::Own(x)), Some(m)) if masked.contains(&m) => {
+                        (Sym::K(ident), Some(Sym::Own(x) | Sym::Uni(x)), Some(m))
+                            if masked.contains(&m) =>
+                        {
                             Sym::Red {
                                 op: None,
                                 src: x,
@@ -614,72 +861,102 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Left {
                     })
                     .collect()
             }
-            ("v_permlanex16_b32", Some(a)) => {
-                // Lanes of each row read the other row of their half; lane
-                // i's pick is nibble i of {src2, src1}.
-                let sel = |k: usize| match v.src.get(k) {
-                    Some(&Operand::Const(c)) => crate::resource::inline(c),
-                    Some(&Operand::Literal(x)) => Some(x),
-                    _ => None,
+            ("v_permlane16_b32" | "v_permlanex16_b32", Some(a)) => {
+                // Lanes of each row read this row (permlane16) or the other row
+                // of their 32-lane half (permlanex16); lane i's pick is nibble i
+                // of {src2, src1}. OP_SEL[0:1] are fetch-inactive and bound-ctrl
+                // (higher OP_SEL bits are unused on 32-bit permlane).
+                let fetch_inactive = v.opsel & 1 != 0;
+                let bound_ctrl = v.opsel & 2 != 0;
+                let sel = |k: usize| {
+                    v.src
+                        .get(k)
+                        .and_then(|op| lane_number_in(inst, op, &uni, pre_consts))
                 };
                 match (sel(1), sel(2)) {
                     (Some(s1), Some(s2)) => {
                         let s = u64::from(s1) | u64::from(s2) << 32;
+                        let swap = if name == "v_permlanex16_b32" { 16 } else { 0 };
                         (0..wave)
                             .map(|l| {
-                                let other = (l & !31) | ((l & 16) ^ 16);
+                                let row = (l & !15) ^ swap;
                                 let pick = (s >> (4 * (l & 15)) & 15) as u32;
-                                a[(other | pick) as usize]
+                                let src_l = row | pick;
+                                if (exec >> src_l) & 1 == 0 && !fetch_inactive {
+                                    if bound_ctrl {
+                                        Sym::K(0)
+                                    } else {
+                                        writes &= !(1u64 << l);
+                                        old[l as usize]
+                                    }
+                                } else {
+                                    a[src_l as usize]
+                                }
                             })
                             .collect()
                     }
                     _ => vec![Sym::Unknown; wave as usize],
                 }
             }
-            ("v_sub_nc_u32", Some(a)) => {
+            ("v_sub_nc_u32" | "v_sub_nc_i32" | "v_subrev_nc_u32" | "v_subrev_nc_i32", Some(a)) => {
                 // A prefix sum less the lane's own term: the exclusive one.
                 let b = src(1).unwrap_or_default();
+                let rev = name.contains("subrev");
                 (0..wave as usize)
-                    .map(|l| match (a[l], b.get(l).copied()) {
-                        (
-                            Sym::Red {
-                                op: None | Some(Op::AddU),
-                                src,
-                                mask,
-                                ident: 0,
-                                lanes,
-                            },
-                            Some(Sym::Red {
-                                op: None | Some(Op::AddU),
-                                src: s2,
-                                mask: m2,
-                                ident: 0,
-                                lanes: l2,
-                            }),
-                        ) if (src, mask) == (s2, m2) && lanes & l2 == l2 => {
-                            let rest = lanes & !l2;
-                            if rest == 0 {
-                                Sym::K(0)
-                            } else {
-                                Sym::Red {
-                                    op: Some(Op::AddU),
+                    .map(|l| {
+                        let pair = if rev {
+                            (b.get(l).copied(), Some(a[l]))
+                        } else {
+                            (Some(a[l]), b.get(l).copied())
+                        };
+                        match pair {
+                            (
+                                Some(Sym::Red {
+                                    op: None | Some(Op::AddU),
                                     src,
                                     mask,
                                     ident: 0,
-                                    lanes: rest,
+                                    lanes,
+                                }),
+                                Some(Sym::Red {
+                                    op: None | Some(Op::AddU),
+                                    src: s2,
+                                    mask: m2,
+                                    ident: 0,
+                                    lanes: l2,
+                                }),
+                            ) if (src, mask) == (s2, m2) && lanes & l2 == l2 => {
+                                let rest = lanes & !l2;
+                                if rest == 0 {
+                                    Sym::K(0)
+                                } else {
+                                    Sym::Red {
+                                        op: Some(Op::AddU),
+                                        src,
+                                        mask,
+                                        ident: 0,
+                                        lanes: rest,
+                                    }
                                 }
                             }
+                            _ => Sym::Unknown,
                         }
-                        _ => Sym::Unknown,
                     })
                     .collect()
             }
-            (n, Some(a)) => match (Op::of(n), src(1)) {
-                (Some(op), Some(b)) => (0..wave as usize)
-                    .map(|l| combine(op, a[l], b[l]))
-                    .collect(),
-                _ => vec![Sym::Unknown; wave as usize],
-            },
+            (n, Some(a)) => {
+                if let (Some(op), Some(b), Some(c)) = (Op::of3(n), src(1), src(2)) {
+                    (0..wave as usize)
+                        .map(|l| combine(op, combine(op, a[l], b[l]), c[l]))
+                        .collect()
+                } else if let (Some(op), Some(b)) = (Op::of(n), src(1)) {
+                    (0..wave as usize)
+                        .map(|l| combine(op, a[l], b[l]))
+                        .collect()
+                } else {
+                    vec![Sym::Unknown; wave as usize]
+                }
+            }
             _ => vec![Sym::Unknown; wave as usize],
         };
         let merged = (0..wave as usize)
@@ -694,6 +971,76 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Left {
         vec.insert(dst, merged);
     }
     (vec, uni)
+}
+
+/// Updates constant `exec` across an EXEC-writing scalar instruction inside a
+/// section (`s_mov`, `s_or`, `s_and` with constant operands).
+fn update_exec(inst: &Inst, exec: u64, high_only: bool, all: u64) -> Option<u64> {
+    let name = inst.name();
+    if name.starts_with("s_mov_b") {
+        let k = constant(inst)?;
+        let next = if high_only {
+            (exec & 0xFFFF_FFFF) | ((k & 0xFFFF_FFFF) << 32)
+        } else if name == "s_mov_b64" {
+            k
+        } else {
+            (exec & !0xFFFF_FFFF) | (k & 0xFFFF_FFFF)
+        };
+        return Some(next & all);
+    }
+    let Fields::Sop { src, .. } = &inst.fields else {
+        return None;
+    };
+    let (wide, is_or) = match name {
+        "s_or_b64" => (true, true),
+        "s_and_b64" => (true, false),
+        "s_or_b32" => (false, true),
+        "s_and_b32" => (false, false),
+        _ => return None,
+    };
+    if high_only && wide {
+        return None;
+    }
+    let target_reg = if high_only { EXEC + 1 } else { EXEC };
+    let is_exec = |op: &Operand| matches!(*op, Operand::Scalar { code, .. } if code == target_reg);
+    let const_op = |op: &Operand| -> Option<u64> {
+        match *op {
+            Operand::Scalar { code: NULL, .. } => Some(0),
+            Operand::Const(c @ 128..=208) => {
+                let x = crate::resource::inline(c)?;
+                Some(if wide {
+                    i64::from(x as i32) as u64
+                } else {
+                    u64::from(x)
+                })
+            }
+            Operand::Const(c) if !wide => crate::resource::inline(c).map(u64::from),
+            Operand::Literal(x) if !wide || x >> 31 == 0 => Some(u64::from(x)),
+            _ => None,
+        }
+    };
+    let [a, b] = &src[..] else {
+        return None;
+    };
+    let k = if is_exec(a) {
+        const_op(b)?
+    } else if is_exec(b) {
+        const_op(a)?
+    } else {
+        return None;
+    };
+    let next = if wide {
+        if is_or { exec | k } else { exec & k }
+    } else if high_only {
+        let hi = (exec >> 32) & 0xFFFF_FFFF;
+        let nh = if is_or { hi | k } else { hi & k } & 0xFFFF_FFFF;
+        (exec & 0xFFFF_FFFF) | (nh << 32)
+    } else {
+        let lo = exec & 0xFFFF_FFFF;
+        let nl = if is_or { lo | k } else { lo & k } & 0xFFFF_FFFF;
+        (exec & !0xFFFF_FFFF) | nl
+    };
+    Some(next & all)
 }
 
 fn constant(inst: &Inst) -> Option<u64> {
@@ -1288,5 +1635,101 @@ mod tests {
             bad_ident[0] = red(None, v0, m0, 1, 1);
             assert_eq!(per_lane(&bad_ident, all), None);
         }
+    }
+
+    #[test]
+    fn ds_swizzle_permlane16_three_op_hoisted_identity_and_scalar_tail() {
+        // 1. Wave32 OR reduction via `ds_swizzle_b32` xor butterfly.
+        let p = build(
+            &[
+                0xBE843DC1, 0xD5010001, 0x00120080, 0xD8D4041F, 0x02000001, 0x38020501,
+                0xD8D4081F, 0x02000001, 0x38020501, 0xD8D4101F, 0x02000001, 0x38020501,
+                0xD8D4201F, 0x02000001, 0x38020501, 0xD8D4401F, 0x02000001, 0x38020501,
+                0xBEFE0304,
+            ],
+            false,
+        );
+        let insts = &p.blocks[0].insts;
+        let saved = insts[0].write(Reg::S(4)).unwrap();
+        let v0 = p.inputs.iter().find_map(|&(r, v)| (r == Reg::V(0)).then_some(v)).unwrap();
+        let out_v1 = insts[insts.len() - 3].write(Reg::V(1)).unwrap();
+        let sec = &sections(&p, 0)[&0];
+        assert_eq!(sec.shapes.get(&out_v1), Some(&Shape::Active(Op::Or, v0, saved, 0)));
+
+        // 2. Hoisted `+inf` before `s_orn1_saveexec_b64 0` + `v_readfirstlane_b32`.
+        let p = build(
+            &[
+                0xBE8603FF, 0x7F800000, 0xBE843880, 0xD5010001, 0x00120006, 0x1E0202E9,
+                0xDE54C101, 0x1E0202E9, 0x93601201, 0x1E0202E9, 0x00092401, 0x1E0202FA,
+                0xFF094001, 0xD7780002, 0x02010101, 0x1E020302, 0xD7600007, 0x02014101,
+                0x1E020207, 0x7E100501, 0xBEFE0404,
+            ],
+            true,
+        );
+        let insts = &p.blocks[0].insts;
+        let saved = insts[1].write(Reg::S(4)).unwrap();
+        let v0 = p.inputs.iter().find_map(|&(r, v)| (r == Reg::V(0)).then_some(v)).unwrap();
+        let s8 = insts[insts.len() - 3].write(Reg::S(8)).unwrap();
+        let sec = &sections(&p, 0)[&1];
+        assert_eq!(
+            sec.shapes.get(&s8),
+            Some(&Shape::Active(Op::MinF, v0, saved, 0x7F80_0000))
+        );
+
+        // 3. `v_permlane16_b32` + `v_or3_b32` + scalar `s_or_b32` tail + `v_writelane_b32`.
+        let p = build(
+            &[
+                0xBE8425C1, 0xD5010001, 0x00120080, 0x380202E9, 0xDE54C101, 0x380202E9,
+                0x93601201, 0x380202E9, 0x00092401, 0x380202FA, 0xFF094001, 0xD7770002,
+                0x02010101, 0xD7780003, 0x02010102, 0xD7720001, 0x040E0501, 0xD7600006,
+                0x02010101, 0xD7600007, 0x02014101, 0x88080706, 0xD7610004, 0x02010008,
+                0xD7600009, 0x02010104, 0xBEFE0404,
+            ],
+            true,
+        );
+        let insts = &p.blocks[0].insts;
+        let saved = insts[0].write(Reg::S(4)).unwrap();
+        let v0 = p.inputs.iter().find_map(|&(r, v)| (r == Reg::V(0)).then_some(v)).unwrap();
+        let s8 = insts[insts.len() - 5].write(Reg::S(8)).unwrap();
+        let s9 = insts[insts.len() - 3].write(Reg::S(9)).unwrap();
+        let sec = &sections(&p, 0)[&0];
+        assert_eq!(sec.shapes.get(&s8), Some(&Shape::Active(Op::Or, v0, saved, 0)));
+        assert_eq!(sec.shapes.get(&s9), Some(&Shape::Active(Op::Or, v0, saved, 0)));
+
+        // 4. DPP with partial constant `exec` (`exec_hi = 0`) + `s_or_b64 exec, exec, -1`.
+        let p = build(
+            &[
+                0xBE8425C1, 0xD5010001, 0x00120080, 0xBEFF0380, 0x380202FA, 0xFF096101,
+                0x88FEC17E, 0xBEFE0404,
+            ],
+            true,
+        );
+        let insts = &p.blocks[0].insts;
+        let saved = insts[0].write(Reg::S(4)).unwrap();
+        let v0 = p.inputs.iter().find_map(|&(r, v)| (r == Reg::V(0)).then_some(v)).unwrap();
+        let consts = collect_scalar_consts(&p);
+        let (vec, _) = simulate(&insts[1..insts.len() - 2], 64, saved, &consts);
+        let v1_dpp = insts[3].write(Reg::V(1)).unwrap();
+        assert_eq!(
+            vec[&v1_dpp][0],
+            Sym::Red {
+                op: Some(Op::Or),
+                src: v0,
+                mask: saved,
+                ident: 0,
+                lanes: 0b11,
+            }
+        );
+        // Upper half (inactive during DPP) retained its single-lane masked value.
+        assert_eq!(
+            vec[&v1_dpp][32],
+            Sym::Red {
+                op: None,
+                src: v0,
+                mask: saved,
+                ident: 0,
+                lanes: 1u64 << 32,
+            }
+        );
     }
 }
